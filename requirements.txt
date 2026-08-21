@@ -1,0 +1,9 @@
+# Discord gateway client.
+discord.py>=2.4.0
+# The bot's own model calls: question answering, commitment detection, nudge wording.
+anthropic>=0.39.0
+# Transport used by the Anthropic SDK; pinned here so a resolver can't pick an
+# incompatible one behind our back.
+httpx>=0.27.0
+# Loads .env in config.py.
+python-dotenv>=1.0.0

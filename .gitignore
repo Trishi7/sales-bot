@@ -1,0 +1,35 @@
+# Secrets & local state — never commit these
+.env
+.env.*
+!.env.example
+*.db
+sales_bot.db
+sales_bot.db-journal
+sales_bot.db-wal
+sales_bot.db-shm
+
+# Runtime state written by the bot. state/summary.json and state/audit.jsonl are
+# LOCAL operational data (see the STATE CONTRACT in README) — the directory is
+# tracked via .gitkeep, its contents never are.
+state/*
+!state/.gitkeep
+
+# Logs (PM2 writes here; see DEPLOY.md)
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
