@@ -2,11 +2,28 @@
 .env
 .env.*
 !.env.example
+
+# Google service-account key files (GOOGLE_SERVICE_ACCOUNT_JSON). These carry a
+# live private key that can read and WRITE the GTM sheets — never commit one.
+# The patterns are deliberately broad: a key dropped in here under any plausible
+# name is ignored by default, because the failure mode is unrecoverable (a
+# committed key must be revoked in GCP, not just deleted from history).
+*service-account*.json
+*service_account*.json
+*-credentials.json
+credentials.json
+gcp-*.json
+sales-bot-*.json
+secrets/
 *.db
 sales_bot.db
 sales_bot.db-journal
 sales_bot.db-wal
 sales_bot.db-shm
+
+# Meeting notes pulled down by NOTES_SYNC_CMD. Company meeting content synced
+# from Drive — never commit it, and the bot re-syncs it on every boot anyway.
+notes/
 
 # Runtime state written by the bot. state/summary.json and state/audit.jsonl are
 # LOCAL operational data (see the STATE CONTRACT in README) — the directory is

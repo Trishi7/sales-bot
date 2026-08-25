@@ -326,14 +326,24 @@ def fallback_capability_reply() -> str:
     answer and it must survive an API failure."""
     lines = [
         f"I'm {NAME}, the sales and marketing chief of staff for this team. "
-        "I read the sales channels, track what people commit to and chase it when "
-        "it's overdue, and answer questions from what I can actually see."
+        "I read the sales channels, track what people commit to, and answer "
+        "questions from what I can actually see. Anything overdue, stalled or "
+        "waiting on us goes into one digest a day rather than pinging you "
+        "through it."
     ]
     statuses = sources.status_report()
     connected = [s for s in statuses if s["status"] == sources.CONNECTED]
-    waiting = [s for s in statuses if s["status"] != sources.CONNECTED]
+    stale = [s for s in statuses if s["status"] == sources.DEGRADED]
+    waiting = [s for s in statuses if s["status"] not in sources.USABLE]
     if connected:
         lines.append("Connected: " + ", ".join(s["label"] for s in connected) + ".")
+    if stale:
+        # Readable, so it belongs in what I CAN see — but never without the
+        # caveat, or a stale answer reads as a current one.
+        lines.append(
+            "Readable but going stale: "
+            + ", ".join(f"{s['label']} ({s['detail']})" for s in stale)
+        )
     if waiting:
         lines.append(
             "Still waiting on access to: "

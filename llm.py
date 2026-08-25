@@ -9,6 +9,11 @@ which runs a tool-use loop. What lives here are the four short calls around it:
                       and the LIVE source statuses.
   detect_commitment() is this someone promising to come back with something?
   chase_nudge()       the persona-voiced reminder text for an overdue promise.
+                      NO LONGER ON THE CHASE PATH: an overdue promise is a
+                      deterministic line in the daily digest (digest.py), because
+                      forty model calls to build one message would be slow, and
+                      unpredictable in a message people are meant to skim. Kept
+                      for a one-off, hand-asked reminder.
 
 Two rules run through all of them:
 
@@ -238,7 +243,10 @@ class LLM:
         `mention` is pasted verbatim; it was produced by `guardrails.mention_for`,
         so it is already roster-checked. Always returns something sendable — a
         chase that silently doesn't fire is the one failure this feature cannot
-        have, so any failure falls back to `followups.fallback_nudge`."""
+        have, so any failure falls back to `followups.fallback_nudge`.
+
+        NOT CALLED BY THE SWEEPER any more — overdue promises are lines in the
+        daily digest, written deterministically. See the module docstring."""
         log.info("[llm.nudge] composing for %s about %r", mention, (what or "")[:80])
         item = {
             "person_id": None,

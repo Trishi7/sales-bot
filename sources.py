@@ -1,22 +1,39 @@
 """THE SOURCE LAYER — the three things this bot reasons over, and whether it can
 actually reach them yet.
 
-A sales Chief of Staff is only as good as what it can see. Three sources matter:
+A sales Chief of Staff is only as good as what it can see. Four sources matter:
 
-  sales_spreadsheet    the pipeline / targets / outreach log — who we're talking
-                       to, at what stage, against what number.
+  sales_spreadsheet    the GTM Playbook — the outreach tracker, the positioning
+                       matrix and the prospect priority list. LIVE via the Google
+                       Sheets API (gtm_sheet.py).
+  researcher_mapping   the researcher/buyer mapping — which PEOPLE to pitch
+                       inside those orgs, in which ICP lane, with what hook, and
+                       who must not be pitched at all. LIVE and STRICTLY
+                       READ-ONLY (mapping_sheet.py).
   strategy_doc         the current sales & marketing strategy — the plan outreach
-                       is supposed to be executing.
+                       is supposed to be executing. STILL A STUB.
   sales_meeting_notes  the Drive-synced meeting notes (notes.py) — what was
-                       actually said and committed to.
+                       actually said and committed to. LIVE, and filtered: only
+                       notes that are SALES meetings are ever loaded.
 
-Right now only the third is wired up. The other two are STUBS whose real readers
-land in the next prompt. That is deliberate and it is the point of this module:
-each source SELF-REPORTS its status, so the bot can be honest about its own blind
-spots instead of quietly answering from two sources out of three and sounding
-just as confident.
+Three of the four are wired up. The strategy doc is still a stub, and that gap is
+load-bearing rather than cosmetic: the deadline cadence prefers the strategy doc
+and only falls back to the env defaults because the doc can't be read yet.
+
+The playbook and the mapping sheet are two sources rather than one on purpose:
+they answer different questions (which ACCOUNT vs which PERSON), they can fail
+independently, and only one of them is ever writable. Collapsing them would let
+an outage in one be reported as health in the other.
+
+Which is the point of this module. Each source SELF-REPORTS its status, so the
+bot can be honest about its own blind spots instead of quietly answering from two
+sources out of three and sounding just as confident.
 
     connected        the source is reachable and readable right now.
+    degraded         readable, but something behind it is broken and the data is
+                     going stale — e.g. the notes folder is readable while the
+                     rclone sync that fills it is failing. Usable, WITH a caveat
+                     the answer must carry.
     awaiting-access  we know what it is, we don't have access/credentials/a path
                      for it yet. NOT an error — a known gap.
     error            it's configured and should work, but reading it failed.
@@ -29,16 +46,24 @@ Every reader here is READ-ONLY by construction. Nothing in this module writes to
 a spreadsheet, a doc, or Drive — a source is something the bot looks at.
 """
 import logging
+from datetime import date
 from typing import Optional
 
 import config
+import gtm_sheet
+import mapping_sheet
 import notes
 
 log = logging.getLogger(__name__)
 
 CONNECTED = "connected"
+DEGRADED = "degraded"
 AWAITING_ACCESS = "awaiting-access"
 ERROR = "error"
+
+#: Statuses the bot may actually answer FROM. `degraded` is in here on purpose:
+#: stale data with the staleness stated is useful, silence is not.
+USABLE = (CONNECTED, DEGRADED)
 
 
 class Source:
@@ -83,45 +108,200 @@ class Source:
     def connected(self) -> bool:
         return self.status()["status"] == CONNECTED
 
+    @property
+    def usable(self) -> bool:
+        """Readable at all — connected, or degraded and going stale. Callers that
+        can carry a staleness caveat should check this; callers that need fresh
+        data should check `connected`."""
+        return self.status()["status"] in USABLE
+
 
 class SalesSpreadsheet(Source):
-    """The pipeline / targets / outreach log.
+    """The GTM Playbook — the pipeline, the positioning matrix and the priority
+    list. WIRED UP, live through the Sheets API (see gtm_sheet.py).
 
-    STUB. The next prompt gives this a real reader (Sheets API or a synced
-    export). Until then it reports awaiting-access and names what's missing, so
-    "how are we tracking against target?" is answered with "I can't see the
-    sheet yet" rather than a guess.
+    Two spreadsheets sit behind this one source: the ORIGINAL (read-only source
+    of truth) and the sandbox COPY (the bot's writable mirror). The source is
+    CONNECTED when the original is readable, because that is what answers
+    questions; the copy being unreachable degrades writing only, and is reported
+    in the detail rather than by pretending the whole source is down.
 
-    When it is implemented, it needs at minimum:
-      - rows(): the pipeline rows as dicts,
-      - targets(): the number(s) being tracked against,
-      - freshness(): how current the data is.
+    The probe is cheap by design — it reuses the last startup access check rather
+    than hitting the API on every status call, since `status_report()` runs on
+    every capability answer and every state write.
     """
 
     key = "sales_spreadsheet"
-    label = "the sales spreadsheet"
-    purpose = "pipeline, targets and the outreach log"
+    label = "the GTM Playbook spreadsheet"
+    purpose = "the outreach tracker, the positioning matrix and the prospect priority list"
 
     def _probe(self) -> tuple[str, str]:
-        if config.SALES_SPREADSHEET_FILE or config.SALES_SPREADSHEET_ID:
-            # Configured, but there is no reader yet — say so precisely rather
-            # than claiming a connection this module cannot make.
+        if not config.GOOGLE_SERVICE_ACCOUNT_JSON:
             return (
                 AWAITING_ACCESS,
-                "The spreadsheet location is configured, but the reader isn't built yet "
-                "— I can't read pipeline or target numbers from it.",
+                "No Google service-account key is configured "
+                "(GOOGLE_SERVICE_ACCOUNT_JSON), so I can't open the GTM Playbook.",
             )
-        return (
-            AWAITING_ACCESS,
-            "I don't have access to the sales spreadsheet yet — no location is "
-            "configured (SALES_SPREADSHEET_ID / SALES_SPREADSHEET_FILE) and the reader "
-            "isn't built.",
-        )
+
+        access = gtm_sheet.SHEETS.last_access()
+        if not access:
+            # Nothing probed yet (a status call before startup finished). Do it
+            # now rather than reporting a state we haven't checked.
+            access = gtm_sheet.SHEETS.check_access()
+
+        original = access.get(gtm_sheet.ORIGINAL, {})
+        copy = access.get(gtm_sheet.COPY, {})
+
+        if not original.get("ok"):
+            remedy = original.get("remedy") or ""
+            return (
+                AWAITING_ACCESS,
+                f"I can't open the GTM Playbook: {original.get('error', 'unknown error')}. "
+                + (f"Fix: {remedy}" if remedy else ""),
+            )
+
+        # Readable. Say what's in it, and be explicit when the sandbox — and so
+        # writing — is the part that's unavailable.
+        try:
+            tabs = gtm_sheet.SHEETS.read(gtm_sheet.ORIGINAL)
+        except gtm_sheet.SheetAccessError as e:
+            return (AWAITING_ACCESS, f"I can open the GTM Playbook but couldn't read it: {e}")
+
+        found = ", ".join(f"{kind} ({len(tab.rows)} rows)" for kind, tab in tabs.items())
+        detail = f"Reading {original.get('title') or 'the GTM Playbook'}: {found or 'no recognised tabs'}."
+
+        if config.SHEET_WRITE_TARGET == "off":
+            detail += " Sheet writing is off, so deadlines are stored locally only."
+        elif not copy.get("ok"):
+            detail += (
+                f" The sandbox copy is NOT writable ({copy.get('error', 'unknown')}). "
+                f"{copy.get('remedy', '')} Deadlines still work — they're stored locally "
+                "and announced — they just aren't mirrored to the sheet."
+            )
+        return (CONNECTED, detail)
+
+    def tabs(self) -> dict:
+        """{kind: Tab} from the original. Raises SheetAccessError when the sheet
+        has never been readable; callers check `connected` first."""
+        return gtm_sheet.SHEETS.read(gtm_sheet.ORIGINAL)
 
     def rows(self) -> list[dict]:
-        """Pipeline rows. Empty until the reader lands — callers must check
-        `connected` and say so rather than treating [] as 'no deals'."""
-        return []
+        """Outreach tracker rows. Callers must check `connected` and say so
+        rather than treating [] as "no deals"."""
+        try:
+            tab = gtm_sheet.SHEETS.tab(gtm_sheet.TRACKER)
+        except gtm_sheet.SheetAccessError:
+            return []
+        return tab.rows if tab else []
+
+
+class ResearcherMapping(Source):
+    """The researcher/buyer mapping sheet. WIRED UP, live, and READ-ONLY.
+
+    This is the source that turns "we're talking to Acme" into "and the person to
+    pitch there is <researcher>, T1, lane a, here's the hook" — and, just as
+    often, into "nobody there: the sheet flags them as a competitor".
+
+    Its status detail deliberately reports more than reachability, because each
+    of these changes how an answer built from it must be phrased:
+      - whether the legend parsed. The legend IS the rule set; without it the
+        staleness threshold and the exclusion lists fall back to last-known.
+      - whether the DEPARTURES list was readable. If it wasn't, the do-not-pitch
+        check CANNOT run, and "nobody is flagged" would be a fabrication.
+      - how old the sheet's research pass is against its own refresh rule.
+      - that it is read-only, so nobody expects the bot to update it.
+    """
+
+    key = "researcher_mapping"
+    label = "the researcher/buyer mapping sheet"
+    purpose = (
+        "which researcher to pitch at each org, in which ICP lane, with what hook "
+        "— plus who must not be pitched (read-only)"
+    )
+
+    def _probe(self) -> tuple[str, str]:
+        if not config.GOOGLE_SERVICE_ACCOUNT_JSON:
+            return (
+                AWAITING_ACCESS,
+                "No Google service-account key is configured "
+                "(GOOGLE_SERVICE_ACCOUNT_JSON), so I can't open the researcher mapping.",
+            )
+        if not config.GTM_MAPPING_SHEET_ID:
+            return (
+                AWAITING_ACCESS,
+                "No mapping spreadsheet id is configured (GTM_MAPPING_SHEET_ID), so I "
+                "can't tell you who to pitch at an org.",
+            )
+
+        access = mapping_sheet.MAPPING.last_access()
+        if not access:
+            access = mapping_sheet.MAPPING.check_access()
+        if not access.get("ok"):
+            remedy = access.get("remedy") or ""
+            return (
+                AWAITING_ACCESS,
+                "I can't open the researcher mapping sheet: "
+                f"{access.get('error', 'unknown error')}. "
+                + (f"Fix: {remedy}" if remedy else ""),
+            )
+
+        try:
+            tabs = mapping_sheet.MAPPING.read()
+        except gtm_sheet.SheetAccessError as e:
+            return (AWAITING_ACCESS,
+                    f"I can open the researcher mapping but couldn't read it: {e}")
+
+        found = ", ".join(f"{kind} ({len(tab.rows)} rows)" for kind, tab in tabs.items())
+        detail = (
+            f"Reading {access.get('title') or 'the researcher mapping'} (READ-ONLY — I "
+            f"never write to this sheet): {found or 'no recognised tabs'}."
+        )
+
+        legend = mapping_sheet.MAPPING.legend()
+        # A missing legend or a missing DEPARTURES row is DEGRADED, not connected:
+        # the rows are still readable, but rules every recommendation has to obey
+        # can't be applied, and the answer must carry that caveat.
+        gaps = []
+        if not legend.built:
+            gaps.append(
+                "the legend's build date didn't parse, so the staleness caveat runs on "
+                f"the default ~{legend.refresh_weeks}-week clock"
+            )
+        if not mapping_sheet.MAPPING.departures_known():
+            gaps.append(
+                "the Edge Map's DEPARTURES row wasn't readable, so I CANNOT check "
+                "whether someone has left before recommending them"
+            )
+        if gaps:
+            return (DEGRADED, detail + " Caveat: " + "; and ".join(gaps) + ".")
+
+        days = (date.today() - legend.built).days
+        limit = legend.stale_after_days()
+        age = (
+            f" The research pass is from {legend.built.isoformat()} ({days} days ago); "
+            + (
+                f"that is past its own ~{legend.refresh_weeks}-week refresh rule, so "
+                "EVERY row needs a re-verify-role caveat."
+                if days > limit else
+                f"the sheet's own ~{legend.refresh_weeks}-week refresh rule bites in "
+                f"{limit - days} day(s)."
+            )
+        )
+        return (
+            CONNECTED,
+            detail + age
+            + f" {len(mapping_sheet.MAPPING.departures().people)} person(s) are on the "
+              "DEPARTURES do-not-pitch list.",
+        )
+
+    def researchers(self) -> list[dict]:
+        """Raw researcher rows. Callers should use `mapping_sheet.MAPPING.enrich`
+        before showing one to the model — an un-enriched row carries no departure
+        check, no staleness verdict and no org flags."""
+        try:
+            return mapping_sheet.MAPPING.researchers()
+        except gtm_sheet.SheetAccessError:
+            return []
 
 
 class StrategyDoc(Source):
@@ -164,12 +344,22 @@ class StrategyDoc(Source):
 
 
 class SalesMeetingNotes(Source):
-    """Drive-synced sales meeting notes. THIS ONE IS WIRED UP (notes.py).
+    """Drive-synced sales meeting notes. WIRED UP, including the sync (notes.py).
 
-    A separate sync process (rclone or equivalent) drops the notes into
-    NOTES_DIR; this bot only ever reads local files and holds no Google
-    credential of its own. That's why this source can be connected while the
-    other two aren't: it needs a folder, not an API grant.
+    The bot runs NOTES_SYNC_CMD — an rclone command — to pull the Drive docs into
+    NOTES_DIR at startup, every NOTES_SYNC_MINUTES and before answering a notes
+    question. It still holds no Google credential of its own: rclone owns that.
+
+    TWO different failures have to stay distinguishable here, because they have
+    different fixes and only one of them is the bot's fault:
+
+      the SYNC is broken   → DEGRADED. The folder is readable, it's just going
+                             stale. The detail names the fix (usually rclone not
+                             being on PATH, or an expired token).
+      nothing SALES came    → CONNECTED with zero notes loaded. The sync works;
+      down                   the sales calls simply aren't being recorded, or the
+                             sync account wasn't invited to them. No amount of
+                             config fixes that, so the detail asks the question.
     """
 
     key = "sales_meeting_notes"
@@ -182,41 +372,102 @@ class SalesMeetingNotes(Source):
                 AWAITING_ACCESS,
                 "No notes folder is configured (NOTES_DIR), so I can't read meeting notes.",
             )
-        if not notes.is_configured():
+
+        st = notes.sync_status()
+        if not st["dir_exists"]:
             return (
                 AWAITING_ACCESS,
                 f"NOTES_DIR is set to {config.NOTES_DIR!r} but that folder doesn't exist "
-                "— the Drive sync may not have run yet.",
+                "and I couldn't create it — check the path is writable.",
             )
-        found = notes.list_notes(days=3650)
-        if not found:
-            # Reachable but empty: connected, with the emptiness stated. An empty
-            # folder is a different fact from no access, and conflating them is
-            # how a bot ends up saying "nothing was discussed" about a meeting it
-            # simply couldn't see.
-            return (
-                CONNECTED,
-                f"I can read {config.NOTES_DIR}, but there are no meeting notes in it yet.",
+
+        # 1. THE SYNC: when it last ran, and whether it is working.
+        if not st["cmd_configured"]:
+            sync_line = (
+                "No sync command is configured (NOTES_SYNC_CMD), so nothing refreshes this "
+                "folder — what's in it is whatever was last copied there by hand."
             )
-        latest_date, synced_at = notes.freshness()
-        return (
-            CONNECTED,
-            f"I can read {len(found)} meeting note(s); the most recent is from "
-            f"{latest_date}" + (f" (synced {synced_at})." if synced_at else "."),
+        elif st["ok"] is None:
+            sync_line = f"The sync (every {st['interval_minutes']} min) hasn't run yet this session."
+        elif st["ok"]:
+            sync_line = f"Last synced {st['last_success']} (every {st['interval_minutes']} min)."
+        else:
+            stale = (
+                f" The newest thing I have is whatever the last good sync ({st['last_success']}) "
+                "left behind, so it may be out of date."
+                if st["last_success"]
+                else " I have never completed a sync, so I'm reading whatever was already on disk."
+            )
+            sync_line = (
+                f"The sync is FAILING (last tried {st['last_attempt']}): {st['error']} "
+                f"Fix: {st['remedy']}{stale}"
+            )
+
+        # 2. THE FILTER: how much came down, how much went into context, and how
+        #    much was held back. The filter is EXCLUDE-based — everything loads
+        #    except the product standups — so the honest phrasing is "loaded /
+        #    excluded", not "qualified / didn't qualify".
+        counts = (
+            f"{st['docs_seen']} doc(s) on disk, {st['docs_loaded']} loaded, "
+            f"{st['docs_excluded']} excluded (product standups)"
         )
 
+        # 3. Nothing loaded is NOT "no notes" and NOT "no access". Under an
+        #    exclude-based filter it means either everything that came down was a
+        #    standup, or nothing that came down parsed as a dated note — and those
+        #    have different fixes, so say which one it is.
+        if not st["docs_loaded"]:
+            undated = max(0, st["docs_seen"] - st["notes_seen"])
+            why = []
+            if st["docs_excluded"]:
+                why.append(
+                    f"{st['docs_excluded']} were excluded as standups by "
+                    f"{st['exclude_patterns']}"
+                )
+            if undated:
+                why.append(f"{undated} had no parseable date, so they aren't meeting notes")
+            detail = (
+                f"{sync_line} {counts} — nothing is loaded into context"
+                + (": " + " and ".join(why) if why else "")
+                + ". That is not the same as no meetings happening. Every synced doc is "
+                "loaded EXCEPT titles matching "
+                f"{st['exclude_patterns']}; widen or clear NOTES_EXCLUDE_TITLE_PATTERNS "
+                "if a real meeting is being caught by it."
+            )
+        else:
+            latest_date, _ = notes.freshness()
+            detail = (
+                f"{sync_line} {counts}; the most recent loaded note is from {latest_date}. "
+                "Everything the sync pulls is read EXCEPT titles matching "
+                f"{st['exclude_patterns']} — those are the product standups and they stay "
+                "on disk, unread."
+            )
+
+        # DEGRADED, not CONNECTED, while the sync is broken: the notes are readable
+        # but going stale, and an answer built on them has to say so.
+        return (DEGRADED if st["degraded"] else CONNECTED, detail)
+
+    def sync(self, question: str = "") -> dict:
+        """Pull the freshest notes before answering. Blocking — call it via
+        asyncio.to_thread. Returns the sync outcome; never raises."""
+        return notes.sync_for_question(question)
+
     def latest(self) -> Optional[dict]:
-        """The most recent meeting note, parsed. None when unavailable."""
+        """The most recent LOADED meeting note, parsed — the newest note that isn't
+        an excluded standup. None when unavailable."""
         return notes.read_note()
 
 
 # Built once at import — these hold no connections, only configuration, so a
 # module-level instance is cheap and every caller sees the same three.
 SALES_SPREADSHEET = SalesSpreadsheet()
+RESEARCHER_MAPPING = ResearcherMapping()
 STRATEGY_DOC = StrategyDoc()
 SALES_MEETING_NOTES = SalesMeetingNotes()
 
-ALL: list[Source] = [SALES_SPREADSHEET, STRATEGY_DOC, SALES_MEETING_NOTES]
+ALL: list[Source] = [
+    SALES_SPREADSHEET, RESEARCHER_MAPPING, STRATEGY_DOC, SALES_MEETING_NOTES,
+]
 
 
 def status_report() -> list[dict]:
@@ -232,9 +483,17 @@ def status_report() -> list[dict]:
 
 
 def awaiting_access() -> list[dict]:
-    """Just the sources the bot can't reach yet — the blind spots it is required
-    to volunteer when asked what it can do."""
-    return [s for s in status_report() if s["status"] != CONNECTED]
+    """Just the sources the bot CANNOT reach — the blind spots it is required to
+    volunteer when asked what it can do. A degraded source is deliberately not in
+    here: it can be read, it just has to be read with a caveat (see
+    `degraded()`)."""
+    return [s for s in status_report() if s["status"] not in USABLE]
+
+
+def degraded() -> list[dict]:
+    """Sources that are readable but going stale — a failing notes sync, say. The
+    bot may answer from these, but must say what is wrong with them."""
+    return [s for s in status_report() if s["status"] == DEGRADED]
 
 
 def describe_for_prompt() -> str:
@@ -246,6 +505,8 @@ def describe_for_prompt() -> str:
     lines.append(
         "You MUST NOT answer from a source marked AWAITING-ACCESS or ERROR, and you must "
         "SAY SO plainly when a question needs one of them. Never imply you checked "
-        "something you cannot reach."
+        "something you cannot reach. A source marked DEGRADED may be used, but you MUST "
+        "state the caveat in its detail line — that data is going stale — in the same "
+        "breath as the answer you build from it."
     )
     return "\n".join(lines)

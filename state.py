@@ -158,6 +158,13 @@ def write_summary(
             "sources_awaiting_access": sum(
                 1 for s in (source_statuses or []) if s.get("status") == "awaiting-access"
             ),
+            # Readable but going stale (e.g. the notes folder is fine, the rclone
+            # sync filling it is failing). Counted separately from both of the
+            # above: a supervisor that sees only connected/awaiting would read a
+            # degraded source as healthy.
+            "sources_degraded": sum(
+                1 for s in (source_statuses or []) if s.get("status") == "degraded"
+            ),
             "open_chases": len(open_chases or []),
             "notable_events": len(notable_events or []),
         },
