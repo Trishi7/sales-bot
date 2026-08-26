@@ -16,9 +16,11 @@ Nothing is shared between the two.
 
 ## What it does
 
-**Answers questions.** In the ask channel (`SALES_ASK_CHANNEL_ID`) every message
-is treated as a potential question; in the other sales channels it answers when
-explicitly @-mentioned. Questions go to a read-only tool-use loop that reads the
+**Answers questions — only when tagged.** In **every** sales channel, the ask
+channel (`SALES_ASK_CHANNEL_ID`) included, the bot answers only when it is
+**@-mentioned** in the message text or when someone **replies directly to one of
+its own messages**. A message that tags somebody else is never answered, even if
+it also tags the bot. Questions go to a read-only tool-use loop that reads the
 **GTM Playbook live** ("where are we with OpenAI", "which P1s have we never
 contacted", "what do we pitch to a D2C brand"), reads the **researcher/buyer
 mapping** ("who do we pitch at Anthropic for red-teaming", "give me T1 evals
@@ -74,6 +76,7 @@ only exists in a prompt is a suggestion.
 | **Never DMs anyone.** Not as a fallback, not for a failed post. | `guardrails.send()` refuses any non-guild destination |
 | **Only @-mentions people on the team roster.** Everyone else is named in plain text. | `guardrails.mention_for()` is the only source of a mention token; `sanitize()` strips any the model invented |
 | **Reads and posts only in `SALES_CHANNEL_IDS`.** | `guardrails.may_read()` gates every incoming message and every history scan; `send()` gates every post |
+| **Answers only when tagged** — @-mentioned, or replied to. Never a message that tags someone else. | `SalesBot._is_query_trigger()` in `bot.py`, the single gate for both `on_message` and edits |
 | **Every action is audited** with a timestamp and a reason — including refusals. | `guardrails.send()` → `state.audit()` |
 
 Code scoping is the **second** layer. The first is server-side: the bot's Discord
@@ -103,6 +106,39 @@ Portal → your app → Bot → Privileged Gateway Intents). Without it every me
 arrives with empty content and the bot silently does nothing.
 
 For production (PM2, process name `sales-bot`), see [DEPLOY.md](DEPLOY.md).
+
+---
+
+## When it answers
+
+One rule, the same in **every** channel in `SALES_CHANNEL_IDS` — including
+`SALES_ASK_CHANNEL_ID`. There is no channel with a no-mention mode.
+
+| The message | Answered? |
+|---|---|
+| `@sales-bot where are we with OpenAI?` | **Yes** — the bot is @-mentioned in the text. |
+| A reply to something the bot posted (an answer, the digest, a deadline announcement) | **Yes** — replying is how you talk to it without typing its name. |
+| `where are we with OpenAI?` with nobody tagged, in any channel | No. |
+| `@Vaishnavi can you check OpenAI?` | No — it tags someone else. |
+| `@Vaishnavi @sales-bot thoughts?` | No — a message tagging somebody else is never answered, even when it also tags the bot. |
+| A reply to **another person's** message | No — the parent has to be the bot's own message. |
+
+The gate is `SalesBot._is_query_trigger()` in `bot.py`, and it is the single
+entry point for both new messages and edits — fix a typo in a tagged message and
+it re-fires; edit an untagged one and it still gets nothing.
+
+Two details worth knowing:
+
+- **Only the message text is read for tags.** Discord silently adds a mention of
+  the person you reply to; that is not you tagging them, so it never counts
+  against a reply.
+- **`SALES_ASK_CHANNEL_ID` is a posting home, not an answering rule.** It is
+  where the daily digest and the deadline announcements land. Its behaviour on
+  incoming messages is identical to every other sales channel.
+
+What did **not** change: the daily digest, the ask-time deadline announcement,
+and the reply-based deadline chasing — a reply to the bot's digest or to the
+original promise still closes that chase, whether or not it also gets an answer.
 
 ---
 
@@ -711,7 +747,7 @@ attempt.
 | `SALES_DIGEST_ENABLED` | `true` | `false` → the bot sends **no** unprompted messages at all. |
 | `SALES_DIGEST_TIME` | `10:00` | Wall-clock IST (Asia/Kolkata, computed explicitly — never the server clock). |
 | `SALES_DIGEST_MAX_PER_SECTION` | `15` | Items shown per section; the overflow is counted, not dropped. |
-| `SALES_DIGEST_CHANNEL_ID` | unset | Must be in `SALES_CHANNEL_IDS`; unset → the ask channel. |
+| `SALES_DIGEST_CHANNEL_ID` | unset | Must be in `SALES_CHANNEL_IDS`; unset → `SALES_ASK_CHANNEL_ID`, else the first sales channel. |
 
 ---
 

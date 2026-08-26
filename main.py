@@ -44,7 +44,7 @@ def main() -> None:
     log.info(
         "[main] config OK. sales_channels=%s ask_channel=%s roster=%d model=%s db=%s state=%s",
         config.SALES_CHANNEL_IDS,
-        config.SALES_ASK_CHANNEL_ID or "(none — @-mention required everywhere)",
+        config.SALES_ASK_CHANNEL_ID or "(none — digest falls back to the first channel)",
         len(config.TEAM_ROSTER_IDS),
         config.MODEL,
         config.DB_PATH,
@@ -55,6 +55,11 @@ def main() -> None:
         "never DMs anyone and only @-mentions the %d person(s) on the roster. Server-side, "
         "its Discord role should also be denied View Channel everywhere else (see DEPLOY.md).",
         len(config.SALES_CHANNEL_IDS), len(config.TEAM_ROSTER_IDS),
+    )
+    log.info(
+        "[main] ANSWERING: only when @-mentioned, or when someone replies to one of the "
+        "bot's own messages — in EVERY sales channel, the ask channel included. Messages "
+        "tagging anyone else are never answered."
     )
 
     for src in sources.status_report():

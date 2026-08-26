@@ -2,8 +2,10 @@
 
 Scoped to the sales channels, it does three things and nothing else:
 
-  ANSWERS QUESTIONS. In the ask channel every message is a potential question; in
-  the other sales channels an explicit @-mention is required. Questions go to the
+  ANSWERS QUESTIONS — ONLY WHEN TAGGED. In EVERY sales channel, including
+  SALES_ASK_CHANNEL_ID, the bot answers only when it is @-mentioned in the
+  message text or when someone replies directly to one of its own messages. A
+  message that tags somebody else is never answered. Questions go to the
   read-only tool-use engine (query_engine.py), which is handed Discord tools
   scoped to the sales channels plus the meeting-notes tools, and which answers
   under the policy in sales_policy.md — re-read on every question.
@@ -69,6 +71,11 @@ log = logging.getLogger(__name__)
 
 # ✅ on a nudge closes that chase — "handled, stop asking".
 CLOSE_EMOJI = "✅"
+
+# Every mention token Discord puts in message TEXT: <@id>, <@!id> (a nickname
+# mention) and <@&id> (a role). Used by the tag gate to tell "they tagged me"
+# from "they tagged someone else", which is never answered.
+_MENTION_TOKEN_RE = re.compile(r"<@[!&]?(\d+)>")
 
 # Interrogative / imperative openers that mark a message as a question worth
 # handing to the engine. Used only as a LAST-RESORT guard, so a real question
@@ -447,7 +454,7 @@ class SalesBot(discord.Client):
         # itself be a question, and it deserves an answer.
         await self._maybe_close_chase(message)
 
-        if self._is_query_trigger(message):
+        if await self._is_query_trigger(message):
             handled = await self._handle_query(message)
             if handled:
                 return
@@ -469,7 +476,7 @@ class SalesBot(discord.Client):
             message = await channel.fetch_message(payload.message_id)
         except discord.DiscordException:
             return
-        if message.author.bot or not self._is_query_trigger(message):
+        if message.author.bot or not await self._is_query_trigger(message):
             return
         log.info("[bot] edited message %s re-fired as a query", message.id)
         await self._handle_query(message)
@@ -506,21 +513,82 @@ class SalesBot(discord.Client):
 
     # -- query routing -----------------------------------------------------
 
-    def _is_query_trigger(self, message: discord.Message) -> bool:
+    async def _is_query_trigger(self, message: discord.Message) -> bool:
         """Should this be handled as a question?
 
-        In the ASK channel, every human message is a potential question — the
-        @-mention requirement is dropped there. In every other sales channel an
-        explicit @-mention is required, so the bot stays out of the way of people
-        talking to each other."""
-        if config.is_ask_channel(message.channel.id):
+        THE TAG GATE. There are exactly two ways to address this bot, and they
+        are the same in EVERY sales channel — the ask channel included. It is
+        still the digest's home and where deadline announcements land, but it
+        has no special answering rule any more:
+
+          - an explicit @-mention of the bot in the message TEXT, or
+          - a direct reply to one of the bot's own messages.
+
+        Everything else is people talking to each other, and the bot stays out
+        of it. A message that tags somebody ELSE is never answered — even one
+        that also tags the bot, or replies to it: another person was asked, and
+        the bot answering over them is exactly the noise this gate prevents."""
+        if self._tags_someone_else(message):
+            log.debug(
+                "[bot] msg=%s tags someone else — not answering", message.id,
+            )
+            return False
+        if self._is_self_mentioned_explicitly(message):
             return True
-        return self._is_self_mentioned_explicitly(message)
+        return await self._is_reply_to_self(message)
+
+    def _tags_someone_else(self, message: discord.Message) -> bool:
+        """True when the message TEXT tags anyone but the bot — another person, a
+        role, @everyone or @here.
+
+        Only the text is read. Discord adds an invisible mention of the author
+        being replied to, and that is not somebody being tagged; reading
+        `message.mentions` here would silence every reply to a person."""
+        content = message.content or ""
+        if not content:
+            return False
+        if "@everyone" in content or "@here" in content:
+            return True
+        me = str(getattr(self.user, "id", "") or "")
+        for match in _MENTION_TOKEN_RE.finditer(content):
+            if match.group(0).startswith("<@&"):
+                return True  # a role is never the bot
+            if match.group(1) != me:
+                return True
+        return False
+
+    async def _is_reply_to_self(self, message: discord.Message) -> bool:
+        """True when the message is a direct reply to one of the BOT's own
+        messages — its answer, the digest, a deadline announcement. Replying is
+        how you talk to it without typing its name, and it is what the
+        deadline chasing has always run on.
+
+        The parent comes from what Discord already sent along where possible and
+        is fetched otherwise; a deleted or unreadable parent is not a trigger."""
+        me = getattr(self.user, "id", None)
+        ref = message.reference
+        if me is None or ref is None:
+            return False
+        resolved = getattr(ref, "resolved", None)
+        parent = resolved if isinstance(resolved, discord.Message) else ref.cached_message
+        if parent is None:
+            if not ref.message_id:
+                return False
+            try:
+                parent = await message.channel.fetch_message(ref.message_id)
+            except discord.DiscordException:
+                log.debug(
+                    "[bot] msg=%s replies to %s, which could not be read — not "
+                    "treating it as a reply to me", message.id, ref.message_id,
+                )
+                return False
+        return getattr(parent.author, "id", None) == me
 
     def _is_self_mentioned_explicitly(self, message: discord.Message) -> bool:
         """True only when the bot is @-mentioned in the message TEXT. A reply-ping
-        (which Discord auto-adds to `message.mentions`) doesn't count — replying
-        to the bot's nudge shouldn't be read as a new question."""
+        (which Discord auto-adds to `message.mentions`) doesn't count here — the
+        reply case is decided by `_is_reply_to_self`, which checks who actually
+        wrote the message being replied to."""
         if self.user is None or not message.content:
             return False
         me = self.user.id
@@ -605,9 +673,9 @@ class SalesBot(discord.Client):
             await self._engine_no_progress_reply(message, text=text, history=history)
             return True
 
-        # "other" — a statement, not addressed to the bot as a question. In the
-        # ask channel say something rather than ignoring them; elsewhere they
-        # explicitly @-mentioned the bot, so a reply is owed either way.
+        # "other" — a statement, not a question. They still addressed the bot
+        # directly (an @-mention, or a reply to something it said), so a reply
+        # is owed either way.
         await self._send_social(message, "unclear", text=text)
         return True
 

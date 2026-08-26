@@ -12,7 +12,10 @@ The values that matter most are the SCOPE ones:
                         that enforcement is the second layer: the bot's Discord
                         role should also be denied View Channel everywhere else
                         (DEPLOY.md).
-  SALES_ASK_CHANNEL_ID— the one sales channel where an @-mention isn't needed.
+  SALES_ASK_CHANNEL_ID— the sales channel the bot POSTS in unprompted: the daily
+                        digest and the deadline announcements. It is NOT an
+                        answering exemption — everywhere, the bot replies only
+                        when @-mentioned or replied to.
   TEAM_ROSTER_IDS     — the only people the bot may ever @-mention.
 
 `validate()` returns the missing REQUIRED vars and logs loud warnings for the
@@ -123,10 +126,12 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 # validate() refuses to start on — silence is better than a bot loose in a server.
 SALES_CHANNEL_IDS: list[int] = _int_list("SALES_CHANNEL_IDS")
 
-# The one sales channel where the @-mention requirement is DROPPED: every human
-# message there is treated as a question for the bot. Must itself be a sales
-# channel — validate() folds it in if someone forgets, so the ask channel can
-# never become a hole in the scope rule.
+# The sales channel that is the bot's POSTING home: the daily digest and the
+# deadline announcements go here by default. It buys NO answering exemption —
+# in this channel, exactly as in every other one, the bot answers only when it
+# is @-mentioned or when someone replies to one of its own messages. Must itself
+# be a sales channel — validate() folds it in if someone forgets, so the ask
+# channel can never become a hole in the scope rule.
 SALES_ASK_CHANNEL_ID = _int("SALES_ASK_CHANNEL_ID", 0)
 
 if SALES_ASK_CHANNEL_ID and SALES_ASK_CHANNEL_ID not in SALES_CHANNEL_IDS:
@@ -145,16 +150,6 @@ def is_sales_channel(channel_id) -> bool:
     guardrails.py). A non-numeric / None channel id is NOT a sales channel."""
     try:
         return int(channel_id) in SALES_CHANNEL_ID_SET
-    except (TypeError, ValueError):
-        return False
-
-
-def is_ask_channel(channel_id) -> bool:
-    """True for the dedicated ask channel, where no @-mention is needed."""
-    if not SALES_ASK_CHANNEL_ID:
-        return False
-    try:
-        return int(channel_id) == SALES_ASK_CHANNEL_ID
     except (TypeError, ValueError):
         return False
 
@@ -568,9 +563,10 @@ def validate() -> list[str]:
 
     if not SALES_ASK_CHANNEL_ID:
         log.warning(
-            "SALES_ASK_CHANNEL_ID is unset — there is no channel where the bot answers "
-            "without an @-mention. It will still answer when explicitly @-mentioned in "
-            "any channel in SALES_CHANNEL_IDS."
+            "SALES_ASK_CHANNEL_ID is unset — the daily digest and the deadline "
+            "announcements will fall back to the first channel in SALES_CHANNEL_IDS. "
+            "Answering is unaffected: in every sales channel the bot replies only when "
+            "@-mentioned or replied to."
         )
 
     if not TEAM_ROSTER_IDS and not TEAM_ROSTER_NAMES:
