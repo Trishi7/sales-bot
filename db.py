@@ -175,6 +175,42 @@ CREATE TABLE IF NOT EXISTS digest_items (
 );
 CREATE INDEX IF NOT EXISTS ix_digest_items_seen ON digest_items(last_seen);
 
+-- WHAT THE NEXT STEPS CELL SAID, AND SINCE WHEN.
+--
+-- Cadence rule (i) is "Next Steps present but UNCHANGED for n days", and
+-- "unchanged" is not a property of a spreadsheet cell — the sheet has no
+-- history the bot can read. So the bot keeps its own: one row per tracked
+-- sheet row, holding a hash of the current Next Steps text and the date that
+-- text was FIRST seen. Days-unchanged is (today - first_seen).
+--
+-- The text itself is stored only as a short sample, for the log line that
+-- explains why a row fired. The hash is what the comparison uses, so a 400-char
+-- next-step costs the same as a short one.
+CREATE TABLE IF NOT EXISTS nextstep_state (
+    row_key     TEXT PRIMARY KEY,   -- "<company>|<poc>" from the master tab
+    text_hash   TEXT NOT NULL,      -- sha1 of the normalised Next Steps text
+    text_sample TEXT NOT NULL DEFAULT '',
+    first_seen  TEXT NOT NULL,      -- YYYY-MM-DD IST — when THIS text appeared
+    last_seen   TEXT NOT NULL       -- YYYY-MM-DD IST — last time it was observed
+);
+CREATE INDEX IF NOT EXISTS ix_nextstep_seen ON nextstep_state(last_seen);
+
+-- MEETING-PREP BRIEFS ALREADY WRITTEN.
+--
+-- A brief is attached to the digest ONCE PER MEETING, not once a day until the
+-- meeting happens. The key is the company + PoC + meeting date, so moving a
+-- meeting to a new date legitimately earns a fresh brief and re-reading the
+-- same sheet row tomorrow does not.
+CREATE TABLE IF NOT EXISTS prep_briefs (
+    meeting_key  TEXT PRIMARY KEY,  -- "<company>|<poc>|<YYYY-MM-DD>"
+    company      TEXT NOT NULL DEFAULT '',
+    poc          TEXT NOT NULL DEFAULT '',
+    meeting_date TEXT NOT NULL DEFAULT '',
+    sent_on      TEXT NOT NULL,     -- YYYY-MM-DD IST the digest carried it
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_prep_briefs_sent ON prep_briefs(sent_on);
+
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
     value       TEXT,
@@ -714,6 +750,112 @@ class DB:
             return cur.rowcount or 0
 
     # -- meta (the bot's own bookkeeping) ----------------------------------
+
+    # -- cadence: the Next Steps clock -------------------------------------
+
+    @staticmethod
+    def nextstep_key(company: str, poc: str = "") -> str:
+        """The stable identity of a tracked row: company + PoC, normalised.
+
+        NOT the sheet row number. Rows get inserted above and sorted, and a key
+        that moved with them would reset the clock on every reorder — which is
+        exactly the failure rule (i) exists to catch.
+        """
+        return f"{DB.company_key(company)}|{DB.company_key(poc)}"
+
+    def track_next_steps(self, *, row_key: str, text: str, on_date: str) -> int:
+        """Record what the Next Steps cell says today; return DAYS UNCHANGED.
+
+        First sighting returns 0 — a next step the bot has never seen before is
+        not stale, it is new. The count only starts once there is a previous
+        observation to compare against, which means a fresh database earns its
+        rule-(i) findings over the following days rather than firing a wall of
+        them on day one.
+
+        An edited cell resets the clock: new text, new `first_seen`.
+        """
+        import hashlib
+
+        clean = " ".join(str(text or "").split()).strip().lower()
+        if not clean:
+            # Blank Next Steps is a different rule's business (f / h). Forget any
+            # previous text so re-entering the SAME text later starts a new clock.
+            with self.conn() as c:
+                c.execute("DELETE FROM nextstep_state WHERE row_key = ?", (row_key,))
+            return 0
+
+        digest_hash = hashlib.sha1(clean.encode("utf-8")).hexdigest()
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT text_hash, first_seen FROM nextstep_state WHERE row_key = ?",
+                (row_key,),
+            ).fetchone()
+            if row is None or row["text_hash"] != digest_hash:
+                c.execute(
+                    "INSERT INTO nextstep_state "
+                    "(row_key, text_hash, text_sample, first_seen, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(row_key) DO UPDATE SET "
+                    "  text_hash = excluded.text_hash, "
+                    "  text_sample = excluded.text_sample, "
+                    "  first_seen = excluded.first_seen, "
+                    "  last_seen = excluded.last_seen",
+                    (row_key, digest_hash, str(text or "")[:200], on_date, on_date),
+                )
+                return 0
+            c.execute(
+                "UPDATE nextstep_state SET last_seen = ? WHERE row_key = ?",
+                (on_date, row_key),
+            )
+            first_seen = str(row["first_seen"] or on_date)
+
+        try:
+            from datetime import date as _date
+
+            return max(0, (_date.fromisoformat(on_date) - _date.fromisoformat(first_seen)).days)
+        except ValueError:
+            log.debug("[db] unparseable next-step dates %r/%r", on_date, first_seen)
+            return 0
+
+    def prune_next_steps(self, *, before_date: str) -> int:
+        """Forget rows not seen since `before_date` — a deleted sheet row should
+        not keep a clock running forever."""
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM nextstep_state WHERE last_seen < ?", (before_date,))
+            return int(cur.rowcount or 0)
+
+    # -- cadence: meeting-prep brief dedup ----------------------------------
+
+    @staticmethod
+    def prep_key(company: str, poc: str, meeting_date: str) -> str:
+        """One brief per company + PoC + meeting DATE. A rescheduled meeting is a
+        different meeting and earns a new brief; the same one re-read tomorrow
+        does not."""
+        return f"{DB.company_key(company)}|{DB.company_key(poc)}|{str(meeting_date or '').strip()}"
+
+    def prep_brief_sent(self, meeting_key: str) -> bool:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM prep_briefs WHERE meeting_key = ?", (meeting_key,)
+            ).fetchone()
+            return row is not None
+
+    def record_prep_brief(
+        self, *, meeting_key: str, company: str, poc: str,
+        meeting_date: str, sent_on: str,
+    ) -> None:
+        """Mark a brief as written. Called only AFTER the digest actually posts —
+        a refused send must not consume the one brief a meeting gets."""
+        with self.conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO prep_briefs "
+                "(meeting_key, company, poc, meeting_date, sent_on) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (meeting_key, company, poc, meeting_date, sent_on),
+            )
+        log.info(
+            "[db] prep brief recorded for %s / %s on %s", company, poc or "(no PoC)", meeting_date
+        )
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.conn() as c:

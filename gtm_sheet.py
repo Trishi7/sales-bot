@@ -17,11 +17,30 @@ method and a read-only OAuth scope. This module only has to know that it must
 never write to it: `_refuse_if_read_only()` checks every write target against
 `config.is_read_only_sheet_id()` before a cell is touched.
 
-THREE KINDS OF TAB, recognised by what's in them rather than by name:
+FOUR KINDS OF TAB. Three are recognised by what's in them rather than by name;
+the fourth is recognised by its NAME, deliberately:
+    master_data          THE canonical cadence source — one row per company/PoC
+                         being worked, auto-updated from a HIDDEN "outreach
+                         updates" sheet. Identified by TITLE
+                         (GTM_MASTER_TAB_TITLES), because "this tab is the
+                         master" is a human decision, not something to infer
+                         from headers that the old tracker also has.
     positioning_matrix   use cases A–I: label, use case, problem, offering,
                          company type, ICP, business impact.
-    outreach_tracker     one row per company being worked.
+    outreach_tracker     one row per company being worked. The pre-master
+                         tracker; still read, still the fallback when no master
+                         tab exists.
     prospect_priority    scored companies, P1–P3, with a rationale.
+
+HIDDEN TABS ARE READ. gspread returns hidden worksheets like any other, and the
+master tab's own feed is hidden — so discovery includes them (GTM_READ_HIDDEN_TABS)
+and the schema log marks them "hidden" rather than pretending they aren't there.
+
+THE BOT READS VALUES, NEVER FORMATTING. A status conveyed by CELL COLOUR is
+invisible to it. That failure is silent by nature, so `_warn_colour_coded()`
+looks for its signature at startup — a mapped column that is empty on nearly
+every row — and names the column in a warning instead of quietly treating the
+whole column as blank.
 
 HEADERS ARE DISCOVERED AT PARSE TIME. The tabs will evolve — columns get added,
 renamed, reordered — so nothing here is positional. Each tab's header row is
@@ -74,9 +93,18 @@ ORIGINAL = "original"
 COPY = "copy"
 
 # Tab kinds.
+MASTER = "master_data"
 POSITIONING = "positioning_matrix"
 TRACKER = "outreach_tracker"
 PRIORITY = "prospect_priority"
+
+# The roles the phase-1 cadence rules read. Every one of them is nameable in
+# GTM_COLUMN_MAP, so a column rename in the sheet is an env change.
+CADENCE_ROLES = (
+    "company", "industry", "poc", "poc_designation", "poc_vertical",
+    "first_contacted", "connected", "intro_date", "last_followed_up",
+    "followups_count", "response", "meeting_date", "assets_shared", "next_steps",
+)
 
 
 # -- header roles -------------------------------------------------------------
@@ -85,6 +113,47 @@ PRIORITY = "prospect_priority"
 # substring, longest alias first — so "last followed up date" beats a loose
 # "date" match. Order within a list is only a tie-break aid; specificity wins.
 ROLES: dict[str, dict[str, tuple[str, ...]]] = {
+    # The master tab. Its rule fields are exactly the ones named in the phase-1
+    # spec; the aliases cover the wordings the playbook has actually used
+    # ("initial contact month" for first contact, "membrane Intro Date" for the
+    # intro). Anything unmatched still arrives in the row's "_extra".
+    MASTER: {
+        "sr_no": ("sr. no.", "sr no", "s.no", "sno", "serial", "#"),
+        "company": ("company", "company name", "account", "organisation",
+                    "organization", "client", "org"),
+        "industry": ("industry", "sector", "domain"),
+        "poc": ("poc", "person", "point of contact", "contact name",
+                "contact person", "poc name", "champion", "contact"),
+        "poc_designation": ("designation", "poc designation", "title", "job title", "role"),
+        "poc_vertical": ("vertical", "poc vertical", "department", "function", "team"),
+        "first_contacted": ("first contacted", "initial contact month", "initial contact",
+                            "first contact", "date of first contact", "month of first contact",
+                            "outreach date", "contacted on"),
+        "connected": ("connected?", "connected", "connection status", "is connected"),
+        "intro_date": ("membrane intro date", "intro date", "introduction date",
+                       "membrane intro", "intro"),
+        "last_followed_up": ("last followed-up date", "last followed up date",
+                             "last follow-up date", "last followed up", "last follow up",
+                             "last followup", "last touch"),
+        "followups_count": ("total follow-ups", "total follow ups", "total followups",
+                            "total follow-ups till date", "number of follow-ups",
+                            "no of follow ups", "follow-ups", "followups"),
+        "response": ("response", "response?", "response (y/p/n)", "responded", "replied"),
+        "meeting_date": ("meeting date", "meeting", "call date", "demo date", "meeting on"),
+        "assets_shared": ("assets shared", "assets", "collateral shared",
+                          "material shared", "deck shared"),
+        "next_steps": ("next steps", "next step", "next action", "action items", "action"),
+        # Not in the spec's field list, but read when present: they make the
+        # digest addressable and the exclusion rule reliable.
+        "owner": ("owner", "row owner", "assigned to", "assignee", "sdr", "bd",
+                  "account owner", "handled by", "responsible"),
+        "status": ("status", "stage", "deal status", "current status"),
+        "reason": ("reason", "lost reason", "reason for no response", "why"),
+        "use_case": ("use case", "usecase", "pitch"),
+        "other_updates": ("other updates", "updates", "notes", "comments", "remarks"),
+        "bot_deadline": (config.BOT_DEADLINE_COLUMN.lower(), "next deadline (bot)",
+                         "next deadline"),
+    },
     POSITIONING: {
         "label": ("label", "use case label", "ref", "id"),
         "use_case": ("use case", "usecase", "case"),
@@ -138,6 +207,20 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
 # it came from, so a scored tab with no company column has nothing citable in it
 # (the live "Activation Score - Warmed Up Co" tab is exactly this — a scoring
 # scratchpad with priority and score headers and no companies).
+#
+# MASTER IS DELIBERATELY ABSENT FROM THE SCORE-OFF BELOW. Its columns are a
+# superset of the tracker's, so on headers alone every tracker tab would score as
+# a master and the "which tab is canonical" question would be decided by row
+# counts. It is matched by TITLE instead (`_is_master_title`), and its signature
+# is only ever used to confirm a title match — see `_detect_kind`.
+_MASTER_SIGNATURE = (
+    MASTER,
+    ("company", "poc", "first_contacted", "connected", "response",
+     "last_followed_up", "next_steps"),
+    3,
+    ("company",),
+)
+
 _KIND_SIGNATURES: list[tuple[str, tuple[str, ...], int, tuple[str, ...]]] = [
     (TRACKER, ("company", "first_contacted", "last_followed_up", "response", "next_steps"),
      3, ("company",)),
@@ -607,6 +690,8 @@ class GTMSheets:
         headers happened to contain the word "notes".
         """
         spec = next((s for s in _KIND_SIGNATURES if s[0] == kind), None)
+        if spec is None and kind == MASTER:
+            spec = _MASTER_SIGNATURE
         if spec is None:
             return 0
         _k, needed, threshold, mandatory = spec
@@ -616,11 +701,49 @@ class GTMSheets:
         score = sum(1 for r in needed if r in mapped)
         return score if score >= threshold else 0
 
-    def _detect_kind(self, title: str, headers: list[str]) -> Optional[str]:
-        """What KIND of tab this is — by name first, then by header signature so
-        detection survives a rename. None when it is none of the three, which is
-        the common case in a real playbook full of research and strategy tabs."""
+    @staticmethod
+    def _is_master_title(title: str) -> bool:
+        """Is this the tab an operator has NAMED as the master?
+
+        Exact normalised title match against GTM_MASTER_TAB_TITLES. Deliberately
+        NOT a substring test: the live playbook already has a "Master Lead List"
+        that is a prospect-priority tab, and a loose match would hand the whole
+        cadence to it.
+        """
         low = normalise_header(title)
+        if not low:
+            return False
+        return any(
+            low == normalise_header(t)
+            for t in (config.GTM_MASTER_TAB_TITLES or [])
+            if str(t).strip()
+        )
+
+    def _detect_kind(self, title: str, headers: list[str]) -> Optional[str]:
+        """What KIND of tab this is.
+
+        THE MASTER TAB IS DECIDED BY ITS TITLE, first and unconditionally-ish:
+        an operator named it in GTM_MASTER_TAB_TITLES, and that is a decision
+        about which tab is canonical, not a guess to be overridden by a header
+        score. Its signature still has to match, so a tab renamed "Master data"
+        with none of the rule columns in it is reported rather than silently
+        driving the cadence.
+
+        Everything else is by name hint first, then by header signature so
+        detection survives a rename. None when it is none of the kinds, which is
+        the common case in a real playbook full of research and strategy tabs.
+        """
+        low = normalise_header(title)
+        if self._is_master_title(title):
+            if self._matches_kind(MASTER, headers):
+                return MASTER
+            log.warning(
+                "[gtm] tab %r is named as the master tab (GTM_MASTER_TAB_TITLES) but "
+                "does not carry the cadence columns — found headers %s. The cadence "
+                "will fall back to the outreach tracker. Fix the tab, or point "
+                "GTM_MASTER_TAB_TITLES / GTM_COLUMN_MAP at the right thing.",
+                title, ", ".join(repr(h) for h in headers[:20]) or "(none)",
+            )
         for kind, hints in _KIND_NAME_HINTS:
             if any(h in low for h in hints) and self._matches_kind(kind, headers):
                 # The name hint only wins if the HEADERS agree: a tab called
@@ -692,6 +815,105 @@ class GTMSheets:
             for title, vr in zip(titles, ranges)
         }
 
+    @staticmethod
+    def _worksheets(sh) -> list[tuple[str, bool]]:
+        """[(title, hidden)] for EVERY worksheet, hidden ones included.
+
+        gspread's `worksheets()` grew an `exclude_hidden` argument; older
+        releases have no such parameter and return everything. Both are handled,
+        because the master tab is fed by a hidden "outreach updates" sheet and a
+        discovery pass that skips hidden tabs would miss the thing this phase is
+        built on.
+        """
+        try:
+            sheets = sh.worksheets(exclude_hidden=False)
+        except TypeError:
+            sheets = sh.worksheets()   # older gspread: hidden already included
+        out: list[tuple[str, bool]] = []
+        for ws in sheets:
+            hidden = getattr(ws, "isSheetHidden", None)
+            if hidden is None:
+                try:
+                    hidden = bool((ws._properties or {}).get("hidden", False))
+                except Exception:
+                    hidden = False
+            out.append((ws.title, bool(hidden)))
+        if not config.GTM_READ_HIDDEN_TABS:
+            skipped = [title for title, hidden in out if hidden]
+            if skipped:
+                log.warning(
+                    "[gtm] GTM_READ_HIDDEN_TABS=false — skipping %d hidden tab(s): %s. "
+                    "The master tab's feed is hidden, so this can hide the cadence "
+                    "source.", len(skipped), ", ".join(repr(s) for s in skipped),
+                )
+            out = [(title, hidden) for title, hidden in out if not hidden]
+        return out
+
+    def _warn_colour_coded(self, tab: "Tab") -> None:
+        """Name the mapped columns that are systematically empty.
+
+        THE BOT READS VALUES, NOT FORMATTING. In the master tab a status can be
+        carried by the CELL'S COLOUR, which the Sheets values API does not return
+        and this bot therefore cannot see. The failure is silent — every rule
+        that reads such a column just sees blanks and never fires — so the
+        signature is checked here and reported by name.
+
+        Only mapped CADENCE roles are checked: an empty "_extra" column is
+        somebody's scratch space, not a rule input.
+        """
+        total = len(tab.rows)
+        if total < max(1, config.CADENCE_EMPTY_COLUMN_MIN_ROWS):
+            return
+        ratio = max(0.0, float(config.CADENCE_EMPTY_COLUMN_RATIO))
+        for role in CADENCE_ROLES:
+            if role not in tab.role_to_col:
+                continue
+            filled = sum(1 for r in tab.rows if str(r.get(role) or "").strip())
+            if filled > total * ratio:
+                continue
+            header = tab.headers[tab.role_to_col[role]] if tab.role_to_col[role] < len(tab.headers) else role
+            log.warning(
+                "[gtm] tab %r: the %s column (%r) is filled on %d of %d rows. It MAY BE "
+                "COLOR-CODED — this bot reads cell VALUES only and cannot see fills, so "
+                "every rule that reads %s will see a blank. It needs a text value in "
+                "each cell (or point GTM_COLUMN_MAP[%r][%r] at the column that has one).",
+                tab.title, role, header, filled, total, role, tab.kind, role,
+            )
+
+    def _log_full_schema(self, which: str, entries: list[dict]) -> None:
+        """Log the FULL discovered schema of every tab, once per spreadsheet.
+
+        Every tab, hidden or not, recognised or not, with its complete header
+        list. This is a diagnosis tool with one job: when a rule stops firing
+        because someone renamed a column, the answer is in the startup log
+        instead of in a debugging session.
+        """
+        log.info(
+            "[gtm.schema] ===== %s: %d tab(s) discovered (%d hidden) =====",
+            which, len(entries), sum(1 for e in entries if e["hidden"]),
+        )
+        for e in entries:
+            log.info(
+                "[gtm.schema] %s%-22r kind=%-17s rows=%-5s headers(%d)=[%s]",
+                "HIDDEN " if e["hidden"] else "       ",
+                e["title"], e["kind"] or "(unrecognised)",
+                e["rows"] if e["rows"] is not None else "-",
+                len(e["headers"]),
+                " | ".join(str(h) for h in e["headers"]) or "(no header row)",
+            )
+            if e["kind"] and e["mapped"]:
+                log.info(
+                    "[gtm.schema]        %r mapped roles: %s",
+                    e["title"],
+                    ", ".join(f"{role}->{col!r}" for role, col in sorted(e["mapped"].items())),
+                )
+            if e["kind"] and e["unmapped"]:
+                log.info(
+                    "[gtm.schema]        %r columns carried as _extra (no role): %s",
+                    e["title"], ", ".join(repr(h) for h in e["unmapped"]),
+                )
+        log.info("[gtm.schema] ===== end of %s schema =====", which)
+
     def _parse_values(
         self, title: str, values: list[list], *, read_at: float
     ) -> Optional[Tab]:
@@ -724,7 +946,7 @@ class GTMSheets:
                     row["_extra"][header] = value
             # A tracker/priority row with no company is a spacer or a total line,
             # not a deal — carrying it would let it be counted and flagged.
-            if kind in (TRACKER, PRIORITY) and not (row.get("company") or "").strip():
+            if kind in (MASTER, TRACKER, PRIORITY) and not (row.get("company") or "").strip():
                 continue
             rows.append(row)
 
@@ -757,27 +979,77 @@ class GTMSheets:
 
         try:
             sh = self._open(which)
-            titles = [ws.title for ws in sh.worksheets()]
+            discovered = self._worksheets(sh)          # [(title, hidden)], hidden included
+            titles = [title for title, _hidden in discovered]
+            hidden_by_title = {title: hidden for title, hidden in discovered}
             by_title = self._batch_values(sh, titles)
             read_at = time.time()
             groups: dict[str, list[Tab]] = {}
             unrecognised: list[str] = []
+            schema_entries: list[dict] = []
             for title in titles:
+                raw = by_title.get(title) or []
                 try:
-                    tab = self._parse_values(
-                        title, by_title.get(title) or [], read_at=read_at
-                    )
+                    tab = self._parse_values(title, raw, read_at=read_at)
                 except Exception:
                     log.exception("[gtm] tab %r failed to parse; skipping it", title)
-                    continue
+                    tab = None
+                # The schema entry is built for EVERY tab, recognised or not —
+                # an unrecognised tab's headers are exactly what you need to see
+                # when working out why it wasn't recognised.
+                if tab is not None:
+                    mapped = {
+                        role: (tab.headers[i] if i < len(tab.headers) else f"col{i}")
+                        for role, i in tab.role_to_col.items()
+                    }
+                    taken = set(tab.role_to_col.values())
+                    schema_entries.append({
+                        "title": title, "hidden": hidden_by_title.get(title, False),
+                        "kind": tab.kind, "rows": len(tab.rows), "headers": tab.headers,
+                        "mapped": mapped,
+                        "unmapped": [h for i, h in enumerate(tab.headers)
+                                     if i not in taken and str(h).strip()],
+                    })
+                else:
+                    hidx = self._header_row_index(raw) if raw else 0
+                    headers = [str(h).strip() for h in (raw[hidx] if raw else [])]
+                    schema_entries.append({
+                        "title": title, "hidden": hidden_by_title.get(title, False),
+                        "kind": None, "rows": max(0, len(raw) - hidx - 1) if raw else 0,
+                        "headers": headers, "mapped": {}, "unmapped": [],
+                    })
                 if tab is None:
                     unrecognised.append(title)
                     continue
                 groups.setdefault(tab.kind, []).append(tab)
                 key = (which, tab.title)
                 if key not in self._schema_logged:
-                    log.info("[gtm] %s %s", which, tab.schema_line())
+                    log.info(
+                        "[gtm] %s %s%s", which, tab.schema_line(),
+                        " [HIDDEN TAB]" if hidden_by_title.get(title) else "",
+                    )
                     self._schema_logged.add(key)
+
+            # The full schema, and the colour-coding check, are STARTUP work:
+            # once per spreadsheet per process, not on every cache miss.
+            full_key = (which, "_full_schema")
+            if config.GTM_LOG_FULL_SCHEMA and full_key not in self._schema_logged:
+                self._log_full_schema(which, schema_entries)
+                for tab in groups.get(MASTER, []) or groups.get(TRACKER, []):
+                    try:
+                        self._warn_colour_coded(tab)
+                    except Exception:
+                        log.debug("[gtm] colour-coding check failed", exc_info=True)
+                self._schema_logged.add(full_key)
+
+            if MASTER not in groups and (which, "_no_master") not in self._schema_logged:
+                log.warning(
+                    "[gtm] %s has no master tab: none of %s exists in it. The daily "
+                    "cadence will fall back to the outreach tracker, which is the "
+                    "pre-master source. Set GTM_MASTER_TAB_TITLES to the real tab name.",
+                    which, ", ".join(repr(x) for x in (config.GTM_MASTER_TAB_TITLES or [])),
+                )
+                self._schema_logged.add((which, "_no_master"))
 
             # SEVERAL tabs can legitimately share a kind — the real playbook has
             # a master lead list, a Fortune-500 list and a vertical list, all of
@@ -849,6 +1121,23 @@ class GTMSheets:
         self.read(which)  # ensure the cache is populated / fresh
         with self._lock:
             return list(self._cache.get((which, kind)) or [])
+
+    def cadence_tab(self, which: str = ORIGINAL) -> tuple[Optional[Tab], str]:
+        """THE tab the daily cadence runs against, and which one it turned out to be.
+
+        Returns (tab, source) where source is "master_data" or "outreach_tracker".
+        The master tab wins whenever it exists; the tracker is the fallback so
+        that a sheet which hasn't grown a "Master data" tab yet still produces a
+        cadence rather than an empty digest. `(None, "")` when neither exists.
+        """
+        tabs = self.read(which)
+        master = tabs.get(MASTER)
+        if master is not None:
+            return master, MASTER
+        tracker_tab = tabs.get(TRACKER)
+        if tracker_tab is not None:
+            return tracker_tab, TRACKER
+        return None, ""
 
     def staleness_note(self, tab: Tab) -> str:
         """The note an answer must carry when it came from cache rather than a

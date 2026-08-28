@@ -180,6 +180,43 @@ def is_on_roster(user_id, display_name: str = "") -> bool:
     return bool(name) and name in TEAM_ROSTER_NAMES
 
 
+def roster_id_for_name(display_name: str) -> int:
+    """A NAME from a spreadsheet → the roster Discord id, or 0.
+
+    The master tab's Owner column holds a human's name, not an id, and a name is
+    SPOOFABLE — which is why this only ever resolves against ROSTER_DISPLAY_NAMES
+    and TEAM_ROSTER_IDS. An unknown name returns 0, and the caller then names the
+    person in plain text instead of pinging them. That is the failing-closed
+    behaviour the roster gate is built on.
+
+    Matching is case-insensitive and ignores surrounding punctuation, and a
+    first-name-only match is accepted when it is UNAMBIGUOUS — sheets say
+    "Vaishnavi", Discord says "Vaishnavi K".
+    """
+    want = " ".join(str(display_name or "").split()).strip().lower()
+    if not want:
+        return 0
+    pairs = []
+    for raw_id, name in (ROSTER_DISPLAY_NAMES or {}).items():
+        try:
+            uid = int(str(raw_id).strip())
+        except (TypeError, ValueError):
+            continue
+        if uid in TEAM_ROSTER_IDS:
+            pairs.append((uid, " ".join(str(name or "").split()).strip().lower()))
+
+    for uid, name in pairs:
+        if name and name == want:
+            return uid
+    # First token, but only when exactly one roster member answers to it.
+    first = want.split()[0] if want.split() else ""
+    if first:
+        hits = [uid for uid, name in pairs if name.split()[:1] == [first]]
+        if len(hits) == 1:
+            return hits[0]
+    return 0
+
+
 # -- Model --------------------------------------------------------------------
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -422,6 +459,118 @@ GTM_MAPPING_COLUMN_MAP: dict = _json_object("GTM_MAPPING_COLUMN_MAP", default={}
 # gtm_sheet.ROLES.
 GTM_COLUMN_MAP: dict = _json_object("GTM_COLUMN_MAP", default={})
 
+# -- The "Master data" tab: THE canonical cadence source ----------------------
+# The GTM Playbook now carries a "Master data" tab that auto-updates from a
+# HIDDEN "outreach updates" sheet. It is the clean source the daily cadence runs
+# against — every rule in cadence.py reads this tab, not the older outreach
+# tracker.
+#
+# RE-POINTING THE BOT AT A NEW SHEET IS AN ENV CHANGE PLUS A RESTART, and this
+# is the promise made in the 27 Aug alignment meeting. Nothing about the sheet's
+# identity or its column names is compiled in:
+#   GTM_SHEET_ORIGINAL_ID     which spreadsheet
+#   GTM_MASTER_TAB_TITLES     which tab in it is the master
+#   GTM_COLUMN_MAP            which header means which rule field
+#   the CADENCE_* thresholds below
+# Change those four, restart, and the bot runs the same rules against the new
+# sheet. There is no migration and no code edit.
+
+# Accepted titles for the master tab, comma-separated, matched case- and
+# punctuation-insensitively. The FIRST one that exists in the spreadsheet wins.
+# A tab named here is read as the master even when its headers also look like
+# the old tracker's — the title is the authority, because "Master data" is a
+# deliberate human decision about which tab is canonical.
+GTM_MASTER_TAB_TITLES: list[str] = _str_list(
+    "GTM_MASTER_TAB_TITLES", "Master data,Master Data,Master-data,Masterdata"
+)
+
+# Read tabs the spreadsheet marks HIDDEN. The master tab is fed by a hidden
+# "outreach updates" sheet, and gspread returns hidden worksheets like any other
+# — this flag exists so discovery can be narrowed if a hidden tab ever causes
+# trouble, not because hidden means private. Hidden tabs are logged as hidden.
+GTM_READ_HIDDEN_TABS = _bool("GTM_READ_HIDDEN_TABS", default=True)
+
+# Log the FULL discovered schema — every tab, every header, hidden or not — once
+# per spreadsheet at startup. This is how a column rename is diagnosed in one
+# log read instead of a debugging session, so it defaults ON.
+GTM_LOG_FULL_SCHEMA = _bool("GTM_LOG_FULL_SCHEMA", default=True)
+
+# A mapped master column that is empty on nearly every row is the signature of a
+# status conveyed by CELL COLOUR rather than by text. The bot reads VALUES ONLY
+# — it cannot see fills — so it warns at startup naming the column instead of
+# silently treating every row as blank.
+# The warning fires when a tab has at least MIN_ROWS rows and the column is
+# filled on no more than RATIO of them.
+CADENCE_EMPTY_COLUMN_MIN_ROWS = _int("CADENCE_EMPTY_COLUMN_MIN_ROWS", 10)
+CADENCE_EMPTY_COLUMN_RATIO = _float("CADENCE_EMPTY_COLUMN_RATIO", 0.05)
+
+# -- PHASE 1 CADENCE RULES ----------------------------------------------------
+# The nine daily rules from Vaishnavi's "Steps for Sales Bot" doc, computed
+# against the master tab and fed into the EXISTING once-daily digest. No rule
+# has a send path of its own; nothing here can make the bot speak twice.
+#
+# EVERY "n" BELOW IS A PLACEHOLDER. Vaishnavi's numbers were left unset in the
+# doc and will be tuned once the digest has been read for a week. They are env
+# vars precisely so that tuning is a restart, not a deploy.
+
+# Master switch for the whole cadence block. Off = the five cadence sections are
+# simply absent from the digest; nothing else changes.
+CADENCE_ENABLED = _bool("CADENCE_ENABLED", default=True)
+
+# (a) Last Followed-up Date older than this, with no response → chase the owner.
+FOLLOWUP_STALE_DAYS = _int("FOLLOWUP_STALE_DAYS", 5)
+# (c) First Contacted set but never Connected after this long → start interacting.
+CONNECT_REMINDER_DAYS = _int("CONNECT_REMINDER_DAYS", 7)
+# (d) Total follow-ups at or above this with no response → try another channel.
+ALT_CHANNEL_AT = _int("ALT_CHANNEL_AT", 4)
+# (e) Total follow-ups at or above this with no response → ask the OWNER to mark
+# the PoC unresponsive in the sheet. The bot never writes that itself: its only
+# writable cell anywhere remains its own BOT_DEADLINE_COLUMN.
+UNRESPONSIVE_AT = _int("UNRESPONSIVE_AT", 7)
+# (i) Next Steps present but unchanged for this many days → chase.
+NEXTSTEP_STALL_DAYS = _int("NEXTSTEP_STALL_DAYS", 10)
+
+# Cell values that mark a row REJECTED. A rejected row is excluded from every
+# rule and every digest section — never chased, revisited offline by humans.
+# Matched as whole phrases against the response, reason, status, next-steps and
+# notes cells, case-insensitively.
+#
+# "Response = N" is NOT a rejection: rule (g) exists precisely to suggest another
+# PoC at a company whose first contact said no. Rejection has to be written down
+# deliberately.
+CADENCE_REJECTED_MARKERS: list[str] = _str_list(
+    "CADENCE_REJECTED_MARKERS",
+    "rejected,not interested,disqualified,do not contact,dnc,closed lost,"
+    "lost,dropped,drop,blacklist,blacklisted",
+)
+
+# How many cadence items the digest carries, urgent first. 15 is the 10–15
+# phase-1 agreement from the 27 Aug meeting. Everything past the cap is counted
+# in one closing line and available on demand via the "full cadence list" query.
+DIGEST_MAX_ITEMS = _int("DIGEST_MAX_ITEMS", 15)
+
+# The uncapped on-demand list is bounded too — a Discord reply has a size limit,
+# and 400 lines of cadence is not an answer.
+CADENCE_FULL_LIST_MAX = _int("CADENCE_FULL_LIST_MAX", 200)
+
+# -- Meeting-prep briefs ------------------------------------------------------
+# A meeting inside MEETING_PREP_DAYS gets ONE prep brief attached to that day's
+# digest, deduped in SQLite so it is written once per meeting rather than once
+# per day until the meeting happens.
+CADENCE_PREP_BRIEFS_ENABLED = _bool("CADENCE_PREP_BRIEFS_ENABLED", default=True)
+# How many briefs one digest may carry. Three meetings on one day is a good day;
+# ten is a formatting problem.
+CADENCE_PREP_MAX_PER_DIGEST = _int("CADENCE_PREP_MAX_PER_DIGEST", 3)
+# How far back the brief looks for a meeting note about the same company.
+CADENCE_PREP_NOTES_DAYS = _int("CADENCE_PREP_NOTES_DAYS", 120)
+
+# ONLINE RESEARCH IS NOT IN PHASE 1. This bot has no web access, so a brief's
+# external-research section says so in as many words rather than being quietly
+# absent — and nothing in it may be invented. Leave this ON until a web-access
+# decision is made and implemented; turning it off only hides the notice, it
+# does not add research.
+CADENCE_PREP_NOTE_NO_WEB = _bool("CADENCE_PREP_NOTE_NO_WEB", default=True)
+
 # -- Deadline authority -------------------------------------------------------
 # When asked about a deadline that doesn't exist, the bot SETS one rather than
 # shrugging. Defaults are in WORKING DAYS, IST. The strategy doc's cadence wins
@@ -431,8 +580,11 @@ GTM_COLUMN_MAP: dict = _json_object("GTM_COLUMN_MAP", default={})
 OUTREACH_FOLLOWUP_DAYS = _int("OUTREACH_FOLLOWUP_DAYS", 3)
 # Days to wait on a reply before chasing it.
 REPLY_CHASE_DAYS = _int("REPLY_CHASE_DAYS", 2)
-# Days before a booked meeting that prep is due.
-MEETING_PREP_DAYS = _int("MEETING_PREP_DAYS", 1)
+# Days before a booked meeting that prep is due. This ALSO defines the
+# meeting-prep window for the cadence: a meeting within this many days is URGENT
+# in the digest and is what triggers its one prep brief. Raised from 1 to 4 for
+# phase 1 — a brief that lands the morning of the meeting is too late to act on.
+MEETING_PREP_DAYS = _int("MEETING_PREP_DAYS", 4)
 
 # Discord ids told about every deadline the bot sets ("shout to change"). These
 # must ALSO be in TEAM_ROSTER_IDS to actually be pinged — the roster is the only
@@ -568,6 +720,42 @@ def validate() -> list[str]:
             "Answering is unaffected: in every sales channel the bot replies only when "
             "@-mentioned or replied to."
         )
+
+    # The cadence thresholds. Nothing here is fatal — the rules are all
+    # independently useful — but a threshold ordering that makes a rule
+    # unreachable is worth one line at boot rather than a week of silence.
+    if CADENCE_ENABLED:
+        log.info(
+            "[config] cadence ON. Thresholds (ALL PLACEHOLDERS until tuned): "
+            "FOLLOWUP_STALE_DAYS=%d CONNECT_REMINDER_DAYS=%d ALT_CHANNEL_AT=%d "
+            "UNRESPONSIVE_AT=%d NEXTSTEP_STALL_DAYS=%d MEETING_PREP_DAYS=%d "
+            "DIGEST_MAX_ITEMS=%d",
+            FOLLOWUP_STALE_DAYS, CONNECT_REMINDER_DAYS, ALT_CHANNEL_AT,
+            UNRESPONSIVE_AT, NEXTSTEP_STALL_DAYS, MEETING_PREP_DAYS, DIGEST_MAX_ITEMS,
+        )
+        if ALT_CHANNEL_AT >= UNRESPONSIVE_AT:
+            log.warning(
+                "ALT_CHANNEL_AT=%d is not below UNRESPONSIVE_AT=%d — rule (d) 'try another "
+                "channel' can never fire, because rule (e) 'mark them unresponsive' takes "
+                "over at or above its own threshold. Set ALT_CHANNEL_AT lower.",
+                ALT_CHANNEL_AT, UNRESPONSIVE_AT,
+            )
+        if DIGEST_MAX_ITEMS < 1:
+            log.warning(
+                "DIGEST_MAX_ITEMS=%d caps the cadence at nothing — the digest would carry "
+                "no cadence items at all. The phase-1 agreement was 10-15.",
+                DIGEST_MAX_ITEMS,
+            )
+        if not GTM_MASTER_TAB_TITLES:
+            log.warning(
+                "GTM_MASTER_TAB_TITLES is empty — no tab can be recognised as the master, "
+                "so the cadence will run against the older outreach tracker instead."
+            )
+        if not CADENCE_REJECTED_MARKERS:
+            log.warning(
+                "CADENCE_REJECTED_MARKERS is empty — NO row will be treated as rejected, so "
+                "prospects the team has written off will keep appearing in the digest."
+            )
 
     if not TEAM_ROSTER_IDS and not TEAM_ROSTER_NAMES:
         log.warning(

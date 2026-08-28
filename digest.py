@@ -19,6 +19,24 @@ WHAT IS IN IT, hot first, because the order is the priority:
 
     HOT          They replied and we haven't come back. Speed to lead is the
                  most expensive failure in the sheet, so it leads the digest.
+
+    THE CADENCE — Vaishnavi's daily list, computed by cadence.py against the
+    "Master data" tab and ranked urgent-first before it ever reaches this
+    module. Five sections, grouped per owner with one @mention each:
+
+    FOLLOW-UPS   this week: cold follow-ups, never-connected rows, rows worth
+                 trying on another channel, and companies where the PoC said no.
+    INTROS       to be done: connected, no membrane intro date.
+    MEETINGS     this week: positive replies with no next step, and meetings
+                 inside the prep window.
+    ASSETS       to be shared: a meeting happened and nothing followed it.
+    UPDATE-TRACKER  reminders: rows with gaps their owner should fill —
+                 including the ask to mark a PoC unresponsive, which the bot
+                 asks for and NEVER writes itself.
+
+    The cadence is CAPPED at DIGEST_MAX_ITEMS with a closing line saying how
+    many were held, because a silently truncated list reads as a short day.
+
     DEADLINES    Due today or tomorrow, addressed to the owner.
     OVERDUE      Chases and deadlines past due, GROUPED PER OWNER with one
                  @mention each, so a person with four overdue things is pinged
@@ -26,6 +44,10 @@ WHAT IS IN IT, hot first, because the order is the priority:
     ESCALATIONS  Past COS_NUDGE_MAX_ATTEMPTS. Kushal's section, at the bottom,
                  because it is the only part addressed to him specifically.
     HYGIENE      Stalled and dead-deal rows.
+    MEETING PREP One brief per meeting inside MEETING_PREP_DAYS, written once
+                 (deduped in SQLite) rather than every day until the meeting.
+                 Reference material, not a task — which is why it sits at the
+                 bottom and does not count towards "is there anything to post".
 
 CARRY-FORWARD, AND WHY THERE IS NO "RESOLVED" LINE. An unresolved item simply
 appears again tomorrow, with its age ("3rd day"). An item that got resolved
@@ -58,33 +80,89 @@ SECTION_HYGIENE = "hygiene"
 # scheduled post and now ride along on the digest of their weekday.
 SECTION_FUNNEL = "funnel"
 
+# THE PHASE-1 CADENCE SECTIONS — Vaishnavi's daily list, in her order and in her
+# words. They come from cadence.py, which computes them against the master tab;
+# the keys are defined THERE so that a rule and its section can never drift
+# apart, and are re-exported here because this module owns rendering.
+#
+# They sit between HOT and DEADLINES on purpose: HOT is still "they replied and
+# we said nothing", which outranks everything, and the cadence is the day's
+# actual work list, which outranks the bot's own bookkeeping below it.
+SECTION_CADENCE_FOLLOWUPS = "cadence_followups"
+SECTION_CADENCE_INTROS = "cadence_intros"
+SECTION_CADENCE_MEETINGS = "cadence_meetings"
+SECTION_CADENCE_ASSETS = "cadence_assets"
+SECTION_CADENCE_UPDATES = "cadence_updates"
+
+# The prep briefs, and the one line that makes the cadence cap honest. Neither
+# is an "item": a brief is reference material for a meeting already counted in
+# CADENCE_MEETINGS, and the overflow line is a footnote about what was cut.
+SECTION_PREP = "prep_briefs"
+SECTION_CADENCE_OVERFLOW = "cadence_overflow"
+
+CADENCE_SECTIONS = (
+    SECTION_CADENCE_FOLLOWUPS,
+    SECTION_CADENCE_INTROS,
+    SECTION_CADENCE_MEETINGS,
+    SECTION_CADENCE_ASSETS,
+    SECTION_CADENCE_UPDATES,
+)
+
 SECTION_ORDER = (
     SECTION_HOT,
+    SECTION_CADENCE_FOLLOWUPS,
+    SECTION_CADENCE_INTROS,
+    SECTION_CADENCE_MEETINGS,
+    SECTION_CADENCE_ASSETS,
+    SECTION_CADENCE_UPDATES,
+    SECTION_CADENCE_OVERFLOW,
     SECTION_DEADLINES,
     SECTION_OVERDUE,
     SECTION_ESCALATIONS,
     SECTION_FUNNEL,
     SECTION_HYGIENE,
+    SECTION_PREP,
 )
 
 SECTION_TITLES = {
     SECTION_HOT: "HOT — they replied, nothing has gone back",
+    SECTION_CADENCE_FOLLOWUPS: "FOLLOW-UPS this week",
+    SECTION_CADENCE_INTROS: "INTROS to be done",
+    SECTION_CADENCE_MEETINGS: "MEETINGS this week",
+    SECTION_CADENCE_ASSETS: "ASSETS to be shared",
+    SECTION_CADENCE_UPDATES: "UPDATE-TRACKER reminders",
     SECTION_DEADLINES: "DEADLINES — due today or tomorrow",
     SECTION_OVERDUE: "OVERDUE",
     SECTION_ESCALATIONS: "ESCALATIONS — asked enough, needs a decision",
     SECTION_FUNNEL: "WEEKLY FUNNEL",
     SECTION_HYGIENE: "HYGIENE — stalled and dead-deal rows",
+    # Deliberately untitled: every brief opens with its own
+    # "MEETING PREP — <company> / <PoC> — <date>" header, and a section heading
+    # above it would print the same two words twice.
+    SECTION_PREP: "",
 }
 
 # Sections that count as "items". A digest containing ONLY the funnel block is
 # still an empty day — the funnel is a report, not something anyone has to do.
+# The prep briefs and the overflow footnote are excluded for the same reason:
+# neither is a thing to do, and a digest that posted because a brief existed
+# would be posting reference material at people with no work in it.
 ITEM_SECTIONS = (
     SECTION_HOT,
+    SECTION_CADENCE_FOLLOWUPS,
+    SECTION_CADENCE_INTROS,
+    SECTION_CADENCE_MEETINGS,
+    SECTION_CADENCE_ASSETS,
+    SECTION_CADENCE_UPDATES,
     SECTION_DEADLINES,
     SECTION_OVERDUE,
     SECTION_ESCALATIONS,
     SECTION_HYGIENE,
 )
+
+# Sections rendered as free-form blocks rather than as owner-addressed bullets:
+# their "text" is already the finished thing.
+BLOCK_SECTIONS = (SECTION_FUNNEL, SECTION_PREP, SECTION_CADENCE_OVERFLOW)
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2})\s*[:.\s]\s*(\d{1,2})\s*$")
 
@@ -211,14 +289,32 @@ def render(
         if not items:
             continue
 
-        if key == SECTION_FUNNEL:
+        if key in BLOCK_SECTIONS:
             lines.append("")
-            lines.append(f"**{SECTION_TITLES[key]}**")
-            lines.extend(str(item["text"]) for item in items)
+            title = SECTION_TITLES.get(key)
+            if title:
+                lines.append(f"**{title}**")
+            for item in items:
+                lines.append(str(item["text"]))
             continue
 
         lines.append("")
         lines.append(f"**{SECTION_TITLES.get(key, key.upper())} ({len(items)})**")
+
+        if key in CADENCE_SECTIONS:
+            # Grouped per owner, ONE @mention each — the same anti-nag rule as
+            # OVERDUE — but one bullet per item rather than a joined run-on.
+            # A cadence line is a whole sentence ("met 7d ago, no assets shared
+            # and no next steps"); four of them joined with semicolons is a
+            # paragraph nobody finishes reading.
+            for _owner_key, group in group_by_owner(items):
+                who = (group[0].get("owner_mention") or "").strip() or unowned_mention
+                if who:
+                    lines.append(f"{who}")
+                for item in group:
+                    body = (str(item["text"]) + age_note(item.get("age", 1))).strip()
+                    lines.append(f"• {body}")
+            continue
 
         if key == SECTION_OVERDUE:
             for _owner_key, group in group_by_owner(items):

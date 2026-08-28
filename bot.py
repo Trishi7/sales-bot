@@ -55,6 +55,7 @@ from typing import Optional
 
 import discord
 
+import cadence
 import config
 import deadlines as dl
 import digest
@@ -64,6 +65,7 @@ import guardrails
 import mapping_sheet
 import notes
 import persona
+import prep
 import query
 import sources
 import state
@@ -258,6 +260,14 @@ class SalesBot(discord.Client):
             "loaded" if pol["loaded"] else "MISSING", pol["path"], pol["chars"],
         )
 
+        # THE CADENCE DRY RUN, at boot. It reads the master tab, runs the nine
+        # rules and LOGS what would fire today with the cap applied. It sends
+        # NOTHING — the digest still posts at SALES_DIGEST_TIME and only then.
+        # This exists so that a threshold nobody has tuned yet, or a column that
+        # turns out to be colour-coded, is visible on the first restart rather
+        # than in a week of empty digest sections.
+        await self._log_cadence_dry_run()
+
         self._write_state_summary(trigger="startup")
         state.audit(
             "startup",
@@ -272,6 +282,49 @@ class SalesBot(discord.Client):
                 "[bot] chase sweeper started (every %d min)",
                 config.COS_FOLLOWUP_CHECK_INTERVAL_MINUTES,
             )
+
+    async def _log_cadence_dry_run(self) -> None:
+        """Log which rows each cadence rule fires on TODAY, with the cap applied.
+
+        READ-ONLY and SEND-FREE. It exists to make the phase-1 rules auditable
+        from the startup log: every firing is printed with the cells that caused
+        it, so a threshold can be argued about against real rows rather than in
+        the abstract.
+
+        Note this DOES advance the next-step clock for rule (i), which is
+        correct — the clock measures days observed, and a boot is an observation.
+        """
+        if not config.CADENCE_ENABLED:
+            return
+        try:
+            result = await self._run_cadence(today=dl.today_ist())
+        except Exception:
+            log.exception("[cadence] the startup dry run failed; the digest is unaffected")
+            return
+        if result is None:
+            log.info("[cadence] startup dry run skipped — no readable cadence source")
+            return
+        try:
+            text = cadence.dry_run_text(
+                result, source=result.get("source", ""), staleness=result.get("staleness", "")
+            )
+        except Exception:
+            log.exception("[cadence] could not render the dry run")
+            return
+        for line in text.splitlines():
+            log.info("[cadence.dryrun] %s", line)
+        state.audit(
+            "cadence_dry_run",
+            reason="startup: which rows the nine phase-1 rules fire on today",
+            source=result.get("source", ""),
+            rows=result.get("rows", 0),
+            excluded_rejected=result.get("excluded", 0),
+            items=len(result.get("all") or []),
+            shown=len(result.get("items") or []),
+            held=len(result.get("held") or []),
+            cap=config.DIGEST_MAX_ITEMS,
+            by_rule=result.get("counts", {}),
+        )
 
     def _check_sheets(self) -> dict:
         """STARTUP CHECK for both GTM spreadsheets. Blocking; called via a thread.
@@ -1523,6 +1576,52 @@ class SalesBot(discord.Client):
                 ),
             }
 
+        async def _cadence_list(inp: dict) -> dict:
+            """The uncapped cadence, for the question the digest's overflow line
+            invites. READ-ONLY — it re-runs the same rules against the same tab
+            and sends nothing."""
+            result = await self._run_cadence(today=dl.today_ist(), limit=0)
+            if result is None:
+                return {
+                    "ok": False,
+                    "reason": (
+                        "The cadence could not be computed - either CADENCE_ENABLED is "
+                        "off or the master tab could not be read. Say so plainly."
+                    ),
+                }
+            wanted = str((inp or {}).get("rule") or "").strip().lower()[:1]
+            items = result.get("all") or []
+            if wanted:
+                items = [i for i in items if i.get("letter") == wanted]
+            log.info(
+                "[cadence] full list requested%s -> %d item(s)",
+                f" (rule {wanted})" if wanted else "", len(items),
+            )
+            return {
+                "ok": True,
+                "source": result.get("source", ""),
+                "staleness": result.get("staleness", ""),
+                "rows_considered": result.get("rows", 0),
+                "rejected_excluded": result.get("excluded", 0),
+                "digest_cap": config.DIGEST_MAX_ITEMS,
+                "shown_in_digest": len(result.get("items") or []),
+                "held_back": len(result.get("held") or []),
+                "counts_by_rule": result.get("counts", {}),
+                "items": [
+                    {
+                        "rule": i["rule"], "letter": i["letter"], "priority": i["priority"],
+                        "company": i["company"], "poc": i["poc"], "owner": i.get("owner", ""),
+                        "text": i["text"], "why": i.get("detail", ""),
+                    }
+                    for i in items[: max(1, config.CADENCE_FULL_LIST_MAX)]
+                ],
+                "truncated": len(items) > max(1, config.CADENCE_FULL_LIST_MAX),
+                "note": (
+                    "Rows a human marked rejected are excluded from every rule by design - "
+                    "they are revisited offline, not chased."
+                ),
+            }
+
         async def _row_flags(inp: dict):
             tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.TRACKER)
             if err:
@@ -1690,6 +1789,39 @@ class SalesBot(discord.Client):
                     },
                 },
                 "handler": _positioning,
+            },
+            {
+                "schema": {
+                    "name": "cadence_list",
+                    "description": (
+                        "THE FULL CADENCE LIST — every item the nine daily rules fire on "
+                        "today, UNCAPPED, ranked urgent first. The daily digest carries only "
+                        "the top DIGEST_MAX_ITEMS of these and closes with 'N more held'; "
+                        "this is what that line points at. Use it for 'full cadence list', "
+                        "'what did the digest leave out', 'show me everything', 'what else "
+                        "is pending', or any question about the follow-ups / intros / "
+                        "meetings / assets / update-tracker sections. Each line carries its "
+                        "rule letter (a-i) and its priority (urgent / waiting / held). Rows "
+                        "marked rejected are excluded from all of it, by design. Optionally "
+                        "filter to one rule letter."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "rule": {
+                                "type": "string",
+                                "description": (
+                                    "Optional single rule letter a-i to filter to: a stale "
+                                    "follow-up, b intro pending, c start interacting, d try "
+                                    "another channel, e mark unresponsive, f lock a meeting, "
+                                    "g try another PoC, h post-meeting gap, i next-step stall."
+                                ),
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _cadence_list,
             },
             {
                 "schema": {
@@ -2788,12 +2920,26 @@ class SalesBot(discord.Client):
             **{f"n_{k}": v for k, v in counts.items()},
         )
         log.info(
-            "[digest] POSTED %s — hot=%d deadlines=%d overdue=%d escalations=%d hygiene=%d",
+            "[digest] POSTED %s — hot=%d deadlines=%d overdue=%d escalations=%d hygiene=%d "
+            "| cadence: follow-ups=%d intros=%d meetings=%d assets=%d update-tracker=%d "
+            "prep-briefs=%d",
             marker,
             counts[digest.SECTION_HOT], counts[digest.SECTION_DEADLINES],
             counts[digest.SECTION_OVERDUE], counts[digest.SECTION_ESCALATIONS],
             counts[digest.SECTION_HYGIENE],
+            counts[digest.SECTION_CADENCE_FOLLOWUPS], counts[digest.SECTION_CADENCE_INTROS],
+            counts[digest.SECTION_CADENCE_MEETINGS], counts[digest.SECTION_CADENCE_ASSETS],
+            counts[digest.SECTION_CADENCE_UPDATES], counts[digest.SECTION_PREP],
         )
+
+        try:
+            # A sheet row that disappeared should not keep a next-step clock
+            # running forever. Same 30-day window as the carry-forward table.
+            gone = self.db.prune_next_steps(before_date=dl.iso(today - timedelta(days=30)))
+            if gone:
+                log.info("[cadence] pruned %d stale next-step clock(s)", gone)
+        except Exception:
+            log.exception("[cadence] could not prune the next-step clocks")
 
         try:
             cutoff = dl.iso(today - timedelta(days=30))
@@ -2890,6 +3036,22 @@ class SalesBot(discord.Client):
                 sections[key].extend(items)
         except Exception:
             log.exception("[digest] could not collect the sheet sections; they are omitted")
+
+        # THE PHASE-1 CADENCE. Independently guarded like every other source: a
+        # master tab that cannot be read costs the team its cadence sections and
+        # nothing else. It is capped by cadence.run() itself (DIGEST_MAX_ITEMS,
+        # urgent first) rather than by the per-section clip below, because the cap
+        # is across all five sections — fifteen items total, not fifteen each.
+        try:
+            cadence_sections, cadence_effects, cadence_staleness = (
+                await self._collect_cadence_sections(today=today)
+            )
+            for key, items in cadence_sections.items():
+                sections[key].extend(items)
+            effects.extend(cadence_effects)
+            staleness = staleness or cadence_staleness
+        except Exception:
+            log.exception("[digest] could not collect the cadence sections; they are omitted")
 
         # Cap each section, saying how many were left out. Escalations are NOT
         # capped: there are never many, and an escalation that scrolled off is
@@ -3117,6 +3279,234 @@ class SalesBot(discord.Client):
 
         return out, staleness
 
+    # -- the phase-1 cadence -----------------------------------------------
+
+    def _cadence_owner(self, item: dict) -> tuple[str, str]:
+        """(mention, owner_key) for one cadence item.
+
+        The master tab's Owner column holds a NAME. It is resolved against the
+        roster and pinged only when that succeeds; otherwise the person is named
+        in plain text by guardrails.mention_for, which is the roster gate failing
+        closed. A row with no owner at all groups under "" and the renderer
+        addresses it to the deadline-notify list instead.
+        """
+        name = str(item.get("owner") or "").strip()
+        if not name:
+            return "", ""
+        uid = config.roster_id_for_name(name)
+        return guardrails.mention_for(uid, name), gtm_sheet.normalise_header(name)
+
+    def _cadence_stall_clock(self, today):
+        """A stall_days(row) callable backed by the bot's own next-step history.
+
+        The sheet has no history, so rule (i) reads the nextstep_state table:
+        every row's Next Steps text is recorded each day, and the clock is how
+        long the CURRENT text has read the same. A database error degrades to
+        zero — rule (i) simply does not fire — rather than taking the digest down.
+        """
+        on_date = dl.iso(today)
+
+        def stall_days(row: dict) -> int:
+            try:
+                key = self.db.nextstep_key(
+                    str(row.get("company") or ""), str(row.get("poc") or "")
+                )
+                return self.db.track_next_steps(
+                    row_key=key, text=str(row.get("next_steps") or ""), on_date=on_date
+                )
+            except Exception:
+                log.debug("[cadence] next-step clock failed for a row", exc_info=True)
+                return 0
+
+        return stall_days
+
+    def _cadence_mapping_lookup(self):
+        """A mapping_lookup(company) for rule (g): alternative PoCs at an org.
+
+        Names come back WITH their caveats folded into the string — a mapped
+        researcher quoted without their staleness and departure checks is exactly
+        the mistake that sheet's legend warns about, and a digest line has no room
+        for a second sentence of qualification.
+        """
+        def lookup(company: str) -> list:
+            try:
+                rows = mapping_sheet.MAPPING.for_org(company) or []
+            except Exception:
+                log.debug("[cadence] mapping lookup failed for %r", company, exc_info=True)
+                return []
+            out = []
+            for raw in rows[:3]:
+                try:
+                    person = mapping_sheet.MAPPING.enrich(raw)
+                except Exception:
+                    continue
+                name = str(person.get("researcher") or raw.get("researcher") or "").strip()
+                if not name:
+                    continue
+                caveats = []
+                staleness = person.get("staleness") or {}
+                if isinstance(staleness, dict) and staleness.get("note"):
+                    caveats.append(str(staleness["note"]))
+                if person.get("departed"):
+                    caveats.append("may have left")
+                for flag in person.get("flags") or []:
+                    label = flag.get("label") if isinstance(flag, dict) else str(flag)
+                    if label:
+                        caveats.append(str(label))
+                note = "; ".join(caveats)
+                out.append(name + (" (" + note + ")" if note else ""))
+            return out
+
+        return lookup
+
+    async def _run_cadence(self, *, today, limit=None) -> Optional[dict]:
+        """Run the nine rules against the master tab. None when it cannot be read.
+
+        This is the ONLY place the cadence is computed, and it computes nothing
+        else: it returns cadence.run()'s result, and the caller decides whether
+        that becomes a digest section or an answer to a question.
+        """
+        if not config.CADENCE_ENABLED:
+            log.info("[cadence] CADENCE_ENABLED=false — the cadence sections are omitted")
+            return None
+        try:
+            tab, source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
+        except gtm_sheet.SheetAccessError as e:
+            log.info("[cadence] no sheet to run the cadence against: %s", e)
+            return None
+        except Exception:
+            log.exception("[cadence] the cadence source could not be read")
+            return None
+        if tab is None:
+            log.warning(
+                "[cadence] neither a master tab nor an outreach tracker exists — no cadence"
+            )
+            return None
+        if source != gtm_sheet.MASTER:
+            log.warning(
+                "[cadence] running against %r (%s), NOT the master tab. Set "
+                "GTM_MASTER_TAB_TITLES if the playbook has a 'Master data' tab.",
+                tab.title, source,
+            )
+
+        staleness = ""
+        try:
+            staleness = gtm_sheet.SHEETS.staleness_note(tab) or ""
+        except Exception:
+            log.debug("[cadence] no staleness note available", exc_info=True)
+
+        result = await asyncio.to_thread(
+            lambda: cadence.run(
+                tab.rows, today=today,
+                mapping_lookup=self._cadence_mapping_lookup(),
+                stall_days=self._cadence_stall_clock(today),
+                limit=limit,
+            )
+        )
+        result["source"] = source + " tab " + repr(tab.title)
+        result["staleness"] = staleness
+        result["tab"] = tab
+        return result
+
+    async def _collect_cadence_sections(self, *, today) -> tuple[dict, list[dict], str]:
+        """The five cadence sections, the prep briefs, and their effects.
+
+        Returns (sections, effects, staleness). Every failure is contained: a
+        cadence that cannot be computed leaves its sections empty and the rest of
+        the digest posts, because a broken sheet must not cost the team its
+        deadline reminders.
+        """
+        out = {k: [] for k in digest.SECTION_ORDER}
+        effects: list[dict] = []
+
+        result = await self._run_cadence(today=today)
+        if result is None:
+            return out, effects, ""
+
+        for item in result["items"]:
+            mention, owner_key = self._cadence_owner(item)
+            out[item["section"]].append({
+                "key": item["key"],
+                "text": item["text"],
+                "owner_mention": mention,
+                "owner_key": owner_key,
+            })
+
+        held = len(result.get("held") or [])
+        line = cadence.overflow_line(held)
+        if line:
+            out[digest.SECTION_CADENCE_OVERFLOW] = [{"text": "_" + line + "_"}]
+
+        briefs, brief_effects = await self._collect_prep_briefs(result, today=today)
+        if briefs:
+            out[digest.SECTION_PREP] = briefs
+            effects.extend(brief_effects)
+
+        return out, effects, result.get("staleness") or ""
+
+    async def _collect_prep_briefs(self, result: dict, *, today) -> tuple[list[dict], list[dict]]:
+        """ONE brief per meeting inside the prep window, deduped in SQLite.
+
+        The dedup is CHECKED here but RECORDED as an effect, applied only after
+        the digest actually posts — a refused send must not consume the single
+        brief a meeting gets.
+        """
+        if not config.CADENCE_PREP_BRIEFS_ENABLED:
+            return [], []
+
+        wanted = cadence.meetings_needing_prep(result.get("all") or [])
+        if not wanted:
+            return [], []
+
+        positioning_rows: list[dict] = []
+        try:
+            ptab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POSITIONING)
+            positioning_rows = list(ptab.rows) if ptab else []
+        except Exception:
+            log.info("[prep] no positioning matrix available for the briefs", exc_info=True)
+
+        briefs: list[dict] = []
+        effects: list[dict] = []
+        for item in wanted:
+            if len(briefs) >= max(1, config.CADENCE_PREP_MAX_PER_DIGEST):
+                log.info(
+                    "[prep] %d meeting(s) in the window; capped at %d brief(s) this digest",
+                    len(wanted), config.CADENCE_PREP_MAX_PER_DIGEST,
+                )
+                break
+            company, poc = item.get("company") or "", item.get("poc") or ""
+            meeting_date = item.get("meeting_date") or ""
+            key = self.db.prep_key(company, poc, meeting_date)
+            try:
+                if self.db.prep_brief_sent(key):
+                    log.info(
+                        "[prep] brief for %s / %s on %s already written — not repeating it",
+                        company, poc or "(no PoC)", meeting_date,
+                    )
+                    continue
+            except Exception:
+                log.exception("[prep] dedup check failed; skipping this brief to be safe")
+                continue
+
+            try:
+                body = await asyncio.to_thread(
+                    prep.build,
+                    item["_row"], meeting_date=meeting_date, today=today,
+                    mapping=mapping_sheet.MAPPING,
+                    positioning_rows=positioning_rows,
+                    notes_module=notes,
+                )
+            except Exception:
+                log.exception("[prep] could not build the brief for %s", company)
+                continue
+
+            briefs.append({"text": body})
+            effects.append({
+                "type": "prep_brief_sent", "meeting_key": key, "company": company,
+                "poc": poc, "meeting_date": meeting_date, "sent_on": dl.iso(today),
+            })
+        return briefs, effects
+
     def _age_digest_items(self, sections: dict, *, on_date: str) -> None:
         """Stamp each item with how many digests it has now appeared in.
 
@@ -3169,7 +3559,23 @@ class SalesBot(discord.Client):
         for eff in effects:
             kind = eff.get("type")
             try:
-                if kind == "deadline_reminded":
+                if kind == "prep_brief_sent":
+                    # Recorded only now, after the digest actually posted, so a
+                    # refused send does not consume the one brief a meeting gets.
+                    self.db.record_prep_brief(
+                        meeting_key=eff["meeting_key"], company=eff["company"],
+                        poc=eff["poc"], meeting_date=eff["meeting_date"],
+                        sent_on=eff["sent_on"],
+                    )
+                    state.audit(
+                        "meeting_prep_brief",
+                        reason="a meeting inside MEETING_PREP_DAYS; one brief per meeting",
+                        company=eff["company"], poc=eff["poc"],
+                        meeting_date=eff["meeting_date"],
+                        web_research="not included - pending web access decision",
+                    )
+
+                elif kind == "deadline_reminded":
                     self.db.mark_deadline(eff["id"], reminded=True)
 
                 elif kind == "deadline_attempt":
