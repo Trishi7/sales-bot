@@ -293,14 +293,15 @@ A healthy start logs, in order:
 [bot] chase sweeper started (every 15 min)
 ```
 
-Then check the four things that matter:
+Then check the things that matter:
 
 | Check | How | Expected |
 |---|---|---|
 | It joined | member list of a sales channel | the bot is there |
 | It answers in persona and states its sources | post `@<bot> what can you do?` in the ask channel | a direct, emoji-free reply that **names the sources awaiting access** |
 | It answers a reply | reply to that answer with a follow-up question, tagging nobody | a reply — replying to the bot counts as addressing it |
-| It stays quiet when untagged | post `what can you do?` in the ask channel with nobody tagged | **no reply** (the no-mention mode is gone; the ask channel is only the digest's home) |
+| It stays quiet when untagged | post `what can you do?` in the ask channel with nobody tagged | **no reply**, and `[gate] ignored msg=… reason=ignored` in the log (the no-mention mode is gone; the ask channel is only the digest's home) |
+| It ignores a room-wide ping | post `@here taking the first half off` in a sales channel | no reply — `@here`/`@everyone` is never a bot mention |
 | It stays out of other people's conversations | post `@<a teammate> can you check OpenAI?` in a sales channel | no reply — a message tagging someone else is never answered |
 | It ignores everything else | post a question in a NON-sales channel | no reply, and nothing in the logs beyond DEBUG |
 | It can't see other channels | member list of a non-sales channel | the bot is **not** there |

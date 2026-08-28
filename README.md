@@ -76,7 +76,7 @@ only exists in a prompt is a suggestion.
 | **Never DMs anyone.** Not as a fallback, not for a failed post. | `guardrails.send()` refuses any non-guild destination |
 | **Only @-mentions people on the team roster.** Everyone else is named in plain text. | `guardrails.mention_for()` is the only source of a mention token; `sanitize()` strips any the model invented |
 | **Reads and posts only in `SALES_CHANNEL_IDS`.** | `guardrails.may_read()` gates every incoming message and every history scan; `send()` gates every post |
-| **Answers only when tagged** — @-mentioned, or replied to. Never a message that tags someone else. | `SalesBot._is_query_trigger()` in `bot.py`, the single gate for both `on_message` and edits |
+| **Answers only when tagged** — @-mentioned, or replied to. Never a message that tags someone else, never `@here`/`@everyone`, never another bot. | `SalesBot.should_respond()` in `bot.py` — the ONE gate, called by both `on_message` and the edit handler, logging `[gate] …` for every verdict |
 | **Every action is audited** with a timestamp and a reason — including refusals. | `guardrails.send()` → `state.audit()` |
 
 Code scoping is the **second** layer. The first is server-side: the bot's Discord
@@ -123,21 +123,44 @@ One rule, the same in **every** channel in `SALES_CHANNEL_IDS` — including
 | `@Vaishnavi @sales-bot thoughts?` | No — a message tagging somebody else is never answered, even when it also tags the bot. |
 | A reply to **another person's** message | No — the parent has to be the bot's own message. |
 
-The gate is `SalesBot._is_query_trigger()` in `bot.py`, and it is the single
-entry point for both new messages and edits — fix a typo in a tagged message and
-it re-fires; edit an untagged one and it still gets nothing.
+The gate is **`SalesBot.should_respond()`** in `bot.py` — ONE function, the only
+thing in the codebase that can authorise a reply to a human message. Both paths
+that could produce one (`on_message` and `on_raw_message_edit`) call it and
+nothing else, so a typo fixed in a tagged message re-fires, and an edited
+untagged one still gets nothing. It returns `True` only when the author is a
+human (never another bot, never the bot itself) **and** either the bot is
+explicitly @-mentioned or the message replies to one of the bot's own messages.
 
-Two details worth knowing:
+**Every verdict is logged**, so you never have to guess why a message did or did
+not get an answer:
+
+```
+[gate] responded msg=1234567890 reason=mentioned
+[gate] responded msg=1234567891 reason=reply-to-bot
+[gate] ignored   msg=1234567892 reason=ignored
+```
+
+If the bot ever answers something it shouldn't, that line names the message id
+and the reason — grep the PM2 log for `[gate]` before anything else.
+
+Three details worth knowing:
 
 - **Only the message text is read for tags.** Discord silently adds a mention of
   the person you reply to; that is not you tagging them, so it never counts
   against a reply.
 - **`SALES_ASK_CHANNEL_ID` is a posting home, not an answering rule.** It is
   where the daily digest and the deadline announcements land. Its behaviour on
-  incoming messages is identical to every other sales channel.
+  incoming messages is identical to every other sales channel. There is no
+  `is_ask_channel()` branch in the answering path — the function no longer
+  exists in the codebase.
+- **`@here` / `@everyone` is never a bot mention.** `message.mention_everyone`
+  is rejected before the mention test can even run, so a broadcast at the room
+  is not a question for the bot.
 
-What did **not** change: the daily digest, the ask-time deadline announcement,
-and the reply-based deadline chasing — a reply to the bot's digest or to the
+Also unaffected: **passive reading**. The bot still watches every sales channel
+for commitments to chase — it just does so silently, and the gate has no say in
+it. What did **not** change: the daily digest, the ask-time deadline
+announcement, and the reply-based deadline chasing — a reply to the bot's digest or to the
 original promise still closes that chase, whether or not it also gets an answer.
 
 ---

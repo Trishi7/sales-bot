@@ -40,6 +40,12 @@ never @-mention anyone off the team roster, read and post only in
 SALES_CHANNEL_IDS. Every send in this file goes through `guardrails.send()`,
 which enforces all three and writes the audit line. `on_message` drops anything
 from outside the scope before it is even looked at.
+
+WHETHER TO ANSWER AT ALL is `should_respond()` — ONE function, the only thing in
+this file that can authorise a reply to a human message. Both entry points that
+can produce one (`on_message` and `on_raw_message_edit`) call it and nothing
+else; there is no per-channel variant and no second copy of the rule. It logs
+every verdict as `[gate] <responded|ignored> msg=<id> reason=<...>`.
 """
 import asyncio
 import logging
@@ -454,7 +460,9 @@ class SalesBot(discord.Client):
         # itself be a question, and it deserves an answer.
         await self._maybe_close_chase(message)
 
-        if await self._is_query_trigger(message):
+        # THE ONE GATE. `should_respond` is the only thing in this file that can
+        # authorise a reply, and it logs its verdict either way.
+        if await self.should_respond(message):
             handled = await self._handle_query(message)
             if handled:
                 return
@@ -476,7 +484,9 @@ class SalesBot(discord.Client):
             message = await channel.fetch_message(payload.message_id)
         except discord.DiscordException:
             return
-        if message.author.bot or not await self._is_query_trigger(message):
+        # The SAME gate as on_message — including its author-is-a-human check, so
+        # nothing is re-implemented here.
+        if not await self.should_respond(message):
             return
         log.info("[bot] edited message %s re-fired as a query", message.id)
         await self._handle_query(message)
@@ -513,29 +523,83 @@ class SalesBot(discord.Client):
 
     # -- query routing -----------------------------------------------------
 
-    async def _is_query_trigger(self, message: discord.Message) -> bool:
-        """Should this be handled as a question?
+    async def should_respond(self, message: discord.Message) -> bool:
+        """THE ONE GATE. Every reply this bot can produce to a human message is
+        decided here and nowhere else. There is no second gate, no per-channel
+        rule, and no exemption for SALES_ASK_CHANNEL_ID — that channel is the
+        bot's POSTING home (the digest, the deadline announcements) and nothing
+        more. Its incoming messages are treated exactly like every other sales
+        channel's.
 
-        THE TAG GATE. There are exactly two ways to address this bot, and they
-        are the same in EVERY sales channel — the ask channel included. It is
-        still the digest's home and where deadline announcements land, but it
-        has no special answering rule any more:
+        True ONLY when BOTH hold:
 
-          - an explicit @-mention of the bot in the message TEXT, or
-          - a direct reply to one of the bot's own messages.
+          (a) the author is a human — never another bot, and never this bot
+              itself; AND
+          (b) the bot is EXPLICITLY @-mentioned (`self.user in message.mentions`,
+              backed by the literal <@id> / <@!id> token in the message text), OR
+              the message is a DIRECT REPLY to one of the BOT'S OWN messages
+              (`message.reference` resolving to a message the bot authored).
 
-        Everything else is people talking to each other, and the bot stays out
-        of it. A message that tags somebody ELSE is never answered — even one
-        that also tags the bot, or replies to it: another person was asked, and
-        the bot answering over them is exactly the noise this gate prevents."""
-        if self._tags_someone_else(message):
-            log.debug(
-                "[bot] msg=%s tags someone else — not answering", message.id,
+        Never a trigger, whatever else the message contains:
+
+          - @here / @everyone. `message.mention_everyone` is a broadcast at the
+            channel, not a tag of this bot, and it is checked before anything
+            that could say yes.
+          - a message that tags somebody ELSE — even one that also tags the bot
+            or replies to it. Another person was asked; the bot answering over
+            them is exactly the noise this gate exists to prevent.
+
+        Everything else is people talking to each other. No reply, and no typing
+        indicator — this bot never opens one, so an ignored message costs a log
+        line and nothing else.
+
+        Every decision is logged at INFO as
+        `[gate] <responded|ignored> msg=<id> reason=<...>`, so the reason a
+        message did or did not get an answer is readable in production without
+        a repro.
+        """
+        mid = getattr(message, "id", 0)
+
+        def verdict(ok: bool, reason: str) -> bool:
+            log.info(
+                "[gate] %s msg=%s reason=%s",
+                "responded" if ok else "ignored", mid, reason,
             )
-            return False
+            return ok
+
+        # (a) A human wrote it. Other bots and — critically — this bot's own
+        # messages can never trigger an answer; a bot replying to itself is a
+        # loop, not a conversation.
+        author = getattr(message, "author", None)
+        if author is None or getattr(author, "bot", False):
+            return verdict(False, "ignored")
+        me = getattr(self.user, "id", None)
+        if me is not None and getattr(author, "id", None) == me:
+            return verdict(False, "ignored")
+
+        # @here / @everyone is addressed at the room. It is NOT a bot mention,
+        # and it is rejected before the mention test so it can never be read as
+        # one.
+        if getattr(message, "mention_everyone", False):
+            return verdict(False, "ignored")
+
+        # Someone else was tagged: it is their message to answer.
+        if self._tags_someone_else(message):
+            return verdict(False, "ignored")
+
+        # (b) Reply-to-bot is tested BEFORE the mention test, because Discord
+        # silently adds the replied-to author to `message.mentions` — so a bare
+        # reply to the bot would otherwise be logged as "mentioned" when what
+        # actually happened is a reply. This is also the path the deadline
+        # chasing runs on: a reply to a nudge or to the digest reaches the bot
+        # by design.
+        if await self._is_reply_to_self(message):
+            return verdict(True, "reply-to-bot")
+
         if self._is_self_mentioned_explicitly(message):
-            return True
-        return await self._is_reply_to_self(message)
+            return verdict(True, "mentioned")
+
+        return verdict(False, "ignored")
 
     def _tags_someone_else(self, message: discord.Message) -> bool:
         """True when the message TEXT tags anyone but the bot — another person, a
@@ -585,14 +649,27 @@ class SalesBot(discord.Client):
         return getattr(parent.author, "id", None) == me
 
     def _is_self_mentioned_explicitly(self, message: discord.Message) -> bool:
-        """True only when the bot is @-mentioned in the message TEXT. A reply-ping
-        (which Discord auto-adds to `message.mentions`) doesn't count here — the
-        reply case is decided by `_is_reply_to_self`, which checks who actually
-        wrote the message being replied to."""
-        if self.user is None or not message.content:
+        """True when the bot is EXPLICITLY @-mentioned.
+
+        Two sources agree before this says yes-ish: `self.user in
+        message.mentions` (Discord's own parse) and the literal <@id> / <@!id>
+        token in the message TEXT. Either is enough, but the text token is what
+        makes the distinction meaningful, because `message.mentions` also
+        contains people the author never typed — Discord adds the author of a
+        replied-to message to it. That reply case is decided by
+        `_is_reply_to_self`, which checks who actually WROTE the parent, and
+        `should_respond` tests it first for exactly this reason.
+
+        @here / @everyone never reaches here: `should_respond` rejects
+        `message.mention_everyone` before calling this."""
+        me = getattr(self.user, "id", None)
+        if me is None:
             return False
-        me = self.user.id
-        return f"<@{me}>" in message.content or f"<@!{me}>" in message.content
+        for user in getattr(message, "mentions", None) or ():
+            if getattr(user, "id", None) == me:
+                return True
+        content = message.content or ""
+        return f"<@{me}>" in content or f"<@!{me}>" in content
 
     def _strip_self_mention(self, content: str) -> str:
         if not content or self.user is None:
