@@ -6,9 +6,11 @@ the last conversation. It rides on the daily digest — it is NOT a message of i
 own, and there is no send path in this file.
 
 WHERE EVERY LINE COMES FROM, and nowhere else:
-    the master tab            company, PoC, designation, vertical, industry,
+    the outreach tracker      company, PoC, designation, vertical, industry,
                               history (contacted / connected / intro / follow-ups
-                              / response / assets / next steps)
+                              / response / assets / next steps). The tracker, not
+                              the master tab: it is the one that has the dates
+                              a "where we are" line is made of.
     Researcher Buyer Mapping  the PoC's mapped row: role, evidence, pitch hook,
                               watch-outs — WITH ITS CAVEATS. A name from that
                               sheet is only usable alongside its staleness
@@ -61,7 +63,7 @@ def _or_not_recorded(value) -> str:
 
 
 def _history_line(row: dict, *, today: date) -> str:
-    """The relationship so far, from the master row's own date columns."""
+    """The relationship so far, from the tracker row's own date columns."""
     bits: list[str] = []
     for role, label in (
         ("first_contacted", "first contacted"),
@@ -71,7 +73,7 @@ def _history_line(row: dict, *, today: date) -> str:
         raw = str(row.get(role) or "").strip()
         if not raw:
             continue
-        parsed = dl.parse_date(raw)
+        parsed = gtm_sheet.sheet_date(raw)
         if parsed:
             days = (today - parsed).days
             bits.append(f"{label} {dl.format_date(parsed)} ({days}d ago)")
@@ -92,7 +94,7 @@ def _history_line(row: dict, *, today: date) -> str:
 def _positioning_match(row: dict, positioning_rows: list[dict]) -> Optional[dict]:
     """The positioning-matrix row that best fits this company.
 
-    Matched on the master row's own words — its Use Case cell first, then its
+    Matched on the tracker row's own words — its Use Case cell first, then its
     Industry — against the matrix's use case, ICP and company-type columns. No
     match returns None, and the brief then says so rather than attaching an
     arbitrary pitch.
@@ -280,7 +282,7 @@ def build(
     today = today or dl.today_ist()
     company = str(row.get("company") or "").strip() or "(unnamed company)"
     poc = str(row.get("poc") or "").strip()
-    parsed = dl.parse_date(meeting_date)
+    parsed = gtm_sheet.sheet_date(meeting_date)
     when = dl.format_date(parsed) if parsed else str(meeting_date or "")
     days_away = (parsed - today).days if parsed else None
     when_note = (

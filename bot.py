@@ -260,8 +260,9 @@ class SalesBot(discord.Client):
             "loaded" if pol["loaded"] else "MISSING", pol["path"], pol["chars"],
         )
 
-        # THE CADENCE DRY RUN, at boot. It reads the master tab, runs the nine
-        # rules and LOGS what would fire today with the cap applied. It sends
+        # THE CADENCE DRY RUN, at boot. It reads the TRACKER tab, runs the
+        # phase-1 rules and LOGS what would fire today with the caps applied,
+        # after logging which real tab matched which role. It sends
         # NOTHING — the digest still posts at SALES_DIGEST_TIME and only then.
         # This exists so that a threshold nobody has tuned yet, or a column that
         # turns out to be colour-coded, is visible on the first restart rather
@@ -291,11 +292,21 @@ class SalesBot(discord.Client):
         it, so a threshold can be argued about against real rows rather than in
         the abstract.
 
-        Note this DOES advance the next-step clock for rule (i), which is
+        Note this DOES advance the next-step clock for rule (j), which is
         correct — the clock measures days observed, and a boot is an observation.
         """
         if not config.CADENCE_ENABLED:
             return
+        roles = []
+        try:
+            # WHICH TAB GOT WHICH ROLE, before anything else: names drift, and
+            # "the cadence found no rows" is almost always "the tracker was read
+            # as something else today".
+            roles = await asyncio.to_thread(gtm_sheet.SHEETS.role_assignment)
+            for kind, label, titles in roles:
+                log.info("[gtm.roles] %-18s %-52s -> %s", kind, label, titles)
+        except Exception:
+            log.info("[cadence] could not report the tab roles", exc_info=True)
         try:
             result = await self._run_cadence(today=dl.today_ist())
         except Exception:
@@ -306,7 +317,8 @@ class SalesBot(discord.Client):
             return
         try:
             text = cadence.dry_run_text(
-                result, source=result.get("source", ""), staleness=result.get("staleness", "")
+                result, source=result.get("source", ""),
+                staleness=result.get("staleness", ""), roles=roles,
             )
         except Exception:
             log.exception("[cadence] could not render the dry run")
@@ -315,14 +327,21 @@ class SalesBot(discord.Client):
             log.info("[cadence.dryrun] %s", line)
         state.audit(
             "cadence_dry_run",
-            reason="startup: which rows the nine phase-1 rules fire on today",
+            reason="startup: which rows the phase-1 rules fire on today",
             source=result.get("source", ""),
+            tab_roles={kind: titles for kind, _label, titles in roles},
             rows=result.get("rows", 0),
             excluded_rejected=result.get("excluded", 0),
             items=len(result.get("all") or []),
             shown=len(result.get("items") or []),
             held=len(result.get("held") or []),
+            cold=len(result.get("cold") or []),
+            cold_ceiling_days=config.CONNECT_REMINDER_MAX_DAYS,
+            update_asks=len(result.get("updates_all") or []),
+            update_shown=len(result.get("updates") or []),
+            urgent_cap=config.URGENT_MAX,
             cap=config.DIGEST_MAX_ITEMS,
+            update_cap=config.UPDATE_TRACKER_MAX,
             by_rule=result.get("counts", {}),
         )
 
@@ -1579,18 +1598,28 @@ class SalesBot(discord.Client):
         async def _cadence_list(inp: dict) -> dict:
             """The uncapped cadence, for the question the digest's overflow line
             invites. READ-ONLY — it re-runs the same rules against the same tab
-            and sends nothing."""
-            result = await self._run_cadence(today=dl.today_ist(), limit=0)
+            and sends nothing. Both caps are lifted: the digest holds back
+            cadence items AND update-tracker asks, and "everything" means both.
+
+            The data-quality flags are computed WITHOUT their dedup here, on
+            purpose: this is somebody asking what is wrong with the sheet, and
+            "I already mentioned that on Tuesday" is not an answer to that
+            question.
+            """
+            result = await self._run_cadence(
+                today=dl.today_ist(), limit=0, update_limit=0
+            )
             if result is None:
                 return {
                     "ok": False,
                     "reason": (
                         "The cadence could not be computed - either CADENCE_ENABLED is "
-                        "off or the master tab could not be read. Say so plainly."
+                        "off, or no tab carries the tracker signature ('Last followed up "
+                        "date' + 'Total follow-ups till date'). Say so plainly."
                     ),
                 }
             wanted = str((inp or {}).get("rule") or "").strip().lower()[:1]
-            items = result.get("all") or []
+            items = (result.get("all") or []) + (result.get("updates_all") or [])
             if wanted:
                 items = [i for i in items if i.get("letter") == wanted]
             log.info(
@@ -1604,8 +1633,10 @@ class SalesBot(discord.Client):
                 "rows_considered": result.get("rows", 0),
                 "rejected_excluded": result.get("excluded", 0),
                 "digest_cap": config.DIGEST_MAX_ITEMS,
+                "update_tracker_cap": config.UPDATE_TRACKER_MAX,
                 "shown_in_digest": len(result.get("items") or []),
                 "held_back": len(result.get("held") or []),
+                "update_asks": len(result.get("updates_all") or []),
                 "counts_by_rule": result.get("counts", {}),
                 "items": [
                     {
@@ -1618,7 +1649,69 @@ class SalesBot(discord.Client):
                 "truncated": len(items) > max(1, config.CADENCE_FULL_LIST_MAX),
                 "note": (
                     "Rows a human marked rejected are excluded from every rule by design - "
-                    "they are revisited offline, not chased."
+                    "they are revisited offline, not chased; the one exception is the "
+                    "single per-company 'try another PoC' suggestion (rule g). Rows whose "
+                    "rule inputs are blank become 'update the tracker' asks (letter "
+                    "'fill'), never chases."
+                ),
+            }
+
+        async def _cold_list(inp: dict) -> dict:
+            """The UNCAPPED cold list — every never-connected row past the cold
+            ceiling, which the digest reports only as a count.
+
+            READ-ONLY. This is the other half of the ceiling: the rows are
+            suppressed from individual chases precisely so that this question can
+            answer them all at once, per company, rather than as 756 identical
+            nudges spread over fifty digests.
+            """
+            result = await self._run_cadence(today=dl.today_ist(), limit=0, update_limit=0)
+            if result is None:
+                return {
+                    "ok": False,
+                    "reason": (
+                        "The cadence could not be computed - either CADENCE_ENABLED is "
+                        "off, or no tab carries the tracker signature. Say so plainly."
+                    ),
+                }
+            rows = result.get("cold") or []
+            today = result.get("today")
+            by_company: dict = {}
+            for row in rows:
+                company, poc = cadence.row_identity(row)
+                by_company.setdefault(company, []).append({
+                    "poc": poc,
+                    "designation": str(row.get("poc_designation") or ""),
+                    "first_contacted": str(row.get("first_contacted") or ""),
+                    "days_since_contact": cadence.contact_age(row, today=today),
+                    "sheet_row": row.get("_row"),
+                })
+            ordered = sorted(
+                by_company.items(),
+                key=lambda kv: -max(
+                    [p["days_since_contact"] or 0 for p in kv[1]] or [0]
+                ),
+            )
+            log.info("[cadence] cold list requested -> %d row(s) across %d companies",
+                     len(rows), len(ordered))
+            return {
+                "ok": True,
+                "source": result.get("source", ""),
+                "staleness": result.get("staleness", ""),
+                "cold_ceiling_days": config.CONNECT_REMINDER_MAX_DAYS,
+                "total_rows": len(rows),
+                "total_companies": len(ordered),
+                "companies": [
+                    {"company": name, "pocs": pocs[:25], "poc_count": len(pocs)}
+                    for name, pocs in ordered[: max(1, config.CADENCE_FULL_LIST_MAX)]
+                ],
+                "truncated": len(ordered) > max(1, config.CADENCE_FULL_LIST_MAX),
+                "note": (
+                    "These are NOT rejected and NOT written off - they are leads first "
+                    "contacted more than the ceiling ago that never connected. The digest "
+                    "counts them in one line instead of chasing each one, because 'start "
+                    "interacting' is the wrong sentence six months on. Their other rules "
+                    "still fire normally."
                 ),
             }
 
@@ -1794,16 +1887,17 @@ class SalesBot(discord.Client):
                 "schema": {
                     "name": "cadence_list",
                     "description": (
-                        "THE FULL CADENCE LIST — every item the nine daily rules fire on "
-                        "today, UNCAPPED, ranked urgent first. The daily digest carries only "
-                        "the top DIGEST_MAX_ITEMS of these and closes with 'N more held'; "
-                        "this is what that line points at. Use it for 'full cadence list', "
-                        "'what did the digest leave out', 'show me everything', 'what else "
-                        "is pending', or any question about the follow-ups / intros / "
-                        "meetings / assets / update-tracker sections. Each line carries its "
-                        "rule letter (a-i) and its priority (urgent / waiting / held). Rows "
-                        "marked rejected are excluded from all of it, by design. Optionally "
-                        "filter to one rule letter."
+                        "THE FULL CADENCE LIST — every item the phase-1 rules fire on "
+                        "today, UNCAPPED, ranked urgent first. The digest carries every "
+                        "URGENT item plus the top DIGEST_MAX_ITEMS of the rest, and closes "
+                        "with 'N more held'; this is what that line points at. Use it for "
+                        "'full cadence list', 'what did the digest leave out', 'show me "
+                        "everything', 'what else is pending', or any question about the "
+                        "follow-ups / intros / meetings / update-tracker / assets sections. "
+                        "Each line carries its rule letter (a-j) and its priority (urgent / "
+                        "waiting / intro / suggestion). Rows marked rejected are excluded by "
+                        "design, and the cold contacts have their own tool (cold_list). "
+                        "Optionally filter to one rule letter."
                     ),
                     "input_schema": {
                         "type": "object",
@@ -1811,10 +1905,11 @@ class SalesBot(discord.Client):
                             "rule": {
                                 "type": "string",
                                 "description": (
-                                    "Optional single rule letter a-i to filter to: a stale "
+                                    "Optional single rule letter a-j to filter to: a stale "
                                     "follow-up, b intro pending, c start interacting, d try "
                                     "another channel, e mark unresponsive, f lock a meeting, "
-                                    "g try another PoC, h post-meeting gap, i next-step stall."
+                                    "g try another PoC at a rejected company, h meeting soon, "
+                                    "i post-meeting gap, j next-step stall."
                                 ),
                             },
                         },
@@ -1822,6 +1917,23 @@ class SalesBot(discord.Client):
                     },
                 },
                 "handler": _cadence_list,
+            },
+            {
+                "schema": {
+                    "name": "cold_list",
+                    "description": (
+                        "THE COLD CONTACTS — every never-connected row first contacted more "
+                        "than CONNECT_REMINDER_MAX_DAYS ago, UNCAPPED and grouped by company. "
+                        "The daily digest reports these as a single count line ('N cold "
+                        "contacts ... ask cold list to see them') rather than chasing each "
+                        "one; this is what that line points at. Use it for 'cold list', "
+                        "'show me the cold contacts', 'who never connected', 'what about the "
+                        "March outreach', 'which leads went quiet'. They are NOT rejected - "
+                        "say so if it matters to the question."
+                    ),
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                "handler": _cold_list,
             },
             {
                 "schema": {
@@ -2921,15 +3033,15 @@ class SalesBot(discord.Client):
         )
         log.info(
             "[digest] POSTED %s — hot=%d deadlines=%d overdue=%d escalations=%d hygiene=%d "
-            "| cadence: follow-ups=%d intros=%d meetings=%d assets=%d update-tracker=%d "
+            "| cadence: follow-ups=%d intros=%d meetings=%d update-tracker=%d assets=%d "
             "prep-briefs=%d",
             marker,
             counts[digest.SECTION_HOT], counts[digest.SECTION_DEADLINES],
             counts[digest.SECTION_OVERDUE], counts[digest.SECTION_ESCALATIONS],
             counts[digest.SECTION_HYGIENE],
             counts[digest.SECTION_CADENCE_FOLLOWUPS], counts[digest.SECTION_CADENCE_INTROS],
-            counts[digest.SECTION_CADENCE_MEETINGS], counts[digest.SECTION_CADENCE_ASSETS],
-            counts[digest.SECTION_CADENCE_UPDATES], counts[digest.SECTION_PREP],
+            counts[digest.SECTION_CADENCE_MEETINGS], counts[digest.SECTION_CADENCE_UPDATES],
+            counts[digest.SECTION_CADENCE_ASSETS], counts[digest.SECTION_PREP],
         )
 
         try:
@@ -3038,10 +3150,15 @@ class SalesBot(discord.Client):
             log.exception("[digest] could not collect the sheet sections; they are omitted")
 
         # THE PHASE-1 CADENCE. Independently guarded like every other source: a
-        # master tab that cannot be read costs the team its cadence sections and
-        # nothing else. It is capped by cadence.run() itself (DIGEST_MAX_ITEMS,
-        # urgent first) rather than by the per-section clip below, because the cap
-        # is across all five sections — fifteen items total, not fifteen each.
+        # tracker tab that cannot be read costs the team its cadence sections and
+        # nothing else. It is capped by cadence.run() itself rather than by the
+        # per-section clip below, because the budgets are ACROSS the five
+        # sections rather than per section, and there are three of them:
+        # URGENT_MAX (a hard ceiling; the urgent items are never truncated),
+        # DIGEST_MAX_ITEMS (everything else in the cadence), and
+        # UPDATE_TRACKER_MAX (the tracker asks, so a sparse sheet's fill-in
+        # requests cannot eat the work list). The cold summary is outside all
+        # three — one line, and the line that keeps the cold ceiling honest.
         try:
             cadence_sections, cadence_effects, cadence_staleness = (
                 await self._collect_cadence_sections(today=today)
@@ -3264,18 +3381,36 @@ class SalesBot(discord.Client):
         # The weekly funnel numbers, on their weekday only. They used to be
         # their own scheduled post; a second unprompted message a week is still
         # a second unprompted message, so they ride along here instead.
+        #
+        # THE FUNNEL DEFINITION IS THE PLAYBOOK'S OWN, from the "Sales Funnel"
+        # pivot tab: Contacted -> Connected -> Intro Sent -> Positive (P/Y) ->
+        # Meeting Done -> Assets Shared, counted off the master tab the pivot is
+        # a pivot of. The older leading/lagging block still follows it, because
+        # it reads the tracker's DATES and answers a different question — what
+        # happened this week, rather than where the pipeline stands.
         if config.WEEKLY_DIGEST_ENABLED:
             weekday = max(0, min(6, config.WEEKLY_DIGEST_WEEKDAY))
             if today.weekday() == weekday:
+                funnel_lines: list[str] = []
+                try:
+                    master = await asyncio.to_thread(
+                        gtm_sheet.SHEETS.tab, gtm_sheet.MASTER
+                    )
+                    if master is not None:
+                        funnel_lines = tracker.stage_funnel_lines(
+                            tracker.stage_funnel(master.rows)
+                        )
+                except Exception:
+                    log.exception("[digest] could not compute the funnel stages")
                 try:
                     metrics = tracker.funnel_metrics(
                         tab.rows, since=today - timedelta(days=7), today=today
                     )
-                    out[digest.SECTION_FUNNEL] = [
-                        {"text": line} for line in tracker.funnel_lines(metrics)
-                    ]
+                    funnel_lines.extend(tracker.funnel_lines(metrics))
                 except Exception:
                     log.exception("[digest] could not compute the weekly funnel metrics")
+                if funnel_lines:
+                    out[digest.SECTION_FUNNEL] = [{"text": line} for line in funnel_lines]
 
         return out, staleness
 
@@ -3284,17 +3419,29 @@ class SalesBot(discord.Client):
     def _cadence_owner(self, item: dict) -> tuple[str, str]:
         """(mention, owner_key) for one cadence item.
 
-        The master tab's Owner column holds a NAME. It is resolved against the
-        roster and pinged only when that succeeds; otherwise the person is named
-        in plain text by guardrails.mention_for, which is the roster gate failing
-        closed. A row with no owner at all groups under "" and the renderer
-        addresses it to the deadline-notify list instead.
+        THE TRACKER HAS NO OWNER COLUMN, so this resolves in two steps:
+          1. the row's own owner cell, if a column ever appears or GTM_COLUMN_MAP
+             names one. It holds a NAME, resolved against the roster;
+          2. SALES_DEFAULT_OWNER_ID — Vaishnavi, who works every row today.
+
+        A ping needs BOTH an id and roster membership: `guardrails.mention_for`
+        is the roster gate, and it fails closed by naming the person in plain
+        text instead. A row that resolves to nobody groups under "" and the
+        renderer addresses it to the deadline-notify list.
+
+        Sheet-health lines (the data-quality flags) are about the spreadsheet
+        rather than about a prospect, so they are addressed to the default owner
+        too — somebody has to fix the formula.
         """
         name = str(item.get("owner") or "").strip()
-        if not name:
+        if name:
+            uid = config.roster_id_for_name(name)
+            return guardrails.mention_for(uid, name), gtm_sheet.normalise_header(name)
+        uid = int(config.SALES_DEFAULT_OWNER_ID or 0)
+        if not uid:
             return "", ""
-        uid = config.roster_id_for_name(name)
-        return guardrails.mention_for(uid, name), gtm_sheet.normalise_header(name)
+        display = (config.ROSTER_DISPLAY_NAMES or {}).get(str(uid)) or "the row owner"
+        return guardrails.mention_for(uid, str(display)), f"uid:{uid}"
 
     def _cadence_stall_clock(self, today):
         """A stall_days(row) callable backed by the bot's own next-step history.
@@ -3359,12 +3506,18 @@ class SalesBot(discord.Client):
 
         return lookup
 
-    async def _run_cadence(self, *, today, limit=None) -> Optional[dict]:
-        """Run the nine rules against the master tab. None when it cannot be read.
+    async def _run_cadence(
+        self, *, today, limit=None, urgent_limit=None, update_limit=None
+    ) -> Optional[dict]:
+        """Run the phase-1 rules against the TRACKER. None when it cannot be read.
 
         This is the ONLY place the cadence is computed, and it computes nothing
         else: it returns cadence.run()'s result, and the caller decides whether
         that becomes a digest section or an answer to a question.
+
+        THE TRACKER, NOT THE MASTER TAB. The master tab is read too, but only as
+        the cross-check's other side and as the source of the misaligned-row
+        flag: it has no dates, so it cannot answer a single date-based rule.
         """
         if not config.CADENCE_ENABLED:
             log.info("[cadence] CADENCE_ENABLED=false — the cadence sections are omitted")
@@ -3378,16 +3531,12 @@ class SalesBot(discord.Client):
             log.exception("[cadence] the cadence source could not be read")
             return None
         if tab is None:
-            log.warning(
-                "[cadence] neither a master tab nor an outreach tracker exists — no cadence"
+            log.error(
+                "[cadence] no tab carries the tracker signature ('Last followed up "
+                "date' + 'Total follow-ups till date'), so there is no cadence today. "
+                "See the [gtm.roles] lines for what each tab was read as."
             )
             return None
-        if source != gtm_sheet.MASTER:
-            log.warning(
-                "[cadence] running against %r (%s), NOT the master tab. Set "
-                "GTM_MASTER_TAB_TITLES if the playbook has a 'Master data' tab.",
-                tab.title, source,
-            )
 
         staleness = ""
         try:
@@ -3395,12 +3544,39 @@ class SalesBot(discord.Client):
         except Exception:
             log.debug("[cadence] no staleness note available", exc_info=True)
 
+        # The master tab: the other side of the cross-check, and the rows the
+        # misaligned-row flag reads. Its absence costs those two things and
+        # nothing else.
+        master_rows = None
+        try:
+            master = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.MASTER)
+            master_rows = list(master.rows) if master else None
+        except Exception:
+            log.info("[cadence] no master tab for the cross-check", exc_info=True)
+
+        # Broken formulas, from EVERY tab the bot recognises — a #REF! in the
+        # researcher lines is worth one line even though no rule reads it.
+        errors: dict = {}
+        try:
+            for kind in (gtm_sheet.TRACKER, gtm_sheet.MASTER, gtm_sheet.RESEARCHER_LINES,
+                         gtm_sheet.PIPELINE, gtm_sheet.FUNNEL, gtm_sheet.POSITIONING):
+                for t in await asyncio.to_thread(gtm_sheet.SHEETS.tabs_of, kind):
+                    if t.error_cells:
+                        errors[t.title] = t.error_cells
+        except Exception:
+            log.debug("[cadence] could not collect the error cells", exc_info=True)
+
         result = await asyncio.to_thread(
             lambda: cadence.run(
                 tab.rows, today=today,
                 mapping_lookup=self._cadence_mapping_lookup(),
                 stall_days=self._cadence_stall_clock(today),
                 limit=limit,
+                urgent_limit=urgent_limit,
+                update_limit=update_limit,
+                master_rows=master_rows,
+                error_cells_by_tab=errors,
+                quality_seen=self.db.quality_flag_seen,
             )
         )
         result["source"] = source + " tab " + repr(tab.title)
@@ -3409,7 +3585,8 @@ class SalesBot(discord.Client):
         return result
 
     async def _collect_cadence_sections(self, *, today) -> tuple[dict, list[dict], str]:
-        """The five cadence sections, the prep briefs, and their effects.
+        """The five cadence sections, the tracker asks, the prep briefs, and their
+        effects.
 
         Returns (sections, effects, staleness). Every failure is contained: a
         cadence that cannot be computed leaves its sections empty and the rest of
@@ -3423,7 +3600,13 @@ class SalesBot(discord.Client):
         if result is None:
             return out, effects, ""
 
-        for item in result["items"]:
+        # The cadence items (urgent on their own never-truncated budget, the
+        # rest on DIGEST_MAX_ITEMS, the cold summary on neither) and the
+        # separately-capped UPDATE-TRACKER asks. All are rendered as ordinary
+        # owner-grouped bullets; the only difference between them is which
+        # budget they came out of. `result["items"]` already carries the cold
+        # summary at its head.
+        for item in list(result["items"]) + list(result.get("updates") or []):
             mention, owner_key = self._cadence_owner(item)
             out[item["section"]].append({
                 "key": item["key"],
@@ -3432,10 +3615,24 @@ class SalesBot(discord.Client):
                 "owner_key": owner_key,
             })
 
-        held = len(result.get("held") or [])
-        line = cadence.overflow_line(held)
+        line = cadence.overflow_line(
+            len(result.get("held") or []), len(result.get("updates_held") or [])
+        )
         if line:
             out[digest.SECTION_CADENCE_OVERFLOW] = [{"text": "_" + line + "_"}]
+
+        # Sheet-health flags are recorded as EFFECTS, applied only once the
+        # digest has actually posted. A refused send must not mark a flag as
+        # "already reported" and silence it for good.
+        for item in result.get("updates") or []:
+            if item.get("rule") == cadence.RULE_DATA_QUALITY and item.get("flag_key"):
+                effects.append({
+                    "type": "quality_flag_reported",
+                    "flag_key": item["flag_key"],
+                    "signature": item.get("signature", ""),
+                    "on_date": dl.iso(today),
+                    "text": item.get("text", ""),
+                })
 
         briefs, brief_effects = await self._collect_prep_briefs(result, today=today)
         if briefs:
@@ -3573,6 +3770,20 @@ class SalesBot(discord.Client):
                         company=eff["company"], poc=eff["poc"],
                         meeting_date=eff["meeting_date"],
                         web_research="not included - pending web access decision",
+                    )
+
+                elif kind == "quality_flag_reported":
+                    # "Deduped until fixed": the signature of what was found is
+                    # stored, and the flag stays quiet until that changes.
+                    self.db.record_quality_flag(
+                        flag_key=eff["flag_key"], signature=eff["signature"],
+                        on_date=eff["on_date"],
+                    )
+                    state.audit(
+                        "sheet_quality_flag",
+                        reason="reported once in the digest; not repeated until it changes",
+                        flag_key=eff["flag_key"], signature=eff["signature"],
+                        detail=eff.get("text", "")[:300],
                     )
 
                 elif kind == "deadline_reminded":

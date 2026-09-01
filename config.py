@@ -459,27 +459,42 @@ GTM_MAPPING_COLUMN_MAP: dict = _json_object("GTM_MAPPING_COLUMN_MAP", default={}
 # gtm_sheet.ROLES.
 GTM_COLUMN_MAP: dict = _json_object("GTM_COLUMN_MAP", default={})
 
-# -- The "Master data" tab: THE canonical cadence source ----------------------
-# The GTM Playbook now carries a "Master data" tab that auto-updates from a
-# HIDDEN "outreach updates" sheet. It is the clean source the daily cadence runs
-# against — every rule in cadence.py reads this tab, not the older outreach
-# tracker.
+# -- TAB IDENTIFICATION: BY HEADER SIGNATURE ----------------------------------
+# The GTM Playbook's tabs are found by the COLUMNS they carry, not by their
+# names — names drift, signatures don't. gtm_sheet.py holds the signatures; the
+# tab NAME that matched each role is logged at startup under [gtm.roles].
+#
+#   TRACKER   "Last followed up date" + "Total follow-ups till date"
+#             (live: the HIDDEN "Outreach Updates" tab). THE CADENCE SOURCE —
+#             the only tab with dates in it, so every phase-1 rule runs there.
+#   MASTER    "Response Status" + "Intro Sent" + "Meeting Done"
+#             (live: "Master Data"). STATUS ONLY, no dates: aggregate answers,
+#             the weekly funnel definition, and the nightly cross-check.
+#   PIPELINE  "Lead Stage" + "Estimated Value (INR)"  (live: "Lead Master Sheet")
+#   FUNNEL    "Vertical / Stage"   (live: "Sales Funnel - March-June 2026")
+#   RESEARCHER LINES  "Outreach Line - Researchers" + "Dates"
+#             (live: "Master Pipeline")
 #
 # RE-POINTING THE BOT AT A NEW SHEET IS AN ENV CHANGE PLUS A RESTART, and this
 # is the promise made in the 27 Aug alignment meeting. Nothing about the sheet's
 # identity or its column names is compiled in:
 #   GTM_SHEET_ORIGINAL_ID     which spreadsheet
-#   GTM_MASTER_TAB_TITLES     which tab in it is the master
 #   GTM_COLUMN_MAP            which header means which rule field
+#   GTM_MASTER_TAB_TITLES     an optional NAME hint for the master tab
+#   SALES_DEFAULT_OWNER_ID    who cadence items are addressed to
 #   the CADENCE_* thresholds below
-# Change those four, restart, and the bot runs the same rules against the new
-# sheet. There is no migration and no code edit.
+# Change those, restart, and the bot runs the same rules against the new sheet.
+# There is no migration and no code edit.
 
-# Accepted titles for the master tab, comma-separated, matched case- and
-# punctuation-insensitively. The FIRST one that exists in the spreadsheet wins.
-# A tab named here is read as the master even when its headers also look like
-# the old tracker's — the title is the authority, because "Master data" is a
-# deliberate human decision about which tab is canonical.
+# An optional NAME hint for the master tab, comma-separated, matched case- and
+# punctuation-insensitively.
+#
+# IT IS A HINT, NOT AN AUTHORITY, and that is a deliberate downgrade. It used to
+# decide which tab was the master outright, which put the entire cadence on a
+# status-only tab with no dates in it — every date rule read a blank and quietly
+# never fired. A tab named here is still only read as the master if it carries
+# the master signature, and naming a tab here can never take the cadence off the
+# tracker.
 GTM_MASTER_TAB_TITLES: list[str] = _str_list(
     "GTM_MASTER_TAB_TITLES", "Master data,Master Data,Master-data,Masterdata"
 )
@@ -521,6 +536,22 @@ CADENCE_ENABLED = _bool("CADENCE_ENABLED", default=True)
 FOLLOWUP_STALE_DAYS = _int("FOLLOWUP_STALE_DAYS", 5)
 # (c) First Contacted set but never Connected after this long → start interacting.
 CONNECT_REMINDER_DAYS = _int("CONNECT_REMINDER_DAYS", 7)
+# ...AND NOT AFTER THIS LONG. Past this, the row is COLD, not "yet to start".
+#
+# THIS IS THE CEILING RULE (c) NEEDED AND DID NOT HAVE. On the live sheet rule
+# (c) fired on 756 of 886 rows, because most of the tracker is March-June
+# outreach that never connected. Raising CONNECT_REMINDER_DAYS does not help at
+# all — those rows are older than ANY threshold, so a higher floor still lets
+# every one of them through. A ceiling is the only lever that works.
+#
+# Rows past it are excluded from the individual "start interacting" chase and
+# reported as ONE summary line instead ("N cold contacts (never connected, first
+# contacted Mar-Jun) — ask 'cold list' to see them"). The list itself is
+# available uncapped on demand. Nothing is hidden; it is counted rather than
+# enumerated, because 756 identical nudges is not a work list.
+#
+# Set to 0 to turn the ceiling off and go back to chasing every one of them.
+CONNECT_REMINDER_MAX_DAYS = _int("CONNECT_REMINDER_MAX_DAYS", 30)
 # (d) Total follow-ups at or above this with no response → try another channel.
 ALT_CHANNEL_AT = _int("ALT_CHANNEL_AT", 4)
 # (e) Total follow-ups at or above this with no response → ask the OWNER to mark
@@ -544,9 +575,67 @@ CADENCE_REJECTED_MARKERS: list[str] = _str_list(
     "lost,dropped,drop,blacklist,blacklisted",
 )
 
-# How many cadence items the digest carries, urgent first. 15 is the 10–15
-# phase-1 agreement from the 27 Aug meeting. Everything past the cap is counted
-# in one closing line and available on demand via the "full cadence list" query.
+# WHO A CADENCE ITEM IS ADDRESSED TO.
+#
+# THE TRACKER HAS NO OWNER COLUMN. Every row is worked by the same person today,
+# so a cadence line resolves its owner in this order:
+#   1. the row's own owner cell, if a column ever appears (or GTM_COLUMN_MAP
+#      names one: {"outreach_tracker": {"owner": "Owned By"}}), resolved against
+#      the roster by display name;
+#   2. SALES_DEFAULT_OWNER_ID — Vaishnavi's Discord id.
+# The id must ALSO be in TEAM_ROSTER_IDS to actually be @-mentioned; the roster
+# is the only thing that authorises a mention, and an id that isn't on it is
+# named in plain text instead. Unset means cadence lines are addressed to the
+# DEADLINE_NOTIFY_IDS group line, which is worse but never wrong.
+SALES_DEFAULT_OWNER_ID = _int("SALES_DEFAULT_OWNER_ID", 0)
+
+# How many UPDATE-TRACKER fill-in asks the digest carries. SEPARATE from
+# DIGEST_MAX_ITEMS on purpose: the tracker is sparse (follow-up counts are blank
+# on most rows), so a row whose rule inputs are missing becomes a "please fill
+# this in" ask rather than a chase — and without its own budget those asks would
+# consume the whole 15-item cadence and push the real work off the digest.
+UPDATE_TRACKER_MAX = _int("UPDATE_TRACKER_MAX", 5)
+
+# THE NIGHTLY CONSISTENCY CROSS-CHECK. The master tab and the tracker describe
+# the same rows in two vocabularies; where they disagree, one of them is wrong
+# and a human has to say which. The bot reports the disagreement as an
+# UPDATE-TRACKER line and NEVER infers a winner — picking one silently is how a
+# status gets quietly rewritten by a bot nobody asked.
+CADENCE_CROSSCHECK_ENABLED = _bool("CADENCE_CROSSCHECK_ENABLED", default=True)
+# How many disagreements one digest reports. They are a fill-in ask like any
+# other and share the UPDATE_TRACKER_MAX budget; this caps how many are computed
+# into the list at all.
+CADENCE_CROSSCHECK_MAX = _int("CADENCE_CROSSCHECK_MAX", 5)
+
+# THE DATA-QUALITY FLAGS: broken formulas (#REF! and friends), master rows whose
+# cells come from the wrong vocabulary, and response values nobody standardised.
+# One UPDATE-TRACKER line each, and DEDUPED UNTIL FIXED — a flag whose signature
+# hasn't changed since the last time it was reported is not repeated, because a
+# daily reminder of a known-broken formula is how a digest gets muted.
+CADENCE_DATA_QUALITY_ENABLED = _bool("CADENCE_DATA_QUALITY_ENABLED", default=True)
+
+# THE URGENT ITEMS ARE NEVER TRUNCATED, and they have their own ceiling.
+#
+# A positive reply with no next step (f), a meeting inside MEETING_PREP_DAYS (h)
+# and a post-meeting gap (i) are exactly what Vaishnavi prioritised. Sharing one
+# fifteen-item budget with the rest of the cadence, sixteen urgent rows filled
+# the whole digest on day one and then — one row later — would have started
+# truncating the positives themselves. Truncating the positives defeats the
+# digest, so they get their own budget and DIGEST_MAX_ITEMS applies to
+# everything else.
+#
+# THIS IS A HARD CEILING, NOT A TARGET. It exists only so a broken sheet — a
+# column that suddenly reads as positive on every row — cannot produce a
+# thousand-line message. If it is ever actually hit, that is a bug to look at,
+# and the closing "N more held" line will say so.
+URGENT_MAX = _int("URGENT_MAX", 25)
+
+# How many NON-URGENT cadence items the digest carries. 15 is the 10–15
+# phase-1 agreement from the 27 Aug meeting. The urgent items are counted
+# separately against URGENT_MAX above and are never truncated by this cap.
+#
+# Everything past the cap is counted in one closing line and available on demand
+# via the "full cadence list" query.
 DIGEST_MAX_ITEMS = _int("DIGEST_MAX_ITEMS", 15)
 
 # The uncapped on-demand list is bounded too — a Discord reply has a size limit,
@@ -728,10 +817,11 @@ def validate() -> list[str]:
         log.info(
             "[config] cadence ON. Thresholds (ALL PLACEHOLDERS until tuned): "
             "FOLLOWUP_STALE_DAYS=%d CONNECT_REMINDER_DAYS=%d ALT_CHANNEL_AT=%d "
-            "UNRESPONSIVE_AT=%d NEXTSTEP_STALL_DAYS=%d MEETING_PREP_DAYS=%d "
-            "DIGEST_MAX_ITEMS=%d",
+            "CONNECT_REMINDER_MAX_DAYS=%d UNRESPONSIVE_AT=%d NEXTSTEP_STALL_DAYS=%d "
+            "MEETING_PREP_DAYS=%d URGENT_MAX=%d DIGEST_MAX_ITEMS=%d UPDATE_TRACKER_MAX=%d",
             FOLLOWUP_STALE_DAYS, CONNECT_REMINDER_DAYS, ALT_CHANNEL_AT,
-            UNRESPONSIVE_AT, NEXTSTEP_STALL_DAYS, MEETING_PREP_DAYS, DIGEST_MAX_ITEMS,
+            CONNECT_REMINDER_MAX_DAYS, UNRESPONSIVE_AT, NEXTSTEP_STALL_DAYS,
+            MEETING_PREP_DAYS, URGENT_MAX, DIGEST_MAX_ITEMS, UPDATE_TRACKER_MAX,
         )
         if ALT_CHANNEL_AT >= UNRESPONSIVE_AT:
             log.warning(
@@ -747,14 +837,57 @@ def validate() -> list[str]:
                 DIGEST_MAX_ITEMS,
             )
         if not GTM_MASTER_TAB_TITLES:
-            log.warning(
-                "GTM_MASTER_TAB_TITLES is empty — no tab can be recognised as the master, "
-                "so the cadence will run against the older outreach tracker instead."
+            log.info(
+                "GTM_MASTER_TAB_TITLES is empty. That is fine — the master tab is found "
+                "by its header signature ('Response Status' + 'Intro Sent' + 'Meeting "
+                "Done'), and the name is only a tie-break hint."
             )
         if not CADENCE_REJECTED_MARKERS:
             log.warning(
-                "CADENCE_REJECTED_MARKERS is empty — NO row will be treated as rejected, so "
-                "prospects the team has written off will keep appearing in the digest."
+                "CADENCE_REJECTED_MARKERS is empty — the only rows treated as rejected "
+                "will be the ones whose Response says so ('N', 'N - Rejected'). A row "
+                "written off in a Reason or Status cell will keep being chased."
+            )
+        if not SALES_DEFAULT_OWNER_ID:
+            log.warning(
+                "SALES_DEFAULT_OWNER_ID is unset and the tracker has no owner column, so "
+                "no cadence line can be addressed to anybody: they will all go out under "
+                "the DEADLINE_NOTIFY_IDS group line. Set it to Vaishnavi's Discord id."
+            )
+        elif SALES_DEFAULT_OWNER_ID not in TEAM_ROSTER_IDS:
+            log.warning(
+                "SALES_DEFAULT_OWNER_ID=%d is not in TEAM_ROSTER_IDS — the roster gate "
+                "fails closed, so cadence items will name that person in plain text "
+                "instead of @-mentioning them. Add the id to TEAM_ROSTER_IDS.",
+                SALES_DEFAULT_OWNER_ID,
+            )
+        if CONNECT_REMINDER_MAX_DAYS and CONNECT_REMINDER_MAX_DAYS <= CONNECT_REMINDER_DAYS:
+            log.warning(
+                "CONNECT_REMINDER_MAX_DAYS=%d is not above CONNECT_REMINDER_DAYS=%d — the "
+                "window rule (c) fires in is empty, so NOBODY will be reminded to start "
+                "interacting and every never-connected row goes straight to the cold "
+                "summary. Set the ceiling above the floor.",
+                CONNECT_REMINDER_MAX_DAYS, CONNECT_REMINDER_DAYS,
+            )
+        elif not CONNECT_REMINDER_MAX_DAYS:
+            log.warning(
+                "CONNECT_REMINDER_MAX_DAYS=0 — the cold ceiling is OFF, so rule (c) fires "
+                "on every never-connected row however old. On the live sheet that was 756 "
+                "of 886 rows. The default of 30 exists for exactly that reason."
+            )
+        if URGENT_MAX < 1:
+            log.warning(
+                "URGENT_MAX=%d — the urgent items (positive replies awaiting a next step, "
+                "meetings in the prep window, post-meeting gaps) would be capped at "
+                "nothing. That is the part of the digest Vaishnavi prioritised.",
+                URGENT_MAX,
+            )
+        if UPDATE_TRACKER_MAX < 1:
+            log.warning(
+                "UPDATE_TRACKER_MAX=%d — no fill-in asks will be posted, so rows whose "
+                "follow-up count or last-followed date is missing will simply be silent "
+                "rather than asked about.",
+                UPDATE_TRACKER_MAX,
             )
 
     if not TEAM_ROSTER_IDS and not TEAM_ROSTER_NAMES:

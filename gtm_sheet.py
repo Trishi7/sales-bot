@@ -17,19 +17,35 @@ method and a read-only OAuth scope. This module only has to know that it must
 never write to it: `_refuse_if_read_only()` checks every write target against
 `config.is_read_only_sheet_id()` before a cell is touched.
 
-FOUR KINDS OF TAB. Three are recognised by what's in them rather than by name;
-the fourth is recognised by its NAME, deliberately:
-    master_data          THE canonical cadence source — one row per company/PoC
-                         being worked, auto-updated from a HIDDEN "outreach
-                         updates" sheet. Identified by TITLE
-                         (GTM_MASTER_TAB_TITLES), because "this tab is the
-                         master" is a human decision, not something to infer
-                         from headers that the old tracker also has.
+TABS ARE IDENTIFIED BY HEADER SIGNATURE, NOT BY NAME. Tab names in the real
+playbook drift — "Outreach Updates" has also been "outreach updates" and
+"Master data" is now "Master Data" — but the COLUMNS a tab carries are what make
+it that tab. So every kind below is defined by a small set of headers that only
+that tab has, and the title is at most a tie-break hint. The tab NAME that
+matched each role is logged at startup (`_log_role_assignment`), so "which tab is
+the tracker today" is answerable from one log line.
+
+    outreach_tracker     THE CADENCE SOURCE, and the only tab with DATES in it.
+                         Signature: "Last followed up date" AND "Total
+                         follow-ups till date". Live name: the HIDDEN "Outreach
+                         Updates" tab. EVERY phase-1 rule runs on this tab.
+    master_data          STATUS ONLY — Connected / Intro Sent / Response Status /
+                         Meeting Done / Assets Shared, one row per company/PoC,
+                         and a "Month" that is a month, not a date. Signature:
+                         "Response Status" AND "Intro Sent" AND "Meeting Done".
+                         Used for aggregate answers, for the weekly funnel, and
+                         for a nightly cross-check against the tracker. IT
+                         CANNOT DRIVE THE CADENCE: it has no dates, so every
+                         date rule would silently never fire.
+    lead_pipeline        Signature: "Lead Stage" AND "Estimated Value (INR)".
+                         Priority Level is populated; stage and value are blank
+                         today, which is why nothing reads them yet.
+    funnel_pivot         Signature: "Vertical / Stage". The funnel DEFINITION:
+                         Contacted → Connected → Intro Sent → Positive (P/Y) →
+                         Meeting Done → Assets Shared.
+    researcher_lines     Signature: "Outreach Line - Researchers" AND "Dates".
     positioning_matrix   use cases A–I: label, use case, problem, offering,
                          company type, ICP, business impact.
-    outreach_tracker     one row per company being worked. The pre-master
-                         tracker; still read, still the fallback when no master
-                         tab exists.
     prospect_priority    scored companies, P1–P3, with a rationale.
 
 HIDDEN TABS ARE READ. gspread returns hidden worksheets like any other, and the
@@ -97,6 +113,22 @@ MASTER = "master_data"
 POSITIONING = "positioning_matrix"
 TRACKER = "outreach_tracker"
 PRIORITY = "prospect_priority"
+PIPELINE = "lead_pipeline"
+FUNNEL = "funnel_pivot"
+RESEARCHER_LINES = "researcher_lines"
+
+# What each kind IS, in one phrase, for the startup role-assignment log. The
+# whole point of that log line is that somebody reading it can tell whether the
+# right tab got the right job without opening the spreadsheet.
+KIND_LABELS = {
+    TRACKER: "TRACKER — the cadence source (the only tab with dates)",
+    MASTER: "MASTER — status only (aggregates, funnel, cross-check)",
+    PIPELINE: "PIPELINE — lead stage / estimated value",
+    FUNNEL: "FUNNEL PIVOT — the funnel stage definition",
+    RESEARCHER_LINES: "RESEARCHER LINES — outreach lines for researchers",
+    POSITIONING: "POSITIONING — the use-case / pitch matrix",
+    PRIORITY: "PRIORITY — scored prospect lists",
+}
 
 # The roles the phase-1 cadence rules read. Every one of them is nameable in
 # GTM_COLUMN_MAP, so a column rename in the sheet is an env change.
@@ -106,6 +138,61 @@ CADENCE_ROLES = (
     "followups_count", "response", "meeting_date", "assets_shared", "next_steps",
 )
 
+# SPREADSHEET ERROR VALUES ARE NOT DATA. A "#REF!" left behind by a broken
+# formula is the absence of a value, and reading it as text made a date column
+# unparseable and a status column "responded". Every one of these is normalised
+# to EMPTY at parse time (section 2 of the phase-1 spec) — and the raw cell is
+# remembered on the Tab so the data-quality flag can report it once.
+SHEET_ERROR_VALUES = (
+    "#ref!", "#n/a", "#value!", "#div/0!", "#name?", "#null!", "#num!",
+    "#error!", "#getting_data", "#spill!", "#calc!",
+)
+
+
+def is_error_value(value) -> bool:
+    """True when a cell holds a spreadsheet error rather than a value."""
+    return str(value or "").strip().lower() in SHEET_ERROR_VALUES
+
+
+def clean_cell(value) -> str:
+    """A raw cell as the rest of the bot should see it: stripped, and EMPTY when
+    it is a spreadsheet error. This is the single normalisation point — every
+    row dict built by `_parse_values` has been through it."""
+    text = str(value or "").strip()
+    return "" if is_error_value(text) else text
+
+
+def sheet_date(value):
+    """A sheet cell → a date, tolerating the two things this sheet actually does.
+
+    `deadlines.parse_date` handles the formats; this handles the CELL. Two of
+    them in the live tracker hold more than one date ("25-Mar-2026\\n02-04-2026"
+    is a meeting that moved), and `parse_date` on the whole string returns None -
+    which read as "no meeting date" and dropped a real meeting out of the
+    cadence. Multi-value cells are split and the LATEST readable date wins,
+    because a rescheduled meeting is the one that is going to happen.
+
+    Imported lazily: `deadlines` imports `config`, and a module-level import
+    here would make the two files circular the day `deadlines` needs a sheet.
+    """
+    import deadlines as _dl
+
+    text = clean_cell(value)
+    if not text:
+        return None
+    direct = _dl.parse_date(text)
+    if direct is not None:
+        return direct
+    found = []
+    for part in re.split(r"[\n;,/]|\s{2,}", text):
+        part = part.strip()
+        if not part:
+            continue
+        parsed = _dl.parse_date(part)
+        if parsed is not None:
+            found.append(parsed)
+    return max(found) if found else None
+
 
 # -- header roles -------------------------------------------------------------
 # role -> the alias fragments that identify it. Matching is case-insensitive and
@@ -113,46 +200,45 @@ CADENCE_ROLES = (
 # substring, longest alias first — so "last followed up date" beats a loose
 # "date" match. Order within a list is only a tie-break aid; specificity wins.
 ROLES: dict[str, dict[str, tuple[str, ...]]] = {
-    # The master tab. Its rule fields are exactly the ones named in the phase-1
-    # spec; the aliases cover the wordings the playbook has actually used
-    # ("initial contact month" for first contact, "membrane Intro Date" for the
-    # intro). Anything unmatched still arrives in the row's "_extra".
+    # THE MASTER TAB — STATUS ONLY. Its columns are Connected / Intro Sent /
+    # Response Status / Meeting Done / Assets Shared plus a "Month" that is a
+    # MONTH ("Mar-2026"), not a date. It carries no Last-followed-up, no
+    # Total-follow-ups, no Next Steps and no Meeting Date, which is exactly why
+    # the cadence cannot run on it: every date rule would read a blank and
+    # silently never fire. It answers aggregate questions, defines the weekly
+    # funnel, and is cross-checked against the tracker.
+    #
+    # Its status columns get their OWN roles (intro_sent, response_status,
+    # meeting_done) rather than being aliased onto the tracker's date roles.
+    # They were aliased once — "Intro Sent" matched `intro_date` on the
+    # substring "intro" — and rule (b) then read the word "No" as a recorded
+    # intro date and never fired on a single row.
     MASTER: {
-        "sr_no": ("sr. no.", "sr no", "s.no", "sno", "serial", "#"),
+        "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
         "company": ("company", "company name", "account", "organisation",
                     "organization", "client", "org"),
         "industry": ("industry", "sector", "domain"),
         "poc": ("poc", "person", "point of contact", "contact name",
                 "contact person", "poc name", "champion", "contact"),
         "poc_designation": ("designation", "poc designation", "title", "job title", "role"),
-        "poc_vertical": ("vertical", "poc vertical", "department", "function", "team"),
-        "first_contacted": ("first contacted", "initial contact month", "initial contact",
-                            "first contact", "date of first contact", "month of first contact",
-                            "outreach date", "contacted on"),
-        "connected": ("connected?", "connected", "connection status", "is connected"),
-        "intro_date": ("membrane intro date", "intro date", "introduction date",
-                       "membrane intro", "intro"),
-        "last_followed_up": ("last followed-up date", "last followed up date",
-                             "last follow-up date", "last followed up", "last follow up",
-                             "last followup", "last touch"),
-        "followups_count": ("total follow-ups", "total follow ups", "total followups",
-                            "total follow-ups till date", "number of follow-ups",
-                            "no of follow ups", "follow-ups", "followups"),
-        "response": ("response", "response?", "response (y/p/n)", "responded", "replied"),
-        "meeting_date": ("meeting date", "meeting", "call date", "demo date", "meeting on"),
-        "assets_shared": ("assets shared", "assets", "collateral shared",
+        "poc_vertical": ("poc vertical", "vertical", "department", "function", "team"),
+        # A month, not a date. Read as the 1st when a date is unavoidable, and
+        # never used by a cadence rule.
+        "month": ("month", "initial contact month", "month of first contact"),
+        "connected": ("connected", "connected?", "connection status", "is connected"),
+        "intro_sent": ("intro sent", "intro sent?", "membrane intro sent", "introduction sent"),
+        "response_status": ("response status", "response?", "response", "responded", "replied"),
+        "meeting_done": ("meeting done", "meeting done?", "met", "meeting held"),
+        "assets_shared": ("assets shared", "assets shared?", "assets", "collateral shared",
                           "material shared", "deck shared"),
-        "next_steps": ("next steps", "next step", "next action", "action items", "action"),
-        # Not in the spec's field list, but read when present: they make the
-        # digest addressable and the exclusion rule reliable.
+        "asset_detail": ("asset detail", "assets detail", "asset details", "which assets"),
+        # Read when present; the live tab has neither, and the cadence resolves
+        # its owner through SALES_DEFAULT_OWNER_ID instead.
         "owner": ("owner", "row owner", "assigned to", "assignee", "sdr", "bd",
                   "account owner", "handled by", "responsible"),
         "status": ("status", "stage", "deal status", "current status"),
         "reason": ("reason", "lost reason", "reason for no response", "why"),
-        "use_case": ("use case", "usecase", "pitch"),
         "other_updates": ("other updates", "updates", "notes", "comments", "remarks"),
-        "bot_deadline": (config.BOT_DEADLINE_COLUMN.lower(), "next deadline (bot)",
-                         "next deadline"),
     },
     POSITIONING: {
         "label": ("label", "use case label", "ref", "id"),
@@ -182,8 +268,63 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "next_steps": ("next steps", "next step", "action", "next action"),
         "other_updates": ("other updates", "updates", "notes", "comments", "remarks"),
         "connected": ("connected?", "connected", "connection status"),
+        # THE TRACKER HAS NO OWNER COLUMN TODAY. The role is mapped anyway so
+        # that the day one appears (or GTM_COLUMN_MAP names one) the cadence
+        # starts addressing rows to the person who owns them. Until then every
+        # cadence line resolves to SALES_DEFAULT_OWNER_ID.
+        "owner": ("owner", "row owner", "assigned to", "assignee", "sdr", "bd",
+                  "account owner", "handled by", "responsible"),
+        "status": ("status", "stage", "deal status", "current status"),
         # The bot's own column. Never auto-created by a read; see ensure_bot_column().
         "bot_deadline": (config.BOT_DEADLINE_COLUMN.lower(), "next deadline (bot)", "next deadline"),
+    },
+    # THE PIPELINE TAB. Priority Level is populated (High/Medium/Low); Lead
+    # Stage and Estimated Value are blank on every row today. Nothing reads the
+    # blank ones — they are mapped so that the day they get filled the tab is
+    # already understood.
+    PIPELINE: {
+        "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial"),
+        "use_case": ("use case", "usecase"),
+        "company": ("company", "company name", "account", "client"),
+        "industry": ("industry", "sector"),
+        "priority": ("priority level", "priority", "tier", "band"),
+        "poc": ("poc", "poc name", "point of contact", "contact name"),
+        "poc_designation": ("poc designation", "designation", "title"),
+        "geography": ("geography", "region", "country", "geo"),
+        "lead_source": ("lead source", "source"),
+        "lead_stage": ("lead stage", "stage", "deal stage"),
+        "likelihood": ("% likelihood", "likelihood", "probability", "confidence"),
+        "est_value": ("estimated value (inr)", "estimated value", "deal value",
+                      "value (inr)", "est value"),
+        "remarks": ("remarks", "notes", "comments"),
+        "won_lost_reason": ("deal won / lost - reason", "won / lost reason",
+                            "won lost reason", "deal reason"),
+    },
+    # THE FUNNEL PIVOT. Read for its STAGE NAMES, which are the funnel
+    # definition the weekly digest reports against — not for its numbers, which
+    # are a pivot of the master tab and are recomputed from the master rows so
+    # that a stale pivot cannot be reported as this week's funnel.
+    FUNNEL: {
+        "vertical_stage": ("vertical / stage", "vertical/stage", "vertical stage",
+                           "response / month", "response/month"),
+        "contacted": ("contacted",),
+        "connected": ("connected",),
+        "intro_sent": ("intro sent",),
+        "positive": ("positive (p/y)", "positive"),
+        "meeting_done": ("meeting done",),
+        "assets_shared": ("assets shared",),
+    },
+    # THE RESEARCHER OUTREACH LINES. One line per company for researcher-led
+    # outreach, plus a "Dates" column that is a formula.
+    RESEARCHER_LINES: {
+        "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial"),
+        "company": ("company", "company name", "account"),
+        "industry": ("industry", "sector"),
+        "geography": ("geography", "region", "country", "geo"),
+        "funding": ("approx. funding", "approx funding", "funding"),
+        "outreach_line": ("outreach line - researchers", "outreach line researchers",
+                          "outreach line"),
+        "dates": ("dates", "date"),
     },
     PRIORITY: {
         "company": ("company", "company name", "account", "prospect", "organisation", "organization"),
@@ -195,43 +336,68 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
     },
 }
 
-# Tab-kind detection: (kind, signature roles, how many must match, roles that are
-# MANDATORY however good the rest of the score is).
+# TAB-KIND DETECTION IS BY HEADER SIGNATURE. Names drift; signatures don't.
 #
-# The mandatory column is what stops false positives on a sheet with twenty tabs.
-# A prospect list is identified by having an actual priority/score column — the
-# real playbook has an investor tab whose "Activity / Notes" header matched
-# "rationale" and whose fund names matched loosely, and without this it was
-# detected as a prospect-priority tab and its rows would have been answered from.
-# `company` is mandatory for PRIORITY too: every prospect answer cites the company
-# it came from, so a scored tab with no company column has nothing citable in it
-# (the live "Activation Score - Warmed Up Co" tab is exactly this — a scoring
-# scratchpad with priority and score headers and no companies).
+# Each entry is (kind, signature roles, how many must match, roles that are
+# MANDATORY however good the rest of the score is). The mandatory set is the
+# signature from the phase-1 spec — the columns only that tab has — and it is
+# what stops false positives on a spreadsheet with twenty tabs.
 #
-# MASTER IS DELIBERATELY ABSENT FROM THE SCORE-OFF BELOW. Its columns are a
-# superset of the tracker's, so on headers alone every tracker tab would score as
-# a master and the "which tab is canonical" question would be decided by row
-# counts. It is matched by TITLE instead (`_is_master_title`), and its signature
-# is only ever used to confirm a title match — see `_detect_kind`.
-_MASTER_SIGNATURE = (
-    MASTER,
-    ("company", "poc", "first_contacted", "connected", "response",
-     "last_followed_up", "next_steps"),
-    3,
-    ("company",),
-)
-
+# Two false positives this list is shaped by, both real:
+#   - the investor tab, whose "2025-26 Activity / Notes" header matched
+#     `rationale` and whose fund names matched loosely, was read as a prospect
+#     list. `company` and `priority` are mandatory for PRIORITY now, so a
+#     scoring scratchpad with no companies in it (the live "Activation Score -
+#     Warmed Up Co" tab) cannot claim the kind.
+#   - the master tab and the tracker share most of their column NAMES. They are
+#     separated by the columns each has that the other does not: the tracker
+#     alone has "Last followed up date" and "Total follow-ups till date", the
+#     master alone has "Response Status" + "Intro Sent" + "Meeting Done". That
+#     is the whole distinction, and it is the one that matters: only the tracker
+#     has dates, so only the tracker can drive the cadence.
 _KIND_SIGNATURES: list[tuple[str, tuple[str, ...], int, tuple[str, ...]]] = [
-    (TRACKER, ("company", "first_contacted", "last_followed_up", "response", "next_steps"),
-     3, ("company",)),
-    (POSITIONING, ("use_case", "problem", "offering", "icp", "business_impact"),
-     3, ("use_case",)),
-    (PRIORITY, ("company", "priority", "score", "rationale"),
-     2, ("company", "priority")),
+    # TRACKER FIRST. It is the cadence source, and on a tie it must win.
+    (TRACKER,
+     ("company", "poc", "first_contacted", "last_followed_up", "followups_count",
+      "response", "meeting_date", "next_steps"),
+     4,
+     ("company", "last_followed_up", "followups_count")),
+    (MASTER,
+     ("company", "poc", "connected", "intro_sent", "response_status",
+      "meeting_done", "assets_shared"),
+     4,
+     ("company", "response_status", "intro_sent", "meeting_done")),
+    (FUNNEL,
+     ("vertical_stage", "contacted", "connected", "intro_sent", "meeting_done"),
+     2,
+     ("vertical_stage",)),
+    (RESEARCHER_LINES,
+     ("company", "outreach_line", "dates"),
+     2,
+     ("outreach_line", "dates")),
+    (PIPELINE,
+     ("company", "lead_stage", "est_value", "priority", "likelihood"),
+     3,
+     ("company", "lead_stage", "est_value")),
+    (POSITIONING,
+     ("use_case", "problem", "offering", "icp", "business_impact"),
+     3,
+     ("use_case",)),
+    (PRIORITY,
+     ("company", "priority", "score", "rationale"),
+     2,
+     ("company", "priority")),
 ]
 
+# Name hints are a TIE-BREAK ONLY, applied when two kinds score equally. They
+# never override a signature, because the signature is the thing that survives a
+# rename — which is the whole reason detection works this way.
 _KIND_NAME_HINTS: list[tuple[str, tuple[str, ...]]] = [
-    (TRACKER, ("outreach", "tracker", "pipeline")),
+    (TRACKER, ("outreach update", "outreach", "tracker")),
+    (MASTER, ("master data", "master")),
+    (FUNNEL, ("funnel",)),
+    (RESEARCHER_LINES, ("researcher", "master pipeline")),
+    (PIPELINE, ("lead", "pipeline")),
     (POSITIONING, ("positioning", "matrix", "use case", "usecase", "playbook")),
     (PRIORITY, ("priority", "prospect", "scoring", "score", "p1")),
 ]
@@ -248,44 +414,77 @@ _PRIORITY_RE = re.compile(r"\bp[\s\-]?([123])\b", re.IGNORECASE)
 _YES = {"yes", "y", "true", "1", "responded", "replied", "connected", "positive", "done"}
 _NO = {"no", "n", "false", "0", "none", "-", "na", "n/a", "not yet", "nil"}
 
-# THE RESPONSE VOCABULARY, taken from what the real tracker actually contains
-# rather than from what a "Response?" header suggests. The live column holds
-# "P" / "N" / "Did Respond" / "Awaited" / blank — not yes and no — and reading it
-# as a yes/no flag made every replied prospect invisible to the HOT check.
+# THE RESPONSE VOCABULARY, taken from what the two live tabs actually contain
+# rather than from what a "Response?" header suggests. The tracker's column
+# holds "P" / "N" / "Did Respond" / "Awaited" / blank; the master's "Response
+# Status" holds "P - Positive/In Progress" / "N - Rejected" / "No Response".
+# Neither is a yes/no flag, and reading them as one made every replied prospect
+# invisible.
 #
-# The distinction that matters is POLARITY, because the two flags need different
-# things: STALLED must not chase anyone who replied at all (positive or not),
-# while HOT is about a reply that deserves an answer and hasn't had one.
+# THE THREE BUCKETS ARE THE PHASE-1 SPEC'S, exactly:
+#   POSITIVE  Y, P, "Did Respond", "P - Positive/In Progress"
+#   REJECTED  N, "N - Rejected", "No"
+#   NONE      blank, "No Response", "Awaited"
+# A fourth state, RESPONSE_UNKNOWN, exists for values in NEITHER list. It is
+# never silently folded into one of the three: an unrecognised value means
+# somebody DID write something in the cell, so the row is not chased as silent,
+# it is treated as awaiting our action, AND the raw value is reported once by
+# the data-quality flag so the sheet can be standardised.
 RESPONSE_POSITIVE = "positive"
 RESPONSE_NEGATIVE = "negative"
 RESPONSE_UNKNOWN = "responded"   # they replied; the sheet doesn't say how it went
 RESPONSE_NONE = "none"           # nothing back yet
 
-_RESP_POSITIVE = {"p", "positive", "yes", "y", "interested", "warm", "keen", "good"}
-_RESP_NEGATIVE = {"n", "negative", "no", "not interested", "declined", "rejected", "pass"}
+_RESP_POSITIVE = {
+    "p", "y", "yes", "positive", "p positive in progress", "p positive",
+    "positive in progress", "in progress", "did respond", "responded", "replied",
+    "interested", "warm", "keen", "good",
+}
+_RESP_NEGATIVE = {
+    "n", "no", "negative", "n rejected", "rejected", "not interested",
+    "declined", "pass", "lost",
+}
 _RESP_NONE = {"", "awaited", "awaiting", "await", "no response", "none", "-", "na",
-              "n/a", "nil", "not yet", "pending", "tbd"}
+              "n/a", "nil", "not yet", "pending", "tbd", "no reply", "not responded"}
+
+# Every value the three sets above cover, for the "raw response values outside
+# the known set" data-quality flag.
+KNOWN_RESPONSE_VALUES = _RESP_POSITIVE | _RESP_NEGATIVE | _RESP_NONE
 
 
 def response_status(value) -> str:
-    """Classify a Response? cell into positive / negative / responded / none.
+    """Classify a Response? / Response Status cell into one of the four states.
 
     Anything unrecognised counts as RESPONSE_UNKNOWN — a human wrote something
     in the cell, so they DID hear back, and treating an unfamiliar note as
     silence would make the bot chase a prospect who has already answered.
     """
-    v = normalise_header(str(value or "")).replace("?", "").strip()
+    v = normalise_header(clean_cell(value)).replace("?", "").strip()
     if v in _RESP_NONE:
         return RESPONSE_NONE
     if v in _RESP_POSITIVE:
         return RESPONSE_POSITIVE
     if v in _RESP_NEGATIVE:
         return RESPONSE_NEGATIVE
-    if "did respond" in v or "responded" in v or "replied" in v:
-        return RESPONSE_UNKNOWN
-    if v.startswith("not ") or v.startswith("no "):
+    # Prefix forms the sheet uses for its own dropdowns: "P - …" and "N - …".
+    if v.startswith("p ") or v.startswith("y "):
+        return RESPONSE_POSITIVE
+    if v.startswith("n ") or v.startswith("not ") or v.startswith("no "):
         return RESPONSE_NEGATIVE
+    if "did respond" in v or "responded" in v or "replied" in v:
+        return RESPONSE_POSITIVE
     return RESPONSE_UNKNOWN
+
+
+def is_known_response(value) -> bool:
+    """Is this raw cell one of the values the vocabulary above knows by name?
+
+    Used only by the data-quality flag. A False here is not an error — the row
+    is still classified, by the prefix rules — it is a note that the sheet has
+    grown a wording nobody standardised.
+    """
+    v = normalise_header(clean_cell(value)).replace("?", "").strip()
+    return v in KNOWN_RESPONSE_VALUES
 
 
 def normalise_header(text: str) -> str:
@@ -299,14 +498,14 @@ def normalise_header(text: str) -> str:
 def is_yes(value) -> bool:
     """True when a Response?/Connected? cell says yes. Anything unrecognised is
     NOT a yes — a "maybe" or a stray note must never be read as a reply."""
-    v = normalise_header(str(value or "")).replace("?", "").strip()
+    v = normalise_header(clean_cell(value)).replace("?", "").strip()
     return v in _YES
 
 
 def is_no_or_blank(value) -> bool:
     """True when a cell is empty or explicitly negative. Distinct from `not
     is_yes(...)`, which would also swallow "waiting on legal"."""
-    v = normalise_header(str(value or "")).replace("?", "").strip()
+    v = normalise_header(clean_cell(value)).replace("?", "").strip()
     return v == "" or v in _NO
 
 
@@ -343,7 +542,7 @@ class Tab:
 
     def __init__(self, *, title: str, kind: str, headers: list[str],
                  role_to_col: dict[str, int], rows: list[dict], read_at: float,
-                 header_row: int = 1):
+                 header_row: int = 1, error_cells: Optional[list] = None):
         self.title = title
         self.kind = kind
         self.headers = headers
@@ -354,6 +553,12 @@ class Tab:
         # column has to put its header on the SAME row, and re-reading the whole
         # tab just to rediscover that costs a request we don't need to spend.
         self.header_row = header_row
+        # [(sheet_row, header, raw)] for every cell that held a spreadsheet
+        # ERROR rather than a value. Those cells were normalised to empty in the
+        # rows above — this is what remembers that they existed, so the
+        # data-quality flag can name the column and the count instead of the
+        # cadence silently treating a broken formula as a blank.
+        self.error_cells: list = list(error_cells or [])
 
     @property
     def age_seconds(self) -> float:
@@ -685,13 +890,12 @@ class GTMSheets:
     def _matches_kind(self, kind: str, headers: list[str]) -> int:
         """How well `headers` fit `kind`: the signature score, or 0 for no match.
 
-        A kind's mandatory roles must ALL be present — that is what keeps a tab
-        of investor notes from being read as a prospect list because one of its
-        headers happened to contain the word "notes".
+        A kind's MANDATORY roles must ALL be present. That is the signature from
+        the phase-1 spec, and it is what keeps a tab of investor notes from being
+        read as a prospect list because one of its headers happened to contain
+        the word "notes".
         """
         spec = next((s for s in _KIND_SIGNATURES if s[0] == kind), None)
-        if spec is None and kind == MASTER:
-            spec = _MASTER_SIGNATURE
         if spec is None:
             return 0
         _k, needed, threshold, mandatory = spec
@@ -702,58 +906,63 @@ class GTMSheets:
         return score if score >= threshold else 0
 
     @staticmethod
-    def _is_master_title(title: str) -> bool:
-        """Is this the tab an operator has NAMED as the master?
-
-        Exact normalised title match against GTM_MASTER_TAB_TITLES. Deliberately
-        NOT a substring test: the live playbook already has a "Master Lead List"
-        that is a prospect-priority tab, and a loose match would hand the whole
-        cadence to it.
-        """
+    def _title_hints(title: str) -> set:
+        """The kinds whose NAME hints this title matches. A tie-break, nothing more."""
         low = normalise_header(title)
         if not low:
-            return False
-        return any(
-            low == normalise_header(t)
-            for t in (config.GTM_MASTER_TAB_TITLES or [])
-            if str(t).strip()
-        )
+            return set()
+        return {kind for kind, hints in _KIND_NAME_HINTS if any(h in low for h in hints)}
 
     def _detect_kind(self, title: str, headers: list[str]) -> Optional[str]:
-        """What KIND of tab this is.
+        """What KIND of tab this is — decided by its HEADER SIGNATURE.
 
-        THE MASTER TAB IS DECIDED BY ITS TITLE, first and unconditionally-ish:
-        an operator named it in GTM_MASTER_TAB_TITLES, and that is a decision
-        about which tab is canonical, not a guess to be overridden by a header
-        score. Its signature still has to match, so a tab renamed "Master data"
-        with none of the rule columns in it is reported rather than silently
-        driving the cadence.
+        NAMES DRIFT AND SIGNATURES DON'T, so the signature is the authority and
+        the title is only consulted when two kinds score exactly the same. The
+        old behaviour was the other way round — the master tab was claimed by
+        TITLE from GTM_MASTER_TAB_TITLES — and it put the whole cadence on a
+        status-only tab with no dates in it, where every date rule read a blank
+        and quietly never fired. That is the failure this ordering exists to
+        prevent.
 
-        Everything else is by name hint first, then by header signature so
-        detection survives a rename. None when it is none of the kinds, which is
-        the common case in a real playbook full of research and strategy tabs.
+        `_KIND_SIGNATURES` is in priority order, so a genuine tie (same score,
+        no name hint) goes to the earlier entry — the tracker, which is the tab
+        the cadence needs.
+
+        None when it is none of the kinds, which is the common case in a real
+        playbook full of research and strategy tabs.
         """
-        low = normalise_header(title)
-        if self._is_master_title(title):
-            if self._matches_kind(MASTER, headers):
-                return MASTER
-            log.warning(
-                "[gtm] tab %r is named as the master tab (GTM_MASTER_TAB_TITLES) but "
-                "does not carry the cadence columns — found headers %s. The cadence "
-                "will fall back to the outreach tracker. Fix the tab, or point "
-                "GTM_MASTER_TAB_TITLES / GTM_COLUMN_MAP at the right thing.",
-                title, ", ".join(repr(h) for h in headers[:20]) or "(none)",
-            )
-        for kind, hints in _KIND_NAME_HINTS:
-            if any(h in low for h in hints) and self._matches_kind(kind, headers):
-                # The name hint only wins if the HEADERS agree: a tab called
-                # "Playbook" holding tracker columns is a tracker.
-                return kind
-        best, best_score = None, 0
-        for kind, _needed, _threshold, _mandatory in _KIND_SIGNATURES:
+        hints = self._title_hints(title)
+        best, best_score, best_rank = None, 0, 99
+        for rank, (kind, _needed, _threshold, _mandatory) in enumerate(_KIND_SIGNATURES):
             score = self._matches_kind(kind, headers)
-            if score > best_score:
-                best, best_score = kind, score
+            if not score:
+                continue
+            # (score, name-hint agreement, declaration order) — in that order.
+            better = (
+                score > best_score
+                or (score == best_score and kind in hints and best not in hints)
+                or (score == best_score and (kind in hints) == (best in hints)
+                    and rank < best_rank)
+            )
+            if better:
+                best, best_score, best_rank = kind, score, rank
+        if best is not None and config.GTM_MASTER_TAB_TITLES:
+            # An operator naming a tab as the master is still worth honouring
+            # when the headers agree — but it can NEVER promote a tab that does
+            # not carry the master signature, and it can never demote the
+            # tracker, because only the tracker has dates.
+            named = any(
+                normalise_header(title) == normalise_header(t)
+                for t in config.GTM_MASTER_TAB_TITLES if str(t).strip()
+            )
+            if named and best not in (MASTER, TRACKER):
+                log.warning(
+                    "[gtm] tab %r is named in GTM_MASTER_TAB_TITLES but its headers "
+                    "match %s, not the master signature (Response Status + Intro Sent "
+                    "+ Meeting Done). Reading it as %s. Headers: %s",
+                    title, best, best,
+                    ", ".join(repr(h) for h in headers[:20]) or "(none)",
+                )
         return best
 
     @staticmethod
@@ -932,8 +1141,20 @@ class GTMSheets:
         col_to_role = {v: k for k, v in role_to_col.items()}
 
         rows: list[dict] = []
+        error_cells: list = []
         for r, raw in enumerate(values[hidx + 1:], start=hidx + 2):  # 1-based sheet row
-            cells = [str(c).strip() for c in raw]
+            # EVERY cell goes through clean_cell: a "#REF!" left behind by a
+            # broken formula is the ABSENCE of a value, and carrying it as text
+            # made one date column unparseable and one status column read as
+            # "responded". The raw error is remembered separately.
+            cells = []
+            for i, cell in enumerate(raw):
+                text = str(cell).strip()
+                if is_error_value(text):
+                    header = headers[i] if i < len(headers) else "col%d" % i
+                    error_cells.append((r, header, text))
+                    text = ""
+                cells.append(text)
             if not any(cells):
                 continue
             row: dict = {"_row": r, "_extra": {}}
@@ -946,14 +1167,15 @@ class GTMSheets:
                     row["_extra"][header] = value
             # A tracker/priority row with no company is a spacer or a total line,
             # not a deal — carrying it would let it be counted and flagged.
-            if kind in (MASTER, TRACKER, PRIORITY) and not (row.get("company") or "").strip():
+            if kind in (MASTER, TRACKER, PRIORITY, PIPELINE, RESEARCHER_LINES) \
+                    and not (row.get("company") or "").strip():
                 continue
             rows.append(row)
 
         return Tab(
             title=title, kind=kind, headers=headers,
             role_to_col=role_to_col, rows=rows, read_at=read_at,
-            header_row=hidx + 1,
+            header_row=hidx + 1, error_cells=error_cells,
         )
 
     # -- reads -------------------------------------------------------------
@@ -1032,22 +1254,44 @@ class GTMSheets:
 
             # The full schema, and the colour-coding check, are STARTUP work:
             # once per spreadsheet per process, not on every cache miss.
+            # WHICH REAL TAB GOT WHICH ROLE. Logged before the full schema
+            # because it is the line people actually need.
+            for kind, label in KIND_LABELS.items():
+                found = groups.get(kind) or []
+                log.info(
+                    "[gtm.roles] %s %-18s %-52s -> %s", which, kind, label,
+                    ", ".join("%r (%d rows%s)" % (
+                        t.title, len(t.rows),
+                        ", HIDDEN" if hidden_by_title.get(t.title) else "",
+                    ) for t in found) or "(no tab matched this signature)",
+                )
+
             full_key = (which, "_full_schema")
             if config.GTM_LOG_FULL_SCHEMA and full_key not in self._schema_logged:
                 self._log_full_schema(which, schema_entries)
-                for tab in groups.get(MASTER, []) or groups.get(TRACKER, []):
+                for tab in groups.get(TRACKER, []) or groups.get(MASTER, []):
                     try:
                         self._warn_colour_coded(tab)
                     except Exception:
                         log.debug("[gtm] colour-coding check failed", exc_info=True)
                 self._schema_logged.add(full_key)
 
+            if TRACKER not in groups and (which, "_no_tracker") not in self._schema_logged:
+                log.error(
+                    "[gtm] %s has NO tab carrying the tracker signature ('Last followed "
+                    "up date' + 'Total follow-ups till date'). The daily cadence runs on "
+                    "that tab and only that tab — it is the only one with dates — so the "
+                    "digest will have no cadence sections. Point GTM_COLUMN_MAP[%r] at "
+                    "the right headers if the columns were renamed.",
+                    which, TRACKER,
+                )
+                self._schema_logged.add((which, "_no_tracker"))
             if MASTER not in groups and (which, "_no_master") not in self._schema_logged:
                 log.warning(
-                    "[gtm] %s has no master tab: none of %s exists in it. The daily "
-                    "cadence will fall back to the outreach tracker, which is the "
-                    "pre-master source. Set GTM_MASTER_TAB_TITLES to the real tab name.",
-                    which, ", ".join(repr(x) for x in (config.GTM_MASTER_TAB_TITLES or [])),
+                    "[gtm] %s has no master tab (signature: 'Response Status' + 'Intro "
+                    "Sent' + 'Meeting Done'). Aggregate answers, the weekly funnel and "
+                    "the tracker cross-check are unavailable; the cadence is unaffected.",
+                    which,
                 )
                 self._schema_logged.add((which, "_no_master"))
 
@@ -1123,21 +1367,68 @@ class GTMSheets:
             return list(self._cache.get((which, kind)) or [])
 
     def cadence_tab(self, which: str = ORIGINAL) -> tuple[Optional[Tab], str]:
-        """THE tab the daily cadence runs against, and which one it turned out to be.
+        """THE tab the daily cadence runs against: the OUTREACH TRACKER.
 
-        Returns (tab, source) where source is "master_data" or "outreach_tracker".
-        The master tab wins whenever it exists; the tracker is the fallback so
-        that a sheet which hasn't grown a "Master data" tab yet still produces a
-        cadence rather than an empty digest. `(None, "")` when neither exists.
+        Returns (tab, source). It is the tracker or it is nothing.
+
+        THIS USED TO PREFER THE MASTER TAB AND THAT WAS THE BUG. The master tab
+        is status-only — Connected / Intro Sent / Response Status / Meeting Done
+        / Assets Shared and a "Month" that is a month. It has no Last-followed-up
+        date, no follow-up count, no Meeting Date and no Next Steps. Every
+        date-based rule (a, c, h, i, j) read a blank from it and silently never
+        fired, so the cadence looked calm because it was blind. The tracker is
+        the only tab in the spreadsheet with dates in it, so the cadence runs
+        there and nowhere else.
+
+        `(None, "")` when no tab carries the tracker signature — the digest then
+        goes out without its cadence sections and says so in the log, which is
+        the honest failure.
         """
         tabs = self.read(which)
-        master = tabs.get(MASTER)
-        if master is not None:
-            return master, MASTER
         tracker_tab = tabs.get(TRACKER)
         if tracker_tab is not None:
             return tracker_tab, TRACKER
+        log.error(
+            "[gtm] no tab in %s carries the tracker signature ('Last followed up "
+            "date' + 'Total follow-ups till date'). The cadence cannot run: it is "
+            "the only tab with dates in it. %s",
+            which,
+            ("The master tab %r was found, but it is status-only and cannot drive "
+             "the cadence." % tabs[MASTER].title) if tabs.get(MASTER) else
+            "No master tab was found either.",
+        )
         return None, ""
+
+    def role_assignment(self, which: str = ORIGINAL) -> list[tuple[str, str, str]]:
+        """[(kind, label, tab title)] — which real tab got which role today.
+
+        Section 1 of the phase-1 spec asks for exactly this: names drift, so the
+        tab NAME that matched each role is reported rather than assumed. Logged
+        at startup and printed by the cadence dry run.
+        """
+        self.read(which)
+        out: list[tuple[str, str, str]] = []
+        with self._lock:
+            for kind, label in KIND_LABELS.items():
+                tabs = self._cache.get((which, kind)) or []
+                if tabs:
+                    titles = ", ".join(repr(t.title) for t in tabs)
+                else:
+                    titles = "(no tab matched this signature)"
+                out.append((kind, label, titles))
+        return out
+
+    def log_role_assignment(self, which: str = ORIGINAL) -> None:
+        """Log the role→tab map once. Cheap, and it is the first thing anyone
+        asks for when a rule stops firing."""
+        key = (which, "_roles")
+        with self._lock:
+            if key in self._schema_logged:
+                return
+        for kind, label, titles in self.role_assignment(which):
+            log.info("[gtm.roles] %-18s %-52s -> %s", kind, label, titles)
+        with self._lock:
+            self._schema_logged.add(key)
 
     def staleness_note(self, tab: Tab) -> str:
         """The note an answer must carry when it came from cache rather than a
@@ -1513,9 +1804,18 @@ def _self_test() -> int:
         return 1
 
     for which in (ORIGINAL, COPY):
+        print(f"\n{which} roles:")
+        try:
+            for kind, label, titles in SHEETS.role_assignment(which):
+                print(f"  {kind:<18} {label}")
+                print(f"  {'':<18}   -> {titles}")
+        except SheetAccessError as e:
+            print(f"  could not read: {e}")
+            return 1
         print(f"\n{which} schema:")
         try:
-            for kind in (TRACKER, POSITIONING, PRIORITY):
+            for kind in (TRACKER, MASTER, PIPELINE, FUNNEL,
+                         RESEARCHER_LINES, POSITIONING, PRIORITY):
                 for tab in SHEETS.tabs_of(kind, which):
                     print(f"  {tab.schema_line()}")
         except SheetAccessError as e:

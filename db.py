@@ -187,7 +187,7 @@ CREATE INDEX IF NOT EXISTS ix_digest_items_seen ON digest_items(last_seen);
 -- explains why a row fired. The hash is what the comparison uses, so a 400-char
 -- next-step costs the same as a short one.
 CREATE TABLE IF NOT EXISTS nextstep_state (
-    row_key     TEXT PRIMARY KEY,   -- "<company>|<poc>" from the master tab
+    row_key     TEXT PRIMARY KEY,   -- "<company>|<poc>" from the tracker tab
     text_hash   TEXT NOT NULL,      -- sha1 of the normalised Next Steps text
     text_sample TEXT NOT NULL DEFAULT '',
     first_seen  TEXT NOT NULL,      -- YYYY-MM-DD IST — when THIS text appeared
@@ -210,6 +210,28 @@ CREATE TABLE IF NOT EXISTS prep_briefs (
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_prep_briefs_sent ON prep_briefs(sent_on);
+
+-- SHEET-HEALTH FLAGS ALREADY REPORTED, AND WHAT THEY SAID.
+--
+-- The three data-quality findings — a broken formula, a misaligned master row,
+-- a response value nobody standardised — are reported ONCE and then not again
+-- UNTIL THEY CHANGE. A daily reminder about a #REF! everybody already knows
+-- about is exactly the drip that gets a digest muted, and "we told you
+-- yesterday" is not new information.
+--
+-- The SIGNATURE is what makes "until fixed" work without the bot having to know
+-- what fixed looks like: it is a short description of what was actually found
+-- (which columns, how many cells, which values). A flag whose signature matches
+-- the stored one is skipped. Fix half of it and the signature changes, so the
+-- remaining half is reported again — which is right, because the finding is now
+-- a different finding.
+CREATE TABLE IF NOT EXISTS quality_flags (
+    flag_key    TEXT PRIMARY KEY,   -- e.g. "broken_formula:Master Pipeline"
+    signature   TEXT NOT NULL,      -- what was found, last time it was reported
+    first_seen  TEXT NOT NULL,      -- YYYY-MM-DD IST
+    last_seen   TEXT NOT NULL,      -- YYYY-MM-DD IST
+    times_seen  INTEGER NOT NULL DEFAULT 1
+);
 
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
@@ -856,6 +878,45 @@ class DB:
         log.info(
             "[db] prep brief recorded for %s / %s on %s", company, poc or "(no PoC)", meeting_date
         )
+
+    # -- sheet-health flags, deduped until they change ---------------------
+
+    def quality_flag_seen(self, flag_key: str, signature: str) -> bool:
+        """Has this exact finding already been reported, unchanged?
+
+        True means DON'T repeat it. The comparison is on the SIGNATURE, not on
+        the date: a broken formula that is still broken tomorrow is not news,
+        and a broken formula that has grown from one column to three is.
+
+        Fails OPEN — a database error returns False, so the flag is reported.
+        The cost of saying it twice is one line; the cost of never saying it is
+        a column of #REF! nobody hears about.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT signature FROM quality_flags WHERE flag_key = ?",
+                    (str(flag_key),),
+                ).fetchone()
+        except Exception:
+            log.debug("[db] quality flag lookup failed for %r", flag_key, exc_info=True)
+            return False
+        return bool(row) and str(row["signature"]) == str(signature)
+
+    def record_quality_flag(self, *, flag_key: str, signature: str, on_date: str) -> None:
+        """Remember that this finding was reported, with what it said."""
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE quality_flags SET signature = ?, last_seen = ?, "
+                "times_seen = times_seen + 1 WHERE flag_key = ?",
+                (str(signature), str(on_date), str(flag_key)),
+            )
+            if cur.rowcount == 0:
+                c.execute(
+                    "INSERT INTO quality_flags (flag_key, signature, first_seen, "
+                    "last_seen, times_seen) VALUES (?, ?, ?, ?, 1)",
+                    (str(flag_key), str(signature), str(on_date), str(on_date)),
+                )
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.conn() as c:

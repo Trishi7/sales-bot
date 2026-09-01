@@ -380,6 +380,101 @@ def flag_message(row: dict, *, mentions: str = "") -> str:
     return f"{label} — {who}: {why}.{tail}"
 
 
+# -- THE FUNNEL DEFINITION (the "Sales Funnel" pivot tab) ---------------------
+#
+# The playbook's funnel pivot defines the funnel, and this is its definition
+# copied exactly:
+#
+#     Contacted -> Connected -> Intro Sent -> Positive (P/Y) -> Meeting Done
+#     -> Assets Shared
+#
+# THE NUMBERS ARE RECOMPUTED FROM THE MASTER TAB RATHER THAN READ OUT OF THE
+# PIVOT. A pivot is a snapshot with a date range baked into its title ("Sales
+# Funnel - March-June 2026"); reporting last quarter's cached totals as this
+# week's funnel is exactly the kind of quietly-wrong number a digest must not
+# carry. The master tab is what the pivot is a pivot OF, so recomputing from it
+# reproduces the pivot when the pivot is current and is right when it isn't.
+#
+# Assets Shared is deliberately NOT nested under Meeting Done: the live sheet
+# has 59 rows with assets shared against 9 meetings done, because assets go out
+# without a meeting all the time. A funnel drawn as a strict nesting would
+# report that as an error rather than as what the team does.
+FUNNEL_STAGES = (
+    ("contacted", "Contacted"),
+    ("connected", "Connected"),
+    ("intro_sent", "Intro Sent"),
+    ("positive", "Positive (P/Y)"),
+    ("meeting_done", "Meeting Done"),
+    ("assets_shared", "Assets Shared"),
+)
+
+
+def stage_funnel(master_rows: list[dict], *, by_vertical: bool = False) -> dict:
+    """The six funnel stages counted off the MASTER tab's status columns.
+
+    Returns {"total": n, "stages": {key: count}, "by_vertical": {vertical:
+    {key: count}}}. `by_vertical` is what the pivot breaks down by, and it is
+    computed only when asked for because the digest line does not use it.
+
+    Every row that exists is "Contacted" — that is what the master tab is a list
+    of, and it is how the pivot counts it (587 rows, 587 contacted).
+    """
+    stages = {key: 0 for key, _label in FUNNEL_STAGES}
+    verticals: dict = {}
+    for row in master_rows or []:
+        vertical = str(row.get("poc_vertical") or "").strip() or "(no vertical)"
+        bucket = verticals.setdefault(vertical, {k: 0 for k, _l in FUNNEL_STAGES})
+
+        hits = {"contacted": True}
+        hits["connected"] = gtm_sheet.is_yes(row.get("connected"))
+        hits["intro_sent"] = gtm_sheet.is_yes(row.get("intro_sent"))
+        hits["positive"] = (
+            gtm_sheet.response_status(row.get("response_status"))
+            == gtm_sheet.RESPONSE_POSITIVE
+        )
+        hits["meeting_done"] = gtm_sheet.is_yes(row.get("meeting_done"))
+        hits["assets_shared"] = gtm_sheet.is_yes(row.get("assets_shared"))
+        for key, hit in hits.items():
+            if hit:
+                stages[key] += 1
+                bucket[key] += 1
+
+    out = {"total": len(master_rows or []), "stages": stages}
+    if by_vertical:
+        out["by_vertical"] = verticals
+    return out
+
+
+def stage_funnel_lines(funnel: dict) -> list[str]:
+    """The funnel as digest lines: the stages in order, with the drop-off.
+
+    The drop-off is the number anybody acts on — "145 intros produced 18
+    positives" is a conversion problem, and the raw counts alone hide it.
+    """
+    stages = funnel.get("stages") or {}
+    total = funnel.get("total", 0)
+    if not total:
+        return []
+    parts = " -> ".join(
+        f"{label} {stages.get(key, 0)}" for key, label in FUNNEL_STAGES
+    )
+    lines = [f"FUNNEL ({total} rows on the master tab) — {parts}"]
+
+    drops = []
+    ordered = [key for key, _label in FUNNEL_STAGES]
+    for prev, nxt in zip(ordered, ordered[1:]):
+        # Assets Shared does not follow Meeting Done in practice, so a
+        # conversion between them would be a made-up number.
+        if nxt == "assets_shared":
+            continue
+        before, after = stages.get(prev, 0), stages.get(nxt, 0)
+        if before:
+            drops.append(f"{dict(FUNNEL_STAGES)[nxt].lower()} {round(100.0 * after / before)}%")
+    if drops:
+        lines.append("CONVERSION — " + " · ".join(drops))
+    return lines
+
+
 # -- funnel metrics (the weekly digest) ---------------------------------------
 
 

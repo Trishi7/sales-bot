@@ -21,21 +21,41 @@ WHAT IS IN IT, hot first, because the order is the priority:
                  most expensive failure in the sheet, so it leads the digest.
 
     THE CADENCE — Vaishnavi's daily list, computed by cadence.py against the
-    "Master data" tab and ranked urgent-first before it ever reaches this
-    module. Five sections, grouped per owner with one @mention each:
+    OUTREACH TRACKER (the only tab with dates in it) and ranked urgent-first
+    before it ever reaches this module. Five sections, grouped per owner with
+    one @mention each:
 
-    FOLLOW-UPS   this week: cold follow-ups, never-connected rows, rows worth
-                 trying on another channel, and companies where the PoC said no.
+    IN VAISHNAVI'S ORDER, from her daily-cadence line — "Follow-ups for this
+    week · Intros to be done this week · Meetings for this week · Update tracker
+    · Assets to be shared this week":
+
+    FOLLOW-UPS   this week: cold follow-ups, recently-contacted rows that never
+                 connected, rows worth trying on another channel, stalled next
+                 steps, the one-per-company suggestion for a rejected account,
+                 and the one-line count of the cold cohort.
     INTROS       to be done: connected, no membrane intro date.
     MEETINGS     this week: positive replies with no next step, and meetings
                  inside the prep window.
-    ASSETS       to be shared: a meeting happened and nothing followed it.
-    UPDATE-TRACKER  reminders: rows with gaps their owner should fill —
-                 including the ask to mark a PoC unresponsive, which the bot
-                 asks for and NEVER writes itself.
+    UPDATE-TRACKER  rows whose rule inputs are blank ("no follow-up count or
+                 last-followed date recorded"), places where the master tab and
+                 the tracker disagree, sheet-health flags, and the ask to mark a
+                 PoC unresponsive — which the bot asks for and NEVER writes.
+    ASSETS       to be shared: a meeting happened and the assets or the next
+                 step never followed it.
 
-    The cadence is CAPPED at DIGEST_MAX_ITEMS with a closing line saying how
-    many were held, because a silently truncated list reads as a short day.
+    THREE BUDGETS, because one number could not serve them. The URGENT items —
+    a positive reply with no next step, a meeting in the prep window, a
+    post-meeting gap — are NEVER truncated (URGENT_MAX is a hard ceiling against
+    a broken sheet, not a target): they are what the digest is for, and cutting
+    them defeats it. DIGEST_MAX_ITEMS caps everything else in the cadence, and
+    UPDATE_TRACKER_MAX caps the tracker asks so a sparse sheet's fill-in
+    requests can never eat the slots the real work needs. One closing line says
+    how many were held, because a silently truncated list reads as a short day.
+
+    The COLD SUMMARY sits outside all three: one line counting the
+    never-connected rows past CONNECT_REMINDER_MAX_DAYS, which are suppressed
+    from individual chases. A count of suppressed rows that could itself be
+    suppressed would be worse than not suppressing anything.
 
     DEADLINES    Due today or tomorrow, addressed to the owner.
     OVERDUE      Chases and deadlines past due, GROUPED PER OWNER with one
@@ -81,7 +101,7 @@ SECTION_HYGIENE = "hygiene"
 SECTION_FUNNEL = "funnel"
 
 # THE PHASE-1 CADENCE SECTIONS — Vaishnavi's daily list, in her order and in her
-# words. They come from cadence.py, which computes them against the master tab;
+# words. They come from cadence.py, which computes them against the tracker;
 # the keys are defined THERE so that a rule and its section can never drift
 # apart, and are re-exported here because this module owns rendering.
 #
@@ -91,8 +111,8 @@ SECTION_FUNNEL = "funnel"
 SECTION_CADENCE_FOLLOWUPS = "cadence_followups"
 SECTION_CADENCE_INTROS = "cadence_intros"
 SECTION_CADENCE_MEETINGS = "cadence_meetings"
-SECTION_CADENCE_ASSETS = "cadence_assets"
 SECTION_CADENCE_UPDATES = "cadence_updates"
+SECTION_CADENCE_ASSETS = "cadence_assets"
 
 # The prep briefs, and the one line that makes the cadence cap honest. Neither
 # is an "item": a brief is reference material for a meeting already counted in
@@ -104,8 +124,8 @@ CADENCE_SECTIONS = (
     SECTION_CADENCE_FOLLOWUPS,
     SECTION_CADENCE_INTROS,
     SECTION_CADENCE_MEETINGS,
-    SECTION_CADENCE_ASSETS,
     SECTION_CADENCE_UPDATES,
+    SECTION_CADENCE_ASSETS,
 )
 
 SECTION_ORDER = (
@@ -113,8 +133,8 @@ SECTION_ORDER = (
     SECTION_CADENCE_FOLLOWUPS,
     SECTION_CADENCE_INTROS,
     SECTION_CADENCE_MEETINGS,
-    SECTION_CADENCE_ASSETS,
     SECTION_CADENCE_UPDATES,
+    SECTION_CADENCE_ASSETS,
     SECTION_CADENCE_OVERFLOW,
     SECTION_DEADLINES,
     SECTION_OVERDUE,
@@ -126,11 +146,11 @@ SECTION_ORDER = (
 
 SECTION_TITLES = {
     SECTION_HOT: "HOT — they replied, nothing has gone back",
-    SECTION_CADENCE_FOLLOWUPS: "FOLLOW-UPS this week",
-    SECTION_CADENCE_INTROS: "INTROS to be done",
-    SECTION_CADENCE_MEETINGS: "MEETINGS this week",
-    SECTION_CADENCE_ASSETS: "ASSETS to be shared",
-    SECTION_CADENCE_UPDATES: "UPDATE-TRACKER reminders",
+    SECTION_CADENCE_FOLLOWUPS: "FOLLOW-UPS for this week",
+    SECTION_CADENCE_INTROS: "INTROS to be done this week",
+    SECTION_CADENCE_MEETINGS: "MEETINGS for this week",
+    SECTION_CADENCE_UPDATES: "UPDATE TRACKER",
+    SECTION_CADENCE_ASSETS: "ASSETS to be shared this week",
     SECTION_DEADLINES: "DEADLINES — due today or tomorrow",
     SECTION_OVERDUE: "OVERDUE",
     SECTION_ESCALATIONS: "ESCALATIONS — asked enough, needs a decision",
@@ -152,8 +172,8 @@ ITEM_SECTIONS = (
     SECTION_CADENCE_FOLLOWUPS,
     SECTION_CADENCE_INTROS,
     SECTION_CADENCE_MEETINGS,
-    SECTION_CADENCE_ASSETS,
     SECTION_CADENCE_UPDATES,
+    SECTION_CADENCE_ASSETS,
     SECTION_DEADLINES,
     SECTION_OVERDUE,
     SECTION_ESCALATIONS,

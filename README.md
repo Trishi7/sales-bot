@@ -28,11 +28,15 @@ champions"), searches the sales channels' history, reads the meeting notes, and
 triangulates across all of them — citing the tab and the company, and saying
 plainly when a cell is empty.
 
-**Runs the daily cadence (phase 1).** Nine rules from Vaishnavi's *Steps for
-Sales Bot* doc run once a day against the GTM Playbook's **"Master data"** tab —
-cold follow-ups, connections with no intro behind them, positive replies with no
-next step, meetings that left nothing behind. Everything they find becomes
-sections of the **existing** daily digest, ranked urgent-first and capped. See
+**Runs the daily cadence (phase 1).** Ten rules (a–j) from Vaishnavi's *Steps for
+Sales Bot* doc run once a day against the GTM Playbook's **outreach tracker** —
+the hidden "Outreach Updates" tab, and the only one with dates in it. Cold
+follow-ups, connections with no intro behind them, positive replies with no next
+step, meetings that left nothing behind. Rows whose rule inputs are blank become
+*"update the tracker"* asks rather than false chases, and never-connected rows
+older than the cold ceiling become **one counted line** rather than 756 nudges —
+both on their own budgets. Everything becomes sections of the **existing** daily
+digest, ranked urgent-first, with the urgent items **never truncated**. See
 [The daily cadence](#the-daily-cadence-phase-1).
 
 **Chases deadlines — and sets them.** When someone says "I'll send Acme the deck
@@ -318,34 +322,64 @@ guesswork; it logs the exact line to fix:
 The key file is a secret: `.gitignore` covers the usual key filenames. If one is
 ever committed, **revoke it in Google Cloud** — deleting the file is not enough.
 
-### The three tabs, and dynamic schema discovery
+### The tabs, identified by header signature
 
-Tabs are recognised **by their content, not their names**, so they can be renamed
-without breaking anything:
+Tabs are recognised **by the columns they carry, never by their names** — names
+in this playbook drift, signatures don't. Each kind is defined by a small
+signature of headers only that tab has:
 
-| Kind | Columns it maps |
-|---|---|
-| `positioning_matrix` | Label, Use Case, Problem Statement, Offering, Company Type, ICP, Business Impact |
-| `outreach_tracker` | Sr. No., Company, Industry, PoC, PoC Designation, PoC Vertical, First Contacted, Use Case, membrane Intro Date, Last followed up date, Total follow-ups till date, Response?, Reason, Meeting Date, Assets Shared, Next Steps, Other Updates, Connected? |
-| `prospect_priority` | Company, Priority (P1–P3), Score, Rationale |
+| Kind | Signature (all required) | Live tab, 1 Sep |
+|---|---|---|
+| `outreach_tracker` | `Last followed up date` + `Total follow-ups till date` | **"Outreach Updates"** (hidden, 886 rows) |
+| `master_data` | `Response Status` + `Intro Sent` + `Meeting Done` | **"Master Data"** (587 rows) |
+| `lead_pipeline` | `Lead Stage` + `Estimated Value (INR)` | **"Lead Master Sheet"** (hidden, 333 rows) |
+| `funnel_pivot` | `Vertical / Stage` | **"Sales Funnel - March-June 2026"** (hidden) |
+| `researcher_lines` | `Outreach Line - Researchers` + `Dates` | **"Master Pipeline"** (271 rows) |
+| `positioning_matrix` | `Use Case` + Problem / Offering / ICP / Business Impact | **"Sales Outreach Matrix"** (hidden) |
+| `prospect_priority` | `Company` + `Priority` (+ score / rationale) | Fortune 500 and AI-agent lists |
 
-**Headers are discovered at parse time** and matched to those roles by alias,
-because the tabs will keep evolving. Nothing is positional. Specific aliases beat
-loose ones (*"Last followed up date"* wins over a bare *"date"*), a header maps to
-at most one role, and any column that matches nothing is still carried through as
-`other_columns` — so a question about a column this code has never heard of is
-still answerable.
+**The tracker is the cadence source, and it is the only tab with dates in it.**
+The master tab is status-only: Connected / Intro Sent / Response Status / Meeting
+Done / Assets Shared and a `Month` that is a month, not a date. It answers
+aggregate questions, defines the weekly funnel and is cross-checked against the
+tracker — it cannot drive a single date rule.
+
+**Which real tab got which role is logged at startup**, so that question is one
+log line rather than a guess:
+
+```
+[gtm.roles] outreach_tracker   TRACKER — the cadence source (the only tab with dates) -> 'Outreach Updates' (886 rows, HIDDEN)
+[gtm.roles] master_data        MASTER — status only (aggregates, funnel, cross-check) -> 'Master Data' (587 rows)
+[gtm.roles] lead_pipeline      PIPELINE — lead stage / estimated value                -> 'Lead Master Sheet' (333 rows, HIDDEN)
+[gtm.roles] funnel_pivot       FUNNEL PIVOT — the funnel stage definition             -> 'Sales Funnel - March-June 2026' (38 rows, HIDDEN)
+[gtm.roles] researcher_lines   RESEARCHER LINES — outreach lines for researchers      -> 'Master Pipeline' (271 rows)
+```
+
+**Hidden tabs are read** (`worksheets(exclude_hidden=False)`), and that is not
+optional here: the cadence source itself is a hidden tab.
+
+**Headers are discovered at parse time** and matched to roles by alias, because
+the tabs keep evolving. Nothing is positional. Specific aliases beat loose ones
+(*"Last followed up date"* wins over a bare *"date"*), a header maps to at most
+one role, and any column that matches nothing is still carried as `_extra` — so a
+question about a column this code has never heard of is still answerable.
+
+**Spreadsheet errors are not data.** A `#REF!` / `#N/A` / `#VALUE!` left behind
+by a broken formula is normalised to **empty** at parse time, and the raw cell is
+remembered so the digest can report it once (see *sheet-health flags*). Reading
+one as text made a date column unparseable and a status column read as
+"responded".
 
 When wording is genuinely ambiguous, override it:
 
 ```bash
-GTM_COLUMN_MAP={"outreach_tracker":{"company":"Client Name","poc":"Point of Contact"}}
+GTM_COLUMN_MAP={"outreach_tracker":{"company":"Client Name","owner":"Owned By"}}
 ```
 
 A one-line schema summary is logged per tab at startup:
 
 ```
-[bot] GTM schema: tab 'Outreach Tracker' kind=outreach_tracker rows=42 cols=18 mapped=[company, first_contacted, …]
+[gtm] original tab 'Outreach Updates' kind=outreach_tracker rows=886 cols=18 mapped=[assets_shared, company, …] [HIDDEN TAB]
 ```
 
 ### Reads, and what happens when the API is down
@@ -613,20 +647,40 @@ says how many rows it left out rather than silently deferring them.
 
 ## Weekly funnel numbers
 
-Leading and lagging indicators over the last seven days:
+**The funnel definition is the playbook's own**, taken from the *"Sales Funnel"*
+pivot tab (signature: `Vertical / Stage`):
+
+> Contacted → Connected → Intro Sent → Positive (P/Y) → Meeting Done → Assets Shared
 
 ```
 **WEEKLY FUNNEL**
+FUNNEL (587 rows on the master tab) — Contacted 587 -> Connected 185 -> Intro Sent 145 -> Positive (P/Y) 18 -> Meeting Done 9 -> Assets Shared 59
+CONVERSION — connected 32% · intro sent 78% · positive (p/y) 12% · meeting done 50%
 Window 2026-08-14 → 2026-08-21
 LEADING — outreach sent 12 · replies 3 (25.0%) · meetings booked 2 · follow-ups done 8 vs 5 due
 LAGGING — pilots 1 · paid 0 · repeats 0
 HYGIENE — 2 row(s) with no named PoC · 3 with no next step
 ```
 
-Leading first, because those are the numbers still changeable this week; lagging
-is reported, not acted on. Rows whose dates can't be read are counted under
-HYGIENE rather than dropped, so a shrinking denominator stays visible instead of
-quietly flattering the numbers.
+**The stage counts are recomputed from the master tab, not read out of the
+pivot.** A pivot is a snapshot with a date range baked into its title (*"Sales
+Funnel - March-June 2026"*), and reporting last quarter's cached totals as this
+week's funnel is exactly the kind of quietly-wrong number a digest must not
+carry. The master tab is what the pivot is a pivot *of*, so recomputing from it
+reproduces the pivot when the pivot is current and is right when it isn't.
+
+**Assets Shared is deliberately not nested under Meeting Done**, which is why it
+gets no conversion percentage: the live sheet has 59 rows with assets shared
+against 9 meetings done, because assets go out without a meeting all the time. A
+funnel drawn as a strict nesting would report that as an error rather than as
+what the team does.
+
+The leading/lagging block below it reads the **tracker's dates** and answers a
+different question — what happened this week, rather than where the pipeline
+stands. Leading first, because those are the numbers still changeable this week;
+lagging is reported, not acted on. Rows whose dates can't be read are counted
+under HYGIENE rather than dropped, so a shrinking denominator stays visible
+instead of quietly flattering the numbers.
 
 These used to be their own scheduled Friday post. They aren't any more — a second
 unprompted message a week is still a second unprompted message. They ride along
@@ -638,9 +692,9 @@ default), which means they appear only if that day's digest has something in it.
 
 ## The daily cadence (phase 1)
 
-Nine rules from Vaishnavi's **"Steps for Sales Bot"** doc, plus the priority and
-cap decisions from the **27 Aug alignment meeting**. They run once a day against
-the **"Master data"** tab and feed the **existing** daily digest.
+Ten rules (**a–j**) from Vaishnavi's **"Steps for Sales Bot"** doc, plus the
+priority and cap decisions from the **27 Aug alignment meeting**. They run once a
+day against the **outreach tracker** and feed the **existing** daily digest.
 
 > **No rule in `cadence.py` can make the bot speak.** There is no
 > `guardrails.send` in that file and there must never be one. Every finding is
@@ -648,23 +702,25 @@ the **"Master data"** tab and feed the **existing** daily digest.
 > path in the codebase. The mention-only gate is untouched — the cadence changes
 > what the one daily message *says*, not how often the bot talks.
 
-### The "Master data" tab
+### It runs on the tracker, not the master tab
 
-The playbook now carries a **"Master data"** tab that auto-updates from a
-**hidden "outreach updates"** sheet. That tab is the canonical cadence source;
-the older outreach tracker stays readable and is the automatic fallback if no
-master tab exists (logged loudly when that happens).
+The cadence source is the tab whose headers carry **`Last followed up date`** and
+**`Total follow-ups till date`** — live, the hidden **"Outreach Updates"** tab.
+It is the only tab in the spreadsheet with dates in it.
 
-- **Hidden tabs are read.** `worksheets(exclude_hidden=False)`, so the hidden
-  feed is discovered like any other tab and marked `HIDDEN` in the log.
-- **The master tab is chosen by TITLE, not by headers** (`GTM_MASTER_TAB_TITLES`,
-  exact match). Its columns are a superset of the old tracker's, so a header
-  score would let any tracker tab claim to be canonical — and the playbook
-  already contains a *"Master Lead List"* that is a prospect-priority tab.
-- **The full schema of every tab is logged at startup** (`GTM_LOG_FULL_SCHEMA`):
-  title, hidden flag, kind, row count, every header, every mapped role, and the
-  columns carried as `_extra`. A column rename is then one log read, not a
-  debugging session.
+The **master tab** ("Master Data": `Response Status` + `Intro Sent` + `Meeting
+Done`) is **status only**. It has no last-followed-up date, no follow-up count,
+no meeting date and no next steps, and its `Month` is a month, not a date.
+Pointed at it, rules **a, c, h, i and j** read a blank and silently never fired —
+the cadence looked calm because it was blind. The master tab now does the three
+jobs it can actually do:
+
+- **aggregate and pivot answers** — 587 rows of clean status;
+- **the weekly funnel definition** (below);
+- **a nightly consistency cross-check against the tracker**. Where the two
+  disagree, the bot reports **both values** as an UPDATE-TRACKER line and
+  **never infers a winner** — picking one silently would be a bot rewriting a
+  status nobody asked it to touch.
 
 **Statuses conveyed by cell colour are invisible to this bot.** It reads cell
 *values* only — the Sheets values API does not return fills. That failure is
@@ -672,12 +728,48 @@ silent by nature, so at startup any mapped column that is empty on nearly every
 row is named in a warning:
 
 ```
-WARNING [gtm] tab 'Master data': the response column ('Response') is filled on
-0 of 340 rows. It MAY BE COLOR-CODED — this bot reads cell VALUES only and
-cannot see fills, so every rule that reads response will see a blank. It needs a
-text value in each cell (or point GTM_COLUMN_MAP['master_data']['response'] at
-the column that has one).
+WARNING [gtm] tab 'Outreach Updates': the meeting_date column ('Meeting Date') is
+filled on 9 of 886 rows. It MAY BE COLOR-CODED — this bot reads cell VALUES only
+and cannot see fills, so every rule that reads meeting_date will see a blank.
 ```
+
+### Vocabulary normalisation
+
+The two tabs say the same things in different words, so everything goes through
+one normaliser before a rule sees it:
+
+| | Values | Reads as |
+|---|---|---|
+| **Response** | `Y`, `P`, `Did Respond`, `P - Positive/In Progress` | POSITIVE |
+| | `N`, `N - Rejected`, `No` | REJECTED |
+| | blank, `No Response`, `Awaited` | NONE |
+| | anything else | *replied, polarity unclear* — never chased as silent, and **listed once** so the sheet can be standardised |
+| **Connected** | tracker `Y` / blank · master `Yes` / `No` | yes / no |
+| **Dates** | `9-Jun-2026`, `17-Mar-2026`, `22/05/2026`, `24-06-2026` | parsed |
+| | two dates in one cell (a meeting that moved) | the **latest** wins |
+| | `#REF!`, `#N/A`, `#VALUE!` | **empty**, and flagged |
+| **Follow-up count** | blank | **0 *and* "not recorded"** — see below |
+
+### Missing data is an ask, not a chase
+
+The tracker is sparse: the follow-up count is blank on 800 of 886 rows, next
+steps on 871. So **a rule fires as a CHASE only when every cell it depends on is
+actually filled.** When a required cell is blank the row becomes an
+**UPDATE-TRACKER fill-in ask** instead:
+
+```
+• OpenAI · Mark Chen (Chief Research Officer) — no last-followed-up date. Update the tracker.
+```
+
+Rules **(b)** and **(f)** are the exceptions — an empty cell *is* the signal
+there, which is the whole point of them.
+
+Without this split the digest would read a blank counter as "0 follow-ups" and
+chase a row nobody had touched, using the sheet's own gaps as evidence against
+the team. A gap is only asked about on a row that is **actually in play**: the
+missing last-followed-up date only when the row shows engagement, the missing
+count only when there is evidence of following up. "We never started" is rule
+(c)'s business, not a bookkeeping gap.
 
 ### Re-pointing at a new sheet is an env change plus a restart
 
@@ -687,47 +779,66 @@ the sheet's identity or its column names is compiled in:
 | Setting | What it moves |
 |---|---|
 | `GTM_SHEET_ORIGINAL_ID` | which spreadsheet |
-| `GTM_MASTER_TAB_TITLES` | which tab in it is canonical |
 | `GTM_COLUMN_MAP` | which header means which rule field |
-| `FOLLOWUP_STALE_DAYS`, `CONNECT_REMINDER_DAYS`, `ALT_CHANNEL_AT`, `UNRESPONSIVE_AT`, `NEXTSTEP_STALL_DAYS`, `MEETING_PREP_DAYS`, `DIGEST_MAX_ITEMS` | every threshold |
+| `SALES_DEFAULT_OWNER_ID` | who every cadence line is addressed to |
+| `GTM_MASTER_TAB_TITLES` | an optional *name hint* for the master tab — a hint, never an authority |
+| `FOLLOWUP_STALE_DAYS`, `CONNECT_REMINDER_DAYS`, `CONNECT_REMINDER_MAX_DAYS`, `ALT_CHANNEL_AT`, `UNRESPONSIVE_AT`, `NEXTSTEP_STALL_DAYS`, `MEETING_PREP_DAYS`, `URGENT_MAX`, `DIGEST_MAX_ITEMS`, `UPDATE_TRACKER_MAX` | every threshold |
 
 Change those, restart, done. No migration and no code edit. `GTM_COLUMN_MAP`
-accepts every rule field as a role: `company`, `industry`, `poc`,
-`poc_designation`, `poc_vertical`, `first_contacted`, `connected`, `intro_date`,
-`last_followed_up`, `followups_count`, `response`, `meeting_date`,
-`assets_shared`, `next_steps`, `owner`, `status`, `reason`.
+accepts every rule field as a role — for `outreach_tracker`: `company`,
+`industry`, `poc`, `poc_designation`, `poc_vertical`, `first_contacted`,
+`use_case`, `connected`, `intro_date`, `last_followed_up`, `followups_count`,
+`response`, `reason`, `meeting_date`, `assets_shared`, `next_steps`,
+`other_updates`, `owner`, `status`.
 
-### The nine rules
+### Who a line is addressed to
+
+**The tracker has no owner column.** Every row is worked by the same person
+today, so a cadence line resolves its owner in two steps: the row's own owner
+cell *if a column ever appears* (or `GTM_COLUMN_MAP` names one), then
+`SALES_DEFAULT_OWNER_ID`. A ping still needs roster membership — an id that isn't
+in `TEAM_ROSTER_IDS` gets named in plain text instead, which is the roster gate
+failing closed.
+
+### The ten rules
 
 **Every `n` is a placeholder.** Vaishnavi's numbers were left unset in the doc;
 the defaults below are guesses she will tune once the digest has been read for a
 week — which is a restart, not a deploy.
 
-| | Rule | Fires when | Threshold | Priority | Digest section |
-|---|---|---|---|---|---|
-| **a** | stale follow-up | Last Followed-up Date older than *n* **and** no response | `FOLLOWUP_STALE_DAYS=5` | waiting | FOLLOW-UPS |
-| **b** | intro pending | Connected = Y but membrane Intro Date blank | — | waiting | INTROS |
-| **c** | start interacting | First Contacted set, never Connected, *n* days gone | `CONNECT_REMINDER_DAYS=7` | waiting | FOLLOW-UPS |
-| **d** | another channel | Total follow-ups ≥ *n*, no response → email / WhatsApp / call | `ALT_CHANNEL_AT=4` | waiting | FOLLOW-UPS |
-| **e** | mark unresponsive | Total follow-ups ≥ *n*, no response → **ask the owner** to mark the PoC unresponsive | `UNRESPONSIVE_AT=7` | waiting | UPDATE-TRACKER |
-| **f** | lock a meeting | Response Y/P but Next Steps blank | — | **urgent** | MEETINGS |
-| **g** | another PoC | Response = N → try someone else at that company | — | held | FOLLOW-UPS |
-| **h** | post-meeting gap | Meeting Date past **and both** Assets Shared and Next Steps blank | — | **urgent** | ASSETS |
-| **i** | next-step stall | Next Steps present but unchanged for *n* days | `NEXTSTEP_STALL_DAYS=10` | waiting | UPDATE-TRACKER |
-| | meeting soon | Meeting Date within *n* days | `MEETING_PREP_DAYS=4` | **urgent** | MEETINGS |
+| | Rule | Fires when | Needs filled | Threshold | Priority | Section |
+|---|---|---|---|---|---|---|
+| **a** | stale follow-up | Last followed-up date older than *n* **and** no response | the date | `FOLLOWUP_STALE_DAYS=5` | waiting | FOLLOW-UPS |
+| **b** | intro pending | Connected = Y but membrane Intro Date blank | — *(blank is the signal)* | — | intro | INTROS |
+| **c** | start interacting | First Contacted set, never Connected, and **inside the window** | the date | `CONNECT_REMINDER_DAYS=7` … `CONNECT_REMINDER_MAX_DAYS=30` | waiting | FOLLOW-UPS |
+| | *cold summary* | the never-connected rows **past** the ceiling — one line for all of them, **never capped** | the date | `CONNECT_REMINDER_MAX_DAYS=30` | — | FOLLOW-UPS |
+| **d** | another channel | Follow-ups ≥ *n*, no response → email / WhatsApp / call | the count | `ALT_CHANNEL_AT=4` | waiting | FOLLOW-UPS |
+| **e** | mark unresponsive | Follow-ups ≥ *n*, no response → **ask the owner** to mark the PoC unresponsive | the count | `UNRESPONSIVE_AT=7` | waiting | UPDATE TRACKER |
+| **f** | lock a meeting | Response positive, Next Steps blank, no meeting on the row | — *(blank is the signal)* | — | **urgent** | MEETINGS |
+| **g** | another PoC | a **rejected** company with nothing else live there — **once per company** | — | — | suggestion | FOLLOW-UPS |
+| **h** | meeting soon | Meeting Date within *n* days → earns the prep brief | the date | `MEETING_PREP_DAYS=4` | **urgent** | MEETINGS |
+| **i** | post-meeting gap | Meeting Date past **and** Assets Shared **or** Next Steps blank | the date | — | **urgent** | ASSETS |
+| **j** | next-step stall | Next Steps present but unchanged for *n* days | the cell | `NEXTSTEP_STALL_DAYS=10` | waiting | FOLLOW-UPS |
 
-Three details that are load-bearing:
+Four details that are load-bearing:
 
 - **Rule (e) asks. It never writes.** The bot's only writable cell anywhere
   remains its own `BOT_DEADLINE_COLUMN`. Marking a person unresponsive is a
   judgement with consequences for the relationship, and it stays with the human
   who owns the row. The digest line says so out loud: *"Please mark Rob N
-  'unresponsive' in the sheet (I don't write that cell)."*
+  'unresponsive' in the tracker (I don't write that cell)."*
+- **Rules (f) and (g) were in conflict, and are reconciled.** Her doc says
+  *"response = N / no response → suggest another PoC"*; the 27 Aug meeting
+  excluded rejected leads from the cadence entirely. Both survive, split by what
+  each was for: a rejected row is **never chased**, and instead the **company**
+  gets **one** suggestion line naming an alternative PoC — skipped when somebody
+  else at that company is still in play. "No response" with a high follow-up
+  count is not a rejection at all; (d) and (e) already own that row.
 - **Rule (g) pulls candidates from the researcher/buyer mapping** when the org is
   mapped — **with its usual caveats** folded into the line (staleness verdict,
   departure check, org flags). A mapped name quoted without them is exactly the
   mistake that sheet's legend warns about.
-- **Rule (i) needs history the sheet doesn't have.** A spreadsheet cell does not
+- **Rule (j) needs history the sheet doesn't have.** A spreadsheet cell does not
   know when it last changed, so the bot keeps its own: `nextstep_state` in SQLite
   holds a hash of each row's Next Steps text and the date that text first
   appeared. A fresh database earns these findings over the following days rather
@@ -737,33 +848,111 @@ Three details that are load-bearing:
 
 **Rejected rows are excluded from every rule and every digest section** — dropped
 before any rule is evaluated, not filtered out afterwards. They are revisited
-offline by humans. A row counts as rejected when any of its cells contains one of
-`CADENCE_REJECTED_MARKERS` (`rejected`, `not interested`, `closed lost`, …).
-
-**`Response = N` is not a rejection.** Rule (g) exists precisely to suggest
-another PoC at a company whose first contact said no. Rejection has to be written
-down deliberately.
+offline by humans. A row counts as rejected when its **Response** says so (`N`,
+`N - Rejected`, `No`) or when any of its cells contains one of
+`CADENCE_REJECTED_MARKERS` (`rejected`, `not interested`, `closed lost`, …). The
+one thing such a row still produces is rule (g)'s single per-company suggestion.
 
 | Bucket | What's in it |
 |---|---|
-| **URGENT** | a positive response awaiting our action (f) · meetings within `MEETING_PREP_DAYS` · post-meeting gaps (h) |
-| **WAITING** | the cadence items — a, b, c, d, e, i |
-| **HELD** | everything else (g) — a "no" is real work, but it must never push a booked meeting off the digest |
+| **URGENT** | a positive response awaiting our action (f) · meetings within `MEETING_PREP_DAYS` (h) · post-meeting gaps (i) — **never truncated**, own budget |
+| **WAITING** | a, c, d, e, j |
+| **INTRO** | b — connected with no intro behind it |
+| **SUGGESTION** | g — a "no" is real work, but it must never push a booked meeting off the digest |
+
+### The cold ceiling: why rule (c) needed a maximum, not a bigger minimum
+
+Rule (c) matched **756 of the live sheet's 886 rows**. Most of the tracker is
+March–July outreach that never connected, and *"first contacted 158d ago and
+still not connected — start interacting"* is not a task, it is an accusation
+about last quarter.
+
+**Raising `CONNECT_REMINDER_DAYS` is the wrong lever.** Those rows are older
+than any threshold you could set, so a higher floor still lets every one of them
+through. A **ceiling** is the only thing that separates the two populations:
+
+| | Window | What it means | What the digest does |
+|---|---|---|---|
+| chase | `CONNECT_REMINDER_DAYS` … `CONNECT_REMINDER_MAX_DAYS` (7–30) | contacted recently, hasn't connected yet | one line per row: *"start interacting"* |
+| **cold** | older than `CONNECT_REMINDER_MAX_DAYS` (30) | contacted long ago, never got anywhere | **one line for all of them** |
+
+```
+• 756 cold contacts across 209 companies (never connected, first contacted
+  Mar-Jul 2026) — ask 'cold list' to see them.
+```
+
+**That line is not capped.** It sits outside `URGENT_MAX`, `DIGEST_MAX_ITEMS` and
+`UPDATE_TRACKER_MAX` alike, because a count of suppressed rows that could itself
+be suppressed would be worse than not suppressing anything — it would just be a
+bot quietly hiding 756 rows. Asking **`cold list`** returns the whole thing,
+uncapped and grouped by company, oldest first, since the decision it supports is
+per-company (*"do we go back at OLX at all?"*) rather than per person.
+
+**Only rule (c) is suppressed, not the row.** A March row that is still being
+followed up every week is live work, and its (a), (d) and (e) lines still fire.
+What's wrong on it is specifically the nudge to *start*, which is five months out
+of date. Cold rows are also **not rejected** — nobody said no, they just never
+answered — and the `cold_list` tool says so, because the two get confused.
+
+`CONNECT_REMINDER_MAX_DAYS=0` turns the ceiling off and goes back to chasing all
+756 individually.
+
+### Three budgets, and the urgent items are never truncated
+
+One number could not serve them, so there are three:
+
+| Budget | Default | Covers | Truncates? |
+|---|---|---|---|
+| `URGENT_MAX` | **25** | (f) positive replies awaiting a next step, (h) meetings inside `MEETING_PREP_DAYS`, (i) post-meeting gaps | **No** — a hard ceiling against a broken sheet, not a target |
+| `DIGEST_MAX_ITEMS` | **15** | everything else in the cadence — a, b, c, d, e, g, j | yes, counted in the closing line |
+| `UPDATE_TRACKER_MAX` | **5** | the fill-in asks, the master/tracker disagreements, the sheet-health flags | yes, counted in the closing line |
+
+**The urgent items are what Vaishnavi prioritised, so truncating them defeats the
+digest.** Sharing one fifteen-item budget with the rest of the cadence, the live
+sheet's sixteen urgent rows filled the entire digest on day one — and one row
+later would have started cutting the positives themselves. `URGENT_MAX` exists
+only so that a broken sheet (a column that suddenly reads as positive on every
+row) cannot produce a thousand-line message; if it is ever actually hit the bot
+logs a warning saying so, because that is a bug to look at rather than a number
+to raise.
+
+The **cold summary** is outside all three, as above.
 
 ### The cap is honest
 
-`DIGEST_MAX_ITEMS` (default **15**, the 10–15 phase-1 agreement) items go out,
-**urgent first, across all five sections combined** — fifteen total, not fifteen
-each. What doesn't fit is counted in one closing line:
+What doesn't fit is counted in one closing line:
 
 ```
-_4 more held — ask 'full cadence list' to see all._
+_218 more held — ask 'full cadence list' for everything._
 ```
 
-Asking that returns the **uncapped** list, ranked, with every item's rule letter
-and priority — the `cadence_list` tool, which obeys the same mention-only gate as
-every other answer. A silently truncated list would read as "there were only
-fifteen things", and that is a lie the digest cannot afford to tell.
+Asking that returns the **uncapped** list — cadence items *and* tracker asks,
+ranked, with every item's rule letter and priority — the `cadence_list` tool,
+which obeys the same mention-only gate as every other answer. `cold list` does
+the same for the cold cohort. A silently truncated list would read as "there were
+only fifteen things", and that is a lie the digest cannot afford to tell.
+
+### Sheet-health flags, deduped until fixed
+
+Three findings about the spreadsheet itself, one line each, in the UPDATE TRACKER
+section:
+
+1. **Broken formulas.** Every `#REF!` / `#N/A` / `#VALUE!` the bot read as empty,
+   named by tab and column. Live on 1 Sep: one cell, `'Master Pipeline'` →
+   `'Outreach Line - Researchers'`.
+2. **Misaligned master rows** — a cell holding a value from the wrong column's
+   vocabulary (`Mar-2026` in Connected, `No Response` in Meeting Done).
+3. **Response values outside the known set**, listed once so the sheet can be
+   standardised.
+
+Each carries a **signature** of what was found, stored in SQLite
+(`quality_flags`). A flag whose signature hasn't changed since it was last
+reported is **not repeated** — a daily reminder about a `#REF!` everybody already
+knows about is exactly the drip that gets a digest muted. Fix half of it and the
+signature changes, so the remaining half is reported again. The recording happens
+**after** the digest actually posts, so a refused send can't silence a flag for
+good. `full cadence list` ignores the dedup entirely: somebody asking what is
+wrong with the sheet wants the whole answer.
 
 ### Meeting-prep briefs
 
@@ -776,7 +965,7 @@ It assembles — and asserts nothing beyond — these four sources:
 
 | Source | What it contributes |
 |---|---|
-| Master data | company, PoC, designation, vertical, industry, the full history, assets shared, next steps |
+| Outreach tracker | company, PoC, designation, vertical, industry, the full history, assets shared, next steps |
 | Researcher Buyer Mapping | the PoC's mapped row: role, evidence, pitch hook, watch-outs — **with its caveats**, via `MAPPING.enrich()` |
 | Positioning matrix | the matching use case, problem statement, offering and business impact |
 | Meeting notes | anything on file about the same company |
@@ -803,22 +992,39 @@ At every startup the bot runs the cadence and **logs which rows each rule fires
 on today**, with the cap applied and the reason in terms of the cells it read. It
 sends nothing.
 
+It opens with **which real tab matched which role**, because "the cadence found
+no rows" is almost always "the tracker was read as something else today":
+
 ```
-[cadence.dryrun] (a) stale_followup       1 row(s)
+[gtm.roles] outreach_tracker   TRACKER — the cadence source (the only tab with dates) -> 'Outreach Updates'
+[gtm.roles] master_data        MASTER — status only (aggregates, funnel, cross-check) -> 'Master Data'
+
+[cadence.dryrun] (a) stale_followup          65 item(s)
 [cadence.dryrun]       · Acme Labs / Priya R [row 2] [waiting]
-[cadence.dryrun]         why: Last Followed-up Date is '2026-08-10'; threshold is 5d.
+[cadence.dryrun]         why: Last followed up date is '2026-08-10'; threshold is 5d.
+[cadence.dryrun] (cold) cold_summary            1 item(s)
+[cadence.dryrun]         why: Past the 30d cold ceiling, so rule (c) does not chase
+[cadence.dryrun]              them individually; the oldest was first contacted 166d ago.
 ```
 
 The same report runs standalone, against the live sheet or against built-in
 fixture rows:
 
 ```bash
-python cadence.py            # the real master tab; read-only, sends nothing
+python cadence.py            # the real tracker tab; read-only, sends nothing
 python cadence.py --demo     # fixture rows: no sheet, no network, no database
 ```
 
+`--demo` is a real test of the rules rather than of the network: it asserts that
+every rule fires on its row, that a rejected row produces **no chase** (only its
+one per-company suggestion), that a blank follow-up count becomes an ask rather
+than a chase, that a row past the cold ceiling produces **no individual item** but
+**does** produce the uncapped summary line, that no urgent item was truncated,
+and that the cross-check and sheet-health flags fire.
+
 Everything also lands in `audit.jsonl` as usual — a `cadence_dry_run` record at
-startup and a `meeting_prep_brief` record per brief written.
+startup (carrying the tab-role map), a `meeting_prep_brief` record per brief
+written, and a `sheet_quality_flag` record per sheet-health flag reported.
 
 ---
 
@@ -841,6 +1047,10 @@ README decorative.
 
 ### What's in it, hot first
 
+The five cadence sections are in **Vaishnavi's daily-cadence order** — *"Follow-ups
+for this week · Intros to be done this week · Meetings for this week · Update
+tracker · Assets to be shared this week"*.
+
 ```
 **Daily sales digest — Tue 25 Aug 2026**
 
@@ -848,34 +1058,42 @@ README decorative.
 • HOT — OpenAI · Sam Altman, CTO: they replied on Mon 18 Aug and the last follow-up
   (Fri 15 Aug) predates it. (3rd day)
 
-**FOLLOW-UPS this week (3)**
+**FOLLOW-UPS for this week (4)**
 @Vaishnavi
+• 756 cold contacts across 209 companies (never connected, first contacted
+  Mar-Jul 2026) — ask 'cold list' to see them.
 • Cinder · Dev M — first contacted 27d ago and still not connected. Start interacting.
 • Acme Labs · Priya R — last followed up 18d ago, still no response. Follow up or park it.
-@Kushal
-• Gantry · Ivan S — Ivan S said no. Try a different PoC at Gantry. Mapped
-  alternatives: Dr Ada Vance (mapped 5 wks ago).
+• Gantry — Ivan S said no. Nobody else there is in play; try a different PoC.
+  Mapped alternatives: Dr Ada Vance (mapped 5 wks ago).
 
-**INTROS to be done (1)**
-@Kushal
+**INTROS to be done this week (1)**
+@Vaishnavi
 • Borealis · Sam K — connected, but no membrane intro date recorded. Intro pending.
 
-**MEETINGS this week (2)**
+**MEETINGS for this week (2)**
 @Vaishnavi
 • Fathom · Lea W — responded (P) with no next step recorded. Lock a meeting.
 • Ionic · Tara B — meeting in 2d (Sun 30 Aug 2026). Prep it.
 
-**ASSETS to be shared (1)**
-@Kushal
-• Halcyon · Mei L — met 7d ago, no assets shared and no next steps. Send the
-  assets and write the next step.
-
-**UPDATE-TRACKER reminders (1)**
-@team
+**UPDATE TRACKER (4)**
+@Vaishnavi
 • Everest · Rob N — 8 follow-ups, no response. Please mark Rob N "unresponsive"
-  in the sheet (I don't write that cell).
+  in the tracker (I don't write that cell).
+• Tab 'Master Pipeline' has 1 cell(s) holding a spreadsheet error (#REF!) in
+  'Outreach Line - Researchers'. I read those as EMPTY — a broken formula is not
+  a value.
+• Anthropic · Sandeep Jha — master and tracker disagree: Intro Sent / membrane
+  Intro Date: master says 'No', tracker says yes. Please fix whichever is wrong
+  (I don't guess which).
+• OpenAI · Mark Chen — no last-followed-up date. Update the tracker.
 
-_4 more held — ask 'full cadence list' to see all._
+**ASSETS to be shared this week (1)**
+@Vaishnavi
+• Halcyon · Mei L — met 7d ago, no next steps. Send what you promised and write
+  the next step.
+
+_218 more held — ask 'full cadence list' for everything._
 
 **DEADLINES — due today or tomorrow (2)**
 • @Vaishnavi — Emami — the follow-up is due today (Tue 25 Aug 2026).
@@ -999,6 +1217,13 @@ attempt.
 | `SALES_DIGEST_TIME` | `10:00` | Wall-clock IST (Asia/Kolkata, computed explicitly — never the server clock). |
 | `SALES_DIGEST_MAX_PER_SECTION` | `15` | Items shown per section; the overflow is counted, not dropped. |
 | `SALES_DIGEST_CHANNEL_ID` | unset | Must be in `SALES_CHANNEL_IDS`; unset → `SALES_ASK_CHANNEL_ID`, else the first sales channel. |
+| `URGENT_MAX` | `25` | Hard ceiling on the urgent items (f, h, i). They are **never truncated** in practice — this only guards against a broken sheet. |
+| `DIGEST_MAX_ITEMS` | `15` | **Non-urgent** cadence items carried, across all five sections combined. |
+| `CONNECT_REMINDER_MAX_DAYS` | `30` | The cold ceiling: never-connected rows older than this are counted in one line instead of chased. `0` turns it off. |
+| `UPDATE_TRACKER_MAX` | `5` | A **separate** budget for the "update the tracker" asks, so a sparse sheet's fill-in requests can't eat the fifteen. |
+| `SALES_DEFAULT_OWNER_ID` | unset | Who every cadence line is addressed to, since the tracker has no owner column. Must also be in `TEAM_ROSTER_IDS` to be pinged. |
+| `CADENCE_CROSSCHECK_ENABLED` | `true` | The nightly master/tracker consistency check. Reports disagreements; never picks a winner. |
+| `CADENCE_DATA_QUALITY_ENABLED` | `true` | The sheet-health flags (broken formulas, misaligned master rows, stray response values), deduped until they change. |
 
 ---
 
@@ -1119,8 +1344,8 @@ guardrails forbid.
 | `main.py` | entry point; validates env, logs scope and source statuses, connects |
 | `bot.py` | the Discord client: routing, question answering, chasing, and the one daily digest — its only proactive send |
 | `digest.py` | the daily digest: sections, per-owner grouping, carry-forward ages, rendering |
-| `cadence.py` | **the nine phase-1 rules**, exclusion, priority, the cap, and the dry run. Pure: rows in, dicts out — no sheet reads, no writes, no Discord |
-| `prep.py` | the meeting-prep brief: master row + mapping (with caveats) + positioning + notes, and the explicit "no web access" section |
+| `cadence.py` | **the ten phase-1 rules (a–j)**, exclusion, the missing-data routing, the master/tracker cross-check, the sheet-health flags, priority, the two caps, and the dry run. Pure: rows in, dicts out — no sheet reads, no writes, no Discord |
+| `prep.py` | the meeting-prep brief: tracker row + mapping (with caveats) + positioning + notes, and the explicit "no web access" section |
 | `guardrails.py` | **the hard rules** — every send and every read passes through here |
 | `config.py` | environment → typed settings, with loud warnings for likely mistakes |
 | `persona.py` | the voice, plus loading `sales_policy.md` fresh on every question |
@@ -1128,7 +1353,7 @@ guardrails forbid.
 | `sources.py` | the four sources and their connected / degraded / awaiting-access status |
 | `gtm_sheet.py` | the Sheets API layer: auth, schema discovery, cached reads, the narrow write path |
 | `mapping_sheet.py` | the researcher/buyer mapping — **read-only**: no write method, read-only scope, and the legend loaded as enforced rules |
-| `tracker.py` | the tracker read as a pipeline: the three flags and the funnel metrics (both rendered into the digest) |
+| `tracker.py` | the tracker read as a pipeline: the three flags, the playbook's six-stage funnel definition, and the week's leading/lagging metrics |
 | `deadlines.py` | IST working-day maths, cadence resolution, the announcement |
 | `notes.py` | syncs the Drive meeting notes into `NOTES_DIR`, filters them to the sales ones, reads those |
 | `query.py` | Discord read primitives, scoped to the sales channels |
