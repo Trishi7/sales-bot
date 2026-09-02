@@ -62,6 +62,13 @@ HONESTY (not negotiable, and not a style rule):
 - Never guess a number, a date, a name, or a deal stage. "I don't know" and "I
   can't see that yet" are complete answers.
 - If someone asks for something you cannot do, say so in one sentence and stop.
+- CITE THE MEETING. Whenever meeting knowledge shapes what you say — a hold, a
+  decision, a commitment — the sentence names the meeting and its date, in
+  brackets: "Acme is on hold (Sales Bot Discussion, 2 Sep)". Use the citation
+  string the tool gave you, verbatim. A claim from a sheet can be checked by
+  opening the sheet; a claim from a meeting cannot be checked at all unless you
+  say which meeting, so an uncited one is indistinguishable from something you
+  made up. If a tool gave you no citation, you do not have the fact.
 
 This persona changes ONLY your voice. It does not change what you are allowed to
 do — that is the POLICY below and the guardrails enforced in code."""
@@ -161,7 +168,31 @@ def system_preamble(*, include_sources: bool = True) -> str:
     if include_sources:
         parts.append(sources.describe_for_prompt() + "\n\n")
 
+    # THE CITATION RULE, restated after the sources rather than only inside the
+    # voice block. It is a factual-integrity rule, not a style one, and the
+    # commitment detector (include_sources=False) is the one path that does no
+    # source reasoning and so has nothing to cite.
+    if include_sources:
+        parts.append(CITATION_RULE + "\n\n")
+
     return "".join(parts)
+
+
+CITATION_RULE = """=== CITING MEETINGS (mandatory) ===
+Any line of yours shaped by meeting knowledge — a hold, a decision, a commitment,
+anything you learned from a meeting note rather than from a spreadsheet cell —
+NAMES THE MEETING AND ITS DATE, in brackets, at the end of that line:
+
+    "Acme is on hold until the pilot lands (Sales Bot Discussion, 2 Sep)"
+
+The tools hand you the exact string in a `citation` field. Use it verbatim; do
+not shorten it, do not paraphrase the meeting's name, and do not reconstruct one
+from a date. If a fact came from a meeting and you have no citation for it, you
+do not have the fact — say you can't see it rather than asserting it uncited.
+
+This is not required for a claim read off the GTM sheets: those already cite the
+tab and the cell. It IS required in every other case, including when you are
+agreeing with something the person asking already said."""
 
 
 # -- reply-path prompts ------------------------------------------------------

@@ -227,11 +227,34 @@ def _notes_section(company: str, *, notes_module, today: date) -> list[str]:
         if want in gtm_sheet.normalise_header(str(n.get("title") or ""))
         or want in gtm_sheet.normalise_header(str(n.get("label") or ""))
     ]
-    if not hits:
-        return [f"_No meeting note on file mentions {company} in the last "
-                f"{config.CADENCE_PREP_NOTES_DAYS} days._"]
+    # Imported here rather than at module scope: prep.py is a pure assembler and
+    # this is the one section that carries meeting knowledge, which is the one
+    # kind of claim that MUST name its source.
+    import meetings
 
     lines: list[str] = []
+
+    # A HOLD LEADS, and it is checked BEFORE the title match. A meeting that
+    # parked this account may never have had the company in its title — the
+    # decision is in the body — so a hold has to be looked for in the facts
+    # rather than in the filenames. It is the first thing the person walking
+    # into the call needs to know, and it is stated with the meeting that
+    # decided it rather than as the bot's own view of the account.
+    try:
+        held = meetings.holds(companies=[company])
+        fact = meetings.hold_for(company, held)
+    except Exception:
+        log.debug("[prep] hold lookup failed for %r", company, exc_info=True)
+        fact = None
+    if fact:
+        lines.append("⚠ " + meetings.cite(f"ON HOLD — {fact['text']}", fact.get("note")))
+
+    if not hits:
+        return lines + [
+            f"_No meeting note on file mentions {company} in the last "
+            f"{config.CADENCE_PREP_NOTES_DAYS} days._"
+        ]
+
     for meta in hits[:2]:
         try:
             note = notes_module.read_note(date=meta.get("date"), label=meta.get("label"))
@@ -240,17 +263,25 @@ def _notes_section(company: str, *, notes_module, today: date) -> list[str]:
             continue
         if not note:
             continue
-        when = meta.get("date") or "?"
-        label = _clip(note.get("label") or note.get("title") or "note", 60)
-        lines.append(f"**{when} — {label}**")
+        # THE CITATION. Every line under this heading came out of a meeting, and
+        # a brief is read out loud minutes before a call — "we agreed to hold
+        # this" with no meeting behind it is exactly the sentence that gets
+        # repeated to a customer and turns out to be the bot's inference.
+        tag = meetings.citation(note)
+        lines.append(f"**{tag or (meta.get('date') or 'a meeting note')}**")
         summary = _clip(note.get("summary") or "", _NOTE_CLIP)
         if summary:
-            lines.append(f"  · {summary}")
+            lines.append(f"  · {meetings.cite(summary, note)}")
         for step in (note.get("next_steps") or [])[:3]:
             task = _clip(step.get("task") if isinstance(step, dict) else step, 120)
             owner = (step.get("owner_name") if isinstance(step, dict) else "") or ""
             if task:
-                lines.append(f"  · next step{f' ({owner})' if owner else ''}: {task}")
+                lines.append(
+                    "  · "
+                    + meetings.cite(
+                        f"next step{f' ({owner})' if owner else ''}: {task}", note
+                    )
+                )
     return lines
 
 

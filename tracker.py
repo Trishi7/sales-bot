@@ -380,6 +380,75 @@ def flag_message(row: dict, *, mentions: str = "") -> str:
     return f"{label} — {who}: {why}.{tail}"
 
 
+# -- THE TWICE-WEEKLY TRACKER REMINDER ----------------------------------------
+#
+# Vaishnavi's Mon/Fri "update the tracker" prompt. It is a SECTION OF THE DAILY
+# DIGEST on TRACKER_REMINDER_DAYS and it has no send path of its own — see the
+# one-message rule at the top of digest.py. This function returns lines; only
+# the digest can put them in front of anyone.
+#
+# WHY IT IS NOT JUST "please update the tracker". A bare reminder on a fixed
+# schedule is the first thing a team learns to skim. So it carries the two
+# things that make it worth reading: WHICH cells are the ones that matter (the
+# ones every date rule depends on), and HOW MANY rows are currently missing
+# them, which is the number that goes down when somebody acts on it.
+
+
+def reminder_items(
+    *,
+    today: date,
+    fill_in_count: int = 0,
+    rows_total: int = 0,
+    facts: Optional[list[dict]] = None,
+) -> list[dict]:
+    """The reminder, as digest items.
+
+    `facts` are `meetings.facts()` entries. Any of them that talks about the
+    tracker is included AS ITS OWN LINE, WITH ITS CITATION — if a meeting
+    decided how the tracker is to be kept, the reminder says so and names the
+    meeting rather than presenting the team's own decision back to them as the
+    bot's opinion.
+
+    Every item is flagged `forces_digest`: the reminder is a real ask, so it is
+    worth the day's one message even when nothing else is outstanding. It is
+    NOT an ITEM_SECTION, so it is never aged — "(3rd day)" on a standing
+    twice-weekly reminder would be meaningless.
+    """
+    day_name = today.strftime("%A")
+    lead = (
+        f"{day_name} tracker check — update the outreach tracker: last followed-up "
+        "date, total follow-ups, response, meeting date, next steps."
+    )
+    if fill_in_count > 0:
+        lead += (
+            f" {fill_in_count} row(s)"
+            + (f" of {rows_total}" if rows_total else "")
+            + " have no follow-up count or last-followed date, so no date rule can "
+            "fire on them at all."
+        )
+    else:
+        lead += " Every row I can see has the dates the rules need — keep it that way."
+    items = [{"text": lead, "forces_digest": True}]
+
+    # Anything a meeting said about the tracker, cited. Imported here rather
+    # than at module scope: tracker.py is imported by the answer path on a box
+    # where the notes folder may not exist, and this is the only place it needs
+    # the meeting layer.
+    import meetings as _meetings
+
+    for fact in (facts or []):
+        text = str(fact.get("text") or "")
+        if "tracker" not in text.lower() and "outreach update" not in text.lower():
+            continue
+        items.append({
+            "text": _meetings.cite(text, fact.get("note")),
+            "forces_digest": True,
+        })
+        if len(items) >= 3:  # the lead plus at most two meeting lines
+            break
+    return items
+
+
 # -- THE FUNNEL DEFINITION (the "Sales Funnel" pivot tab) ---------------------
 #
 # The playbook's funnel pivot defines the funnel, and this is its definition

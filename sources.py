@@ -1,7 +1,7 @@
 """THE SOURCE LAYER — the three things this bot reasons over, and whether it can
 actually reach them yet.
 
-A sales Chief of Staff is only as good as what it can see. Four sources matter:
+A sales Chief of Staff is only as good as what it can see. Five sources matter:
 
   sales_spreadsheet    the GTM Playbook — the outreach tracker, the positioning
                        matrix and the prospect priority list. LIVE via the Google
@@ -11,14 +11,21 @@ A sales Chief of Staff is only as good as what it can see. Four sources matter:
                        who must not be pitched at all. LIVE and STRICTLY
                        READ-ONLY (mapping_sheet.py).
   strategy_doc         the current sales & marketing strategy — the plan outreach
-                       is supposed to be executing. STILL A STUB.
+                       is supposed to be executing. LIVE, read-only over the
+                       Drive API (strategy.py). Reports DEGRADED rather than
+                       connected when the plan is stale, because an answer built
+                       on a plan nobody has revised in a month has to say so.
   sales_meeting_notes  the Drive-synced meeting notes (notes.py) — what was
                        actually said and committed to. LIVE, and filtered: only
-                       notes that are SALES meetings are ever loaded.
+                       notes that are SALES meetings are ever loaded. Everything
+                       derived from them carries a CITATION — see meetings.py.
+  todo_sheet           "Membrane Sales To-Dos" (todos.py) — the sheet the bot
+                       creates, SHARES with the team and appends action items
+                       to. A source because its failure mode is silent: an
+                       unshared sheet is perfectly readable by the bot and
+                       invisible to every human.
 
-Three of the four are wired up. The strategy doc is still a stub, and that gap is
-load-bearing rather than cosmetic: the deadline cadence prefers the strategy doc
-and only falls back to the env defaults because the doc can't be read yet.
+All five are wired up.
 
 The playbook and the mapping sheet are two sources rather than one on purpose:
 they answer different questions (which ACCOUNT vs which PERSON), they can fail
@@ -50,9 +57,12 @@ from datetime import date
 from typing import Optional
 
 import config
+import drive
 import gtm_sheet
 import mapping_sheet
 import notes
+import strategy
+import todos
 
 log = logging.getLogger(__name__)
 
@@ -305,16 +315,20 @@ class ResearcherMapping(Source):
 
 
 class StrategyDoc(Source):
-    """The current sales & marketing strategy document.
+    """The current sales & marketing strategy document. WIRED UP (strategy.py).
 
-    STUB. This is the source the bot checks outreach AGAINST — "is what we're
-    doing still what we said we'd do", and "is the strategy current". Until the
-    reader lands it reports awaiting-access.
+    NO LONGER A STUB. STRATEGY_DOC_ID points at the human-owned strategy doc,
+    and the bot reads it read-only over the Drive API — see drive.py's scopes.
+    It is the source three things run against:
 
-    When implemented it needs at minimum:
-      - text(): the document body,
-      - last_updated(): when it was last revised (strategy CURRENCY is a thing
-        this bot is meant to enforce, so this is not optional).
+      the DEADLINE CADENCE   a cadence stated in the doc outranks the
+                             working-day defaults (deadlines.resolve_rule).
+      CURRENCY               Drive's modifiedTime against STRATEGY_STALE_DAYS.
+      OUTREACH-vs-PLAN       the targets it names against where outreach went.
+
+    DEGRADED, not connected, when the doc is readable but STALE: the answers
+    built on it are still the best available, and every one of them has to say
+    the plan they are quoting hasn't been revised in a month.
     """
 
     key = "strategy_doc"
@@ -322,25 +336,98 @@ class StrategyDoc(Source):
     purpose = "the current sales & marketing strategy, and how current it is"
 
     def _probe(self) -> tuple[str, str]:
-        if config.STRATEGY_DOC_FILE or config.STRATEGY_DOC_ID:
+        try:
+            readable, detail = strategy.status_detail()
+        except Exception as e:
+            log.debug("[sources] strategy probe raised", exc_info=True)
             return (
                 AWAITING_ACCESS,
-                "The strategy doc location is configured, but the reader isn't built yet "
-                "— I can't check outreach against the plan or tell you how current it is.",
+                f"The strategy doc could not be probed ({type(e).__name__}). "
+                "Check STRATEGY_DOC_ID and the service-account key.",
             )
-        return (
-            AWAITING_ACCESS,
-            "I don't have access to the strategy doc yet — no location is configured "
-            "(STRATEGY_DOC_ID / STRATEGY_DOC_FILE) and the reader isn't built.",
-        )
+        if not readable:
+            return AWAITING_ACCESS, detail
+        try:
+            stale = strategy.is_stale()
+        except Exception:
+            stale = False
+        return (DEGRADED if stale else CONNECTED), detail
 
     def text(self) -> Optional[str]:
-        """The doc body. None until the reader lands."""
-        return None
+        """The doc body, or None when it can't be read."""
+        return strategy.text()
 
     def last_updated(self) -> Optional[str]:
-        """ISO date the strategy was last revised. None until the reader lands."""
-        return None
+        """ISO date the strategy was last revised, or None."""
+        return strategy.last_updated()
+
+
+class TodoSheet(Source):
+    """"Membrane Sales To-Dos" — the sheet the bot creates, shares and appends to.
+
+    IT IS A SOURCE BECAUSE ITS FAILURE MODE IS SILENT. A sheet that exists but
+    was never shared looks, from inside the bot, exactly like a healthy one: the
+    bot can read and write it perfectly well and no human can open it. So the
+    status line reports WHO CAN ACTUALLY SEE IT, not merely whether the API call
+    worked.
+    """
+
+    key = "todo_sheet"
+    label = "the team to-do sheet"
+    purpose = "the shared action-item list, appended from the meeting notes"
+
+    def _probe(self) -> tuple[str, str]:
+        if not config.TODO_SHEET_ENABLED:
+            return AWAITING_ACCESS, "TODO_SHEET_ENABLED=false — there is no to-do sheet."
+        ok, why = drive.available()
+        if not ok:
+            return AWAITING_ACCESS, f"{why}, so I can't create or read the to-do sheet."
+        if not config.TEAM_SHARE_EMAILS:
+            return (
+                DEGRADED,
+                "TEAM_SHARE_EMAILS is empty. A sheet the service account creates is "
+                "INVISIBLE to every human until it is shared, so I would be keeping a "
+                "to-do list nobody can open.",
+            )
+        sid = todos.sheet_id(self._db)
+        if not sid:
+            return (
+                AWAITING_ACCESS,
+                f"The to-do sheet hasn't been created yet. It is created on the next "
+                f"boot and shared with {', '.join(config.TEAM_SHARE_EMAILS)}.",
+            )
+
+        url = drive.sheet_url(sid)
+        try:
+            who = [
+                p.get("emailAddress") for p in drive.permissions(sid)
+                if p.get("emailAddress")
+                and p.get("emailAddress") != drive.service_account_email()
+            ]
+        except Exception:
+            who = []
+        missing = [e for e in config.TEAM_SHARE_EMAILS if e not in who]
+        detail = f"{config.TODO_SHEET_TITLE} — {url}."
+        if who:
+            detail += f" Shared with {', '.join(str(w) for w in who)}."
+        if missing:
+            return (
+                DEGRADED,
+                detail + f" NOT shared with {', '.join(missing)} — they cannot open it.",
+            )
+        detail += (
+            f" Refreshed from the meeting notes every {config.TODO_REFRESH_DAY} "
+            "(append-only; Status and Notes belong to the team)."
+        )
+        return CONNECTED, detail
+
+    # The database is injected by bot.py at startup: this source's status
+    # depends on a stored id, and a module-level source object has no other way
+    # to reach it.
+    _db = None
+
+    def bind(self, db) -> None:
+        self._db = db
 
 
 class SalesMeetingNotes(Source):
@@ -464,9 +551,11 @@ SALES_SPREADSHEET = SalesSpreadsheet()
 RESEARCHER_MAPPING = ResearcherMapping()
 STRATEGY_DOC = StrategyDoc()
 SALES_MEETING_NOTES = SalesMeetingNotes()
+TODO_SHEET = TodoSheet()
 
 ALL: list[Source] = [
     SALES_SPREADSHEET, RESEARCHER_MAPPING, STRATEGY_DOC, SALES_MEETING_NOTES,
+    TODO_SHEET,
 ]
 
 

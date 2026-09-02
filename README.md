@@ -60,12 +60,29 @@ rows carry a re-verify caveat computed against today, and flagged non-buyers are
 named as excluded rather than pitched. See
 [The researcher/buyer mapping](#the-researcherbuyer-mapping-sheet-3-read-only).
 
-**Tells the truth about its blind spots.** One of its four sources is still
-awaiting access. Ask it what it can do and it says so, by name, and says what
-that means it can't answer. That honesty is not a prompt preference — the same
-`sources.status_report()` feeds the answer, the system prompt, and
-`state/summary.json`, so what it tells a person and what it tells a supervisor
-process cannot drift apart.
+**Cites the meeting.** Whenever meeting knowledge shapes a line — a hold, a
+decision, a commitment — the line names its source: *"…on hold (Sales Bot
+Discussion, 2 Sep)"*. Everywhere: digest items, cadence chases, the tracker
+reminder, prep briefs, the to-do sheet, and answers. **A meeting-derived claim
+with no meeting citation is a bug**, and there is no setting that turns it off.
+See [Citing meetings](#citing-meetings).
+
+**Keeps the team's to-do sheet.** One Google Sheet — *Membrane Sales To-Dos* —
+that the bot creates, **shares with the team**, and appends action items to every
+week out of the meeting notes, each row carrying the meeting it was committed in.
+It never edits a row and never deletes one: Status and Notes belong to the
+humans. See [The to-do sheet](#the-to-do-sheet).
+
+**Checks outreach against the plan.** The strategy doc is no longer a stub. The
+bot reads it read-only, reports how current it is, adopts any cadence it states
+in place of the working-day defaults, and says weekly where outreach and the plan
+disagree — in both directions. See [The strategy doc](#the-strategy-doc).
+
+**Tells the truth about its blind spots.** Ask it what it can do and it names
+every source it cannot currently read, and says what that means it can't answer.
+That honesty is not a prompt preference — the same `sources.status_report()`
+feeds the answer, the system prompt, and `state/summary.json`, so what it tells a
+person and what it tells a supervisor process cannot drift apart.
 
 **What it does not do.** No triage, no classification, no ticket creation, no
 approval channel, nothing to approve. Its only output is a Discord message in a
@@ -111,6 +128,22 @@ Required: `DISCORD_TOKEN`, `ANTHROPIC_API_KEY`, `SALES_CHANNEL_IDS`. For the GTM
 sheet you also need `GOOGLE_SERVICE_ACCOUNT_JSON` **and both sheets shared with
 the service account** (see [The GTM Playbook](#the-gtm-playbook)). Every variable
 is documented and commented in `.env.example`.
+
+Two Google setup steps are easy to miss, and both fail in ways that look like
+something else:
+
+1. **Enable the Google Drive API** on the service account's Cloud project. The
+   to-do sheet cannot be created without it, and the strategy doc cannot be read.
+   Google's answer to a project that has never enabled it is a bare
+   `403 The caller does not have permission`, which reads as a key or scope
+   problem and is neither — the bot translates it into the console URL that
+   fixes it. See [The to-do sheet](#the-to-do-sheet).
+2. **Share the strategy doc with the service account as Viewer**, and set
+   `STRATEGY_DOC_ID`. See [The strategy doc](#the-strategy-doc).
+
+Before a deploy, `python -m main --dry-run-digest 2026-09-07` prints that day's
+whole digest and **sends nothing** — the fastest way to see what the team will
+actually read.
 
 The Discord application needs the **Message Content Intent** enabled (Developer
 Portal → your app → Bot → Privileged Gateway Intents). Without it every message
@@ -197,8 +230,9 @@ rest of the file can stay as-is.
 |---|---|---|
 | `sales_spreadsheet` | **wired up** (Sheets API) | the GTM Playbook: outreach tracker, positioning matrix, prospect priority |
 | `researcher_mapping` | **wired up** (Sheets API, **read-only**) | which researcher to pitch at each org, in which ICP lane, with what hook — and who must not be pitched |
-| `sales_meeting_notes` | **wired up** (rclone sync + standup exclusion) | what was said, decided and committed to in the team's meetings — every synced note except the product standups |
-| `strategy_doc` | stub — awaiting access | the current strategy, and how current it is |
+| `sales_meeting_notes` | **wired up** (rclone sync + standup exclusion) | what was said, decided and committed to in the team's meetings — every synced note except the product standups. Everything derived from them carries a **citation** |
+| `strategy_doc` | **wired up** (Drive API, **read-only**) | the current strategy, how current it is, and what outreach is checked against |
+| `todo_sheet` | **wired up** (Drive + Sheets API, **append-only**) | *Membrane Sales To-Dos* — the shared action-item list |
 
 Each source self-reports `connected` / `degraded` / `awaiting-access` / `error`
 with a one-sentence detail a human can act on. **`degraded` means readable but
@@ -217,9 +251,16 @@ different questions (which *account* vs which *person*), they fail independently
 and only one of them is ever writable. Collapsing them would let an outage in one
 be reported as health in the other.
 
-The strategy-doc gap is **load-bearing, not cosmetic**: the deadline cadence
-prefers that document and only falls back to the working-day defaults because it
-can't be read yet. Wire it up and the defaults stop being used.
+`todo_sheet` is a source **because its failure mode is silent**. A sheet the
+service account created but never shared is perfectly readable by the bot and
+invisible to every human — from inside, it looks exactly like a healthy one. So
+its status line reports **who can actually open it**, not merely whether the API
+call worked, and it goes `degraded` when an address on `TEAM_SHARE_EMAILS` is
+missing from the file's permissions.
+
+`strategy_doc` goes **degraded rather than connected when the plan is stale**.
+The answers built on it are still the best available, and every one of them has
+to say the plan they are quoting hasn't been revised in a month.
 
 ---
 
@@ -968,7 +1009,7 @@ It assembles — and asserts nothing beyond — these four sources:
 | Outreach tracker | company, PoC, designation, vertical, industry, the full history, assets shared, next steps |
 | Researcher Buyer Mapping | the PoC's mapped row: role, evidence, pitch hook, watch-outs — **with its caveats**, via `MAPPING.enrich()` |
 | Positioning matrix | the matching use case, problem statement, offering and business impact |
-| Meeting notes | anything on file about the same company |
+| Meeting notes | anything on file about the same company, **each line carrying its meeting citation**, and an opening `⚠ ON HOLD — …` line when a meeting parked the account |
 
 **Online research is not included, and the brief says so.** This bot has no web
 access, so every brief carries:
@@ -1186,6 +1227,57 @@ with its part number. Nothing is clipped: the per-section caps
 already bounded the length, and they say how many items they left out rather than
 dropping them silently.
 
+### The tracker reminder is a **section**, not a message
+
+Vaishnavi's twice-weekly *"update the tracker"* prompt goes out on
+`TRACKER_REMINDER_DAYS` (**Mon and Fri** by default) as a **section of that day's
+digest**, immediately after `UPDATE TRACKER`:
+
+```
+**UPDATE THE TRACKER — the twice-weekly check (3)**
+@Vaishnavi
+• Monday tracker check — update the outreach tracker: last followed-up date,
+  total follow-ups, response, meeting date, next steps. 110 row(s) of 886 have
+  no follow-up count or last-followed date, so no date rule can fire on them
+  at all.
+• The outreach tracker must be updated at the start and end of every week.
+  (Sales Bot Discussion, 2 Sep)
+• Update the tracker with last-followed-up dates for every open row.
+  (Sales Bot Discussion, 2 Sep)
+```
+
+**There is no `_post_tracker_reminder` anywhere in the code, and there must
+never be one.** The reminder cannot reach the channel except through the digest.
+That is what keeps "exactly one unprompted message a day" a property of the code
+rather than a promise — and it also means the reminder and the `UPDATE TRACKER`
+section above it arrive together instead of as two prompts about the tracker
+minutes apart, which is how a channel gets muted.
+
+The count in the lead line comes from the cadence that ran seconds earlier
+(`fill_in`), not from a second read, so the reminder can never disagree with the
+section above it. The lines that quote a meeting carry **that meeting's
+citation** — see [Citing meetings](#citing-meetings).
+
+It posts even on a day with nothing else outstanding. That is the one exception
+to *empty day = no digest*, and it is deliberate: the reminder is a real ask, so
+it is worth the day's one message. Mechanically it is an item carrying
+`forces_digest`, which `digest.total_items` counts but `_age_digest_items` never
+ages — *"(3rd day)"* on a standing twice-weekly reminder would be nonsense.
+
+### Audit trail for the whole one-message rule
+
+Three send sites exist in `bot.py`, and only one of them is proactive:
+
+| Where | What | Proactive? |
+|---|---|---|
+| `_post_digest` | the daily digest | **yes — the only one** |
+| `_reply` | an answer to a question | no — someone asked |
+| `_set_deadline_for` | the ask-time deadline announcement | no — someone asked, and it carries the "shout to change" consent |
+
+Everything the bot has to say proactively is a **section** of the first one. If
+you are adding something, add a section to `digest.py`; do not add a
+`guardrails.send`.
+
 ### The exceptions
 
 Two things are still immediate, because both are **answers rather than
@@ -1202,7 +1294,8 @@ interruptions**:
 
 Every digest writes one `daily_digest` line to `state/audit.jsonl` with the date,
 the channel, the message id, the total item count and a per-section count
-(`n_hot`, `n_deadlines`, `n_overdue`, `n_escalations`, `n_hygiene`, `n_funnel`),
+(`n_hot`, `n_deadlines`, `n_overdue`, `n_escalations`, `n_hygiene`, `n_funnel`,
+`n_tracker_reminder`, `n_todos`, `n_plan`),
 so an operator can see the shape of a day without reading the message. The
 attempts and escalations the digest spends are audited individually too
 (`chase_nudged`, `deadline_chase`, `chase_given_up`, `deadline_escalated`) — and
@@ -1224,6 +1317,255 @@ attempt.
 | `SALES_DEFAULT_OWNER_ID` | unset | Who every cadence line is addressed to, since the tracker has no owner column. Must also be in `TEAM_ROSTER_IDS` to be pinged. |
 | `CADENCE_CROSSCHECK_ENABLED` | `true` | The nightly master/tracker consistency check. Reports disagreements; never picks a winner. |
 | `CADENCE_DATA_QUALITY_ENABLED` | `true` | The sheet-health flags (broken formulas, misaligned master rows, stray response values), deduped until they change. |
+| `TRACKER_REMINDER_ENABLED` | `true` | The twice-weekly tracker reminder **section**. It has no send path of its own, so `SALES_DIGEST_ENABLED=false` also silences it. |
+| `TRACKER_REMINDER_DAYS` | `mon,fri` | Which days carry it. `mon`..`sun` or `0`–`6`, comma separated. |
+| `TODO_REFRESH_DAY` | `fri` | Which day's digest refreshes the to-do sheet and carries its one line. |
+| `STRATEGY_CHECK_ENABLED` | `true` | The weekly `AGAINST THE PLAN` block, on `WEEKLY_DIGEST_WEEKDAY`. A report, never an item — it can't make the digest post. |
+
+### Seeing tomorrow's digest before it goes out
+
+```
+python -m main --dry-run-digest              # today
+python -m main --dry-run-digest 2026-09-07   # a Monday
+```
+
+Builds the whole message for that day and prints it. It connects to nothing,
+**sends nothing, creates nothing and ages nothing** — no Discord message, no
+carry-forward ageing (so tomorrow's real digest isn't a day older than it should
+be), no sheet created, no to-do row appended. This is how you check that the
+Monday reminder really is a section of one message rather than a second message,
+without waiting for a Monday.
+
+The one side effect it cannot avoid is the cadence's next-step clock, which
+counts days *observed* — the startup dry run already advances it for the same
+reason.
+
+---
+
+## Citing meetings
+
+> **Whenever meeting knowledge shapes a line — a hold, a decision, a commitment —
+> the line names its source.**
+>
+> `"…on hold (Sales Bot Discussion, 2 Sep)"`
+
+This applies everywhere: digest items, cadence chases, the tracker reminder, prep
+briefs, the to-do sheet's **Source meeting** column, and answers to questions.
+**A meeting-derived claim with no meeting citation is a bug**, not a style lapse,
+and there is no setting that turns it off.
+
+**Why it is a bug.** A sheet-derived line can be argued with by opening the sheet
+— the bot already names the cell it read. A meeting-derived line has no such
+handle: *"we're holding off on Acme"* is either something somebody actually
+decided in a room, or something the bot inferred, and from the outside those two
+are identical. The citation is what makes the difference visible.
+
+`meetings.py` owns it. `meetings.cite(text, note)` writes the string, and it is
+computed once and handed to every renderer (and to the model, in a `citation`
+field on every notes tool result) rather than reconstructed at each call site —
+which is how a line ends up uncited when one caller forgets.
+
+### What is extracted
+
+Only through `notes.list_notes` / `notes.read_note`, so a document the standup
+exclusion holds back can never reach a digest line.
+
+| Kind | From | What it changes |
+|---|---|---|
+| **hold** | a line saying work on a named company is paused, parked, deprioritised or not to be chased | the cadence line for that company gains *"— on hold (…)"*, and a prep brief for it opens with the hold |
+| **decision** | the note's own *Decisions* section, verbatim | quotable in answers, and in the tracker reminder when it is about the tracker |
+| **commitment** | the note's *Next steps* block | becomes a row on the to-do sheet |
+
+**Nothing is summarised by a model.** Every fact is a line the team wrote,
+carried through unchanged apart from clipping. A citation attached to a
+paraphrase is worse than no citation: it lends a model's wording the authority of
+a minute.
+
+### A held company is still shown
+
+Suppressing it would be the bot deciding a meeting outranks the pipeline, and the
+row's owner would never learn why the row vanished. So the row stays, and the
+line says what the meeting said and names it:
+
+```
+• OpenAI · Abhishek Garg (Product Manager) — last followed up 144d ago, still no
+  response. Follow up or park it. — on hold (Sales Bot Discussion, 2 Sep)
+```
+
+### Two guards against a fabricated hold
+
+**Companies come from the tracker.** A fact attaches to a company only when that
+company's name — read off the outreach tracker, never invented — appears in the
+line. The bot cannot announce a hold on a company that is not in the pipeline, or
+mistake a person's surname for an account. Longest name wins, so *"Acme Research
+Labs"* beats *"Acme"* on a line naming both.
+
+**Negation kills a hold.** *"Anthropic stays active and is not paused"* contains
+the word *paused* and means the opposite. Without the guard the bot would
+annotate every Anthropic line with a hold the meeting explicitly ruled out —
+worse than missing a real one, because it puts a fabricated decision in brackets
+next to a genuine citation and lends it that citation's authority. Both
+directions are checked: a negator in front of the phrase (*not*, *no longer*,
+*nothing*, …) and an un-hold verb anywhere in the line (*resumed*, *off hold*,
+*re-activated*, …).
+
+---
+
+## The to-do sheet
+
+One Google Sheet — **Membrane Sales To-Dos** — created by the bot on first run,
+shared with the team, and appended to weekly from the meeting notes.
+
+| # | To-do | Owner | Source meeting | Date raised | Due | Status | Notes |
+|---|---|---|---|---|---|---|---|
+| 1 | Send the revised deck to Comet by Friday. | Vaishnavi | Sales Bot Discussion, 2 Sep | 2026-09-02 | 2026-09-04 | Open | |
+| 2 | Confirm the pricing page copy by 12 Sep. | Kushal | Sales Bot Discussion, 2 Sep | 2026-09-02 | 2026-09-12 | Open | |
+
+**The contract is asymmetric, and that is the point:**
+
+* **the bot** appends action items it read out of the meeting notes;
+* **humans** own Status and Notes entirely — the bot never writes to them, never
+  edits a row and never deletes one.
+
+Every write is a Sheets `append` (`drive.sheet_append`), so it is append-only *by
+construction* rather than by convention: a write that could land on an occupied
+row would silently discard somebody's edit.
+
+### Sharing is the feature, not a nicety
+
+A spreadsheet the service account creates is **owned by the service account** and
+lives in a Drive no human can browse or search. **Until it is shared it is
+invisible** — not "hard to find", invisible. So:
+
+* creation and sharing are one operation (`todos.ensure`);
+* share failures are reported **per address**, because "sharing failed" is not
+  actionable and *"vaishnavi@… bounced: no such Google account"* is;
+* the link is **posted in the sales channel** — as a section of the daily digest,
+  so it is still one message a day;
+* `todo_sheet` is a **source**, and its status line reports who can actually open
+  the file rather than whether the API call worked.
+
+`TEAM_SHARE_EMAILS` defaults to `trishi@nfthing.com`,
+`vaishnavi@membrane.social`, `claudedrive@nfthing.com`, as **Editor**.
+
+### The link is announced once, and the marker is persisted
+
+The sheet is created at boot; the link goes out with the next digest, which may
+be hours later and on the far side of a restart. Keying the announcement on *"did
+I just create it"* would lose the link exactly when the bot was restarted between
+the two — so `todo_sheet_announced` is stored in the `meta` table and the
+announcement is spent as a **digest effect**, after the message actually posted.
+A refused send leaves the link still to be announced tomorrow rather than
+silently never.
+
+The spreadsheet **id** is stored the same way (`todo_sheet_id`), written *before*
+the share and the header row, so a failure in either leaves the next run
+re-opening that sheet rather than creating a second one. `TODO_SHEET_ID`
+overrides it, which is how you point the bot at a sheet somebody made by hand.
+
+### The weekly refresh
+
+On `TODO_REFRESH_DAY` (**Friday** by default), `meetings.action_items` reads the
+last `TODO_NOTES_DAYS` of notes, each item carrying its owner, its **source
+meeting** (the citation, as a column) and a **due date only if the line actually
+states one** — *"by Friday"* resolves against the day it was raised, not against
+today, so a to-do extracted a week late does not silently acquire a new deadline.
+
+New items are deduped against **the rows in the sheet**, not against a bot-side
+memory — that would drift the first time somebody deleted a row, and the item
+would then never come back. The key is normalised task text plus owner: task
+alone would merge *"[Vaishnavi] send the deck"* and *"[Kushal] send the deck"*,
+which are two jobs.
+
+That day's digest carries **one line**:
+
+```
+**TO-DO SHEET**
+To-do sheet updated: +3 new · https://docs.google.com/spreadsheets/d/…/edit
+```
+
+Every append writes a `todo_appended` line to `state/audit.jsonl` naming the
+task, the owner, the source meeting and the note it came from, plus one
+`todo_refresh` summary — so a row in the sheet can always be traced back to the
+meeting that produced it.
+
+### Asking for it
+
+*"@bot show the to-dos"* always replies with **the link and the open items**,
+both, every time. The link alone is a shrug; the items alone leave the asker
+unable to edit anything, and editing is the whole point of a sheet the humans
+own. `todo_candidates` answers *"what came out of this week's meetings"* and is
+**read-only** — asking what would go on the sheet must never trigger a write.
+
+### It needs the Drive API enabled
+
+Creating the sheet requires the **Google Drive API** to be enabled on the service
+account's Cloud project — a one-time click in the console. Until it is, Google
+answers with a bare `403 The caller does not have permission`, which reads as a
+key, scope or sharing problem and is none of those. The bot creates the file
+through the **Drive** endpoint rather than Sheets' own `spreadsheets.create`
+precisely so the error carries Google's real message, and translates it into the
+console URL that fixes it.
+
+---
+
+## The strategy doc
+
+No longer a stub. `STRATEGY_DOC_ID` points at the **human-owned** strategy
+document — Vaishnavi's edited version of the v2 draft — and the bot reads it
+**read-only** over the Drive API (`drive.readonly`; there is no code path in
+`drive.py` that writes to a file the bot did not create).
+
+Three things run against it:
+
+| | What | Where it shows |
+|---|---|---|
+| **cadence** | a cadence *stated in the doc* outranks the working-day defaults | every deadline announcement: *"4 working day(s) after the last touch, **per the strategy doc**"* |
+| **currency** | Drive's `modifiedTime` against `STRATEGY_STALE_DAYS` | the weekly `AGAINST THE PLAN` block, the source status (which goes **degraded**), and before any answer that quotes the plan |
+| **outreach vs plan** | the targets it names, against where outreach went | the weekly `AGAINST THE PLAN` block, and the `outreach_vs_plan` tool |
+
+### How the targets are read, and the limits of it
+
+The doc is prose written by a human, not a schema, so the extraction is
+deliberately conservative. It takes the lines under a heading that says
+**TARGET / ICP / SEGMENT / VERTICAL / PRIORITY**, and nothing else. Where the
+section *ends* is the part that has to be right, because the next heading is
+often a bare word on its own line that no heading regex catches — so the shape of
+the list is the boundary:
+
+* a **bulleted** list ends at the first non-bullet line;
+* an **unbulleted** list ends at the first blank line.
+
+Both fail closed: an early stop loses a target and the check simply says less; a
+late stop would turn the *next section's title* into a target and then report
+*"the plan names Cadence and nothing went to it"* — a finding about the parser
+dressed up as a finding about the team.
+
+**If the doc has no such heading, the bot says so** rather than guessing at a plan
+from the whole text and reporting drift against its own guess. A wrong plan check
+is worse than none: it sends the team to defend outreach against a target nobody
+set.
+
+### Both directions, with counts
+
+```
+**AGAINST THE PLAN**
+Strategy last revised 2026-08-12 (21 days ago), past the 30-day rule. Outreach is
+being checked against a plan nobody has touched since then.
+Checked 885 row(s) touched 2025-07-29 to 2026-09-02 against 4 target(s) in the plan.
+OFF-PLAN — outreach went to segment(s) the plan does not name: Founder / C-Suite
+(244); Marketing & Growth (211); AI Labs - Frontier (138).
+IN THE PLAN, NOTHING SENT — no outreach in this window matched: Quantum Computing.
+```
+
+Neither direction is an accusation — a plan can be out of date and the pipeline
+right. Both are stated as the comparison they are, with the row counts behind
+them, matched on the row's **own cells** (industry, vertical, use case) and never
+on an inference about what a company "is".
+
+**Zero outreach is reported as zero outreach.** On a week where nothing dated
+went out at all, listing every target as neglected would read as a targeting
+failure when it is a volume one, so the block says exactly that instead.
 
 ---
 
@@ -1315,7 +1657,7 @@ else varies by event type.
 | `startup` | the bot connected and rewrote its summary |
 | `sheet_access_check` | startup probe of both GTM spreadsheets |
 | `message_sent` | something was posted. Only three `kind`s exist now: `daily_digest` (the one proactive message, with `part` / `parts` when it was split), `reply` (an answer to a question) and `deadline` (the ask-time announcement). |
-| `daily_digest` | **the digest went out** — with `items` and a per-section count (`n_hot`, `n_deadlines`, `n_overdue`, `n_escalations`, `n_funnel`, `n_hygiene`) |
+| `daily_digest` | **the digest went out** — with `items` and a per-section count (`n_hot`, `n_deadlines`, `n_overdue`, `n_escalations`, `n_funnel`, `n_hygiene`, `n_tracker_reminder`, `n_todos`, `n_plan`) |
 | `send_refused` | **a guardrail blocked a send** — a DM attempt, or a channel outside the scope |
 | `send_failed` | Discord rejected an otherwise-allowed send |
 | `chase_opened` | a commitment was detected and is now tracked |
@@ -1327,6 +1669,11 @@ else varies by event type.
 | `sheet_write` | **every cell write**, with the cell, the value and whether it succeeded |
 | `deadline_chase` | an overdue deadline appeared in the digest's OVERDUE section |
 | `deadline_escalated` | the cap was spent; it moved to ESCALATIONS |
+| `todo_sheet_created` | the to-do sheet did not exist and was created — with its id and url |
+| `todo_sheet_shared` | who it was shared with, and **which addresses failed** |
+| `todo_sheet_announced` | its link went out with the daily digest (spent once, after the send) |
+| `todo_appended` | **one line per row appended** — the task, the owner, the `source_meeting` citation, the date raised, the due date and the note file it came from |
+| `todo_refresh` | the weekly refresh summary: `considered`, `added`, `skipped` |
 
 Retired with the individual sends they recorded: `deadline_reminder`,
 `deadline_escalation`, `row_flag`, `weekly_digest`. Old lines with those events
@@ -1341,16 +1688,20 @@ guardrails forbid.
 
 | File | Role |
 |---|---|
-| `main.py` | entry point; validates env, logs scope and source statuses, connects |
+| `main.py` | entry point; validates env, logs scope and source statuses, connects. `--dry-run-digest [YYYY-MM-DD]` prints a day's digest and sends nothing |
 | `bot.py` | the Discord client: routing, question answering, chasing, and the one daily digest — its only proactive send |
 | `digest.py` | the daily digest: sections, per-owner grouping, carry-forward ages, rendering |
 | `cadence.py` | **the ten phase-1 rules (a–j)**, exclusion, the missing-data routing, the master/tracker cross-check, the sheet-health flags, priority, the two caps, and the dry run. Pure: rows in, dicts out — no sheet reads, no writes, no Discord |
-| `prep.py` | the meeting-prep brief: tracker row + mapping (with caveats) + positioning + notes, and the explicit "no web access" section |
+| `prep.py` | the meeting-prep brief: tracker row + mapping (with caveats) + positioning + **cited** notes, an opening hold line when a meeting parked the account, and the explicit "no web access" section |
+| `meetings.py` | **the meeting knowledge layer and the citation rule**: holds, decisions and commitments read out of the notes, each carrying `"<meeting>, <date>"`. Pure and send-free |
+| `todos.py` | **Membrane Sales To-Dos**: create, share, header, weekly extract + dedup + append, the digest's one line, and the "show the to-dos" answer. Append-only; no Discord |
+| `strategy.py` | the strategy doc: read-only Drive reader, currency (stale-doc) and the outreach-vs-plan check |
+| `drive.py` | the **second** Google credential — Drive + Docs + the Sheets REST calls for the bot's own sheet. Wider scopes live here so `gtm_sheet.py` keeps its narrow one |
 | `guardrails.py` | **the hard rules** — every send and every read passes through here |
 | `config.py` | environment → typed settings, with loud warnings for likely mistakes |
 | `persona.py` | the voice, plus loading `sales_policy.md` fresh on every question |
 | `sales_policy.md` | the operating policy — the eleven principles |
-| `sources.py` | the four sources and their connected / degraded / awaiting-access status |
+| `sources.py` | the five sources and their connected / degraded / awaiting-access status |
 | `gtm_sheet.py` | the Sheets API layer: auth, schema discovery, cached reads, the narrow write path |
 | `mapping_sheet.py` | the researcher/buyer mapping — **read-only**: no write method, read-only scope, and the legend loaded as enforced rules |
 | `tracker.py` | the tracker read as a pipeline: the three flags, the playbook's six-stage funnel definition, and the week's leading/lagging metrics |
@@ -1360,7 +1711,7 @@ guardrails forbid.
 | `query_engine.py` | the bounded tool-use loop; holds no tools of its own |
 | `llm.py` | the short model calls: routing, replies, commitment detection |
 | `followups.py` | commitment prefilter, due-time maths, fallback nudge text |
-| `db.py` | SQLite: `chases`, `nudges`, `deadlines`, `flags_sent`, `digest_items` (carry-forward ages), `nextstep_state` (rule (i)'s clock), `prep_briefs` (one brief per meeting), `meta` (the once-a-day digest marker) |
+| `db.py` | SQLite: `chases`, `nudges`, `deadlines`, `flags_sent`, `digest_items` (carry-forward ages), `nextstep_state` (rule (i)'s clock), `prep_briefs` (one brief per meeting), `meta` (the once-a-day digest marker, the to-do sheet's id and its announcement marker) |
 | `memory.py` | short-term per-channel conversation memory (in-memory only) |
 | `state.py` | writes the state contract above |
 | `ecosystem.config.js` | PM2 process definition (`sales-bot`) |

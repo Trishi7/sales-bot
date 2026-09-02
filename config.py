@@ -61,6 +61,68 @@ def _lower_str_set(name: str, default: str = "") -> set[str]:
     return {x.lower() for x in _str_list(name, default)}
 
 
+# Weekday names as a human writes them. Used by every "which day does X happen"
+# setting, so "fri", "Friday" and "FRI" are the same day everywhere and there is
+# exactly one parser to be wrong.
+_WEEKDAY_NAMES = {
+    "mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1,
+    "wed": 2, "weds": 2, "wednesday": 2, "thu": 3, "thur": 3, "thurs": 3,
+    "thursday": 3, "fri": 4, "friday": 4, "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+
+
+def _weekday(name: str, default: str) -> int:
+    """One weekday name (or a bare 0-6) → Python's weekday index, 0=Monday.
+
+    An unreadable value falls back to the default WITH a warning rather than to
+    "never fires", which is the failure nobody notices: a reminder that silently
+    stopped looks exactly like a week with nothing to remind about.
+    """
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        raw = default.strip().lower()
+    if raw.isdigit() and 0 <= int(raw) <= 6:
+        return int(raw)
+    if raw in _WEEKDAY_NAMES:
+        return _WEEKDAY_NAMES[raw]
+    log.warning(
+        "%s=%r is not a weekday (mon..sun or 0-6); using %s instead", name, raw, default
+    )
+    return _WEEKDAY_NAMES.get(default.strip().lower(), 4)
+
+
+def _weekdays(name: str, default: str) -> set[int]:
+    """A comma-separated list of weekday names → a set of weekday indices.
+
+    Unreadable tokens are SKIPPED with a warning rather than taking the whole
+    list down: "mon,fri" with a typo in one of them should still fire on the
+    other.
+    """
+    def parse(text: str, *, complain: bool) -> set[int]:
+        found: set[int] = set()
+        for tok in (text or "").replace(";", ",").split(","):
+            t = tok.strip().lower()
+            if not t:
+                continue
+            if t.isdigit() and 0 <= int(t) <= 6:
+                found.add(int(t))
+            elif t in _WEEKDAY_NAMES:
+                found.add(_WEEKDAY_NAMES[t])
+            elif complain:
+                log.warning("%s contains %r, which is not a weekday; skipping it", name, tok)
+        return found
+
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return parse(default, complain=False)
+    out = parse(raw, complain=True)
+    if not out:
+        log.warning("%s=%r named no usable weekday; using %s instead", name, raw, default)
+        return parse(default, complain=False)
+    return out
+
+
 _TRUE = {"true", "1", "yes", "on"}
 _FALSE = {"false", "0", "no", "off"}
 
@@ -292,12 +354,108 @@ NOTES_EXCLUDE_TITLE_PATTERNS = _str_list("NOTES_EXCLUDE_TITLE_PATTERNS", "AM syn
 # through the Sheets API. Its settings live in the GTM SPREADSHEET section below
 # (GOOGLE_SERVICE_ACCOUNT_JSON, GTM_SHEET_*_ID, SHEET_WRITE_TARGET).
 #
-# The strategy doc IS still a stub — setting these records the intended location
-# so the status line can say what we're waiting on, but nothing reads it yet.
-# That gap is load-bearing: the deadline cadence prefers this document and only
-# falls back to the working-day defaults because it can't be read.
+# -- The strategy doc (WIRED UP — strategy.py, read-only over Drive) ----------
+# STRATEGY_DOC_ID points at the HUMAN-OWNED strategy document — Vaishnavi's
+# edited version of the v2 draft, once it is in Drive. The knowledge layer reads
+# it, and BOTH enforcements run against it:
+#   - stale-doc: Drive's modifiedTime against STRATEGY_STALE_DAYS;
+#   - outreach-vs-plan: the targets it names against where outreach went.
+# It is also what `deadlines.cadence_from_strategy` reads, so a cadence stated
+# in the doc now outranks the working-day defaults below.
+#
+# The bot has READ-ONLY access to it and no code path that could write to it —
+# see drive.py's scope list. STRATEGY_DOC_FILE is the local-copy fallback.
 STRATEGY_DOC_ID = (os.getenv("STRATEGY_DOC_ID", "") or "").strip()
 STRATEGY_DOC_FILE = (os.getenv("STRATEGY_DOC_FILE", "") or "").strip()
+
+# Past this many CALENDAR days without a revision, the plan is reported stale.
+# Calendar, not working, days: a plan going stale over a long weekend is still
+# going stale. 0 turns the currency rule off (the date is still reported).
+STRATEGY_STALE_DAYS = _int("STRATEGY_STALE_DAYS", 30)
+
+# How long a read of the doc is cached. A failed read is cached for the same
+# interval, so a doc nobody has shared yet doesn't cost every question a round
+# trip to a 403.
+STRATEGY_CACHE_MINUTES = _int("STRATEGY_CACHE_MINUTES", 30)
+
+# The outreach-vs-plan check: master switch, and the two bounds that keep a
+# verbose plan from producing a verbose digest section.
+STRATEGY_CHECK_ENABLED = _bool("STRATEGY_CHECK_ENABLED", default=True)
+STRATEGY_MAX_TARGETS = _int("STRATEGY_MAX_TARGETS", 40)
+STRATEGY_MAX_FINDINGS = _int("STRATEGY_MAX_FINDINGS", 6)
+
+# Hard timeout for one Drive/Docs/Sheets REST call (drive.py).
+DRIVE_TIMEOUT_SECONDS = _int("DRIVE_TIMEOUT_SECONDS", 30)
+
+# -- MEETING CITATIONS (meetings.py) ------------------------------------------
+# THE RULE: whenever meeting knowledge shapes a line — a hold, a decision, a
+# commitment — the line names its source: "…on hold (Sales Bot Discussion,
+# 2 Sep)". It applies to digest items, cadence chases, the tracker reminder,
+# prep briefs and answers alike, and it is NOT a knob: there is no setting that
+# turns citations off, because a meeting-derived claim with no citation is a bug.
+#
+# These two only bound how far back the knowledge layer looks and how many notes
+# it opens per pass — a folder of 300 documents must not be re-parsed in full on
+# every digest section.
+MEETING_FACTS_DAYS = _int("MEETING_FACTS_DAYS", 45)
+MEETING_FACTS_MAX_NOTES = _int("MEETING_FACTS_MAX_NOTES", 40)
+
+# -- THE TO-DO SHEET (todos.py) -----------------------------------------------
+# ONE Google Sheet, created by the bot on first run, SHARED with the team, and
+# appended to weekly from the meeting notes. Humans own Status and Notes; the
+# bot never edits or deletes a row.
+
+TODO_SHEET_ENABLED = _bool("TODO_SHEET_ENABLED", default=True)
+
+# The sheet's title, and its id. The id is normally EMPTY: the bot creates the
+# sheet on first run and remembers the id in its own config store (the `meta`
+# table in the SQLite file), so a restart re-opens the same sheet. Set this only
+# to point the bot at a sheet somebody made by hand — it overrides the store.
+TODO_SHEET_TITLE = (
+    os.getenv("TODO_SHEET_TITLE", "") or ""
+).strip() or "Membrane Sales To-Dos"
+TODO_SHEET_ID = (os.getenv("TODO_SHEET_ID", "") or "").strip()
+
+# WHO THE SHEET IS SHARED WITH, as Editor. CRITICAL: a spreadsheet created by a
+# service account is owned by that service account and lives in a Drive no human
+# can browse — until it is shared it is invisible, not merely hard to find.
+TEAM_SHARE_EMAILS = _str_list(
+    "TEAM_SHARE_EMAILS",
+    "trishi@nfthing.com,vaishnavi@membrane.social,claudedrive@nfthing.com",
+)
+# Send Google's own "X shared a file with you" email on top of the channel post.
+# Off by default: the link is posted in the sales channel, and an email to every
+# address on every redeploy is noise that post already covers.
+TODO_SHARE_NOTIFY = _bool("TODO_SHARE_NOTIFY", default=False)
+
+# Which day's digest carries the weekly refresh. mon..sun or 0-6.
+TODO_REFRESH_DAY = (os.getenv("TODO_REFRESH_DAY", "") or "").strip() or "fri"
+# How far back the refresh reads meeting notes for action items.
+TODO_NOTES_DAYS = _int("TODO_NOTES_DAYS", 7)
+# Bounds: how many new rows one refresh may append, and how many open items the
+# "show the to-dos" answer prints before it stops and gives the link.
+TODO_MAX_NEW_PER_REFRESH = _int("TODO_MAX_NEW_PER_REFRESH", 25)
+TODO_SHOW_MAX = _int("TODO_SHOW_MAX", 20)
+
+
+def todo_refresh_weekday() -> int:
+    """TODO_REFRESH_DAY as Python's weekday index (0=Monday)."""
+    return _weekday("TODO_REFRESH_DAY", "fri")
+
+
+# -- THE TRACKER REMINDER (a SECTION of the digest, never its own message) -----
+# Vaishnavi's twice-weekly "update the tracker" prompt. It is a SECTION INSIDE
+# that day's daily digest — there is no separate send path for it and there must
+# never be one; see the one-message rule in digest.py.
+TRACKER_REMINDER_ENABLED = _bool("TRACKER_REMINDER_ENABLED", default=True)
+TRACKER_REMINDER_DAYS = (
+    os.getenv("TRACKER_REMINDER_DAYS", "") or ""
+).strip() or "mon,fri"
+
+
+def tracker_reminder_weekdays() -> set:
+    """The weekdays whose digest carries the tracker reminder section."""
+    return _weekdays("TRACKER_REMINDER_DAYS", "mon,fri")
 
 # -- Query behaviour ----------------------------------------------------------
 
@@ -1109,6 +1267,69 @@ def validate() -> list[str]:
             "WEEKLY_DIGEST_WEEKDAY=%s is outside 0–6 (0=Monday); it will be clamped to "
             "Friday. It now selects which day's DAILY digest carries the funnel block.",
             WEEKLY_DIGEST_WEEKDAY,
+        )
+
+    # -- the tracker reminder ----------------------------------------------
+    # It is a SECTION of the digest, so it cannot fire on a day the digest
+    # doesn't. Saying so here is the difference between "the reminder is broken"
+    # and "the digest is off".
+    if TRACKER_REMINDER_ENABLED:
+        days = sorted(tracker_reminder_weekdays())
+        names = ", ".join(
+            ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[d] for d in days
+        ) or "(no day)"
+        if not days:
+            log.warning(
+                "TRACKER_REMINDER_DAYS=%r resolved to no weekday — the tracker reminder "
+                "will never appear.", TRACKER_REMINDER_DAYS,
+            )
+        elif not SALES_DIGEST_ENABLED:
+            log.warning(
+                "TRACKER_REMINDER_ENABLED is on (%s) but SALES_DIGEST_ENABLED is off. The "
+                "reminder is a SECTION of the daily digest and has no send path of its "
+                "own, so it will never go out.", names,
+            )
+        else:
+            log.info("Tracker reminder: a section of the %s digest.", names)
+
+    # -- the to-do sheet ---------------------------------------------------
+    if TODO_SHEET_ENABLED:
+        if not GOOGLE_SERVICE_ACCOUNT_JSON:
+            log.warning(
+                "TODO_SHEET_ENABLED is on but GOOGLE_SERVICE_ACCOUNT_JSON is unset — the "
+                "bot cannot create or read the to-do sheet without the service account."
+            )
+        if not TEAM_SHARE_EMAILS:
+            log.warning(
+                "TEAM_SHARE_EMAILS is empty. A spreadsheet the service account creates is "
+                "INVISIBLE to every human until it is shared, so the to-do sheet would "
+                "exist and nobody could open it. Set the team's addresses."
+            )
+        else:
+            log.info(
+                "To-do sheet %r: shared as Editor with %s; refreshed from the meeting "
+                "notes on %s.",
+                TODO_SHEET_TITLE, ", ".join(TEAM_SHARE_EMAILS), TODO_REFRESH_DAY,
+            )
+        if TODO_SHEET_ID:
+            log.info(
+                "TODO_SHEET_ID is set, so the bot will use that sheet and never create "
+                "one of its own."
+            )
+
+    # -- the strategy doc --------------------------------------------------
+    if not (STRATEGY_DOC_ID or STRATEGY_DOC_FILE):
+        log.warning(
+            "Neither STRATEGY_DOC_ID nor STRATEGY_DOC_FILE is set — the bot cannot check "
+            "outreach against the plan, cannot tell you how current the plan is, and "
+            "every deadline falls back to the working-day defaults instead of the "
+            "cadence the strategy doc states."
+        )
+    elif STRATEGY_DOC_ID and not GOOGLE_SERVICE_ACCOUNT_JSON:
+        log.warning(
+            "STRATEGY_DOC_ID is set but GOOGLE_SERVICE_ACCOUNT_JSON is not — the doc is "
+            "read over the Drive API with the service account, so it will stay "
+            "unreadable."
         )
 
     return missing

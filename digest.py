@@ -69,6 +69,32 @@ WHAT IS IN IT, hot first, because the order is the priority:
                  Reference material, not a task — which is why it sits at the
                  bottom and does not count towards "is there anything to post".
 
+    TRACKER      THE TWICE-WEEKLY REMINDER, on TRACKER_REMINDER_DAYS (Mon and
+    REMINDER     Fri by default). A SECTION, never a message. It sits next to
+                 UPDATE TRACKER because they are the same subject at two
+                 altitudes — that section names the rows with gaps, this one is
+                 the standing ask — and merging them into one message is the
+                 whole point: two prompts about the tracker, minutes apart, is
+                 how a channel gets muted.
+
+    TO-DO SHEET  One line. On first run, the "I created it, here is the link,
+                 here is who can open it" announcement; on TODO_REFRESH_DAY,
+                 "To-do sheet updated: +N new · <link>". Everything else about
+                 that sheet happens in Google, not in Discord.
+
+    AGAINST      On the weekly day: how current the strategy doc is, and where
+    THE PLAN     outreach and the plan disagree in both directions (a segment
+                 worked that the plan doesn't name; a target the plan names that
+                 nothing went to). A report, not a task — so it never makes the
+                 digest post on its own.
+
+EVERY MEETING-DERIVED LINE CITES ITS MEETING. When a hold, a decision or a
+commitment out of the meeting notes shapes a line anywhere in this digest, the
+line names the meeting and its date — "…on hold (Sales Bot Discussion, 2 Sep)".
+`meetings.cite` is the one function that writes that string, and the rule is not
+optional: a sheet-derived claim can be checked by opening the sheet, and a
+meeting-derived claim with no citation cannot be checked at all. See meetings.py.
+
 CARRY-FORWARD, AND WHY THERE IS NO "RESOLVED" LINE. An unresolved item simply
 appears again tomorrow, with its age ("3rd day"). An item that got resolved
 during the day simply isn't in tomorrow's digest. Announcing resolutions would
@@ -114,12 +140,41 @@ SECTION_CADENCE_MEETINGS = "cadence_meetings"
 SECTION_CADENCE_UPDATES = "cadence_updates"
 SECTION_CADENCE_ASSETS = "cadence_assets"
 
+# THE TWICE-WEEKLY TRACKER REMINDER — Vaishnavi's Mon/Fri "update the tracker"
+# prompt, and the clearest possible statement of the one-message rule: it is a
+# SECTION OF THIS DIGEST on TRACKER_REMINDER_DAYS. It has no send path of its
+# own, it cannot post on a day the digest doesn't, and there is nowhere in the
+# codebase it could be made to. A reminder that posted separately would be the
+# second unprompted message of the day, which is exactly the thing this file
+# exists to prevent — and it would land minutes from a digest that already asked
+# for tracker updates in its own UPDATE TRACKER section.
+#
+# It sits immediately after UPDATE TRACKER because they are the same subject
+# read at two altitudes: that section lists the specific rows with gaps, this one
+# is the standing twice-weekly ask.
+SECTION_TRACKER_REMINDER = "tracker_reminder"
+
+# THE TO-DO SHEET — the first-run "here is the link" announcement, and the one
+# line the weekly refresh carries. Also a section rather than a post: the sheet's
+# link is worth exactly one line in a message the team already reads.
+SECTION_TODOS = "todos"
+
+# OUTREACH AGAINST THE PLAN, and how current the plan is (strategy.py). A weekly
+# block, on the same day as the funnel, because plan drift is a weekly question
+# and a daily line about it would be a daily line nobody reads.
+SECTION_PLAN = "plan"
+
 # The prep briefs, and the one line that makes the cadence cap honest. Neither
 # is an "item": a brief is reference material for a meeting already counted in
 # CADENCE_MEETINGS, and the overflow line is a footnote about what was cut.
 SECTION_PREP = "prep_briefs"
 SECTION_CADENCE_OVERFLOW = "cadence_overflow"
 
+# The five sections cadence.py produces. Kept distinct from
+# OWNER_GROUPED_SECTIONS below, which is a RENDERING rule and now also covers the
+# tracker reminder: "which sections come from the cadence" and "which sections
+# group per owner" happen to overlap, and conflating them is how a later section
+# gets the wrong one.
 CADENCE_SECTIONS = (
     SECTION_CADENCE_FOLLOWUPS,
     SECTION_CADENCE_INTROS,
@@ -134,12 +189,15 @@ SECTION_ORDER = (
     SECTION_CADENCE_INTROS,
     SECTION_CADENCE_MEETINGS,
     SECTION_CADENCE_UPDATES,
+    SECTION_TRACKER_REMINDER,
     SECTION_CADENCE_ASSETS,
     SECTION_CADENCE_OVERFLOW,
     SECTION_DEADLINES,
     SECTION_OVERDUE,
     SECTION_ESCALATIONS,
+    SECTION_TODOS,
     SECTION_FUNNEL,
+    SECTION_PLAN,
     SECTION_HYGIENE,
     SECTION_PREP,
 )
@@ -150,11 +208,14 @@ SECTION_TITLES = {
     SECTION_CADENCE_INTROS: "INTROS to be done this week",
     SECTION_CADENCE_MEETINGS: "MEETINGS for this week",
     SECTION_CADENCE_UPDATES: "UPDATE TRACKER",
+    SECTION_TRACKER_REMINDER: "UPDATE THE TRACKER — the twice-weekly check",
     SECTION_CADENCE_ASSETS: "ASSETS to be shared this week",
     SECTION_DEADLINES: "DEADLINES — due today or tomorrow",
     SECTION_OVERDUE: "OVERDUE",
     SECTION_ESCALATIONS: "ESCALATIONS — asked enough, needs a decision",
+    SECTION_TODOS: "TO-DO SHEET",
     SECTION_FUNNEL: "WEEKLY FUNNEL",
+    SECTION_PLAN: "AGAINST THE PLAN",
     SECTION_HYGIENE: "HYGIENE — stalled and dead-deal rows",
     # Deliberately untitled: every brief opens with its own
     # "MEETING PREP — <company> / <PoC> — <date>" header, and a section heading
@@ -180,9 +241,36 @@ ITEM_SECTIONS = (
     SECTION_HYGIENE,
 )
 
+# THE OTHER WAY A DIGEST GETS POSTED. Two things are worth a message on a day
+# with no outstanding work — the twice-weekly tracker reminder, and the one-time
+# "here is the to-do sheet" link — but neither belongs in ITEM_SECTIONS, because
+# that tuple also drives CARRY-FORWARD AGEING and "(3rd day)" on a standing
+# Monday reminder would be nonsense. So an item may instead carry
+#     {"forces_digest": True}
+# which makes `total_items` count it without ageing it. Use it sparingly: every
+# one of these is a day the digest posts with no work in it, and a digest that
+# posts for its own bookkeeping is the drip this file exists to stop.
+FORCE_FLAG = "forces_digest"
+
 # Sections rendered as free-form blocks rather than as owner-addressed bullets:
 # their "text" is already the finished thing.
-BLOCK_SECTIONS = (SECTION_FUNNEL, SECTION_PREP, SECTION_CADENCE_OVERFLOW)
+BLOCK_SECTIONS = (
+    SECTION_FUNNEL, SECTION_PREP, SECTION_CADENCE_OVERFLOW,
+    SECTION_TODOS, SECTION_PLAN,
+)
+
+# Sections grouped per owner with ONE @mention each — the anti-nag rule. The
+# tracker reminder joins the cadence sections here because it is addressed to
+# whoever keeps the tracker, and two mentions of the same person in one message
+# is one too many.
+OWNER_GROUPED_SECTIONS = (
+    SECTION_CADENCE_FOLLOWUPS,
+    SECTION_CADENCE_INTROS,
+    SECTION_CADENCE_MEETINGS,
+    SECTION_CADENCE_UPDATES,
+    SECTION_TRACKER_REMINDER,
+    SECTION_CADENCE_ASSETS,
+)
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2})\s*[:.\s]\s*(\d{1,2})\s*$")
 
@@ -321,7 +409,7 @@ def render(
         lines.append("")
         lines.append(f"**{SECTION_TITLES.get(key, key.upper())} ({len(items)})**")
 
-        if key in CADENCE_SECTIONS:
+        if key in OWNER_GROUPED_SECTIONS:
             # Grouped per owner, ONE @mention each — the same anti-nag rule as
             # OVERDUE — but one bullet per item rather than a joined run-on.
             # A cadence line is a whole sentence ("met 7d ago, no assets shared
@@ -370,8 +458,21 @@ def counts(sections: dict[str, list[dict]]) -> dict[str, int]:
 
 def total_items(sections: dict[str, list[dict]]) -> int:
     """How many ACTIONABLE items the digest holds. Zero means no digest today —
-    the funnel block on its own is not a reason to post."""
-    return sum(len(sections.get(key) or []) for key in ITEM_SECTIONS)
+    the funnel block on its own is not a reason to post.
+
+    Counts ITEM_SECTIONS, plus anything anywhere flagged `forces_digest` (the
+    tracker reminder and the one-time to-do link — see FORCE_FLAG). Those are
+    counted but never aged, which is why they are a flag rather than a section.
+    """
+    total = sum(len(sections.get(key) or []) for key in ITEM_SECTIONS)
+    for key in SECTION_ORDER:
+        if key in ITEM_SECTIONS:
+            continue
+        total += sum(
+            1 for item in (sections.get(key) or [])
+            if item.get(FORCE_FLAG) and item.get("text")
+        )
+    return total
 
 
 def clip(items: list[dict], limit: int, *, what: str) -> list[dict]:

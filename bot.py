@@ -59,16 +59,20 @@ import cadence
 import config
 import deadlines as dl
 import digest
+import drive
 import followups
 import gtm_sheet
 import guardrails
 import mapping_sheet
+import meetings
 import notes
 import persona
 import prep
 import query
 import sources
 import state
+import strategy
+import todos
 import tracker
 from db import DB
 from llm import LLM
@@ -175,6 +179,9 @@ class SalesBot(discord.Client):
 
         log.info("[bot.init] opening SQLite DB at %s", config.DB_PATH)
         self.db = DB(config.DB_PATH)
+        # The to-do sheet's id lives in the database, so that source needs a
+        # handle to report its own status honestly.
+        sources.TODO_SHEET.bind(self.db)
         log.info("[bot.init] constructing LLM (model=%s)", config.MODEL)
         self.llm = LLM(config.ANTHROPIC_API_KEY, config.MODEL)
         log.info("[bot.init] constructing QueryEngine (model=%s)", config.MODEL)
@@ -186,6 +193,18 @@ class SalesBot(discord.Client):
         )
         self._sweeper: Optional[asyncio.Task] = None
         self._notes_syncer: Optional[asyncio.Task] = None
+        # The last `todos.ensure()` result: whether the sheet exists, its link,
+        # and which addresses it actually reached. Held so the digest can carry
+        # the link and so "@bot show the to-dos" can explain a failed share
+        # instead of reporting an empty list.
+        self._todo_state: dict = {}
+        # DRY-RUN MODE (`python -m main --dry-run-digest`). When true the digest
+        # can be BUILT but nothing may be written anywhere: no Discord send, no
+        # carry-forward ageing, no sheet created, no row appended. It exists so
+        # "what will Monday's digest look like" can be answered without a
+        # Monday, and it would be worthless if answering the question changed
+        # the thing being asked about.
+        self._dry_run: bool = False
         log.info(
             "[bot.init] %s ready to connect. sales_channels=%s ask_channel=%s roster=%d",
             config.COS_NAME, config.SALES_CHANNEL_IDS, config.SALES_ASK_CHANNEL_ID,
@@ -250,6 +269,19 @@ class SalesBot(discord.Client):
                 "[bot] NOTES_SYNC_CMD is unset — meeting notes are read from %s as-is and "
                 "never refreshed.", config.NOTES_DIR or "(no folder configured)",
             )
+
+        # THE TO-DO SHEET. Created on first run and shared with the team, on a
+        # thread because both are blocking HTTP calls. The LINK is not posted
+        # here: it rides the next daily digest, because this bot sends exactly
+        # one unprompted message a day and a "here is a spreadsheet" post would
+        # be a second one. `needs_announcement` is persisted, so a restart
+        # between the create and that digest doesn't lose the link.
+        await asyncio.to_thread(self._ensure_todo_sheet)
+
+        # THE STRATEGY DOC. Probed once here so "the plan is unreadable" is a
+        # startup line with the fix in it, rather than a surprise inside an
+        # answer hours later. Nothing here posts.
+        await asyncio.to_thread(self._check_strategy_doc)
 
         for src in sources.status_report():
             log.info("[bot] source %s: %s — %s", src["key"], src["status"], src["detail"])
@@ -344,6 +376,73 @@ class SalesBot(discord.Client):
             update_cap=config.UPDATE_TRACKER_MAX,
             by_rule=result.get("counts", {}),
         )
+
+    def _ensure_todo_sheet(self) -> dict:
+        """STARTUP: make sure "Membrane Sales To-Dos" exists and is SHARED.
+
+        Blocking; called via a thread. Never raises — a Drive outage on boot
+        must not stop the bot connecting, and the next boot retries.
+
+        THE SHARE IS THE HALF THAT MATTERS. A spreadsheet the service account
+        creates is owned by the service account and lives in a Drive no human
+        can browse, so an unshared sheet is invisible rather than merely
+        awkward. Every address that failed is logged at ERROR with its fix.
+        """
+        if not todos.enabled():
+            log.info("[todos] TODO_SHEET_ENABLED=false — no to-do sheet is created or read")
+            self._todo_state = {"ok": False, "error": "TODO_SHEET_ENABLED=false"}
+            return self._todo_state
+        if self._dry_run:
+            log.info("[todos] dry run — not creating or sharing anything")
+            self._todo_state = {"ok": False, "error": "dry run: nothing was created"}
+            return self._todo_state
+        try:
+            result = todos.ensure(self.db)
+        except Exception as e:
+            log.exception("[todos] the startup check raised; the bot continues without it")
+            self._todo_state = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            return self._todo_state
+
+        self._todo_state = result
+        if not result["ok"]:
+            log.error(
+                "[todos] the to-do sheet is NOT usable: %s %s",
+                result["error"], result["remedy"],
+            )
+            return result
+        log.info(
+            "[todos] %s — %s (shared with %s%s). The link posts with the next daily "
+            "digest, not as a message of its own.",
+            "CREATED" if result["created"] else "already existed",
+            result["url"], ", ".join(result["shared"]) or "nobody",
+            f"; FAILED for {[f['email'] for f in result['failed']]}" if result["failed"] else "",
+        )
+        for failure in result["failed"]:
+            log.error(
+                "[todos] %s cannot open the to-do sheet: %s %s",
+                failure["email"], failure["error"], failure.get("remedy", ""),
+            )
+        return result
+
+    def _check_strategy_doc(self) -> dict:
+        """STARTUP CHECK for the strategy doc. Blocking; called via a thread.
+
+        Reports three things a human can act on: whether it is readable, HOW
+        CURRENT it is, and whether it has a target section the outreach-vs-plan
+        check can run against. Never raises.
+        """
+        try:
+            readable, detail = strategy.status_detail()
+        except Exception as e:
+            log.exception("[strategy] the startup check raised")
+            return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+        if readable:
+            log.info("[strategy] %s", detail)
+            if strategy.is_stale():
+                log.warning("[strategy] %s", strategy.currency_line())
+        else:
+            log.warning("[strategy] NOT readable — %s", detail)
+        return {"ok": readable, "detail": detail}
 
     def _check_sheets(self) -> dict:
         """STARTUP CHECK for both GTM spreadsheets. Blocking; called via a thread.
@@ -843,6 +942,8 @@ class SalesBot(discord.Client):
                     + self._notes_tools(text)
                     + self._sheet_tools(message)
                     + self._mapping_tools()
+                    + self._todo_tools()
+                    + self._strategy_tools()
                 ),
                 history=history,
             )
@@ -1194,13 +1295,70 @@ class SalesBot(discord.Client):
             except (TypeError, ValueError):
                 days = 30
             found = await asyncio.to_thread(notes.list_notes, max(1, days))
+            # THE CITATION, precomputed per note. Rule 2: anything shaped by a
+            # meeting names that meeting, and handing the model the exact string
+            # is what stops it inventing a shorter one.
+            listed = [dict(m, citation=meetings.citation(m)) for m in found]
             return {
                 "enabled": True,
                 "configured": True,
                 "sync": sync,
                 "notes_filter": _filter_facts(),
-                "notes": found,
+                "notes": listed,
                 "freshness": await _freshness(),
+                "citation_rule": (
+                    "Every claim you take from one of these notes must name it: "
+                    "\"...(<citation>)\". Use the note's own citation field verbatim."
+                ),
+            }
+
+        async def _meeting_facts(inp: dict):
+            """Holds, decisions and commitments, each carrying its citation.
+
+            Companies come from the TRACKER, so a hold can only ever be reported
+            against an account that is actually in the pipeline — the bot cannot
+            invent one out of a sentence in a note.
+            """
+            not_cfg = await _not_configured()
+            if not_cfg:
+                return not_cfg
+            await _sync(question_text)
+            companies = await self._tracker_company_names()
+            try:
+                days = int(inp.get("days") or config.MEETING_FACTS_DAYS)
+            except (TypeError, ValueError):
+                days = config.MEETING_FACTS_DAYS
+            found = await asyncio.to_thread(
+                meetings.facts, companies=companies, days=max(1, days)
+            )
+            want_kind = str(inp.get("kind") or "").strip().lower()
+            if want_kind:
+                found = [f for f in found if f["kind"] == want_kind]
+            want_company = str(inp.get("company") or "").strip()
+            if want_company:
+                key = gtm_sheet.normalise_header(want_company)
+                found = [
+                    f for f in found
+                    if any(gtm_sheet.normalise_header(c) == key for c in f["companies"])
+                ]
+            return {
+                "enabled": True,
+                "configured": True,
+                "window_days": days,
+                "facts": [
+                    {
+                        "kind": f["kind"], "text": f["text"],
+                        "companies": f["companies"], "citation": f["citation"],
+                        "date": f["date"],
+                    }
+                    for f in found[:30]
+                ],
+                "notes_filter": _filter_facts(),
+                "citation_rule": (
+                    "Quote each fact with its citation in brackets. If the list is "
+                    "empty, say no meeting note says that — do NOT infer a hold from "
+                    "the tracker or from the absence of activity."
+                ),
             }
 
         async def _read_meeting_note(inp: dict):
@@ -1259,6 +1417,13 @@ class SalesBot(discord.Client):
                 "freshness": freshness,
                 "other_meetings_that_day": others,
                 "meeting_note": note,
+                "citation": meetings.citation(note),
+                "citation_rule": (
+                    "MANDATORY: every line you write from this note carries the "
+                    "citation above, in brackets, e.g. \"Acme is on hold "
+                    "(<citation>)\". A decision, a hold or a commitment quoted "
+                    "without its meeting is a bug, not a style choice."
+                ),
             }
 
         return [
@@ -1326,6 +1491,291 @@ class SalesBot(discord.Client):
                     },
                 },
                 "handler": _read_meeting_note,
+            },
+            {
+                "schema": {
+                    "name": "meeting_facts",
+                    "description": (
+                        "Holds, decisions and commitments taken from the meeting notes, "
+                        "EACH WITH THE MEETING THAT PRODUCED IT. Use this for 'is X on "
+                        "hold', 'what did we decide about X', 'who committed to what', "
+                        "and whenever you are about to say a company is paused, parked "
+                        "or deprioritised. Pass 'company' to scope it to one account. "
+                        "Every item has a 'citation' — print it in brackets after the "
+                        "claim, e.g. 'Acme is on hold (Sales Bot Discussion, 2 Sep)'. A "
+                        "meeting-derived claim with no citation is WRONG: if an item has "
+                        "no citation, do not make the claim."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "company": {"type": "string",
+                                        "description": "Scope to one company (optional)."},
+                            "kind": {"type": "string",
+                                     "description": "hold | decision | commitment"},
+                            "days": {"type": "integer",
+                                     "description": "Look-back window in days."},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _meeting_facts,
+            },
+        ]
+
+    # -- tools: the to-do sheet --------------------------------------------
+
+    def _todo_tools(self) -> list[dict]:
+        """"@bot show the to-dos" — ALWAYS the link plus the open items.
+
+        Both halves, every time. The link alone is a shrug; the items alone
+        leave the asker unable to edit anything, and editing is the whole point
+        of a sheet the humans own. So the tool returns both and the description
+        tells the model to print both.
+        """
+
+        async def _show_todos(inp: dict) -> dict:
+            if not todos.enabled():
+                return {
+                    "available": False,
+                    "note": "TODO_SHEET_ENABLED is off, so there is no to-do sheet.",
+                }
+            if not todos.sheet_id(self.db):
+                ensured = await asyncio.to_thread(self._ensure_todo_sheet)
+                if not ensured.get("ok"):
+                    return {
+                        "available": False,
+                        "error": ensured.get("error", ""),
+                        "fix": ensured.get("remedy", ""),
+                        "note": (
+                            "The to-do sheet does not exist yet and I could not create "
+                            "it. Say that plainly and give the fix."
+                        ),
+                    }
+            try:
+                limit = int(inp.get("limit") or config.TODO_SHOW_MAX)
+            except (TypeError, ValueError):
+                limit = config.TODO_SHOW_MAX
+            data = await asyncio.to_thread(todos.open_items, self.db, limit=limit)
+            if not data.get("ok"):
+                return {
+                    "available": False,
+                    "error": data.get("error", ""),
+                    "fix": data.get("remedy", ""),
+                    "link": data.get("url", ""),
+                    "note": "Say I couldn't read the sheet, and give the link anyway.",
+                }
+            shared = (self._todo_state or {}).get("shared") or config.TEAM_SHARE_EMAILS
+            return {
+                "available": True,
+                "title": config.TODO_SHEET_TITLE,
+                "link": data.get("url", ""),
+                "shared_with": list(shared),
+                "open_total": data.get("open_total", 0),
+                "items": [
+                    {
+                        "n": r["n"], "task": r["task"], "owner": r["owner"] or None,
+                        "source_meeting": r["source_meeting"] or None,
+                        "date_raised": r["date_raised"] or None,
+                        "due": r["due"] or None, "status": r["status"],
+                    }
+                    for r in data.get("rows") or []
+                ],
+                "note": (
+                    "ALWAYS give the link AND the open items — both, every time. Each "
+                    "item's source_meeting is the meeting it was committed in: quote it "
+                    "in brackets after the item, e.g. 'send the deck (Sales Bot "
+                    "Discussion, 2 Sep)'. An item with no source_meeting came from the "
+                    "sheet by hand — say nothing about where it came from rather than "
+                    "guessing. Status and Notes belong to the team; I never edit them."
+                ),
+            }
+
+        async def _refresh_todos(_inp: dict) -> dict:
+            """Run the extraction WITHOUT writing. Someone asking "what would go
+            on the to-do sheet" must not silently trigger a write — the write
+            happens on TODO_REFRESH_DAY, in the digest, and nowhere else."""
+            companies = await self._tracker_company_names()
+            found = await asyncio.to_thread(
+                meetings.action_items, days=config.TODO_NOTES_DAYS, companies=companies
+            )
+            return {
+                "available": True,
+                "window_days": config.TODO_NOTES_DAYS,
+                "candidates": [
+                    {
+                        "task": f["task"], "owner": f["owner"] or None,
+                        "source_meeting": f["source_meeting"],
+                        "date_raised": f["date_raised"], "due": f["due"] or None,
+                    }
+                    for f in found[: config.TODO_MAX_NEW_PER_REFRESH]
+                ],
+                "note": (
+                    "These are commitments read out of the meeting notes. NOTHING WAS "
+                    "WRITTEN — the sheet is appended on "
+                    + config.TODO_REFRESH_DAY.capitalize()
+                    + " as part of the daily digest. Every one of these carries its "
+                    "source_meeting and you must quote it alongside the task."
+                ),
+            }
+
+        return [
+            {
+                "schema": {
+                    "name": "show_todos",
+                    "description": (
+                        "The team to-do sheet: its LINK and the OPEN items on it. Use "
+                        "this for 'show the to-dos', 'what's on the to-do list', 'what "
+                        "do I owe', 'action items'. Always print the link and the items "
+                        "together."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer",
+                                      "description": "How many open items to return."},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _show_todos,
+            },
+            {
+                "schema": {
+                    "name": "todo_candidates",
+                    "description": (
+                        "Action items in this week's meeting notes that COULD go on the "
+                        "to-do sheet, each with the meeting it was committed in. Read-"
+                        "only — it never writes to the sheet. Use it for 'what came out "
+                        "of this week's meetings' or 'what's not on the list yet'."
+                    ),
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                "handler": _refresh_todos,
+            },
+        ]
+
+    # -- tools: the strategy doc -------------------------------------------
+
+    def _strategy_tools(self) -> list[dict]:
+        """The plan itself, how current it is, and where outreach diverges.
+
+        Two tools rather than one because they answer different questions and
+        fail differently: "what does the plan say" needs the doc, "are we doing
+        it" needs the doc AND the tracker, and an answer must never imply the
+        second when it could only do the first.
+        """
+
+        async def _read_strategy(_inp: dict) -> dict:
+            data = await asyncio.to_thread(strategy.read)
+            if not data["ok"]:
+                return {
+                    "available": False,
+                    "error": data.get("error", ""),
+                    "fix": data.get("remedy", ""),
+                    "note": (
+                        "I cannot read the strategy doc. Say so in those words and give "
+                        "the fix. Do NOT answer what the strategy is from anywhere else."
+                    ),
+                }
+            body = data["text"]
+            clipped = len(body) > 6000
+            return {
+                "available": True,
+                "name": data.get("name", ""),
+                "link": data.get("url", ""),
+                "last_revised": data.get("modified"),
+                "age_days": await asyncio.to_thread(strategy.age_days),
+                "stale": await asyncio.to_thread(strategy.is_stale),
+                "stale_after_days": config.STRATEGY_STALE_DAYS,
+                "currency_line": await asyncio.to_thread(strategy.currency_line),
+                "targets": [t["phrase"] for t in await asyncio.to_thread(strategy.targets)],
+                "text": body[:6000] + ("\n…(truncated)" if clipped else ""),
+                "truncated": clipped,
+                "note": (
+                    "This is the human-owned plan; I have read-only access and never "
+                    "edit it. If stale is true, say the plan hasn't been revised in "
+                    "age_days days BEFORE quoting it — a quote from a plan nobody has "
+                    "touched in a month has to carry that."
+                ),
+            }
+
+        async def _plan_vs_outreach(inp: dict) -> dict:
+            data = await asyncio.to_thread(strategy.read)
+            if not data["ok"]:
+                return {
+                    "available": False, "error": data.get("error", ""),
+                    "fix": data.get("remedy", ""),
+                    "note": "I can't check outreach against a plan I can't read.",
+                }
+            try:
+                days = max(1, int(inp.get("days") or 7))
+            except (TypeError, ValueError):
+                days = 7
+            try:
+                tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
+            except Exception:
+                tab = None
+            if tab is None:
+                return {
+                    "available": False,
+                    "error": "the outreach tracker could not be read",
+                    "note": "Say I could read the plan but not the tracker, so I can't "
+                            "compare them.",
+                }
+            today = dl.today_ist()
+            check = await asyncio.to_thread(
+                strategy.plan_check, list(tab.rows),
+                since=today - timedelta(days=days), today=today,
+            )
+            return {
+                "available": bool(check["ok"]),
+                "reason": check.get("reason", ""),
+                "window_days": days,
+                "rows_touched": check.get("touched", 0),
+                "targets": [t["phrase"] for t in check.get("targets") or []],
+                "off_plan": check.get("off_plan") or [],
+                "in_plan_nothing_sent": check.get("unworked") or [],
+                "lines": check.get("lines") or [],
+                "note": (
+                    "Both directions matter and neither is an accusation: a plan can be "
+                    "out of date and the pipeline right. Give the counts. If available "
+                    "is false, say WHY (reason) rather than reporting 'no drift'."
+                ),
+            }
+
+        return [
+            {
+                "schema": {
+                    "name": "strategy_doc",
+                    "description": (
+                        "The sales & marketing strategy doc: what it says, when it was "
+                        "last revised, and the targets it names. Use it for 'what's the "
+                        "plan', 'what are we targeting', 'is the strategy current'."
+                    ),
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                "handler": _read_strategy,
+            },
+            {
+                "schema": {
+                    "name": "outreach_vs_plan",
+                    "description": (
+                        "Compare where outreach actually went against the targets the "
+                        "strategy doc names, in both directions. Use it for 'are we on "
+                        "plan', 'has outreach drifted', 'are we working the right "
+                        "segments'."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "days": {"type": "integer",
+                                     "description": "Window in days (default 7)."},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _plan_vs_outreach,
             },
         ]
 
@@ -3034,7 +3484,8 @@ class SalesBot(discord.Client):
         log.info(
             "[digest] POSTED %s — hot=%d deadlines=%d overdue=%d escalations=%d hygiene=%d "
             "| cadence: follow-ups=%d intros=%d meetings=%d update-tracker=%d assets=%d "
-            "prep-briefs=%d",
+            "prep-briefs=%d | tracker-reminder=%d todos=%d plan=%d. This is the ONE "
+            "unprompted message of the day.",
             marker,
             counts[digest.SECTION_HOT], counts[digest.SECTION_DEADLINES],
             counts[digest.SECTION_OVERDUE], counts[digest.SECTION_ESCALATIONS],
@@ -3042,6 +3493,8 @@ class SalesBot(discord.Client):
             counts[digest.SECTION_CADENCE_FOLLOWUPS], counts[digest.SECTION_CADENCE_INTROS],
             counts[digest.SECTION_CADENCE_MEETINGS], counts[digest.SECTION_CADENCE_UPDATES],
             counts[digest.SECTION_CADENCE_ASSETS], counts[digest.SECTION_PREP],
+            counts[digest.SECTION_TRACKER_REMINDER], counts[digest.SECTION_TODOS],
+            counts[digest.SECTION_PLAN],
         )
 
         try:
@@ -3159,8 +3612,9 @@ class SalesBot(discord.Client):
         # UPDATE_TRACKER_MAX (the tracker asks, so a sparse sheet's fill-in
         # requests cannot eat the work list). The cold summary is outside all
         # three — one line, and the line that keeps the cold ceiling honest.
+        cadence_stats: dict = {}
         try:
-            cadence_sections, cadence_effects, cadence_staleness = (
+            cadence_sections, cadence_effects, cadence_staleness, cadence_stats = (
                 await self._collect_cadence_sections(today=today)
             )
             for key, items in cadence_sections.items():
@@ -3169,6 +3623,32 @@ class SalesBot(discord.Client):
             staleness = staleness or cadence_staleness
         except Exception:
             log.exception("[digest] could not collect the cadence sections; they are omitted")
+
+        # THE TWICE-WEEKLY TRACKER REMINDER. A SECTION, on its days, inside this
+        # one message — there is no other path by which it can reach the
+        # channel. It is collected AFTER the cadence so it can quote the cadence's
+        # own count of rows missing the dates every rule depends on.
+        try:
+            sections[digest.SECTION_TRACKER_REMINDER].extend(
+                self._collect_tracker_reminder(today=today, stats=cadence_stats)
+            )
+        except Exception:
+            log.exception("[digest] could not build the tracker reminder; it is omitted")
+
+        # The to-do sheet: the one-time link announcement, or the refresh line
+        # on TODO_REFRESH_DAY. One line either way.
+        try:
+            todo_items, todo_effects = await self._collect_todo_section(today=today)
+            sections[digest.SECTION_TODOS].extend(todo_items)
+            effects.extend(todo_effects)
+        except Exception:
+            log.exception("[digest] could not build the to-do section; it is omitted")
+
+        # Outreach against the plan, and how current the plan is. Weekly.
+        try:
+            sections[digest.SECTION_PLAN].extend(await self._collect_plan_section(today=today))
+        except Exception:
+            log.exception("[digest] could not run the outreach-vs-plan check; it is omitted")
 
         # Cap each section, saying how many were left out. Escalations are NOT
         # capped: there are never many, and an escalation that scrolled off is
@@ -3584,21 +4064,55 @@ class SalesBot(discord.Client):
         result["tab"] = tab
         return result
 
-    async def _collect_cadence_sections(self, *, today) -> tuple[dict, list[dict], str]:
+    async def _collect_cadence_sections(
+        self, *, today
+    ) -> tuple[dict, list[dict], str, dict]:
         """The five cadence sections, the tracker asks, the prep briefs, and their
         effects.
 
-        Returns (sections, effects, staleness). Every failure is contained: a
-        cadence that cannot be computed leaves its sections empty and the rest of
-        the digest posts, because a broken sheet must not cost the team its
-        deadline reminders.
+        Returns (sections, effects, staleness, stats). Every failure is
+        contained: a cadence that cannot be computed leaves its sections empty
+        and the rest of the digest posts, because a broken sheet must not cost
+        the team its deadline reminders.
+
+        `stats` carries the two numbers the tracker-reminder section quotes —
+        how many rows the cadence read and how many of them are missing the
+        dates every rule depends on. They are returned rather than recomputed so
+        the reminder can never disagree with the section above it.
         """
         out = {k: [] for k in digest.SECTION_ORDER}
         effects: list[dict] = []
+        stats: dict = {}
 
         result = await self._run_cadence(today=today)
         if result is None:
-            return out, effects, ""
+            return out, effects, "", stats
+
+        stats = {
+            "rows": int(result.get("rows") or 0),
+            "fill_in": sum(
+                1 for u in (result.get("updates_all") or [])
+                if u.get("rule") == cadence.RULE_FILL_IN
+            ),
+        }
+
+        # WHAT THE MEETINGS SAID ABOUT THESE COMPANIES. A company a meeting put
+        # on hold still appears — suppressing it would be the bot deciding a
+        # minute outranks the pipeline, and the row's owner would never learn why
+        # the row vanished — but its line SAYS SO AND CITES THE MEETING. See
+        # meetings.py: a meeting-derived claim with no citation is a bug.
+        held: dict = {}
+        try:
+            held = await asyncio.to_thread(
+                meetings.holds,
+                companies=[
+                    str(i.get("company") or "")
+                    for i in (result.get("all") or []) + (result.get("updates_all") or [])
+                ],
+            )
+        except Exception:
+            log.info("[digest] no meeting knowledge available to annotate the cadence",
+                     exc_info=True)
 
         # The cadence items (urgent on their own never-truncated budget, the
         # rest on DIGEST_MAX_ITEMS, the cold summary on neither) and the
@@ -3610,7 +4124,9 @@ class SalesBot(discord.Client):
             mention, owner_key = self._cadence_owner(item)
             out[item["section"]].append({
                 "key": item["key"],
-                "text": item["text"],
+                "text": meetings.annotate_hold(
+                    item["text"], str(item.get("company") or ""), held
+                ),
                 "owner_mention": mention,
                 "owner_key": owner_key,
             })
@@ -3639,7 +4155,209 @@ class SalesBot(discord.Client):
             out[digest.SECTION_PREP] = briefs
             effects.extend(brief_effects)
 
-        return out, effects, result.get("staleness") or ""
+        return out, effects, result.get("staleness") or "", stats
+
+    # -- the tracker reminder, the to-do sheet, and the plan check ---------
+
+    def _collect_tracker_reminder(self, *, today, stats: dict) -> list[dict]:
+        """THE MON/FRI TRACKER REMINDER — as a SECTION of this digest.
+
+        There is deliberately no `_post_tracker_reminder` anywhere in this file
+        and there must never be one. The reminder cannot reach the channel
+        except through the digest, which is what makes "exactly one unprompted
+        message a day" a property of the code rather than a promise. On a day
+        with nothing else outstanding it still posts, because it is a real ask —
+        that is what the `forces_digest` flag on its items does.
+        """
+        if not (config.TRACKER_REMINDER_ENABLED and config.SALES_DIGEST_ENABLED):
+            return []
+        if today.weekday() not in config.tracker_reminder_weekdays():
+            return []
+
+        facts: list[dict] = []
+        try:
+            facts = meetings.facts()
+        except Exception:
+            log.info("[digest] no meeting facts for the tracker reminder", exc_info=True)
+
+        items = tracker.reminder_items(
+            today=today,
+            fill_in_count=int(stats.get("fill_in") or 0),
+            rows_total=int(stats.get("rows") or 0),
+            facts=facts,
+        )
+        mention, owner_key = self._cadence_owner({})
+        for item in items:
+            item["owner_mention"] = mention
+            item["owner_key"] = owner_key
+        log.info("[digest] tracker reminder: %d line(s) as a section of today's digest",
+                 len(items))
+        return items
+
+    async def _collect_todo_section(self, *, today) -> tuple[list[dict], list[dict]]:
+        """The to-do sheet's ONE line, and the effects that follow it.
+
+        Two things can appear, and never more than those two:
+          - the FIRST-RUN announcement (the link, and who it was shared with),
+            flagged `forces_digest` because a link nobody receives is the same
+            as no sheet at all;
+          - on TODO_REFRESH_DAY, "To-do sheet updated: +N new · <link>".
+
+        The refresh WRITES to Google before the digest posts, which is the one
+        ordering that could not be avoided: the line has to report a real
+        number. That is safe because the sheet is append-only and a refused
+        Discord send leaves the appended rows exactly where they belong —
+        whereas holding the append until after the send would mean a failed
+        digest silently dropped a week of action items.
+        """
+        items: list[dict] = []
+        effects: list[dict] = []
+        if not todos.enabled():
+            return items, effects
+
+        # The sheet may not exist yet (a boot where Drive was down, or the very
+        # first run). Re-ensure here rather than assuming startup succeeded.
+        if not todos.sheet_id(self.db):
+            await asyncio.to_thread(self._ensure_todo_sheet)
+
+        announced = False
+        try:
+            announced = await asyncio.to_thread(todos.needs_announcement, self.db)
+        except Exception:
+            log.exception("[todos] could not check whether the link has been posted")
+
+        if announced:
+            state_now = self._todo_state or {}
+            if not state_now.get("ok"):
+                state_now = await asyncio.to_thread(self._ensure_todo_sheet)
+            for line in todos.announcement_lines(state_now):
+                items.append({"text": line, "forces_digest": True})
+            if items:
+                effects.append({"type": "todo_announced", "on_date": dl.iso(today)})
+
+        if todos.is_refresh_day(today):
+            if self._dry_run:
+                # Say what WOULD be appended, without appending it.
+                try:
+                    companies = await self._tracker_company_names()
+                    found = await asyncio.to_thread(
+                        meetings.action_items,
+                        days=config.TODO_NOTES_DAYS, companies=companies,
+                    )
+                    items.append({
+                        "text": f"[dry run] To-do refresh would consider {len(found)} "
+                                f"action item(s) from the last {config.TODO_NOTES_DAYS} "
+                                "days of meeting notes; nothing was written.",
+                    })
+                except Exception:
+                    log.exception("[todos] dry-run extraction failed")
+                return items, effects
+            try:
+                companies = await self._tracker_company_names()
+                result = await asyncio.to_thread(
+                    todos.refresh, self.db, today=today, companies=companies
+                )
+                items.append({"text": todos.refresh_line(result, db=self.db)})
+            except Exception:
+                log.exception("[todos] the weekly refresh failed; the digest says nothing "
+                              "about it rather than claiming it ran")
+        return items, effects
+
+    async def dry_run_digest(self, *, today) -> str:
+        """BUILD the digest for `today` and return it as text. Send nothing.
+
+        THE VERIFICATION PATH, and the answer to "what will Monday look like".
+        It writes nothing anywhere: no Discord message, no carry-forward ageing
+        (so tomorrow's real digest is not one day older than it should be), no
+        sheet created, no to-do row appended. The one side effect it cannot
+        avoid is the cadence's next-step clock, which counts days OBSERVED and
+        which the startup dry run already advances for the same reason.
+        """
+        was, self._dry_run = self._dry_run, True
+        try:
+            collected = await self._collect_digest(today=today)
+        finally:
+            self._dry_run = was
+        sections = collected["sections"]
+        if not digest.total_items(sections):
+            return (
+                f"(no digest for {dl.iso(today)} — nothing outstanding. An empty day is "
+                "never posted: 'nothing to report' is a message with no information in "
+                "it.)"
+            )
+        return digest.render(
+            day=today,
+            sections=sections,
+            unowned_mention=dl.notify_mentions(),
+            escalate_mention=self._escalate_mention(),
+            staleness=collected.get("staleness", ""),
+        )
+
+    async def _tracker_company_names(self) -> list[str]:
+        """Every company name on the tracker.
+
+        The meeting layer matches facts against THIS list and nothing else, so
+        the bot can never announce a hold on a company that is not in the
+        pipeline, or mistake a person's surname for an account.
+        """
+        try:
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
+        except Exception:
+            log.info("[digest] no tracker to take company names from", exc_info=True)
+            return []
+        if tab is None:
+            return []
+        return [str(r.get("company") or "").strip() for r in tab.rows]
+
+    async def _collect_plan_section(self, *, today) -> list[dict]:
+        """OUTREACH AGAINST THE PLAN, plus the plan's currency. Weekly.
+
+        On WEEKLY_DIGEST_WEEKDAY only. Plan drift is a weekly question, and a
+        daily line about a document nobody edits daily is a daily line nobody
+        reads. It is a BLOCK section and never an item, so it can never be the
+        reason a digest posts.
+        """
+        if not config.STRATEGY_CHECK_ENABLED:
+            return []
+        if not config.WEEKLY_DIGEST_ENABLED:
+            return []
+        if today.weekday() != max(0, min(6, config.WEEKLY_DIGEST_WEEKDAY)):
+            return []
+
+        lines: list[str] = []
+        currency = await asyncio.to_thread(strategy.currency_line, today=today)
+        if currency:
+            lines.append(currency)
+
+        rows: list[dict] = []
+        try:
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
+            rows = list(tab.rows) if tab else []
+        except Exception:
+            log.info("[digest] no tracker for the outreach-vs-plan check", exc_info=True)
+
+        if rows:
+            check = await asyncio.to_thread(
+                strategy.plan_check, rows,
+                since=today - timedelta(days=7), today=today,
+            )
+            if check["ok"]:
+                lines.extend(check["lines"])
+            elif check.get("reason"):
+                # Say WHY there is no comparison, AND how to fix it. "No drift"
+                # and "I could not compare" are different statements and only
+                # one of them is good news, so the digest never lets the second
+                # read as the first.
+                reason = str(check["reason"]).strip()
+                lines.append(
+                    "I could not check outreach against the plan: "
+                    + reason[0].lower() + reason[1:]
+                    + ". " + str(check.get("remedy") or "").strip()
+                )
+        elif not lines:
+            return []
+
+        return [{"text": line} for line in lines if line]
 
     async def _collect_prep_briefs(self, result: dict, *, today) -> tuple[list[dict], list[dict]]:
         """ONE brief per meeting inside the prep window, deduped in SQLite.
@@ -3770,6 +4488,19 @@ class SalesBot(discord.Client):
                         company=eff["company"], poc=eff["poc"],
                         meeting_date=eff["meeting_date"],
                         web_research="not included - pending web access decision",
+                    )
+
+                elif kind == "todo_announced":
+                    # The to-do sheet's link gets ONE announcement, and this is
+                    # what spends it — after the digest actually posted, so a
+                    # refused send leaves the link still to be announced
+                    # tomorrow rather than silently never.
+                    todos.mark_announced(self.db, on_date=eff.get("on_date", ""))
+                    state.audit(
+                        "todo_sheet_announced",
+                        reason="the to-do sheet's link went out with the daily digest",
+                        url=todos.link(self.db), date=eff.get("on_date", ""),
+                        shared=(self._todo_state or {}).get("shared", []),
                     )
 
                 elif kind == "quality_flag_reported":

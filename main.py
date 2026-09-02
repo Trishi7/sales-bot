@@ -5,16 +5,67 @@ can see, then connects. The startup log is deliberately explicit about SCOPE and
 SOURCES: the two things most likely to be misconfigured are a channel id that the
 bot's role can't actually see and a source everyone assumes is connected. Both
 are silent failures at runtime, so they get named here.
+
+    python -m main                                run the bot
+    python -m main --dry-run-digest               print TODAY's digest, send nothing
+    python -m main --dry-run-digest 2026-09-07    print that day's digest
+
+THE DRY RUN EXISTS TO BE CHECKED BEFORE A DEPLOY, and it is the answer to "is the
+Monday tracker reminder really a section of the one message, or is it a second
+message?" — you can read the whole message, on a Monday, without waiting for one.
+It connects to nothing, sends nothing, creates nothing and ages nothing.
 """
+import asyncio
 import logging
 import sys
+from datetime import date
 
 import config
+import deadlines as dl
 import persona
 import sources
 from bot import SalesBot
 
 log = logging.getLogger(__name__)
+
+
+def _dry_run_digest(argv: list[str]) -> int:
+    """Build one day's digest and print it. Sends nothing, writes nothing.
+
+    The date is optional and is parsed strictly: a typo must not silently become
+    "today", because the whole point is to look at a SPECIFIC day (a Monday, a
+    Friday) and a digest for the wrong day would answer a question nobody asked.
+    """
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("discord").setLevel(logging.WARNING)
+
+    day = dl.today_ist()
+    if argv:
+        try:
+            day = date.fromisoformat(argv[0])
+        except ValueError:
+            print(f"Not a date: {argv[0]!r}. Use YYYY-MM-DD.", file=sys.stderr)
+            return 2
+
+    log.info(
+        "[dry-run] building the digest for %s (%s). NOTHING will be sent, written or "
+        "created.", dl.iso(day), day.strftime("%A"),
+    )
+    bot = SalesBot()
+    body = asyncio.run(bot.dry_run_digest(today=day))
+
+    print()
+    print("=" * 78)
+    print(f"DRY-RUN DIGEST — {day.strftime('%A %d %b %Y')} — this is ONE message")
+    print("=" * 78)
+    print(body)
+    print("=" * 78)
+    return 0
 
 
 def main() -> None:
@@ -81,4 +132,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--dry-run-digest" in sys.argv:
+        i = sys.argv.index("--dry-run-digest")
+        sys.exit(_dry_run_digest(sys.argv[i + 1:]))
     main()
