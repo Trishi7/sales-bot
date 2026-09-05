@@ -140,6 +140,46 @@ def _bool(name: str, default: bool) -> bool:
     return default
 
 
+# -- reading .env again, after boot -------------------------------------------
+# `load_dotenv()` above runs once, at import. That is right for almost every
+# setting here: they are read into module constants and a change needs a restart
+# anyway. The digest kill switch is the exception — it has to be flippable
+# without one — so it re-reads the file through this cache.
+#
+# Cached on (path, mtime, size): an unchanged file is parsed once and every
+# later call is a stat. mtime alone can miss an edit inside the same second on a
+# coarse filesystem, so size rides along with it.
+_DOTENV_CACHE: dict = {"key": None, "values": {}}
+
+
+def _dotenv_value(name: str):
+    """The current value of `name` in the .env file, or None if it isn't there.
+
+    Returns None — not a default — for every failure: no file, unreadable file,
+    key absent. The caller decides what "absent" means; this only reports what
+    the file says right now.
+    """
+    from dotenv import dotenv_values, find_dotenv
+
+    try:
+        path = find_dotenv(usecwd=True)
+        if not path:
+            return None
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        if _DOTENV_CACHE["key"] != key:
+            _DOTENV_CACHE["values"] = dict(dotenv_values(path) or {})
+            _DOTENV_CACHE["key"] = key
+    except OSError:
+        # A .env that vanished or went unreadable mid-run. Say nothing at every
+        # tick about it; the caller falls back to the boot value.
+        return None
+    except Exception:
+        log.debug("could not re-read .env for %s", name, exc_info=True)
+        return None
+    return _DOTENV_CACHE["values"].get(name)
+
+
 def _int(name: str, default: int) -> int:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -871,7 +911,63 @@ SHEET_FLAGS_ENABLED = _bool("SHEET_FLAGS_ENABLED", default=True)
 #   - the ask-time deadline announcement, which is the answer to "when is the
 #     follow-up for X?" and is consent-based by design ("shout to change").
 
+# THE KILL SWITCH FOR EVERY UNPROMPTED MESSAGE.
+#
+#   true / unset  the digest posts at SALES_DIGEST_TIME (the historical
+#                 behaviour, which is why unset means on).
+#   false         the bot posts NOTHING unprompted. Not the digest, and not any
+#                 section that rides in it — cadence lines, the tracker-update
+#                 reminder, meeting-prep briefs, escalations, the funnel block.
+#                 None of those has a send path of its own (see bot.py), so one
+#                 gate covers all of them.
+#
+# WHAT DOES NOT STOP: everything still computes. Deadlines are still tracked,
+# cadence is still evaluated, SQLite state and audit.jsonl are still written.
+# The bot still answers when @-mentioned ("full cadence list", a hygiene check,
+# sheet questions) and still announces a deadline when someone asks for one.
+# Only the unprompted posting stops.
+#
+# This module-level value is the BOOT reading, used for the startup log below.
+# The runtime gate is `digest_enabled()`, which re-reads the setting at digest
+# time so flipping it does not need a restart.
 SALES_DIGEST_ENABLED = _bool("SALES_DIGEST_ENABLED", default=True)
+
+
+def digest_enabled() -> bool:
+    """Is unprompted posting on? Read LIVE, not at import.
+
+    Read at digest time rather than at boot so an operator can flip the switch
+    and have it take effect on the next sweep tick. A restart applies it too, of
+    course — this just doesn't require one.
+
+    WHERE IT READS FROM, and why in this order: this project's contract is that
+    config lives in .env and pm2 passes no settings of its own (see
+    ecosystem.config.js), so the .env file is the thing an operator actually
+    edits and it is consulted first — that is what makes the switch live. The
+    process environment is the fallback, which is also the answer when there is
+    no .env file at all. The file is re-read only when its mtime changes, so the
+    sweep tick is not doing disk I/O every few minutes for one boolean.
+
+    Anything unreadable — a missing file, a permission error, a value that isn't
+    a boolean — falls back to the boot reading. A kill switch that fails to a
+    guess would be worse than one that fails to what the operator last booted
+    with.
+    """
+    raw = _dotenv_value("SALES_DIGEST_ENABLED")
+    if raw is None:
+        raw = os.getenv("SALES_DIGEST_ENABLED")
+    if raw is None or not raw.strip():
+        return SALES_DIGEST_ENABLED
+    val = raw.strip().lower()
+    if val in _TRUE:
+        return True
+    if val in _FALSE:
+        return False
+    log.warning(
+        "SALES_DIGEST_ENABLED=%r is not a recognised boolean; using the value the bot "
+        "booted with (%s).", raw, SALES_DIGEST_ENABLED,
+    )
+    return SALES_DIGEST_ENABLED
 
 # WALL-CLOCK IST, "HH:MM". Computed against Asia/Kolkata explicitly (see
 # deadlines.IST), never against the server clock — a cloud box runs UTC, and a
@@ -1258,8 +1354,13 @@ def validate() -> list[str]:
     else:
         log.warning(
             "SALES_DIGEST_ENABLED=false — the bot will send NO unprompted messages at "
-            "all. It will still answer questions and still announce a deadline when "
-            "someone asks for one, but nothing will be chased, flagged or escalated."
+            "all: no digest, and none of the sections that ride in it (cadence, the "
+            "tracker reminder, meeting-prep briefs, escalations, the funnel block). It "
+            "STILL tracks deadlines, evaluates cadence and writes SQLite and "
+            "audit.jsonl, still answers when @-mentioned, and still announces a deadline "
+            "when someone asks for one. Each skipped digest logs one line: "
+            "'[digest] suppressed — SALES_DIGEST_ENABLED=false'. Setting it back to true "
+            "resumes at the NEXT scheduled digest; the skipped days are not replayed."
         )
 
     if WEEKLY_DIGEST_ENABLED and not 0 <= WEEKLY_DIGEST_WEEKDAY <= 6:
@@ -1287,7 +1388,9 @@ def validate() -> list[str]:
             log.warning(
                 "TRACKER_REMINDER_ENABLED is on (%s) but SALES_DIGEST_ENABLED is off. The "
                 "reminder is a SECTION of the daily digest and has no send path of its "
-                "own, so it will never go out.", names,
+                "own, so it will not go out while the switch is off. It is still built "
+                "on those days, so it appears the moment the switch goes back on and in "
+                "`--dry-run-digest` meanwhile.", names,
             )
         else:
             log.info("Tracker reminder: a section of the %s digest.", names)

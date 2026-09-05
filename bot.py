@@ -205,6 +205,12 @@ class SalesBot(discord.Client):
         # Monday, and it would be worthless if answering the question changed
         # the thing being asked about.
         self._dry_run: bool = False
+        # The date whose digest we have already reported as suppressed. The
+        # sweeper ticks every few minutes, so without this the kill switch would
+        # write the same line into pm2's log a few hundred times a day and the
+        # silence would be buried in the noise announcing it. One line per
+        # skipped digest, per day.
+        self._digest_suppressed_on: str = ""
         log.info(
             "[bot.init] %s ready to connect. sales_channels=%s ask_channel=%s roster=%d",
             config.COS_NAME, config.SALES_CHANNEL_IDS, config.SALES_ASK_CHANNEL_ID,
@@ -3404,10 +3410,14 @@ class SalesBot(discord.Client):
         turns up at 14:00, the digest goes out at 14:00. That is still one
         digest, and holding a hot lead for twenty hours to protect a schedule
         would be the wrong trade.
-        """
-        if not config.SALES_DIGEST_ENABLED:
-            return
 
+        THE KILL SWITCH LIVES HERE AND NOWHERE ELSE. `SALES_DIGEST_ENABLED=false`
+        is checked below, at the one point every unprompted message in this bot
+        has to pass through, which is what lets one boolean silence the digest
+        and every section riding in it without any collector having to know the
+        switch exists. Collectors keep computing while it is off, so nothing has
+        to be rebuilt when it goes back on and `--dry-run-digest` stays honest.
+        """
         now = dl.now_ist()
         hour, minute = config.digest_time_ist()
         if not digest.is_due(now, hour=hour, minute=minute):
@@ -3415,6 +3425,7 @@ class SalesBot(discord.Client):
 
         today = now.date()
         marker = dl.iso(today)
+
         try:
             if self.db.get_meta("sales_digest_date") == marker:
                 return
@@ -3423,6 +3434,32 @@ class SalesBot(discord.Client):
                 "[digest] could not read the once-a-day marker; staying quiet rather than "
                 "risking a second digest"
             )
+            return
+
+        # THE KILL SWITCH, read here rather than at boot so flipping it takes
+        # effect on the next sweep tick without a restart.
+        #
+        # Checked LAST of the cheap gates — after "is it time" and after "has
+        # today's already gone out" — so it fires only where a digest was
+        # genuinely about to be posted and wasn't. That is what makes the log
+        # line below mean something: one line per digest actually withheld, not
+        # one for a day whose digest went out before the switch was flipped.
+        #
+        # Checked BEFORE anything is collected, so the suppressed path does no
+        # sheet reads, no LLM calls and, crucially, no ageing: carry-forward
+        # rows must not get a day older for a digest nobody saw.
+        #
+        # NOTHING IS WRITTEN HERE. `sales_digest_date` is deliberately left
+        # alone, so the switch owns the silence and no state has to be unwound
+        # to end it. Re-enabling resumes at the next scheduled digest and never
+        # replays the days that were skipped — there is no backlog to replay,
+        # because a suppressed day computed nothing and queued nothing. What
+        # does come back is whatever is outstanding at that moment, which is the
+        # same thing the digest would have said anyway.
+        if not config.digest_enabled():
+            if self._digest_suppressed_on != marker:
+                self._digest_suppressed_on = marker
+                log.info("[digest] suppressed — SALES_DIGEST_ENABLED=false")
             return
 
         channel_id = config.digest_channel_id()
@@ -4169,7 +4206,13 @@ class SalesBot(discord.Client):
         with nothing else outstanding it still posts, because it is a real ask —
         that is what the `forces_digest` flag on its items does.
         """
-        if not (config.TRACKER_REMINDER_ENABLED and config.SALES_DIGEST_ENABLED):
+        # Only TRACKER_REMINDER_ENABLED is consulted here. The kill switch is
+        # NOT: this is a collector, and collectors must keep computing while
+        # unprompted posting is off — otherwise `--dry-run-digest` would quietly
+        # print a digest missing its reminder, and the one place that decides
+        # whether anything reaches Discord would no longer be the only place.
+        # `_maybe_post_daily_digest` is that place.
+        if not config.TRACKER_REMINDER_ENABLED:
             return []
         if today.weekday() not in config.tracker_reminder_weekdays():
             return []

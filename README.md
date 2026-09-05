@@ -1217,6 +1217,27 @@ people the digest can be skipped. The once-a-day marker is deliberately *not*
 written on an empty day, so something that turns up in the afternoon still gets
 said that day.
 
+### The kill switch: `SALES_DIGEST_ENABLED`
+
+Setting `SALES_DIGEST_ENABLED=false` stops **every unprompted message**: the daily
+digest and, because none of them has a send path of its own, every section that
+rides inside it — cadence lines, the tracker-update reminder, meeting-prep briefs,
+escalations, the weekly funnel block. Nothing else changes. Deadlines are still
+tracked, cadence is still evaluated, SQLite state and `state/audit.jsonl` are still
+written, and the bot still answers normally when someone @-mentions it ("full
+cadence list", "run a hygiene check", any sheet question), including the ask-time
+deadline announcement, which is a reply rather than an interruption; `--dry-run-digest`
+still prints the whole digest, so you can read what is being held back. The flag is
+read **at digest time, not at boot** — the `.env` file first, then the process
+environment — so flipping it takes effect on the next sweep tick without a restart.
+Each skipped digest logs exactly one line, `[digest] suppressed — SALES_DIGEST_ENABLED=false`,
+once per day rather than once per tick, so the silence reads as deliberate in
+`pm2 logs sales-bot` instead of looking like a dead bot. Turning it back on **resumes
+at the next scheduled digest and never replays the missed days**: a suppressed day
+builds nothing and queues nothing, and the once-a-day marker is left untouched while
+the switch is off, so there is no backlog to unwind — the first digest afterwards
+simply reports what is outstanding then, which carry-forward already keeps accurate.
+
 ### One message, even when it's long
 
 If the body exceeds Discord's 2000-char limit it is split on line boundaries by
@@ -1306,7 +1327,7 @@ attempt.
 
 | Var | Default | What it does |
 |---|---|---|
-| `SALES_DIGEST_ENABLED` | `true` | `false` → the bot sends **no** unprompted messages at all. |
+| `SALES_DIGEST_ENABLED` | `true` | The kill switch. `false` → the bot sends **no** unprompted messages at all, while still computing and still answering when asked. Read at digest time, so no restart is needed. See [the kill switch](#the-kill-switch-sales_digest_enabled). |
 | `SALES_DIGEST_TIME` | `10:00` | Wall-clock IST (Asia/Kolkata, computed explicitly — never the server clock). |
 | `SALES_DIGEST_MAX_PER_SECTION` | `15` | Items shown per section; the overflow is counted, not dropped. |
 | `SALES_DIGEST_CHANNEL_ID` | unset | Must be in `SALES_CHANNEL_IDS`; unset → `SALES_ASK_CHANNEL_ID`, else the first sales channel. |
@@ -1317,7 +1338,7 @@ attempt.
 | `SALES_DEFAULT_OWNER_ID` | unset | Who every cadence line is addressed to, since the tracker has no owner column. Must also be in `TEAM_ROSTER_IDS` to be pinged. |
 | `CADENCE_CROSSCHECK_ENABLED` | `true` | The nightly master/tracker consistency check. Reports disagreements; never picks a winner. |
 | `CADENCE_DATA_QUALITY_ENABLED` | `true` | The sheet-health flags (broken formulas, misaligned master rows, stray response values), deduped until they change. |
-| `TRACKER_REMINDER_ENABLED` | `true` | The twice-weekly tracker reminder **section**. It has no send path of its own, so `SALES_DIGEST_ENABLED=false` also silences it. |
+| `TRACKER_REMINDER_ENABLED` | `true` | The twice-weekly tracker reminder **section**. It has no send path of its own, so `SALES_DIGEST_ENABLED=false` also silences it — it is still built on those days, so it reappears the moment the switch goes back on. |
 | `TRACKER_REMINDER_DAYS` | `mon,fri` | Which days carry it. `mon`..`sun` or `0`–`6`, comma separated. |
 | `TODO_REFRESH_DAY` | `fri` | Which day's digest refreshes the to-do sheet and carries its one line. |
 | `STRATEGY_CHECK_ENABLED` | `true` | The weekly `AGAINST THE PLAN` block, on `WEEKLY_DIGEST_WEEKDAY`. A report, never an item — it can't make the digest post. |
