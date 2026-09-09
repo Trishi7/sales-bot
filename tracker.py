@@ -1,31 +1,33 @@
-"""Reading the outreach tracker as a PIPELINE rather than as a grid of strings.
+"""Reading the canonical tab as a PIPELINE rather than as a grid of strings.
 
 `gtm_sheet.py` turns a worksheet into rows keyed by role. This module turns those
-rows into the judgements the policy is written in terms of: is this row hot, is
-it stalled, is it a dead deal, who owns it, when was it last touched.
+rows into the small judgements other modules are written in terms of: when was
+this row last touched, is it open, has it been worked at all, what does the
+funnel look like this week.
 
-THE THREE FLAGS (config.SHEET_FLAGS_ENABLED). None of them posts a message of
-its own any more: HOT is the first section of the ONE daily digest and
-STALLED/DEAD-DEAL are its HYGIENE section, so each is surfaced once a day by
-construction rather than by a per-row rate limit. See digest.py.
+THE THREE ROW-HYGIENE FLAGS ARE GONE — hot_rows, stalled_rows, dead_deal_rows,
+all_flags, digest_flag_line, flag_message, FLAG_HOT / FLAG_STALLED / FLAG_DEAD
+and their two settings. They were the old per-row "what next" logic, and
+`nextaction.py` — the NEXT-ACTION STATE MACHINE — replaces them outright.
 
-  HOT        Response? says yes, but nothing has gone back since the reply.
-             Speed to lead: an answered prospect going cold because nobody
-             replied is the most expensive failure in the sheet, so this is a
-             SAME-DAY flag.
+WHY REPLACED RATHER THAN KEPT. The flags answered "is something wrong with this
+row"; a row could be HOT and DEAD-DEAL at once, and `all_flags` carried an
+ordering to decide which of the two to say out loud. That is a system with three
+opinions and a tie-break. The state machine answers a better question — "what is
+the single next thing somebody does about this row, when is it due, who owns it"
+— and it cannot produce two answers, because its triggers are evaluated in order
+and the first match wins.
 
-  STALLED    An open row, no response, last followed up more than
-             STALLED_AFTER_DAYS working days ago. Silence kills deals; the
-             cadence exists to be kept.
-
-  DEAD-DEAL  An open row with an empty Next Steps AND no future date anywhere.
-             "No next step = dead deal" — the flag asks the owner for the next
-             action, or for the deal to be parked WITH a Reason (the lost-reason
-             log only works if parking requires one).
+WHAT SURVIVES HERE, and why it is not part of that move:
+  - `last_touch`, `future_dates`, `is_open`, `is_engaged` and friends: small,
+    honest readings of cells that several modules share.
+  - the twice-weekly tracker reminder;
+  - the funnel definition and the weekly funnel metrics — those are counts over
+    a whole sheet, not a decision about any one row.
 
 Every judgement here is DERIVED FROM CELLS THAT EXIST. A missing date is
 "unknown", never "old"; an unparseable one is reported rather than guessed. The
-bot must be able to say which cell it read, because a flag that can't be traced
+bot must be able to say which cell it read, because a claim that can't be traced
 back to a cell is one the team will (rightly) argue with.
 """
 import logging
@@ -37,17 +39,6 @@ import deadlines as dl
 import gtm_sheet
 
 log = logging.getLogger(__name__)
-
-FLAG_HOT = "hot"
-FLAG_STALLED = "stalled"
-FLAG_DEAD = "dead_deal"
-
-FLAG_LABELS = {
-    FLAG_HOT: "HOT",
-    FLAG_STALLED: "STALLED",
-    FLAG_DEAD: "DEAD-DEAL",
-}
-
 
 def last_touch(row: dict) -> tuple[Optional[date], str]:
     """(date, which_column) of the most recent outbound touch on a row.
@@ -78,7 +69,6 @@ def future_dates(row: dict, *, today: Optional[date] = None) -> list[tuple[date,
     out: list[tuple[date, str]] = []
     for role, label in (
         ("meeting_date", "Meeting Date"),
-        ("bot_deadline", config.BOT_DEADLINE_COLUMN),
         ("last_followed_up", "Last followed up date"),
         ("intro_date", "membrane Intro Date"),
     ):
@@ -177,207 +167,26 @@ def describe(row: dict) -> str:
     return " · ".join(parts)
 
 
-# -- the three flags ----------------------------------------------------------
-
-
-def hot_rows(rows: list[dict], *, today: Optional[date] = None) -> list[dict]:
-    """Rows that replied and haven't been answered since.
-
-    The test is a comparison of DATES, not a guess: a reply counts as unanswered
-    when the last follow-up predates the response, or when there is no follow-up
-    date at all. A row whose response date can't be read is included with
-    `date_unclear` set, because "they replied and I can't tell if we came back"
-    still needs a human's eye.
-    """
-    today = today or dl.today_ist()
-    out = []
-    for row in rows:
-        if not awaiting_our_reply(row) or not is_open(row):
-            continue
-
-        # A booked future meeting IS the answer to a reply — the ball is not in
-        # our court, so this isn't a speed-to-lead failure.
-        meeting = dl.parse_date(row.get("meeting_date"))
-        if meeting and meeting >= today:
-            continue
-
-        # "No follow-up since" is measured against the FOLLOW-UP column
-        # specifically, not against `last_touch`'s fallback chain. That
-        # distinction is the whole flag: an intro date is when we first wrote to
-        # them, so treating it as a follow-up would mean a prospect who replied
-        # and was never answered looks handled.
-        followed = dl.parse_date(row.get("last_followed_up"))
-
-        response_date = None
-        for header, value in (row.get("_extra") or {}).items():
-            h = gtm_sheet.normalise_header(header)
-            if "response" in h and "date" in h:
-                response_date = dl.parse_date(value)
-                break
-
-        if followed is None:
-            why = "they replied and there's no follow-up date recorded at all"
-        elif response_date is not None and followed <= response_date:
-            why = (
-                f"they replied on {dl.format_date(response_date)} and the last follow-up "
-                f"({dl.format_date(followed)}) predates it"
-            )
-        else:
-            # We answered after they replied, and nothing says otherwise.
-            continue
-
-        out.append({
-            **row,
-            "_flag": FLAG_HOT,
-            "_why": why,
-            "_date_unclear": followed is None and response_date is None,
-        })
-    return out
-
-
-def stalled_rows(rows: list[dict], *, today: Optional[date] = None) -> list[dict]:
-    """Open, unanswered rows whose last touch is older than STALLED_AFTER_DAYS
-    working days."""
-    today = today or dl.today_ist()
-    threshold = max(1, config.STALLED_AFTER_DAYS)
-    out = []
-    for row in rows:
-        if not is_open(row) or has_responded(row):
-            continue
-        # Only rows we've actually worked can stall. A cold name that was emailed
-        # once is an unworked lead, not a stalled deal.
-        if not is_engaged(row):
-            continue
-        # Something already scheduled means the deal isn't stalled, it's waiting.
-        # A booked meeting or a live deadline is a next step, and chasing it as
-        # silence would be wrong — that's the dead-deal rule's job, not this one.
-        if future_dates(row, today=today):
-            continue
-        touched, column = last_touch(row)
-        if touched is None:
-            # No date at all is a hygiene problem of its own, reported honestly
-            # rather than counted as stalled — the bot can't claim a row is old
-            # when it can't read a date.
-            continue
-        age = dl.working_days_between(touched, today)
-        if age > threshold:
-            out.append({
-                **row,
-                "_flag": FLAG_STALLED,
-                "_why": (
-                    f"no response and the last touch ({column}: "
-                    f"{dl.format_date(touched)}) was {age} working days ago"
-                ),
-                "_age_working_days": age,
-            })
-    return out
-
-
-def dead_deal_rows(rows: list[dict], *, today: Optional[date] = None) -> list[dict]:
-    """Open rows with an empty Next Steps AND no future date anywhere.
-
-    Both conditions are required. An empty Next Steps with a meeting booked next
-    Tuesday is untidy, not dead, and flagging it would spend the team's patience
-    on the wrong rows.
-    """
-    today = today or dl.today_ist()
-    out = []
-    for row in rows:
-        if not is_open(row):
-            continue
-        # "No next step = dead deal" only means anything for a deal that was
-        # actually in play. Applied to every cold row on a prospect list it fires
-        # on hundreds of them and stops being a signal at all.
-        if not is_engaged(row):
-            continue
-        if (row.get("next_steps") or "").strip():
-            continue
-        if future_dates(row, today=today):
-            continue
-        out.append({
-            **row,
-            "_flag": FLAG_DEAD,
-            "_why": "no next step recorded and no future date on the row",
-        })
-    return out
-
-
-def all_flags(rows: list[dict], *, today: Optional[date] = None) -> list[dict]:
-    """Every flagged row, most actionable framing first, each row appearing at
-    most once. Two messages about one row is how a bot becomes noise.
-
-    Order is hot → dead → stalled, deliberately. A row that is both dead and
-    stalled gets the DEAD-DEAL message, because "there's no next step — what is
-    it, or park it with a Reason" gives the owner something to do, whereas "this
-    is 11 days old" only tells them something they can already see.
-
-    Dedup is by SHEET ROW, not by company. The tracker holds one row per PoC, so
-    a single company legitimately owns a dozen rows — keying this by company
-    meant the first flagged OpenAI row silenced every other OpenAI row in every
-    category, and on the live sheet that hid all 70 stalled rows behind rows
-    already claimed by the hot and dead-deal finders. Company-level quieting is
-    real, but it belongs in the sweep, which already suppresses a repeat of the
-    same (flag, company) within a day.
-    """
-    today = today or dl.today_ist()
-    seen: set[int] = set()
-    out: list[dict] = []
-    for finder in (hot_rows, dead_deal_rows, stalled_rows):
-        for row in finder(rows, today=today):
-            key = row.get("_row")
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(row)
-    return out
-
-
-def digest_flag_line(row: dict) -> str:
-    """One flag as a LINE IN THE DAILY DIGEST.
-
-    Shorter than `flag_message` on purpose. A flag that was its own message
-    could afford a sentence of coaching ("speed to lead matters more than
-    anything else in the sheet"); forty of them stacked in one digest cannot,
-    and the coaching is the first thing that turns a digest into a wall. What
-    survives is the part nobody can reconstruct themselves: the label, the row,
-    and WHICH CELLS the judgement was read from.
-    """
-    label = FLAG_LABELS.get(row.get("_flag"), "FLAG")
-    return f"{label} — {describe(row)}: {row.get('_why', '')}".rstrip(" .") + "."
-
-
-def flag_message(row: dict, *, mentions: str = "") -> str:
-    """The full in-channel text for one flag, with the coaching line.
-
-    NO LONGER POSTED PROACTIVELY — the digest uses `digest_flag_line` instead.
-    This is kept for the answer path: when someone asks "what's stalled?", a
-    handful of flags with their reasoning is exactly the right answer, and the
-    reasoning is what stops a flag being argued with instead of acted on."""
-    kind = row.get("_flag")
-    label = FLAG_LABELS.get(kind, "FLAG")
-    who = describe(row)
-    why = row.get("_why", "")
-    tail = f" {mentions}" if mentions else ""
-
-    if kind == FLAG_HOT:
-        return (
-            f"{label} — {who}: {why}. Speed to lead matters more than anything else "
-            f"in the sheet; who is replying today?{tail}"
-        )
-    if kind == FLAG_STALLED:
-        n = row.get("_age_working_days")
-        return (
-            f"{label} — {who}: {why}. Either the next touch goes out, or park it with "
-            f"a Reason so the lost-reason log is honest.{tail}"
-            if n is not None
-            else f"{label} — {who}: {why}.{tail}"
-        )
-    if kind == FLAG_DEAD:
-        return (
-            f"{label} — {who}: {why}. No next step is a dead deal. What's the next "
-            f"action, or should it be parked with a Reason?{tail}"
-        )
-    return f"{label} — {who}: {why}.{tail}"
+# -- the three flags — REMOVED ------------------------------------------------
+#
+# hot_rows / stalled_rows / dead_deal_rows / all_flags / digest_flag_line /
+# flag_message lived here. They are replaced by the NEXT-ACTION STATE MACHINE in
+# nextaction.py, which produces exactly ONE action per active row instead of up
+# to three overlapping flags with an ordering to pick between them.
+#
+# Where each flag's judgement went:
+#   HOT       -> the PRIORITY OVERRIDE. Any replied row gets a meeting-proposal
+#                action, due within MEETING_PROPOSAL_WORKING_DAYS, at the front
+#                of the whole queue. Same instinct, but it now says what to DO.
+#   STALLED   -> the lane cadence. A row with nothing since its last touch
+#                produces a follow-up at FOLLOWUP_GRACE_DAYS, HOT_DEAL_DAYS or
+#                SLOW_LANE_DAYS depending on its closure percentage — so a 20%
+#                deal is no longer chased at the same rate as a 90% one.
+#   DEAD-DEAL -> split in two, honestly. A row somebody has actually closed
+#                (0% / Dead / Unresponsive / Won / Lost) now STOPS and is never
+#                chased again; a row that is merely untidy keeps its ordinary
+#                follow-up. The old flag conflated "finished" with "missing a
+#                Next Steps cell", and only one of those is news.
 
 
 # -- THE TWICE-WEEKLY TRACKER REMINDER ----------------------------------------
@@ -389,16 +198,25 @@ def flag_message(row: dict, *, mentions: str = "") -> str:
 #
 # WHY IT IS NOT JUST "please update the tracker". A bare reminder on a fixed
 # schedule is the first thing a team learns to skim. So it carries the two
-# things that make it worth reading: WHICH cells are the ones that matter (the
-# ones every date rule depends on), and HOW MANY rows are currently missing
-# them, which is the number that goes down when somebody acts on it.
+# things that make it worth reading: WHICH cells are the ones that matter, and
+# HOW MANY rows are currently missing them — the number that goes down when
+# somebody acts on it.
+#
+# PHASE 2 CHANGED WHICH CELLS THOSE ARE. The reminder used to count rows missing
+# the follow-up count and last-followed date, because that is what the phase-1
+# date rules read. Those rules are retired. What matters now is ACTIVATION: a
+# row with no first-contact date and no connection date is invisible to
+# everything the bot says unprompted, so the number worth quoting is how many
+# rows are in that state. It is the same reminder aimed at the column that
+# actually decides whether the bot can see a row at all.
 
 
 def reminder_items(
     *,
     today: date,
-    fill_in_count: int = 0,
+    inactive_count: int = 0,
     rows_total: int = 0,
+    active_count: int = 0,
     facts: Optional[list[dict]] = None,
 ) -> list[dict]:
     """The reminder, as digest items.
@@ -416,18 +234,25 @@ def reminder_items(
     """
     day_name = today.strftime("%A")
     lead = (
-        f"{day_name} tracker check — update the outreach tracker: last followed-up "
-        "date, total follow-ups, response, meeting date, next steps."
+        f"{day_name} check — update the Outreach PoCs tab: first-contact date, "
+        "connection date, response, meeting date, next steps."
     )
-    if fill_in_count > 0:
+    if inactive_count > 0:
         lead += (
-            f" {fill_in_count} row(s)"
+            f" {inactive_count} row(s)"
             + (f" of {rows_total}" if rows_total else "")
-            + " have no follow-up count or last-followed date, so no date rule can "
-            "fire on them at all."
+            + " have neither a first-contact date nor a connection date, so I treat "
+            "them as not started and never bring them up. Fill either date in and "
+            "they join the "
+            + (f"{active_count} row(s) I am working from" if active_count
+               else "rows I work from")
+            + "."
         )
-    else:
-        lead += " Every row I can see has the dates the rules need — keep it that way."
+    elif rows_total:
+        lead += (
+            f" All {rows_total} row(s) carry a first-contact or connection date, so "
+            "I can see every one of them — keep it that way."
+        )
     items = [{"text": lead, "forces_digest": True}]
 
     # Anything a meeting said about the tracker, cited. Imported here rather

@@ -130,11 +130,11 @@ class SalesSpreadsheet(Source):
     """The GTM Playbook — the pipeline, the positioning matrix and the priority
     list. WIRED UP, live through the Sheets API (see gtm_sheet.py).
 
-    Two spreadsheets sit behind this one source: the ORIGINAL (read-only source
-    of truth) and the sandbox COPY (the bot's writable mirror). The source is
-    CONNECTED when the original is readable, because that is what answers
-    questions; the copy being unreachable degrades writing only, and is reported
-    in the detail rather than by pretending the whole source is down.
+ONE spreadsheet sits behind this source now — the sandbox copy is retired and
+    the bot reads AND writes the real playbook. CONNECTED means readable, which
+    is what answers questions; whether it is WRITABLE is reported separately in
+    the detail, because a Viewer share reads perfectly and fails on the first
+    write.
 
     The probe is cheap by design — it reuses the last startup access check rather
     than hitting the API on every status call, since `status_report()` runs on
@@ -160,7 +160,6 @@ class SalesSpreadsheet(Source):
             access = gtm_sheet.SHEETS.check_access()
 
         original = access.get(gtm_sheet.ORIGINAL, {})
-        copy = access.get(gtm_sheet.COPY, {})
 
         if not original.get("ok"):
             remedy = original.get("remedy") or ""
@@ -180,13 +179,19 @@ class SalesSpreadsheet(Source):
         found = ", ".join(f"{kind} ({len(tab.rows)} rows)" for kind, tab in tabs.items())
         detail = f"Reading {original.get('title') or 'the GTM Playbook'}: {found or 'no recognised tabs'}."
 
-        if config.SHEET_WRITE_TARGET == "off":
-            detail += " Sheet writing is off, so deadlines are stored locally only."
-        elif not copy.get("ok"):
+        if not config.SHEET_WRITES_ENABLED:
             detail += (
-                f" The sandbox copy is NOT writable ({copy.get('error', 'unknown')}). "
-                f"{copy.get('remedy', '')} Deadlines still work — they're stored locally "
-                "and announced — they just aren't mirrored to the sheet."
+                " Sheet writing is OFF (SHEET_WRITES_ENABLED=false): I still read, "
+                "extract and echo what I would have written, and change nothing."
+            )
+        else:
+            window = config.writable_window_label() or "(none)"
+            detail += (
+                f" I can write cells in the writable window {window} of the Outreach "
+                f"PoCs tab, and nowhere else — the bands {config.RESTRICTED_COLUMN_RANGES} "
+                f"are refused in code. Every write is echoed here and undoable for "
+                f"{config.SHEET_WRITE_UNDO_HOURS}h. The service account needs EDITOR on "
+                f"the playbook for that; Viewer reads fine and fails on the first write."
             )
         return (CONNECTED, detail)
 
@@ -199,7 +204,7 @@ class SalesSpreadsheet(Source):
         """Outreach tracker rows. Callers must check `connected` and say so
         rather than treating [] as "no deals"."""
         try:
-            tab = gtm_sheet.SHEETS.tab(gtm_sheet.TRACKER)
+            tab = gtm_sheet.SHEETS.tab(gtm_sheet.POCS)
         except gtm_sheet.SheetAccessError:
             return []
         return tab.rows if tab else []

@@ -392,7 +392,7 @@ NOTES_EXCLUDE_TITLE_PATTERNS = _str_list("NOTES_EXCLUDE_TITLE_PATTERNS", "AM syn
 
 # The sales spreadsheet is no longer a stub: it is the GTM Playbook, read live
 # through the Sheets API. Its settings live in the GTM SPREADSHEET section below
-# (GOOGLE_SERVICE_ACCOUNT_JSON, GTM_SHEET_*_ID, SHEET_WRITE_TARGET).
+# (GOOGLE_SERVICE_ACCOUNT_JSON, GTM_SHEET_ORIGINAL_ID, SHEET_WRITES_ENABLED).
 #
 # -- The strategy doc (WIRED UP — strategy.py, read-only over Drive) ----------
 # STRATEGY_DOC_ID points at the HUMAN-OWNED strategy document — Vaishnavi's
@@ -562,50 +562,211 @@ STATE_DAILY_HOUR = _int("STATE_DAILY_HOUR", 8)
 # through the Sheets API — there is no sync interval and no local copy of the
 # sheet; rclone is only ever used for the meeting-notes docs.
 
-# Path to the service-account key file. This grants read (and, on the sandbox,
-# write) access to the sheets, so it is a SECRET: .gitignore covers the usual key
-# filenames, and it must never be committed. Empty → the spreadsheet source
-# reports awaiting-access and the bot says so when asked.
+# Path to the service-account key file. This grants READ AND WRITE access to the
+# playbook, so it is a SECRET: .gitignore covers the usual key filenames, and it
+# must never be committed. Empty → the spreadsheet source reports
+# awaiting-access and the bot says so when asked.
+#
+# THE ACCOUNT NOW NEEDS EDITOR, NOT VIEWER. Writes go to the real sheet — see
+# the block below — so a Viewer share reads fine and fails on the first write
+# with a 403 that gtm_sheet translates into "shared read-only, needs Editor".
 GOOGLE_SERVICE_ACCOUNT_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "") or "").strip()
 
-# The ORIGINAL "NFThing <> GTM Playbook" — the READ-ONLY source of truth. The bot
-# never writes here unless SHEET_WRITE_TARGET is explicitly set to "original".
+# The "NFThing <> GTM Playbook" — the team's system of record, and now the
+# bot's WRITE target as well as its read source.
 GTM_SHEET_ORIGINAL_ID = (
     os.getenv("GTM_SHEET_ORIGINAL_ID", "") or ""
 ).strip() or "15fhmQAOVoABg2TpxSRL57LhC_I-62hZZAspl1Dqd_fs"
 
-# The SANDBOX copy — the bot's writable mirror, and the default write target.
-GTM_SHEET_COPY_ID = (
-    os.getenv("GTM_SHEET_COPY_ID", "") or ""
-).strip() or "1yYA38hq6iKguFg2giiyn66AYpXoXfaNiTrKB1Yn2W1A"
+# -- WRITES: THE SANDBOX-COPY ERA IS OVER -------------------------------------
+# GTM_SHEET_COPY_ID, SHEET_WRITE_TARGET, sheet_write_id() and
+# BOT_DEADLINE_COLUMN are REMOVED. Setting any of them now does nothing.
+#
+# WHAT THEY WERE. The bot owned exactly one column — "Next Deadline (bot)",
+# appended at the far right of the tab — and wrote single cells into it, on a
+# SANDBOX COPY of the playbook by default. That design was right when nobody had
+# agreed what the bot may touch: an owned column on a throwaway sheet cannot
+# damage anything, and it let the write path be built and proven before anyone
+# had to trust it.
+#
+# IT WAS ALSO USELESS, and increasingly so. A column on a copy nobody opens is a
+# write into a drawer. The team works in the real sheet; a date the bot recorded
+# somewhere else is a date nobody sees. And the two sheets were only ever
+# row-aligned by luck — one sorted row in the copy and every write landed on the
+# wrong company, which is why `write_deadline_cell` had to re-check the company
+# name before every single write.
+#
+# WHAT REPLACES IT, per Vaishnavi's walkthrough: the bot writes into the REAL
+# "Outreach PoCs" tab, into the columns the team actually keeps, and ONLY inside
+# the WRITABLE WINDOW between the restricted bands (RESTRICTED_COLUMN_RANGES,
+# default A:I and S:X — the identity block and the formula block are still
+# untouchable, enforced in code since V1). There is no copy and no "which sheet"
+# question left to get wrong.
+#
+# WHAT DID NOT CHANGE: SQLite is still the brain. Deadlines, snoozes, scheduled
+# reminders, activations and the drip's own slot log all live there and are
+# authoritative. The sheet is what the TEAM reads; SQLite is what the bot knows.
 
-# Where writes go: "copy" (default, the sandbox), "original" (the real sheet —
-# deliberate and rarely right), or "off" (read-only; deadlines still live in
-# SQLite and are still announced, they just aren't mirrored to a sheet).
-SHEET_WRITE_TARGET = (os.getenv("SHEET_WRITE_TARGET", "") or "copy").strip().lower()
-if SHEET_WRITE_TARGET not in ("copy", "original", "off"):
-    log.warning(
-        "SHEET_WRITE_TARGET=%r is not copy|original|off — falling back to 'copy' "
-        "(the sandbox), which is the safe default.",
-        SHEET_WRITE_TARGET,
-    )
-    SHEET_WRITE_TARGET = "copy"
+# Master switch for cell writes. false → the bot reads, answers, extracts and
+# ECHOES what it would have written, and writes nothing. Useful for a week of
+# watching it get the extraction right before letting it touch the sheet.
+SHEET_WRITES_ENABLED = _bool("SHEET_WRITES_ENABLED", default=True)
 
 
 def sheet_write_id() -> str:
-    """The spreadsheet id writes go to, or "" when writing is off. The ONLY
-    place the write target is resolved, so a caller can't accidentally aim a
-    write at the original."""
-    if SHEET_WRITE_TARGET == "off":
-        return ""
-    return GTM_SHEET_ORIGINAL_ID if SHEET_WRITE_TARGET == "original" else GTM_SHEET_COPY_ID
+    """The spreadsheet id writes go to, or "" when writing is off.
+
+    ONE sheet now. Kept as a function rather than inlined because every write
+    path resolves the target through here, and a single chokepoint is what makes
+    "the bot cannot write anywhere else" checkable rather than asserted.
+    """
+    return GTM_SHEET_ORIGINAL_ID if SHEET_WRITES_ENABLED else ""
 
 
-# The ONE column the bot may write, appended at the far right of the tracker tab.
-# Cell-level writes into this column only — never a row, never another column.
-BOT_DEADLINE_COLUMN = (
-    os.getenv("BOT_DEADLINE_COLUMN", "") or ""
-).strip() or "Next Deadline (bot)"
+# HOW LONG AN "UNDO" STAYS AVAILABLE, in hours. Any team member may undo any
+# write in this window and the exact prior cell values are restored from SQLite.
+#
+# 24 HOURS IS THE POINT, not a detail. The bot writes into the sheet the team
+# actually works in, on the strength of a sentence somebody typed in a channel.
+# That is only acceptable if it is trivially reversible by whoever notices, and
+# noticing usually happens the next morning.
+SHEET_WRITE_UNDO_HOURS = _int("SHEET_WRITE_UNDO_HOURS", 24)
+
+# MOST CELLS ONE REPLY MAY CHANGE. A safety ceiling, not a target: a single
+# sentence should touch one or two cells, and an extraction that suddenly wants
+# to rewrite nine of them has misread something. Past this the write is refused
+# whole — never half-applied — and the bot says so and asks.
+SHEET_WRITE_MAX_CELLS = _int("SHEET_WRITE_MAX_CELLS", 4)
+
+# WORDS THAT MUST APPEAR VERBATIM before the bot will set a prospect status to a
+# terminal value. "Dead" and "Unresponsive" end a row for good — the next-action
+# engine stops it permanently — so the bot never infers one. Somebody has to
+# have actually said it.
+TERMINAL_STATUS_WORDS: list[str] = _str_list(
+    "TERMINAL_STATUS_WORDS",
+    "dead,unresponsive,not interested,no longer interested,drop them,drop it,"
+    "write it off,write them off,close it,closed lost,lost",
+)
+
+
+# -- SUPPRESS-OR-CONVERT: check before you nudge ------------------------------
+# BEFORE ANY PROACTIVE MESSAGE GOES OUT, the bot looks for evidence that the
+# thing it is about to ask for has already happened — in the synced meeting
+# notes and in what the team said in the sales channels.
+#
+# EVIDENCE DOES NOT SILENCE THE NUDGE, IT CHANGES IT. A suppressed message is
+# indistinguishable from a bot that has stopped working, and the sheet is still
+# wrong either way. So the nudge becomes a RECORD-OFFER:
+#
+#   task    "Vaishnavi — has the DM to Sahaj gone out?"
+#   offer   "Saw the meeting's set for Friday — want me to mark it on the row?"
+#
+# That is strictly better than both alternatives. Chasing something already done
+# is the fastest way to get a bot muted; going silent leaves the row wrong AND
+# tells nobody. The offer closes the loop with one word back.
+#
+# THE EVIDENCE IS QUOTED, ALWAYS. Every conversion names what it found and where
+# — the meeting note and its date, or the channel message and its author. A bot
+# that says "I think this is done" without saying why is asking to be trusted on
+# a guess.
+
+# Master switch. Off = every nudge goes out as a task, whatever the notes say.
+SUPPRESS_OR_CONVERT_ENABLED = _bool("SUPPRESS_OR_CONVERT_ENABLED", default=True)
+
+# How far back to look for evidence, in days. Short on purpose: a meeting note
+# from three weeks ago saying "we'll book something" is not evidence that a
+# meeting exists now, and treating it as such would convert a live nudge into an
+# offer to record something that never happened.
+NOTES_LOOKBACK_DAYS = _int("NOTES_LOOKBACK_DAYS", 7)
+
+# -- RESEARCH BRIEFS (mention-triggered only) ---------------------------------
+# "brief me on Sahaj (Acme)" -> who they are, how much their role weighs, which
+# of their work maps to our lanes, an angle, and a DRAFT message to personalise.
+#
+# IT IS COPY MATERIAL. Never auto-sent, never written to the sheet, never
+# actioned on its own. The bot has no outbound channel to a prospect and this
+# does not give it one — it hands a human a draft to edit.
+#
+# IT ONLY READS URLS THAT ARE ALREADY ON THE ROW. The bot does not search the
+# web, does not follow links it found in a page, and does not guess a URL from a
+# name. If the row has no research link, the brief says so.
+
+# Which domains a research link may point at. Anything else is REFUSED with a
+# one-line note naming the domain — not silently skipped, because "I ignored
+# three of your links" is something the person needs to know.
+#
+# Matched on the registered domain and its subdomains, so "arxiv.org" also
+# allows "www.arxiv.org". Widen it deliberately; every entry is a place the bot
+# will fetch from unattended.
+RESEARCH_ALLOWED_DOMAINS: list[str] = _str_list(
+    "RESEARCH_ALLOWED_DOMAINS", "arxiv.org",
+)
+
+# How long a single fetch may take, and how much of a page is read. Bounded so a
+# slow or enormous page degrades the brief instead of hanging the bot.
+RESEARCH_FETCH_TIMEOUT_SECONDS = _int("RESEARCH_FETCH_TIMEOUT_SECONDS", 12)
+RESEARCH_FETCH_MAX_BYTES = _int("RESEARCH_FETCH_MAX_BYTES", 400000)
+# Most links one brief will fetch. A row with twelve papers on it is a reading
+# list, not a brief.
+RESEARCH_MAX_LINKS = _int("RESEARCH_MAX_LINKS", 4)
+
+# LINKEDIN. Set BOTH to enable the LinkedIn half of a brief. Unset (the current
+# state) means the bot SAYS SO in the brief — "LinkedIn access is pending" — in
+# those words, rather than quietly producing a brief with a hole in it where the
+# person's career history should be.
+#
+# There is no scraping fallback and there must not be one: LinkedIn's terms
+# forbid it, and a bot that scrapes on a team's behalf puts the team at risk.
+LINKEDIN_API_CLIENT_ID = (os.getenv("LINKEDIN_API_CLIENT_ID", "") or "").strip()
+LINKEDIN_API_CLIENT_SECRET = (os.getenv("LINKEDIN_API_CLIENT_SECRET", "") or "").strip()
+LINKEDIN_API_ACCESS_TOKEN = (os.getenv("LINKEDIN_API_ACCESS_TOKEN", "") or "").strip()
+
+
+def linkedin_ready() -> bool:
+    """Are LinkedIn API credentials configured?
+
+    An access token alone is enough to call the API; the client id/secret pair is
+    what a refresh flow would need. Either shape counts as configured, and
+    neither is present today.
+    """
+    return bool(
+        LINKEDIN_API_ACCESS_TOKEN
+        or (LINKEDIN_API_CLIENT_ID and LINKEDIN_API_CLIENT_SECRET)
+    )
+
+
+# -- EVENTS & SUMMITS ---------------------------------------------------------
+# The playbook has an "Events & Summits" tab. Each event earns ONE reminder, at
+# T-EVENT_LEAD_DAYS, and never another.
+#
+# ONCE, FOREVER. The dedup is a permanent SQLite row, not a per-day marker: a
+# conference the team has already decided about does not need reminding twice,
+# and "we told you in March" is not a reason to tell you again in April. The
+# reminder rides the drip like everything else — it counts against
+# DAILY_MESSAGE_CAP and the kill switch applies to it.
+
+EVENTS_ENABLED = _bool("EVENTS_ENABLED", default=True)
+
+# Days before the event that the single reminder fires. 20 is the plan's number:
+# far enough out that a booth, a talk slot or a flight is still bookable, close
+# enough that it is not forgotten again immediately.
+EVENT_LEAD_DAYS = _int("EVENT_LEAD_DAYS", 20)
+
+# An optional NAME hint for the events tab, comma-separated. Like the master-tab
+# hint it is only a hint; the tab is also found by its header signature.
+GTM_EVENTS_TAB_TITLES: list[str] = _str_list(
+    "GTM_EVENTS_TAB_TITLES", "Events & Summits,Events and Summits,Events,Summits",
+)
+
+# -- THE WEEKLY FUNNEL LINE ---------------------------------------------------
+# One short Friday message: leading counts, then lagging counts. Nothing else.
+#
+# OFF BY DEFAULT, AND OPT-IN PER THE PLAN. A weekly number nobody asked for is
+# the definition of a message that gets skimmed, and it spends one of the day's
+# three slots. Turn it on when somebody actually wants it.
+WEEKLY_FUNNEL_ENABLED = _bool("WEEKLY_FUNNEL_ENABLED", default=False)
+# 0=Monday ... 4=Friday. Which weekday carries it.
+WEEKLY_FUNNEL_WEEKDAY = _int("WEEKLY_FUNNEL_WEEKDAY", 4)
 
 # Reads are live, cached this long to stay inside the API quota. A stale-but-
 # recent answer is fine; a quota ban is not.
@@ -639,7 +800,7 @@ def is_read_only_sheet_id(sheet_id: str) -> bool:
     """True when `sheet_id` names a sheet that is read-only by policy.
 
     Every write path checks this before touching a cell, so the guarantee holds
-    even if someone points GTM_SHEET_COPY_ID at the mapping sheet by mistake.
+    even if someone points GTM_SHEET_ORIGINAL_ID at the mapping sheet by mistake.
     """
     return bool(sheet_id) and str(sheet_id).strip() in read_only_sheet_ids()
 
@@ -652,61 +813,200 @@ GTM_MAPPING_COLUMN_MAP: dict = _json_object("GTM_MAPPING_COLUMN_MAP", default={}
 # Optional override for header→role mapping when a tab's wording is ambiguous.
 # Headers are discovered dynamically at parse time (tabs will evolve), so this is
 # only needed when auto-detection picks wrong. Shape:
-#   {"outreach_tracker": {"company": "Client Name", "poc": "Point of Contact"}}
+#   {"outreach_pocs": {"company": "Client Name", "poc": "Point of Contact"}}
 # Values are the literal header text in the sheet; keys are the roles in
 # gtm_sheet.ROLES.
 GTM_COLUMN_MAP: dict = _json_object("GTM_COLUMN_MAP", default={})
 
-# -- TAB IDENTIFICATION: BY HEADER SIGNATURE ----------------------------------
-# The GTM Playbook's tabs are found by the COLUMNS they carry, not by their
+# -- THE CANONICAL TAB: "Outreach PoCs", FOUND BY NAME ------------------------
+# PHASE 2 MOVED THE BOT'S SHEET WORLD. The canonical tab is the "Outreach PoCs"
+# tab of the GTM Playbook (GTM_SHEET_ORIGINAL_ID, unchanged). The old outreach
+# TRACKER tab (live: the hidden "Outreach Updates") and the phase-1 cadence
+# rules that ran on it are RETIRED: no rule evaluates against them and no
+# proactive output path is wired to them any more.
+#
+# THIS ONE TAB IS FOUND BY NAME, NOT BY HEADER SIGNATURE, and that is a
+# deliberate reversal of how every other tab is found. A signature is the right
+# authority when the question is "which of these twenty tabs is the tracker";
+# here the tab was named to us directly, and the retired tracker's columns are
+# near-identical to the new tab's, so a signature match would cheerfully
+# re-adopt the retired tab as the canonical one. Naming it is what makes the
+# retirement real.
+#
+# THE COLUMNS ARE STILL DISCOVERED DYNAMICALLY at parse time — tabs evolve, and
+# nothing about this tab's header text is compiled in. The FULL discovered
+# schema of every tab is logged at startup (GTM_LOG_FULL_SCHEMA).
+GTM_POCS_TAB_TITLES: list[str] = _str_list(
+    "GTM_POCS_TAB_TITLES", "Outreach PoCs,Outreach POCs,Outreach PoC,Outreach Pocs"
+)
+
+# The OTHER tabs are still identified by the COLUMNS they carry, not by their
 # names — names drift, signatures don't. gtm_sheet.py holds the signatures; the
 # tab NAME that matched each role is logged at startup under [gtm.roles].
 #
-#   TRACKER   "Last followed up date" + "Total follow-ups till date"
-#             (live: the HIDDEN "Outreach Updates" tab). THE CADENCE SOURCE —
-#             the only tab with dates in it, so every phase-1 rule runs there.
 #   MASTER    "Response Status" + "Intro Sent" + "Meeting Done"
-#             (live: "Master Data"). STATUS ONLY, no dates: aggregate answers,
-#             the weekly funnel definition, and the nightly cross-check.
+#             (live: "Master Data"). STATUS ONLY: aggregate answers and the
+#             weekly funnel definition.
 #   PIPELINE  "Lead Stage" + "Estimated Value (INR)"  (live: "Lead Master Sheet")
 #   FUNNEL    "Vertical / Stage"   (live: "Sales Funnel - March-June 2026")
 #   RESEARCHER LINES  "Outreach Line - Researchers" + "Dates"
 #             (live: "Master Pipeline")
 #
-# RE-POINTING THE BOT AT A NEW SHEET IS AN ENV CHANGE PLUS A RESTART, and this
-# is the promise made in the 27 Aug alignment meeting. Nothing about the sheet's
-# identity or its column names is compiled in:
+# RE-POINTING THE BOT AT A NEW SHEET IS AN ENV CHANGE PLUS A RESTART. Nothing
+# about the sheet's identity or its column names is compiled in:
 #   GTM_SHEET_ORIGINAL_ID     which spreadsheet
-#   GTM_COLUMN_MAP            which header means which rule field
+#   GTM_POCS_TAB_TITLES       which tab is canonical
+#   GTM_COLUMN_MAP            which header means which role
 #   GTM_MASTER_TAB_TITLES     an optional NAME hint for the master tab
-#   SALES_DEFAULT_OWNER_ID    who cadence items are addressed to
-#   the CADENCE_* thresholds below
-# Change those, restart, and the bot runs the same rules against the new sheet.
-# There is no migration and no code edit.
+#   RESTRICTED_COLUMN_RANGES  which columns the bot may never write
+#   SALES_DEFAULT_OWNER_ID    who items are addressed to
+# Change those, restart, and the bot runs against the new sheet.
 
 # An optional NAME hint for the master tab, comma-separated, matched case- and
-# punctuation-insensitively.
-#
-# IT IS A HINT, NOT AN AUTHORITY, and that is a deliberate downgrade. It used to
-# decide which tab was the master outright, which put the entire cadence on a
-# status-only tab with no dates in it — every date rule read a blank and quietly
-# never fired. A tab named here is still only read as the master if it carries
-# the master signature, and naming a tab here can never take the cadence off the
-# tracker.
+# punctuation-insensitively. IT IS A HINT, NOT AN AUTHORITY: a tab named here is
+# still only read as the master if it carries the master signature.
 GTM_MASTER_TAB_TITLES: list[str] = _str_list(
     "GTM_MASTER_TAB_TITLES", "Master data,Master Data,Master-data,Masterdata"
 )
 
-# Read tabs the spreadsheet marks HIDDEN. The master tab is fed by a hidden
-# "outreach updates" sheet, and gspread returns hidden worksheets like any other
-# — this flag exists so discovery can be narrowed if a hidden tab ever causes
-# trouble, not because hidden means private. Hidden tabs are logged as hidden.
+# Read tabs the spreadsheet marks HIDDEN. gspread returns hidden worksheets like
+# any other — this flag exists so discovery can be narrowed if a hidden tab ever
+# causes trouble, not because hidden means private. Hidden tabs are logged as
+# hidden, and the canonical tab is taken by NAME whether it is hidden or not.
 GTM_READ_HIDDEN_TABS = _bool("GTM_READ_HIDDEN_TABS", default=True)
 
 # Log the FULL discovered schema — every tab, every header, hidden or not — once
 # per spreadsheet at startup. This is how a column rename is diagnosed in one
 # log read instead of a debugging session, so it defaults ON.
 GTM_LOG_FULL_SCHEMA = _bool("GTM_LOG_FULL_SCHEMA", default=True)
+
+# -- RESTRICTED COLUMN BANDS: WHERE THE BOT MAY NEVER WRITE -------------------
+# Comma-separated A1 column ranges ("A:I,S:X") or bare single columns ("A,C").
+# Every column inside a band is DENIED to every write path in code, resolved to
+# column INDEXES once at import so a band cannot mean one thing in one code path
+# and something else in another.
+#
+# THIS IS A WRITE LOCK, NOT A READ LOCK. Reading stays completely unrestricted —
+# the bot still parses, quotes and answers questions about every column in the
+# tab. The bands exist because the sheet's left-hand identity block and its
+# right-hand formula block are maintained by people and by formulas, and a bot
+# writing into either would destroy work it cannot see.
+#
+# The columns BETWEEN the bands are the WRITABLE WINDOW, and the NAMED columns
+# inside it are logged at startup — so a shifted column is visible before any
+# write, rather than after one has landed in the wrong place.
+RESTRICTED_COLUMN_RANGES = (
+    os.getenv("RESTRICTED_COLUMN_RANGES", "") or ""
+).strip() or "A:I,S:X"
+
+
+def _column_index(label: str):
+    """"A" -> 0, "S" -> 18, "AA" -> 26. None when it isn't a column label."""
+    text = str(label or "").strip().upper()
+    if not text or not text.isalpha():
+        return None
+    n = 0
+    for ch in text:
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def column_label(index0) -> str:
+    """0-based column index -> A1 letter (0 -> A, 26 -> AA)."""
+    n = int(index0) + 1
+    out = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out
+
+
+def parse_column_ranges(spec: str) -> list:
+    """"A:I,S:X" -> [(0, 8), (18, 23)] — inclusive, 0-based pairs.
+
+    An unparseable fragment is dropped WITH A WARNING NAMING IT rather than
+    raising: a typo here must not take the bot down. It must not silently WIDEN
+    what may be written either, which is why the fragment is named — the bands
+    that did parse still lock exactly what they lock.
+    """
+    out: list = []
+    for part in str(spec or "").split(","):
+        frag = part.strip()
+        if not frag:
+            continue
+        lo_label, _sep, hi_label = frag.partition(":")
+        lo = _column_index(lo_label)
+        hi = _column_index(hi_label) if hi_label.strip() else lo
+        if lo is None or hi is None:
+            log.warning(
+                "RESTRICTED_COLUMN_RANGES: %r is not a column range like 'A:I' or 'S'; "
+                "that fragment is ignored. The other bands still apply.", frag,
+            )
+            continue
+        out.append((min(lo, hi), max(lo, hi)))
+    return sorted(out)
+
+
+RESTRICTED_COLUMN_BANDS: list = parse_column_ranges(RESTRICTED_COLUMN_RANGES)
+RESTRICTED_COLUMN_INDEXES: frozenset = frozenset(
+    i for lo, hi in RESTRICTED_COLUMN_BANDS for i in range(lo, hi + 1)
+)
+
+
+def is_restricted_column(index0) -> bool:
+    """True when this 0-based column index falls inside a restricted band.
+
+    FAILS CLOSED: an index that cannot be read as a number is treated as
+    restricted, because "I could not work out which column this is" has never
+    been a reason to write to it.
+    """
+    try:
+        return int(index0) in RESTRICTED_COLUMN_INDEXES
+    except (TypeError, ValueError):
+        return True
+
+
+def restricted_band_label(index0) -> str:
+    """Which band a column falls in, as "A:I". "" when it falls in none."""
+    try:
+        idx = int(index0)
+    except (TypeError, ValueError):
+        return "(unreadable column index)"
+    for lo, hi in RESTRICTED_COLUMN_BANDS:
+        if lo <= idx <= hi:
+            return f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
+    return ""
+
+
+def writable_windows() -> list:
+    """The contiguous unrestricted runs BETWEEN the restricted bands.
+
+    With bands A:I and S:X that is [(9, 17)] — columns J..R.
+
+    Columns to the RIGHT of the last band are unrestricted too, but they are not
+    "between" the bands and are deliberately not reported as the window: the
+    window is the gap the sheet's owners left for the bot, and naming an
+    open-ended tail alongside it would make a misalignment harder to spot rather
+    than easier.
+    """
+    if len(RESTRICTED_COLUMN_BANDS) < 2:
+        return []
+    out: list = []
+    for (_lo_a, hi_a), (lo_b, _hi_b) in zip(
+        RESTRICTED_COLUMN_BANDS, RESTRICTED_COLUMN_BANDS[1:]
+    ):
+        if lo_b > hi_a + 1:
+            out.append((hi_a + 1, lo_b - 1))
+    return out
+
+
+def writable_window_label() -> str:
+    """The writable window as "J:R". "" when the bands leave no gap between them."""
+    return ", ".join(
+        f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
+        for lo, hi in writable_windows()
+    )
+
 
 # A mapped master column that is empty on nearly every row is the signature of a
 # status conveyed by CELL COLOUR rather than by text. The bot reads VALUES ONLY
@@ -717,128 +1017,217 @@ GTM_LOG_FULL_SCHEMA = _bool("GTM_LOG_FULL_SCHEMA", default=True)
 CADENCE_EMPTY_COLUMN_MIN_ROWS = _int("CADENCE_EMPTY_COLUMN_MIN_ROWS", 10)
 CADENCE_EMPTY_COLUMN_RATIO = _float("CADENCE_EMPTY_COLUMN_RATIO", 0.05)
 
-# -- PHASE 1 CADENCE RULES ----------------------------------------------------
-# The nine daily rules from Vaishnavi's "Steps for Sales Bot" doc, computed
-# against the master tab and fed into the EXISTING once-daily digest. No rule
-# has a send path of its own; nothing here can make the bot speak twice.
+# -- PHASE 2: THE CADENCE RULE SET IS RETIRED ---------------------------------
+# THE PHASE-1 RULES (a-j) ARE GONE, and this block is what is left of them.
 #
-# EVERY "n" BELOW IS A PLACEHOLDER. Vaishnavi's numbers were left unset in the
-# doc and will be tuned once the digest has been read for a week. They are env
-# vars precisely so that tuning is a restart, not a deploy.
+# What was removed, in full: (a) stale_followup, (b) intro_pending,
+# (c) start_interacting and its cold ceiling, (d) alt_channel, (e) unresponsive,
+# (f) lock_meeting, (g) try_another_poc, (h) meeting_soon, (i) post_meeting,
+# (j) nextstep_stall, plus the UPDATE-TRACKER fill-in asks and the
+# master/tracker cross-check that were derived from them. Their thresholds
+# (FOLLOWUP_STALE_DAYS, CONNECT_REMINDER_DAYS, CONNECT_REMINDER_MAX_DAYS,
+# ALT_CHANNEL_AT, UNRESPONSIVE_AT, NEXTSTEP_STALL_DAYS, UPDATE_TRACKER_MAX,
+# CADENCE_CROSSCHECK_ENABLED, CADENCE_CROSSCHECK_MAX) are removed with them —
+# a threshold left behind for a rule that no longer exists is a lie in the
+# config, and somebody would eventually tune it and wonder why nothing changed.
+#
+# The five cadence SECTIONS still exist in the digest and are simply empty until
+# a phase-2 rule set is defined against the "Outreach PoCs" tab. The sheet-health
+# flags below survive, because they are a property of the SHEET rather than a
+# cadence rule, and they are the one thing that still has something to say.
 
-# Master switch for the whole cadence block. Off = the five cadence sections are
-# simply absent from the digest; nothing else changes.
+# Master switch for whatever the cadence block computes. Off = the cadence
+# sections are simply absent from the digest; nothing else changes.
 CADENCE_ENABLED = _bool("CADENCE_ENABLED", default=True)
 
-# (a) Last Followed-up Date older than this, with no response → chase the owner.
-FOLLOWUP_STALE_DAYS = _int("FOLLOWUP_STALE_DAYS", 5)
-# (c) First Contacted set but never Connected after this long → start interacting.
-CONNECT_REMINDER_DAYS = _int("CONNECT_REMINDER_DAYS", 7)
-# ...AND NOT AFTER THIS LONG. Past this, the row is COLD, not "yet to start".
-#
-# THIS IS THE CEILING RULE (c) NEEDED AND DID NOT HAVE. On the live sheet rule
-# (c) fired on 756 of 886 rows, because most of the tracker is March-June
-# outreach that never connected. Raising CONNECT_REMINDER_DAYS does not help at
-# all — those rows are older than ANY threshold, so a higher floor still lets
-# every one of them through. A ceiling is the only lever that works.
-#
-# Rows past it are excluded from the individual "start interacting" chase and
-# reported as ONE summary line instead ("N cold contacts (never connected, first
-# contacted Mar-Jun) — ask 'cold list' to see them"). The list itself is
-# available uncapped on demand. Nothing is hidden; it is counted rather than
-# enumerated, because 756 identical nudges is not a work list.
-#
-# Set to 0 to turn the ceiling off and go back to chasing every one of them.
-CONNECT_REMINDER_MAX_DAYS = _int("CONNECT_REMINDER_MAX_DAYS", 30)
-# (d) Total follow-ups at or above this with no response → try another channel.
-ALT_CHANNEL_AT = _int("ALT_CHANNEL_AT", 4)
-# (e) Total follow-ups at or above this with no response → ask the OWNER to mark
-# the PoC unresponsive in the sheet. The bot never writes that itself: its only
-# writable cell anywhere remains its own BOT_DEADLINE_COLUMN.
-UNRESPONSIVE_AT = _int("UNRESPONSIVE_AT", 7)
-# (i) Next Steps present but unchanged for this many days → chase.
-NEXTSTEP_STALL_DAYS = _int("NEXTSTEP_STALL_DAYS", 10)
-
 # Cell values that mark a row REJECTED. A rejected row is excluded from every
-# rule and every digest section — never chased, revisited offline by humans.
-# Matched as whole phrases against the response, reason, status, next-steps and
-# notes cells, case-insensitively.
-#
-# "Response = N" is NOT a rejection: rule (g) exists precisely to suggest another
-# PoC at a company whose first contact said no. Rejection has to be written down
-# deliberately.
+# proactive feature — never chased, revisited offline by humans. Matched as
+# whole phrases against the response, reason, status, next-steps and notes
+# cells, case-insensitively.
 CADENCE_REJECTED_MARKERS: list[str] = _str_list(
     "CADENCE_REJECTED_MARKERS",
     "rejected,not interested,disqualified,do not contact,dnc,closed lost,"
     "lost,dropped,drop,blacklist,blacklisted",
 )
 
-# WHO A CADENCE ITEM IS ADDRESSED TO.
+# WHO A PROACTIVE ITEM IS ADDRESSED TO.
 #
-# THE TRACKER HAS NO OWNER COLUMN. Every row is worked by the same person today,
-# so a cadence line resolves its owner in this order:
-#   1. the row's own owner cell, if a column ever appears (or GTM_COLUMN_MAP
-#      names one: {"outreach_tracker": {"owner": "Owned By"}}), resolved against
-#      the roster by display name;
+# A line resolves its owner in this order:
+#   1. the row's own owner cell, if the canonical tab carries one (or
+#      GTM_COLUMN_MAP names one: {"outreach_pocs": {"owner": "Owned By"}}),
+#      resolved against the roster by display name;
 #   2. SALES_DEFAULT_OWNER_ID — Vaishnavi's Discord id.
 # The id must ALSO be in TEAM_ROSTER_IDS to actually be @-mentioned; the roster
 # is the only thing that authorises a mention, and an id that isn't on it is
-# named in plain text instead. Unset means cadence lines are addressed to the
+# named in plain text instead. Unset means lines are addressed to the
 # DEADLINE_NOTIFY_IDS group line, which is worse but never wrong.
 SALES_DEFAULT_OWNER_ID = _int("SALES_DEFAULT_OWNER_ID", 0)
 
-# How many UPDATE-TRACKER fill-in asks the digest carries. SEPARATE from
-# DIGEST_MAX_ITEMS on purpose: the tracker is sparse (follow-up counts are blank
-# on most rows), so a row whose rule inputs are missing becomes a "please fill
-# this in" ask rather than a chase — and without its own budget those asks would
-# consume the whole 15-item cadence and push the real work off the digest.
-UPDATE_TRACKER_MAX = _int("UPDATE_TRACKER_MAX", 5)
-
-# THE NIGHTLY CONSISTENCY CROSS-CHECK. The master tab and the tracker describe
-# the same rows in two vocabularies; where they disagree, one of them is wrong
-# and a human has to say which. The bot reports the disagreement as an
-# UPDATE-TRACKER line and NEVER infers a winner — picking one silently is how a
-# status gets quietly rewritten by a bot nobody asked.
-CADENCE_CROSSCHECK_ENABLED = _bool("CADENCE_CROSSCHECK_ENABLED", default=True)
-# How many disagreements one digest reports. They are a fill-in ask like any
-# other and share the UPDATE_TRACKER_MAX budget; this caps how many are computed
-# into the list at all.
-CADENCE_CROSSCHECK_MAX = _int("CADENCE_CROSSCHECK_MAX", 5)
-
 # THE DATA-QUALITY FLAGS: broken formulas (#REF! and friends), master rows whose
 # cells come from the wrong vocabulary, and response values nobody standardised.
-# One UPDATE-TRACKER line each, and DEDUPED UNTIL FIXED — a flag whose signature
-# hasn't changed since the last time it was reported is not repeated, because a
-# daily reminder of a known-broken formula is how a digest gets muted.
+# One line each, and DEDUPED UNTIL FIXED — a flag whose signature hasn't changed
+# since the last time it was reported is not repeated, because a daily reminder
+# of a known-broken formula is how a digest gets muted.
 CADENCE_DATA_QUALITY_ENABLED = _bool("CADENCE_DATA_QUALITY_ENABLED", default=True)
 
-# THE URGENT ITEMS ARE NEVER TRUNCATED, and they have their own ceiling.
-#
-# A positive reply with no next step (f), a meeting inside MEETING_PREP_DAYS (h)
-# and a post-meeting gap (i) are exactly what Vaishnavi prioritised. Sharing one
-# fifteen-item budget with the rest of the cadence, sixteen urgent rows filled
-# the whole digest on day one and then — one row later — would have started
-# truncating the positives themselves. Truncating the positives defeats the
-# digest, so they get their own budget and DIGEST_MAX_ITEMS applies to
-# everything else.
-#
-# THIS IS A HARD CEILING, NOT A TARGET. It exists only so a broken sheet — a
-# column that suddenly reads as positive on every row — cannot produce a
-# thousand-line message. If it is ever actually hit, that is a bug to look at,
-# and the closing "N more held" line will say so.
+# THE URGENT ITEMS ARE NEVER TRUNCATED, and they have their own ceiling. A HARD
+# CEILING, NOT A TARGET: it exists so a broken sheet cannot produce a
+# thousand-line message. If it is ever actually hit, the closing "N more held"
+# line says so.
 URGENT_MAX = _int("URGENT_MAX", 25)
 
-# How many NON-URGENT cadence items the digest carries. 15 is the 10–15
-# phase-1 agreement from the 27 Aug meeting. The urgent items are counted
-# separately against URGENT_MAX above and are never truncated by this cap.
-#
-# Everything past the cap is counted in one closing line and available on demand
-# via the "full cadence list" query.
+# How many NON-URGENT items the digest carries. Everything past the cap is
+# counted in one closing line rather than silently dropped.
 DIGEST_MAX_ITEMS = _int("DIGEST_MAX_ITEMS", 15)
 
-# The uncapped on-demand list is bounded too — a Discord reply has a size limit,
-# and 400 lines of cadence is not an answer.
+# The uncapped on-demand list is bounded too — a Discord reply has a size limit.
 CADENCE_FULL_LIST_MAX = _int("CADENCE_FULL_LIST_MAX", 200)
+
+
+# -- THE NEXT-ACTION STATE MACHINE --------------------------------------------
+# ONE next action per ACTIVE row, and never more than one.
+#
+# This REPLACES the old per-row "what next" logic — the three row-hygiene flags
+# (HOT / STALLED / DEAD-DEAL) and the ad-hoc deadline kinds that stood in for a
+# cadence. Those answered "is something wrong with this row"; a row could match
+# two of them at once, and neither said what to actually do. The state machine
+# answers "what is the single next thing somebody does about this row, when is
+# it due, and who owns it" — which is the question a sales team asks.
+#
+# EXACTLY ONE ACTION PER ROW is the whole design. Triggers are evaluated in a
+# fixed order and the FIRST match wins, so a row can never produce two competing
+# instructions. See nextaction.py, which holds the order and the reason for it.
+#
+# IT SENDS NOTHING. The engine is pure computation: rows in, one action out. It
+# has no send path, it is not wired into the daily digest, and the only way to
+# see its output is to ask for it ("cadence preview") or to read the startup
+# log. That is deliberate — it is safe to deploy with the digest kill switch
+# off, and wiring the queue into the digest is a separate, visible decision.
+
+# Master switch for the engine. Off = no queue is computed and "cadence preview"
+# says so rather than returning an empty list, which would read as "nothing to
+# do" when the truth is "I did not look".
+NEXT_ACTION_ENABLED = _bool("NEXT_ACTION_ENABLED", default=True)
+
+# (1) FIRST CONTACT, NO MOVEMENT. Calendar days after the first-contact date
+# before the row is due a follow-up (or a suggestion to try a different PoC at
+# the same company). The meeting's number.
+FOLLOWUP_GRACE_DAYS = _int("FOLLOWUP_GRACE_DAYS", 7)
+
+# (2) CONNECTED, NO DM YET. Hours after the connection date before the bot asks
+# "DM sent?". HOURS, not days, because this is the one check that is meant to
+# land while the connection is still warm.
+#
+# THE SHEET HOLDS DATES, NOT TIMES, so this is rounded UP to whole days when it
+# is applied (48h -> 2 days). It is expressed in hours anyway because that is
+# how the rule was agreed and how anyone tuning it will think about it.
+CONNECT_DM_CHECK_HOURS = _int("CONNECT_DM_CHECK_HOURS", 48)
+
+# (3) STILL NO DM A WEEK ON. Calendar days after the connection date for the
+# harder DM check. Distinct from the 48-hour nudge above: that one is a prompt,
+# this one is a week of silence on a live connection.
+CONNECTION_DM_CHECK_DAYS = _int("CONNECTION_DM_CHECK_DAYS", 7)
+
+# (4) DM SENT, NOTHING SINCE. Calendar days after the DM-sent date before the
+# progress check. The progress check ALSO asks for an email address or phone
+# number — but ONLY when the first contact was not already by email. Asking a
+# prospect you emailed for their email address is the kind of line that gets a
+# bot switched off, so the ask is type-aware. See EMAIL_CONTACT_TYPES.
+DM_PROGRESS_CHECK_DAYS = _int("DM_PROGRESS_CHECK_DAYS", 7)
+
+# (5) DEMO GIVEN, NOTHING MOVED. Calendar days after the demo before the quote
+# chase. Short on purpose: a demo with no quote behind it goes cold fastest.
+DEMO_QUOTE_DAYS = _int("DEMO_QUOTE_DAYS", 3)
+
+# (6) THE PRIORITY OVERRIDE (strategy section 5.1). ANY positive or replied row
+# gets a meeting-proposal action due within this many WORKING days, and it goes
+# to the front of the queue ahead of everything else. Working days, not calendar
+# days: "propose a meeting within two days" said on a Friday means Tuesday.
+#
+# A reply that has been sitting for a week produces a date IN THE PAST, and that
+# is left in the past rather than pulled to today — the queue shows it as
+# overdue, which is the true statement about it.
+MEETING_PROPOSAL_WORKING_DAYS = _int("MEETING_PROPOSAL_WORKING_DAYS", 2)
+
+# (7) SILENT TOUCHES. How many follow-ups with no response before the bot
+# counsels a change of channel, and before it suggests marking the PoC
+# Unresponsive. THE BOT NEVER WRITES EITHER: marking somebody unresponsive is a
+# judgement with consequences and it belongs to whoever owns the row.
+CHANNEL_SWITCH_AT = _int("CHANNEL_SWITCH_AT", 4)
+UNRESPONSIVE_SUGGEST_AT = _int("UNRESPONSIVE_SUGGEST_AT", 7)
+
+# (8) THE SLOW LANE. Closure below CLOSURE_HOT_THRESHOLD percent gets this
+# cadence in calendar days instead of the 7-day one, and sits at the back of the
+# queue. A 20% deal chased weekly is a bot spending the team's credibility on a
+# row the team has already priced.
+SLOW_LANE_DAYS = _int("SLOW_LANE_DAYS", 20)
+
+# ...and the fast lane. Closure ABOVE the threshold, or a deal marked In
+# Progress, gets this cadence and rides near the front.
+HOT_DEAL_DAYS = _int("HOT_DEAL_DAYS", 7)
+
+# The percentage that divides the two lanes. A row exactly ON the threshold is
+# treated as SLOW: "50%" is not "more likely than not".
+CLOSURE_HOT_THRESHOLD = _int("CLOSURE_HOT_THRESHOLD", 50)
+
+# (9) ON HOLD. A deal parked by agreement is not chased — it gets a pulse check
+# this many calendar days apart, and nothing else.
+ON_HOLD_PULSE_DAYS = _int("ON_HOLD_PULSE_DAYS", 30)
+
+# (10) STOP, FOREVER. Closure values that end the row: no next action is ever
+# produced for it again, by any trigger, including the priority override.
+# Matched case-insensitively as whole phrases against the closure cell; a
+# closure of exactly 0% stops the row too, and that is handled numerically
+# rather than by this list.
+CLOSURE_STOP_MARKERS: list[str] = _str_list(
+    "CLOSURE_STOP_MARKERS",
+    "dead,unresponsive,won,lost,closed won,closed lost,closed-won,closed-lost,"
+    "not interested,do not contact,dnc",
+)
+
+# What the deal-status cell says when a deal is parked, and when it is live.
+# Both are phrase lists so a sheet that writes "Paused" instead of "On Hold"
+# needs an env change rather than a code change.
+DEAL_ON_HOLD_MARKERS: list[str] = _str_list(
+    "DEAL_ON_HOLD_MARKERS", "on hold,onhold,on-hold,paused,parked,deferred",
+)
+DEAL_IN_PROGRESS_MARKERS: list[str] = _str_list(
+    "DEAL_IN_PROGRESS_MARKERS",
+    "in progress,inprogress,in-progress,active,live,ongoing,negotiating,proposal sent",
+)
+
+# What the prospect/stage cell says when a demo has happened. The quote chase
+# fires off this.
+PROSPECT_DEMO_MARKERS: list[str] = _str_list(
+    "PROSPECT_DEMO_MARKERS", "demo,demo done,demo given,demo completed,demo scheduled,demoed",
+)
+
+# What the first-contact-type cell says when the first contact WAS by email.
+# The progress check reads this and drops its "ask for their email" line when it
+# matches — see DM_PROGRESS_CHECK_DAYS.
+EMAIL_CONTACT_TYPES: list[str] = _str_list(
+    "EMAIL_CONTACT_TYPES", "email,e-mail,mail,cold email,emailer",
+)
+
+# NO DUE DATE EVER LANDS ON A SATURDAY OR A SUNDAY. Every computed date is
+# shifted forward to the Monday.
+#
+# THE ONE EXCEPTION IS AN EXPLICITLY SCHEDULED REMINDER — a one-off somebody
+# asked for at a specific time ("remind me about Acme on Saturday morning").
+# That is a person's own instruction about their own weekend and the bot has no
+# business moving it. Rows in the scheduled_reminders table keep their exact
+# date; everything else is shifted.
+#
+# Turning this off is supported but almost certainly wrong: a Saturday due date
+# is read on Monday anyway, two days late, and looks like the bot cannot read a
+# calendar.
+NEXT_ACTION_WEEKEND_SHIFT = _bool("NEXT_ACTION_WEEKEND_SHIFT", default=True)
+
+# How many lines "cadence preview" prints. It is a read-only answer in a Discord
+# message, and a message has a size limit; the count of what was cut is always
+# reported alongside.
+NEXT_ACTION_PREVIEW_MAX = _int("NEXT_ACTION_PREVIEW_MAX", 60)
+
 
 # -- Meeting-prep briefs ------------------------------------------------------
 # A meeting inside MEETING_PREP_DAYS gets ONE prep brief attached to that day's
@@ -882,62 +1271,84 @@ DEADLINE_NOTIFY_IDS: list[int] = _int_list("DEADLINE_NOTIFY_IDS")
 # on the roster to be pinged.
 ESCALATE_TO_ID = _int("ESCALATE_TO_ID", 0)
 
-# -- Row hygiene flags --------------------------------------------------------
-# Surfaced in-channel at most ONCE A DAY per row, so a flag is a signal rather
-# than a recurring complaint.
-
-# An open row with no response whose last follow-up is older than this (working
-# days) is STALLED.
-STALLED_AFTER_DAYS = _int("STALLED_AFTER_DAYS", 5)
-# Master switch for the three row-hygiene flags (HOT / STALLED / DEAD-DEAL).
-# These no longer post on their own: HOT is the first section of the daily
-# digest and STALLED/DEAD-DEAL are its HYGIENE section. Off means both sections
-# are simply absent.
-SHEET_FLAGS_ENABLED = _bool("SHEET_FLAGS_ENABLED", default=True)
-
-# MAX_FLAGS_PER_SWEEP is RETIRED — there is no per-sweep posting left to cap.
-# SALES_DIGEST_MAX_PER_SECTION bounds each digest section instead, and unlike
-# the old cap it SAYS how many rows it left out rather than silently dropping
-# them onto the next tick.
-
-# -- THE ONE DAILY DIGEST -----------------------------------------------------
-# Every proactive thing this bot has to say goes out ONCE A DAY, in one message,
-# at SALES_DIGEST_TIME. There is no other unprompted send path in the code: no
-# reminders, no chases, no escalations, no hygiene flags scattered through the
-# day. See digest.py for what is in it and why.
+# -- Row hygiene flags — RETIRED ----------------------------------------------
+# The three flags (HOT / STALLED / DEAD-DEAL) and their settings
+# (STALLED_AFTER_DAYS, SHEET_FLAGS_ENABLED, and MAX_FLAGS_PER_SWEEP before them)
+# are GONE. They were the old per-row "what next" logic and the NEXT-ACTION
+# STATE MACHINE replaces them outright.
 #
-# The two things that are NOT the digest, and are still immediate:
+# WHY REPLACED RATHER THAN KEPT ALONGSIDE. The flags answered "is something
+# wrong with this row", the state machine answers "what is the single next thing
+# somebody does about it". A row could be HOT and DEAD-DEAL at once and the code
+# had a dedup ordering to pick between them; the state machine cannot produce
+# two answers, because its triggers are evaluated in order and the first match
+# wins. Two systems both deciding what a row needs is how a bot ends up
+# contradicting itself in one message.
+#
+# Their proactive outlet — the digest's HOT and HYGIENE sections — is unwired
+# with them. The state machine deliberately has no proactive outlet yet: it is
+# read through "cadence preview" and the startup log. See NEXT_ACTION_* above.
+
+# -- THE DRIP SCHEDULER -------------------------------------------------------
+# THE ONE DAILY DIGEST IS RETIRED. Its format — one long message at
+# SALES_DIGEST_TIME, grouped into HOT / DEADLINES / OVERDUE / ESCALATIONS /
+# HYGIENE / five cadence sections, with carry-forward "(3rd day)" markers — is
+# gone. What replaces it is a DRIP: at most DAILY_MESSAGE_CAP short messages a
+# weekday, time-spaced, one per (action type x owner).
+#
+# WHY. The digest was one message a day because six kinds of scattered message
+# got the bot muted. It solved that and created the opposite problem: a wall of
+# sections that reads like a report, gets skimmed, and asks a person to find
+# their own name in it. The drip keeps the volume contract — three messages, not
+# six paths — and gives each one a single subject and a single owner, which is
+# how a person actually receives work.
+#
+# THE GROUPING RULE IS ABSOLUTE: one message per (type x owner), companies
+# comma-separated in one sentence. NEVER two types in a message, never two
+# owners. That is what makes a message answerable: "yes, done" means something
+# when the message asked one thing of one person.
+#
+# The two things that are NOT the drip, and are still IMMEDIATE — spacing
+# applies to proactive sends only, never to answers:
 #   - a REPLY to a question someone asked;
 #   - the ask-time deadline announcement, which is the answer to "when is the
 #     follow-up for X?" and is consent-based by design ("shout to change").
 
-# THE KILL SWITCH FOR EVERY UNPROMPTED MESSAGE.
+# THE KILL SWITCH FOR EVERY UNPROMPTED MESSAGE. UNCHANGED, AND DELIBERATELY SO.
 #
-#   true / unset  the digest posts at SALES_DIGEST_TIME (the historical
-#                 behaviour, which is why unset means on).
-#   false         the bot posts NOTHING unprompted. Not the digest, and not any
-#                 section that rides in it — cadence lines, the tracker-update
-#                 reminder, meeting-prep briefs, escalations, the funnel block.
-#                 None of those has a send path of its own (see bot.py), so one
-#                 gate covers all of them.
+# The name, the semantics and the suppressed-log line are all kept as they were.
+# The switch is currently false on the server, and an operator who set it that
+# way to stop the bot talking must not discover that a rewrite quietly re-armed
+# it under a new name. The drip INHERITS this switch; it does not get one of its
+# own.
+#
+#   true / unset  the drip sends its messages (the historical behaviour, which
+#                 is why unset means on).
+#   false         the bot sends NOTHING unprompted. Not a drip message, not a
+#                 re-ask, nothing. There is no second switch to also check.
 #
 # WHAT DOES NOT STOP: everything still computes. Deadlines are still tracked,
-# cadence is still evaluated, SQLite state and audit.jsonl are still written.
-# The bot still answers when @-mentioned ("full cadence list", a hygiene check,
-# sheet questions) and still announces a deadline when someone asks for one.
-# Only the unprompted posting stops.
+# the next-action queue is still evaluated, SQLite state and audit.jsonl are
+# still written. The bot still answers when @-mentioned ("cadence preview",
+# "sheet status", sheet questions) and still announces a deadline when someone
+# asks for one. Only the unprompted sending stops.
 #
 # This module-level value is the BOOT reading, used for the startup log below.
-# The runtime gate is `digest_enabled()`, which re-reads the setting at digest
+# The runtime gate is `digest_enabled()`, which re-reads the setting at send
 # time so flipping it does not need a restart.
 SALES_DIGEST_ENABLED = _bool("SALES_DIGEST_ENABLED", default=True)
 
 
 def digest_enabled() -> bool:
-    """Is unprompted posting on? Read LIVE, not at import.
+    """Is unprompted sending on? Read LIVE, not at import.
 
-    Read at digest time rather than at boot so an operator can flip the switch
-    and have it take effect on the next sweep tick. A restart applies it too, of
+    KEPT UNDER ITS OLD NAME on purpose. This is the same gate the retired digest
+    used, read at the same point in the tick, logging the same line. The drip
+    inherits it rather than introducing a switch of its own — an operator who
+    turned the bot off should not have to learn a new variable to keep it off.
+
+    Read at send time rather than at boot so an operator can flip the switch and
+    have it take effect on the next sweep tick. A restart applies it too, of
     course — this just doesn't require one.
 
     WHERE IT READS FROM, and why in this order: this project's contract is that
@@ -969,28 +1380,77 @@ def digest_enabled() -> bool:
     )
     return SALES_DIGEST_ENABLED
 
-# WALL-CLOCK IST, "HH:MM". Computed against Asia/Kolkata explicitly (see
-# deadlines.IST), never against the server clock — a cloud box runs UTC, and a
-# digest scheduled at "10:00" server time would land at 15:30 for the team.
-SALES_DIGEST_TIME = (os.getenv("SALES_DIGEST_TIME", "") or "").strip() or "10:00"
+# WHEN THE FIRST MESSAGE OF THE DAY GOES OUT. Wall-clock IST, "HH:MM", computed
+# against Asia/Kolkata explicitly (see deadlines.IST) and never against the
+# server clock — a cloud box runs UTC, and "10:00" server time would land at
+# 15:30 for the team.
+SALES_DRIP_START = (
+    os.getenv("SALES_DRIP_START", "") or os.getenv("SALES_DIGEST_TIME", "") or ""
+).strip() or "10:00"
 
-# Most items shown per section. A first run over a messy 886-row sheet can turn
-# up seventy stalled rows, and a digest nobody can scroll to the end of is the
-# problem we started with. Anything past the cap is COUNTED in a trailing line,
-# never silently dropped.
-SALES_DIGEST_MAX_PER_SECTION = _int("SALES_DIGEST_MAX_PER_SECTION", 15)
+# SALES_DIGEST_TIME is kept as an ALIAS so an existing .env keeps working —
+# SALES_DRIP_START wins if both are set. It named the digest's single send time
+# and now names the first drip slot, which is the same thing an operator meant
+# by it.
+SALES_DIGEST_TIME = SALES_DRIP_START
 
-# Which sales channel the digest posts in. 0/unset → the ask channel, else the
-# first channel in SALES_CHANNEL_IDS.
+# HOW MANY PROACTIVE MESSAGES A WEEKDAY, EVER. The volume contract, and a HARD
+# ceiling rather than a target: three short messages a day is what a busy
+# channel absorbs without learning to skim. Anything past it ROLLS TO TOMORROW
+# rather than being dropped — except that a positive reply overrides the roll,
+# because a reply that waits a day is a reply that goes cold.
+DAILY_MESSAGE_CAP = _int("DAILY_MESSAGE_CAP", 3)
+
+# MINUTES BETWEEN PROACTIVE MESSAGES. Three messages in one minute is one long
+# message with extra steps; the spacing is what makes each one land as its own
+# thing and gives the person time to act on the first before the second arrives.
+MESSAGE_GAP_MINUTES = _int("MESSAGE_GAP_MINUTES", 90)
+
+# ...PLUS OR MINUS THIS MANY MINUTES. A bot that posts at exactly 10:00, 11:30
+# and 13:00 every single day reads as a machine running a script, and people
+# start filing it as such. The jitter is DETERMINISTIC — seeded on the date and
+# the slot number — so a restart mid-morning recomputes the same schedule and
+# cannot double-send. Set to 0 for exact spacing.
+MESSAGE_JITTER_MINUTES = _int("MESSAGE_JITTER_MINUTES", 15)
+
+# ONE GENTLE RE-ASK, this many days after a nudge nobody actioned. Then the
+# subject goes back to the normal cadence and is never re-asked again for that
+# nudge. Two asks is a reminder; three is nagging, and nagging is what gets a
+# bot muted.
+DRIP_REASK_DAYS = _int("DRIP_REASK_DAYS", 2)
+
+# WEEKDAYS ONLY. The drip does not send on Saturdays or Sundays — the same
+# instinct as the next-action engine's weekend shift, applied to the sending
+# rather than to the due date. Set false to send every day.
+DRIP_WEEKDAYS_ONLY = _bool("DRIP_WEEKDAYS_ONLY", default=True)
+
+# Which sales channel the drip sends in. 0/unset → the ask channel, else the
+# first channel in SALES_CHANNEL_IDS. Kept under its old name because it is the
+# same channel the digest used and an existing .env should keep working.
 SALES_DIGEST_CHANNEL_ID = _int("SALES_DIGEST_CHANNEL_ID", 0)
 
+# How many companies one message names before it says "and N more". A sentence
+# listing twenty companies is a list wearing a sentence's clothes.
+DRIP_MAX_COMPANIES_PER_MESSAGE = _int("DRIP_MAX_COMPANIES_PER_MESSAGE", 6)
 
-def digest_time_ist() -> tuple[int, int]:
-    """SALES_DIGEST_TIME as (hour, minute) IST. Unreadable values fall back to
+# Compose the message text with the model, in the voice exemplars in
+# sales_policy.md. Off (or any model failure) falls back to a deterministic
+# template that is still one sentence, still gives an out, and still names the
+# companies — a model outage must cost polish, never the message.
+DRIP_LLM_COMPOSE = _bool("DRIP_LLM_COMPOSE", default=True)
+
+
+def drip_start_ist() -> tuple[int, int]:
+    """SALES_DRIP_START as (hour, minute) IST. Unreadable values fall back to
     10:00 with a warning rather than to "never"."""
     import digest as _digest
 
-    return _digest.parse_time(SALES_DIGEST_TIME)
+    return _digest.parse_time(SALES_DRIP_START)
+
+
+def digest_time_ist() -> tuple[int, int]:
+    """Kept as an alias for `drip_start_ist()` — same value, older name."""
+    return drip_start_ist()
 
 
 # -- Weekly funnel numbers ----------------------------------------------------
@@ -1040,10 +1500,10 @@ def validate() -> list[str]:
     """Return the list of missing REQUIRED env vars (empty when startup is safe).
     Everything else here is a warning: legal, but probably not what you meant.
 
-    One check here does more than warn: a write target that resolves to the
-    read-only mapping sheet is forced to "off", which is why this function
-    rebinds SHEET_WRITE_TARGET."""
-    global SHEET_WRITE_TARGET
+    One check here does more than warn: a playbook id that resolves to the
+    read-only mapping sheet forces SHEET_WRITES_ENABLED off, which is why this
+    function rebinds it."""
+    global SHEET_WRITES_ENABLED
 
     required = {
         "DISCORD_TOKEN": DISCORD_TOKEN,
@@ -1064,31 +1524,67 @@ def validate() -> list[str]:
             "@-mentioned or replied to."
         )
 
-    # The cadence thresholds. Nothing here is fatal — the rules are all
-    # independently useful — but a threshold ordering that makes a rule
-    # unreachable is worth one line at boot rather than a week of silence.
+    # The canonical tab, the restricted bands, and what is left of the cadence.
+    if not GTM_POCS_TAB_TITLES:
+        log.error(
+            "GTM_POCS_TAB_TITLES is empty, so there is no canonical tab. The bot's "
+            'sheet world is the "Outreach PoCs" tab and it is found BY NAME — with no '
+            "name to look for, every proactive feature has nothing to run against. Set "
+            "GTM_POCS_TAB_TITLES to the tab's exact title."
+        )
+    else:
+        log.info(
+            "[config] canonical tab (by name): %s. The old outreach tracker tab and the "
+            "phase-1 cadence rules (a-j) are RETIRED — nothing evaluates against them.",
+            ", ".join(repr(t) for t in GTM_POCS_TAB_TITLES),
+        )
+
+    # THE WRITE LOCK. Logged whether or not writing is on, because "which columns
+    # can the bot touch" is a question people ask about a bot that is currently
+    # read-only, and the answer must not depend on a switch somewhere else.
+    if not RESTRICTED_COLUMN_BANDS:
+        log.warning(
+            "RESTRICTED_COLUMN_RANGES=%r resolved to NO bands — no column is denied to "
+            "the write paths. That is almost certainly a typo: the default is 'A:I,S:X'. "
+            "Reading is unrestricted either way.",
+            RESTRICTED_COLUMN_RANGES,
+        )
+    else:
+        window = writable_window_label()
+        log.info(
+            "[config] restricted (never written): %s. Writable window between the bands: "
+            "%s. Reading is UNRESTRICTED — this is a write lock only.",
+            ", ".join(
+                f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
+                for lo, hi in RESTRICTED_COLUMN_BANDS
+            ),
+            window or "(none — the bands leave no gap between them)",
+        )
+        if not window:
+            log.warning(
+                "RESTRICTED_COLUMN_RANGES=%r leaves NO writable window between the bands, "
+                "so every write inside the banded region will be refused. Deadline "
+                "mirroring will report that refusal rather than writing.",
+                RESTRICTED_COLUMN_RANGES,
+            )
+
     if CADENCE_ENABLED:
         log.info(
-            "[config] cadence ON. Thresholds (ALL PLACEHOLDERS until tuned): "
-            "FOLLOWUP_STALE_DAYS=%d CONNECT_REMINDER_DAYS=%d ALT_CHANNEL_AT=%d "
-            "CONNECT_REMINDER_MAX_DAYS=%d UNRESPONSIVE_AT=%d NEXTSTEP_STALL_DAYS=%d "
-            "MEETING_PREP_DAYS=%d URGENT_MAX=%d DIGEST_MAX_ITEMS=%d UPDATE_TRACKER_MAX=%d",
-            FOLLOWUP_STALE_DAYS, CONNECT_REMINDER_DAYS, ALT_CHANNEL_AT,
-            CONNECT_REMINDER_MAX_DAYS, UNRESPONSIVE_AT, NEXTSTEP_STALL_DAYS,
-            MEETING_PREP_DAYS, URGENT_MAX, DIGEST_MAX_ITEMS, UPDATE_TRACKER_MAX,
+            "[config] cadence block ON. The phase-1 rules are retired, so the cadence "
+            "sections carry sheet-health flags only until a phase-2 rule set exists. "
+            "URGENT_MAX=%d DIGEST_MAX_ITEMS=%d MEETING_PREP_DAYS=%d",
+            URGENT_MAX, DIGEST_MAX_ITEMS, MEETING_PREP_DAYS,
         )
-        if ALT_CHANNEL_AT >= UNRESPONSIVE_AT:
-            log.warning(
-                "ALT_CHANNEL_AT=%d is not below UNRESPONSIVE_AT=%d — rule (d) 'try another "
-                "channel' can never fire, because rule (e) 'mark them unresponsive' takes "
-                "over at or above its own threshold. Set ALT_CHANNEL_AT lower.",
-                ALT_CHANNEL_AT, UNRESPONSIVE_AT,
-            )
         if DIGEST_MAX_ITEMS < 1:
             log.warning(
-                "DIGEST_MAX_ITEMS=%d caps the cadence at nothing — the digest would carry "
-                "no cadence items at all. The phase-1 agreement was 10-15.",
+                "DIGEST_MAX_ITEMS=%d caps the digest's non-urgent items at nothing.",
                 DIGEST_MAX_ITEMS,
+            )
+        if URGENT_MAX < 1:
+            log.warning(
+                "URGENT_MAX=%d — the urgent items would be capped at nothing. That is a "
+                "hard ceiling against a broken sheet, not a target.",
+                URGENT_MAX,
             )
         if not GTM_MASTER_TAB_TITLES:
             log.info(
@@ -1100,48 +1596,22 @@ def validate() -> list[str]:
             log.warning(
                 "CADENCE_REJECTED_MARKERS is empty — the only rows treated as rejected "
                 "will be the ones whose Response says so ('N', 'N - Rejected'). A row "
-                "written off in a Reason or Status cell will keep being chased."
+                "written off in a Reason or Status cell will stay visible to the "
+                "proactive features."
             )
         if not SALES_DEFAULT_OWNER_ID:
             log.warning(
-                "SALES_DEFAULT_OWNER_ID is unset and the tracker has no owner column, so "
-                "no cadence line can be addressed to anybody: they will all go out under "
-                "the DEADLINE_NOTIFY_IDS group line. Set it to Vaishnavi's Discord id."
+                "SALES_DEFAULT_OWNER_ID is unset and the canonical tab may have no owner "
+                "column, so no proactive line can be addressed to anybody: they will all "
+                "go out under the DEADLINE_NOTIFY_IDS group line. Set it to Vaishnavi's "
+                "Discord id."
             )
         elif SALES_DEFAULT_OWNER_ID not in TEAM_ROSTER_IDS:
             log.warning(
                 "SALES_DEFAULT_OWNER_ID=%d is not in TEAM_ROSTER_IDS — the roster gate "
-                "fails closed, so cadence items will name that person in plain text "
-                "instead of @-mentioning them. Add the id to TEAM_ROSTER_IDS.",
+                "fails closed, so items will name that person in plain text instead of "
+                "@-mentioning them. Add the id to TEAM_ROSTER_IDS.",
                 SALES_DEFAULT_OWNER_ID,
-            )
-        if CONNECT_REMINDER_MAX_DAYS and CONNECT_REMINDER_MAX_DAYS <= CONNECT_REMINDER_DAYS:
-            log.warning(
-                "CONNECT_REMINDER_MAX_DAYS=%d is not above CONNECT_REMINDER_DAYS=%d — the "
-                "window rule (c) fires in is empty, so NOBODY will be reminded to start "
-                "interacting and every never-connected row goes straight to the cold "
-                "summary. Set the ceiling above the floor.",
-                CONNECT_REMINDER_MAX_DAYS, CONNECT_REMINDER_DAYS,
-            )
-        elif not CONNECT_REMINDER_MAX_DAYS:
-            log.warning(
-                "CONNECT_REMINDER_MAX_DAYS=0 — the cold ceiling is OFF, so rule (c) fires "
-                "on every never-connected row however old. On the live sheet that was 756 "
-                "of 886 rows. The default of 30 exists for exactly that reason."
-            )
-        if URGENT_MAX < 1:
-            log.warning(
-                "URGENT_MAX=%d — the urgent items (positive replies awaiting a next step, "
-                "meetings in the prep window, post-meeting gaps) would be capped at "
-                "nothing. That is the part of the digest Vaishnavi prioritised.",
-                URGENT_MAX,
-            )
-        if UPDATE_TRACKER_MAX < 1:
-            log.warning(
-                "UPDATE_TRACKER_MAX=%d — no fill-in asks will be posted, so rows whose "
-                "follow-up count or last-followed date is missing will simply be silent "
-                "rather than asked about.",
-                UPDATE_TRACKER_MAX,
             )
 
     if not TEAM_ROSTER_IDS and not TEAM_ROSTER_NAMES:
@@ -1223,46 +1693,66 @@ def validate() -> list[str]:
             GOOGLE_SERVICE_ACCOUNT_JSON,
         )
 
-    if SHEET_WRITE_TARGET == "original":
+    if SHEET_WRITES_ENABLED:
         log.warning(
-            "SHEET_WRITE_TARGET=original — the bot will write its %r column into the REAL "
-            "GTM Playbook, not the sandbox. It still only ever writes cells in that one "
-            "column, and never overwrites a human-entered date. Set SHEET_WRITE_TARGET=copy "
-            "to aim writes at the sandbox instead.",
-            BOT_DEADLINE_COLUMN,
+            "SHEET_WRITES_ENABLED=true — the bot WRITES INTO THE REAL GTM Playbook, in "
+            "the writable window %s of the Outreach PoCs tab. The restricted bands (%s) "
+            "are refused in code and cannot be reached. Every write is echoed in "
+            "channel, recorded in audit.jsonl, and undoable by anyone for %dh.",
+            writable_window_label() or "(none — no window between the bands!)",
+            RESTRICTED_COLUMN_RANGES, SHEET_WRITE_UNDO_HOURS,
         )
-    elif SHEET_WRITE_TARGET == "off":
+        if not writable_window_label():
+            log.error(
+                "...but RESTRICTED_COLUMN_RANGES=%r leaves NO writable window, so every "
+                "write will be refused. Fix the bands or set SHEET_WRITES_ENABLED=false "
+                "so the refusal is a decision rather than a surprise.",
+                RESTRICTED_COLUMN_RANGES,
+            )
+    else:
         log.info(
-            "SHEET_WRITE_TARGET=off — deadlines are still set, stored and announced, but "
-            "nothing is mirrored to any sheet."
+            "SHEET_WRITES_ENABLED=false — the bot still reads, extracts and ECHOES what "
+            "it would have written, and writes nothing to any sheet. SQLite state "
+            "(deadlines, snoozes, reminders) is unaffected."
         )
 
-    if GTM_SHEET_ORIGINAL_ID == GTM_SHEET_COPY_ID:
+    if SHEET_WRITE_UNDO_HOURS < 1:
         log.warning(
-            "GTM_SHEET_ORIGINAL_ID and GTM_SHEET_COPY_ID are the SAME id — the 'sandbox' "
-            "is the real sheet, so the read-only guarantee on the original is gone. Point "
-            "the copy at the sandbox spreadsheet."
+            "SHEET_WRITE_UNDO_HOURS=%s is below 1 — a write would be irreversible almost "
+            "immediately. The whole basis for letting the bot touch the real sheet is "
+            "that anyone who notices can put it back.",
+            SHEET_WRITE_UNDO_HOURS,
+        )
+    if SHEET_WRITE_MAX_CELLS < 1:
+        log.warning(
+            "SHEET_WRITE_MAX_CELLS=%s is below 1 — no write will ever be applied.",
+            SHEET_WRITE_MAX_CELLS,
+        )
+    if not TERMINAL_STATUS_WORDS:
+        log.warning(
+            "TERMINAL_STATUS_WORDS is empty — nothing gates a prospect status of Dead or "
+            "Unresponsive, which STOPS a row for good. The bot would be able to end a "
+            "row on an inference. Restore the list."
         )
 
     # The mapping sheet is read-only BY POLICY, so the one configuration that
-    # could break that promise — aiming writes at it — is caught here and
-    # neutralised rather than warned about. A warning would be a note in a log
-    # nobody reads while the bot wrote to a sheet it was told never to touch.
+    # could break that promise — pointing the playbook id at it — is caught here
+    # and neutralised rather than warned about. A warning would be a note in a
+    # log nobody reads while the bot wrote to a sheet it was told never to touch.
     if is_read_only_sheet_id(sheet_write_id()):
         log.error(
-            "SHEET_WRITE_TARGET=%s resolves to GTM_MAPPING_SHEET_ID (%s), which is "
-            "READ-ONLY by policy. Forcing SHEET_WRITE_TARGET=off. Point "
-            "GTM_SHEET_COPY_ID at the sandbox playbook instead; the mapping sheet is "
-            "never a write target.",
-            SHEET_WRITE_TARGET, GTM_MAPPING_SHEET_ID,
+            "GTM_SHEET_ORIGINAL_ID resolves to GTM_MAPPING_SHEET_ID (%s), which is "
+            "READ-ONLY by policy. Forcing SHEET_WRITES_ENABLED=false; the mapping sheet "
+            "is never a write target.",
+            GTM_MAPPING_SHEET_ID,
         )
-        SHEET_WRITE_TARGET = "off"
+        SHEET_WRITES_ENABLED = False
 
-    if GTM_MAPPING_SHEET_ID in (GTM_SHEET_ORIGINAL_ID, GTM_SHEET_COPY_ID):
+    if GTM_MAPPING_SHEET_ID and GTM_MAPPING_SHEET_ID == GTM_SHEET_ORIGINAL_ID:
         log.error(
-            "GTM_MAPPING_SHEET_ID is the same id as one of the GTM Playbook sheets. "
-            "They are different spreadsheets with different rules — the mapping sheet "
-            "is read-only and the playbook is not. Check both ids."
+            "GTM_MAPPING_SHEET_ID is the same id as the GTM Playbook. They are different "
+            "spreadsheets with different rules — the mapping sheet is read-only and the "
+            "playbook is not. Check both ids."
         )
 
     if not GTM_MAPPING_SHEET_ID:
@@ -1284,7 +1774,6 @@ def validate() -> list[str]:
         ("OUTREACH_FOLLOWUP_DAYS", OUTREACH_FOLLOWUP_DAYS),
         ("REPLY_CHASE_DAYS", REPLY_CHASE_DAYS),
         ("MEETING_PREP_DAYS", MEETING_PREP_DAYS),
-        ("STALLED_AFTER_DAYS", STALLED_AFTER_DAYS),
     ):
         if value < 1:
             log.warning(
@@ -1292,6 +1781,77 @@ def validate() -> list[str]:
                 "moment they are set.",
                 name, value,
             )
+
+    # -- the next-action state machine -------------------------------------
+    # Nothing here is fatal: every trigger is independently useful, and a queue
+    # that is quieter than intended is recoverable. What IS worth a line at boot
+    # is a threshold ordering that makes a trigger UNREACHABLE — that failure is
+    # silent by nature, and the whole point of the engine is that its output can
+    # be checked against the rules that produced it.
+    if NEXT_ACTION_ENABLED:
+        log.info(
+            "[config] next-action engine ON (computation only — it has no send path). "
+            "grace=%dd dm_check=%dh/%dd progress=%dd demo_quote=%dd "
+            "meeting_proposal=%dwd channel_switch@%d unresponsive@%d "
+            "fast=%dd slow=%dd (threshold %d%%) on_hold_pulse=%dd weekend_shift=%s",
+            FOLLOWUP_GRACE_DAYS, CONNECT_DM_CHECK_HOURS, CONNECTION_DM_CHECK_DAYS,
+            DM_PROGRESS_CHECK_DAYS, DEMO_QUOTE_DAYS, MEETING_PROPOSAL_WORKING_DAYS,
+            CHANNEL_SWITCH_AT, UNRESPONSIVE_SUGGEST_AT, HOT_DEAL_DAYS, SLOW_LANE_DAYS,
+            CLOSURE_HOT_THRESHOLD, ON_HOLD_PULSE_DAYS, NEXT_ACTION_WEEKEND_SHIFT,
+        )
+        if CHANNEL_SWITCH_AT >= UNRESPONSIVE_SUGGEST_AT:
+            log.warning(
+                "CHANNEL_SWITCH_AT=%d is not below UNRESPONSIVE_SUGGEST_AT=%d, so the "
+                "change-of-channel counsel can NEVER fire: the unresponsive suggestion "
+                "is evaluated first and takes every row that reaches either. Set "
+                "CHANNEL_SWITCH_AT lower.",
+                CHANNEL_SWITCH_AT, UNRESPONSIVE_SUGGEST_AT,
+            )
+        dm_hours_as_days = max(1, -(-max(0, CONNECT_DM_CHECK_HOURS) // 24))
+        if dm_hours_as_days >= CONNECTION_DM_CHECK_DAYS:
+            log.warning(
+                "CONNECT_DM_CHECK_HOURS=%dh rounds to %dd, which is not below "
+                "CONNECTION_DM_CHECK_DAYS=%dd — so the 'DM sent?' prompt can never fire: "
+                "the week-later DM check is evaluated first. Lower the hours or raise "
+                "the days.",
+                CONNECT_DM_CHECK_HOURS, dm_hours_as_days, CONNECTION_DM_CHECK_DAYS,
+            )
+        if SLOW_LANE_DAYS <= HOT_DEAL_DAYS:
+            log.warning(
+                "SLOW_LANE_DAYS=%d is not above HOT_DEAL_DAYS=%d — the slow lane is not "
+                "slower than the fast one, so a 20%% deal is chased as hard as a 90%% "
+                "one. That is the thing the two lanes exist to stop.",
+                SLOW_LANE_DAYS, HOT_DEAL_DAYS,
+            )
+        if not 1 <= CLOSURE_HOT_THRESHOLD <= 99:
+            log.warning(
+                "CLOSURE_HOT_THRESHOLD=%d is outside 1-99, so every row with a closure "
+                "percentage lands in the same lane. The default is 50.",
+                CLOSURE_HOT_THRESHOLD,
+            )
+        if not CLOSURE_STOP_MARKERS:
+            log.warning(
+                "CLOSURE_STOP_MARKERS is empty — only a closure of exactly 0%% will stop "
+                "a row, so Won, Lost, Dead and Unresponsive rows keep producing work "
+                "forever. That is how a queue stops being trusted."
+            )
+        if not NEXT_ACTION_WEEKEND_SHIFT:
+            log.warning(
+                "NEXT_ACTION_WEEKEND_SHIFT=false — due dates may land on a Saturday or a "
+                "Sunday. They will be read on the Monday anyway, two days late."
+            )
+        if MEETING_PROPOSAL_WORKING_DAYS < 1:
+            log.warning(
+                "MEETING_PROPOSAL_WORKING_DAYS=%d — every reply would be due the day it "
+                "arrived, so the whole override band reads as overdue on arrival.",
+                MEETING_PROPOSAL_WORKING_DAYS,
+            )
+    else:
+        log.warning(
+            "NEXT_ACTION_ENABLED=false — no next-action queue is computed at all. "
+            "'cadence preview' will say so rather than returning an empty list, which "
+            "would read as 'nothing to do' when the truth is 'I did not look'."
+        )
 
     # A deadline nobody is told about isn't authority, it's bookkeeping.
     unpingable = [uid for uid in DEADLINE_NOTIFY_IDS if uid not in TEAM_ROSTER_IDS]
@@ -1321,46 +1881,92 @@ def validate() -> list[str]:
             "rather than escalated to a named person."
         )
 
-    # -- the one daily digest ----------------------------------------------
+    # -- the drip ----------------------------------------------------------
     if SALES_DIGEST_ENABLED:
-        hour, minute = digest_time_ist()
+        hour, minute = drip_start_ist()
         channel = digest_channel_id()
         if not channel:
             log.warning(
-                "SALES_DIGEST_ENABLED is on but there is no sales channel to post the "
-                "daily digest in — it will be skipped, and since the digest is the ONLY "
-                "proactive message this bot sends, nothing unprompted will ever go out. "
-                "Set SALES_CHANNEL_IDS (and optionally SALES_DIGEST_CHANNEL_ID)."
+                "SALES_DIGEST_ENABLED is on but there is no sales channel to send the "
+                "drip in — it will be skipped, and since the drip is the ONLY proactive "
+                "path this bot has, nothing unprompted will ever go out. Set "
+                "SALES_CHANNEL_IDS (and optionally SALES_DIGEST_CHANNEL_ID)."
             )
         else:
             log.info(
-                "Daily digest: %02d:%02d IST in channel %s. This is the only unprompted "
-                "message the bot sends; replies and ask-time deadline announcements are "
-                "immediate.",
-                hour, minute, channel,
+                "Drip: up to %d message(s) per weekday in channel %s, first at %02d:%02d "
+                "IST, then gaps of %d+/-%d min. One message per (action type x owner). "
+                "Replies and ask-time deadline announcements are IMMEDIATE and are not "
+                "spaced or capped.",
+                DAILY_MESSAGE_CAP, channel, hour, minute,
+                MESSAGE_GAP_MINUTES, MESSAGE_JITTER_MINUTES,
             )
-        if SALES_DIGEST_MAX_PER_SECTION < 1:
+        if DAILY_MESSAGE_CAP < 1:
             log.warning(
-                "SALES_DIGEST_MAX_PER_SECTION=%s is below 1 — it will be clamped to 1. "
-                "Every section would otherwise show nothing but its overflow line.",
-                SALES_DIGEST_MAX_PER_SECTION,
+                "DAILY_MESSAGE_CAP=%s is below 1 — the bot will never send anything "
+                "unprompted. If that is what you want, SALES_DIGEST_ENABLED=false says "
+                "it plainly and logs one line a day to prove it.",
+                DAILY_MESSAGE_CAP,
+            )
+        elif DAILY_MESSAGE_CAP > 6:
+            log.warning(
+                "DAILY_MESSAGE_CAP=%s is above 6. The whole point of the volume contract "
+                "is that a busy channel absorbs a few short messages and starts skimming "
+                "past more. The agreed number is 3.",
+                DAILY_MESSAGE_CAP,
+            )
+        if MESSAGE_GAP_MINUTES - MESSAGE_JITTER_MINUTES < 15:
+            log.warning(
+                "MESSAGE_GAP_MINUTES=%d minus MESSAGE_JITTER_MINUTES=%d leaves a floor of "
+                "%d minutes between messages. Below about 15 the drip stops being a drip "
+                "and becomes one long message delivered in pieces.",
+                MESSAGE_GAP_MINUTES, MESSAGE_JITTER_MINUTES,
+                MESSAGE_GAP_MINUTES - MESSAGE_JITTER_MINUTES,
+            )
+        if MESSAGE_JITTER_MINUTES < 0:
+            log.warning(
+                "MESSAGE_JITTER_MINUTES=%s is negative; it is used as a +/- spread, so "
+                "the sign is ignored. Set 0 for exact spacing.",
+                MESSAGE_JITTER_MINUTES,
+            )
+        if DRIP_REASK_DAYS < 1:
+            log.warning(
+                "DRIP_REASK_DAYS=%s is below 1, so a group would be re-asked the same "
+                "day it was nudged. Two asks is a reminder; two asks in one day is "
+                "nagging.",
+                DRIP_REASK_DAYS,
+            )
+        if not DRIP_WEEKDAYS_ONLY:
+            log.info(
+                "DRIP_WEEKDAYS_ONLY=false — the drip will send at weekends too. A nudge "
+                "that lands on a Saturday is read on Monday anyway, having spent the "
+                "weekend as an unread badge."
+            )
+        if not DRIP_LLM_COMPOSE:
+            log.info(
+                "DRIP_LLM_COMPOSE=false — messages use the deterministic templates "
+                "rather than the voice exemplars in sales_policy.md. Still one sentence, "
+                "still with an out, just less varied."
             )
         if COS_FOLLOWUP_CHECK_INTERVAL_MINUTES > 60:
             log.warning(
-                "COS_FOLLOWUP_CHECK_INTERVAL_MINUTES=%s is over an hour — the digest can "
-                "only go out on a sweep tick, so it may post up to that late.",
+                "COS_FOLLOWUP_CHECK_INTERVAL_MINUTES=%s is over an hour — a drip message "
+                "can only go out on a sweep tick, so it may land up to that late and the "
+                "spacing will drift.",
                 COS_FOLLOWUP_CHECK_INTERVAL_MINUTES,
             )
     else:
         log.warning(
             "SALES_DIGEST_ENABLED=false — the bot will send NO unprompted messages at "
-            "all: no digest, and none of the sections that ride in it (cadence, the "
-            "tracker reminder, meeting-prep briefs, escalations, the funnel block). It "
-            "STILL tracks deadlines, evaluates cadence and writes SQLite and "
-            "audit.jsonl, still answers when @-mentioned, and still announces a deadline "
-            "when someone asks for one. Each skipped digest logs one line: "
-            "'[digest] suppressed — SALES_DIGEST_ENABLED=false'. Setting it back to true "
-            "resumes at the NEXT scheduled digest; the skipped days are not replayed."
+            "all: no drip message, no re-ask, nothing. The name is unchanged on purpose; "
+            "the drip inherits this switch rather than adding one of its own, so an "
+            "operator who turned the bot off does not have to learn a new variable to "
+            "keep it off. It STILL tracks deadlines, computes the next-action queue and "
+            "writes SQLite and audit.jsonl, still answers when @-mentioned, and still "
+            "announces a deadline when someone asks for one. Each suppressed day logs "
+            "one line: '[digest] suppressed — SALES_DIGEST_ENABLED=false'. Setting it "
+            "back to true resumes at the next scheduled slot; the skipped days are not "
+            "replayed."
         )
 
     if WEEKLY_DIGEST_ENABLED and not 0 <= WEEKLY_DIGEST_WEEKDAY <= 6:

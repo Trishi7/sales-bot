@@ -40,6 +40,30 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
+def _hours_between(earlier_iso: str, later_iso: str) -> Optional[float]:
+    """Hours between two ISO timestamps, or None when either cannot be read.
+
+    None rather than 0 on an unreadable value, and every caller treats None as
+    "outside the window". An undo window that failed OPEN would let a write from
+    last week be reverted by somebody who thought they were undoing this
+    morning's.
+    """
+    from datetime import datetime as _dt
+
+    try:
+        a = _dt.fromisoformat(str(earlier_iso))
+        b = _dt.fromisoformat(str(later_iso))
+    except (TypeError, ValueError):
+        return None
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        # One naive, one aware. Compare them as naive rather than raising: both
+        # are written by this bot in IST, and refusing the undo over a tzinfo
+        # mismatch would be a strange thing to explain to somebody.
+        a = a.replace(tzinfo=None)
+        b = b.replace(tzinfo=None)
+    return (b - a).total_seconds() / 3600.0
+
+
 def _days_between(earlier: str, later: str) -> int:
     """Calendar days between two 'YYYY-MM-DD' strings, or 0 when either is
     unreadable. Only used by the digest carry-forward gap rule, where treating a
@@ -233,6 +257,199 @@ CREATE TABLE IF NOT EXISTS quality_flags (
     times_seen  INTEGER NOT NULL DEFAULT 1
 );
 
+-- EXPLICITLY ACTIVATED ROWS.
+--
+-- A row on the canonical "Outreach PoCs" tab is normally ACTIVE only when it
+-- carries a first-contact date or a connection date; an inactive row is
+-- invisible to every proactive feature. The one exception is somebody asking
+-- for it by name ("set connection reminders for the others at Acme"), and this
+-- table is that exception made durable.
+--
+-- IT IS KEYED ON COMPANY+PoC, NEVER ON THE SHEET ROW NUMBER, because row
+-- numbers move the moment anybody sorts the tab and an activation that followed
+-- a number would silently transfer to whoever landed in that row next.
+--
+-- It persists because the alternative is a bot that forgets, on the next
+-- restart, an instruction it was given out loud — and the person who gave it
+-- would have no way of knowing.
+CREATE TABLE IF NOT EXISTS row_activations (
+    row_key      TEXT PRIMARY KEY,   -- normalised "company|poc"
+    company      TEXT NOT NULL,      -- as displayed, for the answer text
+    poc          TEXT NOT NULL DEFAULT '',
+    reason       TEXT NOT NULL,      -- the request, in the asker's words
+    requested_by TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL       -- YYYY-MM-DD IST
+);
+
+-- SNOOZES — "follow up in 5 days", "come back to this on the 20th".
+--
+-- A snoozed row emits NOTHING from the next-action state machine until its
+-- date. On and after that date the row's action comes back with its due_date
+-- RE-ARMED TO THE SNOOZE DATE rather than to whatever the trigger would have
+-- computed — because the person who said "follow up on the 20th" said WHEN, and
+-- a bot recomputing a different date would be overruling them.
+--
+-- A snooze whose date has passed is therefore OVERDUE, and stays overdue and
+-- visible until somebody acts on it. It is not silently dropped: an instruction
+-- that expires into nothing is an instruction the bot took and then ignored.
+--
+-- Keyed on company+PoC like every other per-row record here, never on the sheet
+-- row number, which moves the moment anybody sorts the tab.
+CREATE TABLE IF NOT EXISTS snoozes (
+    row_key      TEXT PRIMARY KEY,   -- normalised "company|poc"
+    company      TEXT NOT NULL,
+    poc          TEXT NOT NULL DEFAULT '',
+    until_date   TEXT NOT NULL,      -- YYYY-MM-DD IST
+    note         TEXT NOT NULL DEFAULT '',   -- the request, in the asker's words
+    requested_by TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_snoozes_until ON snoozes(until_date);
+
+-- EXPLICITLY SCHEDULED REMINDERS — one-offs somebody asked for at a specific
+-- time ("remind me about Acme on Saturday morning").
+--
+-- THE ONE EXCEPTION TO THE WEEKEND RULE. Every other due date the bot computes
+-- is shifted off a Saturday or Sunday onto the Monday. These are not: a person
+-- asking to be reminded on their own Saturday is making a decision about their
+-- own weekend, and a bot that "corrects" it to Monday has thrown the
+-- instruction away without saying so.
+--
+-- One row per reminder rather than one per sheet row: somebody can legitimately
+-- want two reminders about the same account.
+CREATE TABLE IF NOT EXISTS scheduled_reminders (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_key      TEXT NOT NULL,      -- normalised "company|poc"; "" when not a row
+    company      TEXT NOT NULL DEFAULT '',
+    poc          TEXT NOT NULL DEFAULT '',
+    due_date     TEXT NOT NULL,      -- YYYY-MM-DD IST, EXACT — never weekend-shifted
+    due_time     TEXT NOT NULL DEFAULT '',   -- free text as asked ("morning", "10:00")
+    what         TEXT NOT NULL,
+    requested_by TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'open',   -- open | done | cancelled
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sched_due ON scheduled_reminders(status, due_date);
+CREATE INDEX IF NOT EXISTS ix_sched_row ON scheduled_reminders(row_key, status);
+
+-- DRIP SENDS — one row per proactive message that actually went out.
+--
+-- THIS TABLE IS THE RESTART GUARD, and it replaces the digest's single
+-- `sales_digest_date` marker. The digest only had to answer "did today's one
+-- message go out"; the drip has to answer "which of today's up-to-three slots
+-- went out", because a redeploy at 11:40 must resume at slot 3 rather than
+-- starting the day again.
+--
+-- (on_date, slot) IS UNIQUE, so a double-send is impossible even if two ticks
+-- race: the second INSERT fails and the message is not composed again. The slot
+-- number is stable across a restart because the schedule is DETERMINISTIC —
+-- the jitter is seeded on the date and the slot, not on the clock.
+--
+-- `group_key` is "<action type>|<owner key>", the same key the grouping uses.
+-- `stage` is 'nudge' or 'reask'. Together with `on_date` they are the whole
+-- re-ask clock: a group nudged on the 9th is not re-sent until DRIP_REASK_DAYS
+-- have passed, then gets exactly ONE 'reask', and after that returns to the
+-- normal cadence. Two asks is a reminder; three is nagging.
+CREATE TABLE IF NOT EXISTS drip_sends (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    on_date      TEXT NOT NULL,      -- YYYY-MM-DD IST
+    slot         INTEGER NOT NULL,   -- 1..DAILY_MESSAGE_CAP, the day's send slot
+    group_key    TEXT NOT NULL,      -- "<type>|<owner key>"
+    action_type  TEXT NOT NULL,
+    owner_key    TEXT NOT NULL DEFAULT '',
+    owner_label  TEXT NOT NULL DEFAULT '',
+    companies    TEXT NOT NULL DEFAULT '',   -- comma-separated, as sent
+    stage        TEXT NOT NULL DEFAULT 'nudge',   -- nudge | reask
+    planned_at   TEXT NOT NULL DEFAULT '',   -- HH:MM IST the schedule asked for
+    channel_id   TEXT,
+    message_id   TEXT,
+    sent_at      TEXT NOT NULL,
+    UNIQUE (on_date, slot)
+);
+CREATE INDEX IF NOT EXISTS ix_drip_group ON drip_sends(group_key, on_date);
+CREATE INDEX IF NOT EXISTS ix_drip_date ON drip_sends(on_date);
+
+-- SHEET WRITES — every cell the bot has changed, and what was there before.
+--
+-- THIS TABLE IS WHAT MAKES WRITING INTO THE TEAM'S LIVE SHEET ACCEPTABLE. The
+-- bot changes cells on the strength of a sentence somebody typed in a channel.
+-- That is only reasonable if it is trivially reversible by whoever notices, and
+-- noticing usually happens the next morning — so the PRIOR VALUE of every cell
+-- is stored here and `undo` puts it back exactly.
+--
+-- ONE ROW PER CELL, grouped by `batch_id`. A reply that fills three cells is
+-- three rows with one batch id, because "undo" means undo the whole thing
+-- somebody just saw echoed, not one third of it.
+--
+-- `undone_at` is set rather than the row being deleted. A write that was made
+-- and then reversed is a different history from a write that never happened,
+-- and audit.jsonl carries both events; throwing the row away would leave the
+-- audit trail pointing at a record that no longer exists.
+CREATE TABLE IF NOT EXISTS sheet_writes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     TEXT NOT NULL,      -- one per echoed write; "undo" targets this
+    tab          TEXT NOT NULL DEFAULT '',
+    sheet_row    INTEGER NOT NULL,
+    row_key      TEXT NOT NULL DEFAULT '',   -- normalised "company|poc"
+    company      TEXT NOT NULL DEFAULT '',
+    poc          TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL,      -- the mapped role, e.g. dm_sent_date
+    header       TEXT NOT NULL DEFAULT '',   -- the column's own header text
+    cell         TEXT NOT NULL,      -- A1 address, e.g. "M14"
+    old_value    TEXT NOT NULL DEFAULT '',
+    new_value    TEXT NOT NULL DEFAULT '',
+    trigger      TEXT NOT NULL DEFAULT '',   -- reply | command
+    requested_by TEXT NOT NULL DEFAULT '',
+    source_msg   TEXT NOT NULL DEFAULT '',   -- the Discord message that caused it
+    written_at   TEXT NOT NULL,      -- ISO timestamp, IST
+    undone_at    TEXT NOT NULL DEFAULT '',
+    undone_by    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_sheet_writes_batch ON sheet_writes(batch_id);
+CREATE INDEX IF NOT EXISTS ix_sheet_writes_time ON sheet_writes(written_at);
+
+-- EVENT REMINDERS ALREADY SENT. One row per event, forever.
+--
+-- ONCE AND ONLY ONCE, and the dedup is PERMANENT rather than per-day. A
+-- conference the team has already decided about does not need reminding twice,
+-- and "we mentioned it in March" is not a reason to mention it again in April.
+--
+-- The key is the event name plus its date, so an event that MOVES legitimately
+-- earns a fresh reminder — the new date is new information — while re-reading
+-- the same row tomorrow does not.
+CREATE TABLE IF NOT EXISTS event_reminders (
+    event_key   TEXT PRIMARY KEY,   -- "<normalised name>|<YYYY-MM-DD>"
+    event       TEXT NOT NULL,
+    event_date  TEXT NOT NULL,      -- YYYY-MM-DD IST
+    location    TEXT NOT NULL DEFAULT '',
+    sent_on     TEXT NOT NULL,      -- YYYY-MM-DD IST the reminder went out
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- SUPPRESS-OR-CONVERT DECISIONS. Every nudge the bot turned into a
+-- record-offer, and the evidence that made it do so.
+--
+-- LOGGED BECAUSE A CONVERSION IS A JUDGEMENT. The bot read a meeting note or a
+-- channel message and concluded the thing it was about to ask for has already
+-- happened. When that conclusion is wrong the symptom is subtle — a nudge that
+-- arrived as a strange offer instead of a question — and without this table
+-- there is nothing to look at afterwards. The evidence is stored in the words
+-- it was found in.
+CREATE TABLE IF NOT EXISTS nudge_conversions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    on_date      TEXT NOT NULL,     -- YYYY-MM-DD IST
+    group_key    TEXT NOT NULL DEFAULT '',
+    action_type  TEXT NOT NULL,
+    company      TEXT NOT NULL DEFAULT '',
+    owner_label  TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL,     -- notes | channel
+    evidence     TEXT NOT NULL,     -- the sentence that convinced it
+    citation     TEXT NOT NULL DEFAULT '',   -- the note + date, or the author + date
+    offered      TEXT NOT NULL DEFAULT '',   -- JSON: the fields it offered to record
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_conversions_date ON nudge_conversions(on_date);
+
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
     value       TEXT,
@@ -244,7 +461,13 @@ CREATE TABLE IF NOT EXISTS meta (
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` won't
 # alter an existing table, so an already-created sales_bot.db needs them
 # back-filled. (table, column, DDL) — each added only if missing. Idempotent.
-_MIGRATIONS: list[tuple[str, str, str]] = []
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    # THE PENDING RECORD-OFFER. When suppress-or-convert turns a nudge into
+    # "want me to mark it on the row?", the fields it offered are stored on the
+    # drip row — so a reply of "yes" has something concrete to apply. Added
+    # after drip_sends first shipped, hence the migration.
+    ("drip_sends", "offer", "TEXT NOT NULL DEFAULT ''"),
+]
 
 
 class DB:
@@ -917,6 +1140,584 @@ class DB:
                     "last_seen, times_seen) VALUES (?, ?, ?, ?, 1)",
                     (str(flag_key), str(signature), str(on_date), str(on_date)),
                 )
+
+    # -- explicit row activations -----------------------------------------
+    # The named exception to the first-contact/connection-date rule. See the
+    # row_activations comment in SCHEMA, and activation.py for the rule itself.
+
+    def activate_row(
+        self, *, row_key: str, company: str, poc: str = "", reason: str = "",
+        requested_by: str = "", on_date: str = "",
+    ) -> bool:
+        """Remember that somebody explicitly activated this row.
+
+        Returns True when this was a NEW activation, False when it was already
+        active — the caller says "already on" rather than reporting a change it
+        did not make.
+
+        The first activation's wording is kept rather than overwritten: the
+        reason a row became visible is a fact about a moment, and a later
+        re-request is not a correction of it.
+        """
+        key = str(row_key or "").strip()
+        if not key or key == "|":
+            log.warning("[db] refusing to activate a row with no company or PoC")
+            return False
+        with self.conn() as c:
+            existing = c.execute(
+                "SELECT row_key FROM row_activations WHERE row_key = ?", (key,)
+            ).fetchone()
+            if existing:
+                return False
+            c.execute(
+                "INSERT INTO row_activations (row_key, company, poc, reason, "
+                "requested_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (key, str(company or ""), str(poc or ""), str(reason or ""),
+                 str(requested_by or ""), str(on_date or "")),
+            )
+        log.info("[db] row ACTIVATED: %s (%s)", key, reason or "no reason given")
+        return True
+
+    def activated_row_keys(self) -> frozenset:
+        """Every explicitly activated row key.
+
+        FAILS CLOSED — a database error returns an EMPTY set, so a row falls
+        back to the date rule rather than becoming visible on the strength of a
+        query that did not run. Wrongly quiet is recoverable; wrongly chasing a
+        stranger is not.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute("SELECT row_key FROM row_activations").fetchall()
+        except Exception:
+            log.exception("[db] could not read the row activations; treating as none")
+            return frozenset()
+        return frozenset(str(r["row_key"]) for r in rows)
+
+    def list_activated_rows(self, limit: int = 200) -> list[dict]:
+        """The activations, newest first, for the "sheet status" answer."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT row_key, company, poc, reason, requested_by, created_at "
+                "FROM row_activations ORDER BY created_at DESC, company ASC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def deactivate_row(self, row_key: str) -> bool:
+        """Undo one explicit activation. True when there was one to undo."""
+        with self.conn() as c:
+            cur = c.execute(
+                "DELETE FROM row_activations WHERE row_key = ?", (str(row_key or ""),)
+            )
+        if cur.rowcount:
+            log.info("[db] row activation removed: %s", row_key)
+        return bool(cur.rowcount)
+
+    # -- snoozes and explicitly scheduled reminders ------------------------
+    # The two tables the next-action state machine reads as INPUT. Neither is
+    # written by the engine: it is pure computation, and a computation that
+    # wrote to the database on every run would make "cadence preview" a side
+    # effect rather than a preview.
+
+    def set_snooze(
+        self, *, row_key: str, company: str, poc: str = "", until_date: str,
+        note: str = "", requested_by: str = "", on_date: str = "",
+    ) -> dict:
+        """Snooze one row until `until_date`. Replaces any existing snooze.
+
+        Returns {action: created|moved|refused, previous: <old date or "">} so
+        the caller can say "moved from the 12th to the 20th" rather than
+        reporting a change it cannot describe. Replacing rather than refusing is
+        right: the most recent instruction is the live one.
+        """
+        key = str(row_key or "").strip()
+        if not key or key == "|":
+            log.warning("[db] refusing to snooze a row with no company or PoC")
+            return {"action": "refused", "previous": ""}
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT until_date FROM snoozes WHERE row_key = ?", (key,)
+            ).fetchone()
+            previous = str(row["until_date"]) if row else ""
+            c.execute(
+                "INSERT INTO snoozes (row_key, company, poc, until_date, note, "
+                "requested_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(row_key) DO UPDATE SET until_date = excluded.until_date, "
+                "note = excluded.note, requested_by = excluded.requested_by, "
+                "created_at = excluded.created_at",
+                (key, str(company or ""), str(poc or ""), str(until_date),
+                 str(note or ""), str(requested_by or ""), str(on_date or "")),
+            )
+        log.info("[db] snooze %s until %s (%s)", key, until_date, note or "no note")
+        return {"action": "moved" if previous else "created", "previous": previous}
+
+    def snoozes(self) -> dict:
+        """{row_key: {row_key, company, poc, until_date, note, requested_by}}.
+
+        FAILS OPEN — a database error returns {}, so a row falls back to its
+        normal trigger rather than being silenced by a query that did not run.
+        Losing a snooze costs one line in a preview; honouring one that isn't
+        there costs a row nobody ever chases again.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT row_key, company, poc, until_date, note, requested_by "
+                    "FROM snoozes"
+                ).fetchall()
+        except Exception:
+            log.exception("[db] could not read the snoozes; treating as none")
+            return {}
+        return {str(r["row_key"]): dict(r) for r in rows}
+
+    def list_snoozes(self, limit: int = 200) -> list[dict]:
+        """The snoozes, soonest first, for the preview's footer."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT row_key, company, poc, until_date, note, requested_by, "
+                "created_at FROM snoozes ORDER BY until_date ASC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_snooze(self, row_key: str) -> bool:
+        """Remove one snooze. True when there was one to remove."""
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM snoozes WHERE row_key = ?", (str(row_key or ""),))
+        if cur.rowcount:
+            log.info("[db] snooze cleared: %s", row_key)
+        return bool(cur.rowcount)
+
+    def add_scheduled_reminder(
+        self, *, row_key: str = "", company: str = "", poc: str = "",
+        due_date: str, due_time: str = "", what: str, requested_by: str = "",
+        on_date: str = "",
+    ) -> int:
+        """Record a one-off reminder somebody asked for at a specific time.
+
+        Returns its id. These are the ONLY dates exempt from the weekend shift —
+        see the table comment in SCHEMA.
+        """
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT INTO scheduled_reminders (row_key, company, poc, due_date, "
+                "due_time, what, requested_by, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                (str(row_key or ""), str(company or ""), str(poc or ""), str(due_date),
+                 str(due_time or ""), str(what), str(requested_by or ""),
+                 str(on_date or "")),
+            )
+            new_id = int(cur.lastrowid)
+        log.info(
+            "[db] scheduled reminder #%d for %s on %s%s: %s",
+            new_id, company or row_key or "(no row)", due_date,
+            f" {due_time}" if due_time else "", what,
+        )
+        return new_id
+
+    def scheduled_reminders_by_row(self) -> dict:
+        """{row_key: [reminder, ...]} for every OPEN reminder attached to a row,
+        soonest first.
+
+        FAILS OPEN, like `snoozes()`: a database error returns {} and the rows
+        keep their normal triggers.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT id, row_key, company, poc, due_date, due_time, what, "
+                    "requested_by FROM scheduled_reminders "
+                    "WHERE status = 'open' AND row_key != '' ORDER BY due_date ASC"
+                ).fetchall()
+        except Exception:
+            log.exception("[db] could not read the scheduled reminders; treating as none")
+            return {}
+        out: dict = {}
+        for r in rows:
+            out.setdefault(str(r["row_key"]), []).append(dict(r))
+        return out
+
+    def list_scheduled_reminders(self, limit: int = 200) -> list[dict]:
+        """Every OPEN reminder, soonest first — including ones not tied to a row."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT id, row_key, company, poc, due_date, due_time, what, "
+                "requested_by, created_at FROM scheduled_reminders "
+                "WHERE status = 'open' ORDER BY due_date ASC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def close_scheduled_reminder(self, reminder_id: int, status: str = "done") -> bool:
+        """Mark one reminder done or cancelled. True when it was open."""
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE scheduled_reminders SET status = ? WHERE id = ? AND status = 'open'",
+                (str(status), int(reminder_id)),
+            )
+        return bool(cur.rowcount)
+
+    # -- the drip -----------------------------------------------------------
+    # The per-day restart guard and the re-ask clock. See the drip_sends comment
+    # in SCHEMA for why this is a table of slots rather than one date marker.
+
+    def drip_sent_today(self, on_date: str) -> list[dict]:
+        """Every message already sent today, in slot order.
+
+        THE RESTART GUARD. The scheduler recomputes the whole day's plan on
+        every tick — deterministically — and skips the slots this returns. A
+        redeploy at 11:40 therefore resumes at slot 3 instead of replaying the
+        morning.
+
+        FAILS CLOSED: a database error returns a sentinel that the caller treats
+        as "I cannot tell what has gone out", and it sends NOTHING. A duplicate
+        nudge is worse than a missed one, and the failure is loud in the log.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT slot, group_key, action_type, owner_key, owner_label, "
+                "companies, stage, planned_at, sent_at FROM drip_sends "
+                "WHERE on_date = ? ORDER BY slot ASC",
+                (str(on_date),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_drip_send(
+        self, *, on_date: str, slot: int, group_key: str, action_type: str,
+        owner_key: str = "", owner_label: str = "", companies: str = "",
+        stage: str = "nudge", planned_at: str = "", channel_id=None,
+        message_id=None, sent_at: str = "",
+    ) -> bool:
+        """Record that one drip message went out. False when that slot was
+        already taken.
+
+        The UNIQUE (on_date, slot) constraint is doing real work: two sweep
+        ticks racing on the same slot both try to insert, one wins, and the
+        loser does not send. It is cheaper and more certain than a lock.
+        """
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO drip_sends (on_date, slot, group_key, action_type, "
+                    "owner_key, owner_label, companies, stage, planned_at, channel_id, "
+                    "message_id, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(on_date), int(slot), str(group_key), str(action_type),
+                     str(owner_key or ""), str(owner_label or ""), str(companies or ""),
+                     str(stage or "nudge"), str(planned_at or ""),
+                     str(channel_id) if channel_id else None,
+                     str(message_id) if message_id else None, str(sent_at or "")),
+                )
+        except sqlite3.IntegrityError:
+            log.warning(
+                "[drip] slot %s on %s was already recorded — not sending it twice",
+                slot, on_date,
+            )
+            return False
+        return True
+
+    def drip_group_history(self, lookback_days: int = 30) -> dict:
+        """{group_key: {last_sent, last_stage, last_nudge, last_reask}}.
+
+        THE RE-ASK CLOCK. `last_nudge` is when the group was last asked about
+        fresh; `last_reask` is when its one gentle follow-up went out, if it
+        did. The scheduler reads both to decide whether a group is (a) too
+        recently asked to repeat, (b) due its single re-ask, or (c) back on the
+        normal cadence.
+
+        FAILS OPEN — an error returns {}, so every group looks fresh. That
+        direction is right for a clock whose whole job is to SUPPRESS: losing it
+        costs one extra message, and inverting it would silence a group forever.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT group_key, stage, MAX(on_date) AS last_date FROM drip_sends "
+                    "WHERE on_date >= date('now', ?) GROUP BY group_key, stage",
+                    (f"-{max(1, int(lookback_days))} day",),
+                ).fetchall()
+        except Exception:
+            log.exception("[db] could not read the drip history; treating every group as new")
+            return {}
+        out: dict = {}
+        for r in rows:
+            key = str(r["group_key"])
+            entry = out.setdefault(key, {"last_nudge": "", "last_reask": "", "last_sent": ""})
+            when = str(r["last_date"] or "")
+            if str(r["stage"]) == "reask":
+                entry["last_reask"] = max(entry["last_reask"], when)
+            else:
+                entry["last_nudge"] = max(entry["last_nudge"], when)
+            entry["last_sent"] = max(entry["last_sent"], when)
+        return out
+
+    def attach_drip_message_id(self, *, on_date: str, slot: int, message_id) -> bool:
+        """Record which Discord message a drip slot became.
+
+        The slot row is written BEFORE the send (that is what claims it against
+        a racing tick), so the message id can only be filled in afterwards. It
+        matters because a REPLY to a drip message is one of the two things that
+        may write to the sheet, and `find_drip_by_message_id` is how the reply
+        finds out which companies that nudge was about.
+        """
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE drip_sends SET message_id = ? WHERE on_date = ? AND slot = ?",
+                (str(message_id), str(on_date), int(slot)),
+            )
+        return bool(cur.rowcount)
+
+    def find_drip_by_message_id(self, message_id: str) -> Optional[dict]:
+        """The drip row a Discord message id belongs to, or None.
+
+        THE CONTEXT FOR A REPLY. "Sent this morning" names no company and no
+        column; the nudge it answers names both, and this is the lookup that
+        connects them. None simply means the reply was to something else the bot
+        said, and the extractor works from the reply alone.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT on_date, slot, group_key, action_type, owner_label, "
+                    "companies, stage, offer FROM drip_sends WHERE message_id = ?",
+                    (str(message_id),),
+                ).fetchone()
+        except Exception:
+            log.exception("[db] could not look up the drip message %r", message_id)
+            return None
+        return dict(row) if row else None
+
+    def list_drip_sends(self, limit: int = 50) -> list[dict]:
+        """The most recent drip messages, newest first. For the audit answer."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT on_date, slot, group_key, action_type, owner_label, companies, "
+                "stage, planned_at, sent_at FROM drip_sends "
+                "ORDER BY on_date DESC, slot DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_drip_sends(self, *, before_date: str) -> int:
+        """Drop drip rows older than `before_date`. Returns how many went."""
+        with self.conn() as c:
+            cur = c.execute(
+                "DELETE FROM drip_sends WHERE on_date < ?", (str(before_date),)
+            )
+        return int(cur.rowcount or 0)
+
+    # -- sheet writes and their undo ---------------------------------------
+    # See the sheet_writes comment in SCHEMA. The short version: the bot writes
+    # into the sheet the team actually works in, so every cell it changes is
+    # recorded with what was there before, and anyone can put it back.
+
+    def record_sheet_write(
+        self, *, batch_id: str, tab: str, sheet_row: int, row_key: str = "",
+        company: str = "", poc: str = "", cells: list, trigger: str = "",
+        requested_by: str = "", source_msg: str = "", written_at: str = "",
+    ) -> int:
+        """Record one batch of written cells. Returns how many rows were stored.
+
+        `cells` is what `gtm_sheet.write_cells` returned in `written` — each
+        entry already carries the OLD value, which is the whole point.
+        """
+        rows = [
+            (str(batch_id), str(tab or ""), int(sheet_row), str(row_key or ""),
+             str(company or ""), str(poc or ""), str(c.get("role") or ""),
+             str(c.get("header") or ""), str(c.get("cell") or ""),
+             str(c.get("old") or ""), str(c.get("new") or ""),
+             str(trigger or ""), str(requested_by or ""), str(source_msg or ""),
+             str(written_at or ""))
+            for c in (cells or [])
+        ]
+        if not rows:
+            return 0
+        with self.conn() as c:
+            c.executemany(
+                "INSERT INTO sheet_writes (batch_id, tab, sheet_row, row_key, company, "
+                "poc, role, header, cell, old_value, new_value, trigger, requested_by, "
+                "source_msg, written_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+        log.info("[db] recorded %d written cell(s) as batch %s", len(rows), batch_id)
+        return len(rows)
+
+    def latest_undoable_write(self, *, within_hours: int, now_iso: str) -> Optional[dict]:
+        """The most recent batch still inside the undo window, or None.
+
+        "UNDO" WITH NO TARGET MEANS THE LAST ONE. That is what people mean when
+        they type it, and asking "which one?" of somebody who has just spotted a
+        wrong cell is the wrong response — they want it gone now.
+
+        A batch that has already been undone is not offered again: undoing an
+        undo would re-apply the write, which is never what the word means.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT batch_id, MAX(written_at) AS at FROM sheet_writes "
+                    "WHERE undone_at = '' GROUP BY batch_id ORDER BY at DESC LIMIT 1"
+                ).fetchone()
+        except Exception:
+            log.exception("[db] could not look up the last sheet write")
+            return None
+        if not row or not row["batch_id"]:
+            return None
+        batch = self.sheet_write_batch(str(row["batch_id"]))
+        if not batch:
+            return None
+        age = _hours_between(str(row["at"] or ""), str(now_iso))
+        if age is None or age > max(0, int(within_hours)):
+            log.info(
+                "[db] the last sheet write (batch %s) is %s old — past the %dh undo "
+                "window", row["batch_id"],
+                f"{age:.1f}h" if age is not None else "of unknown age", within_hours,
+            )
+            return None
+        return {"batch_id": str(row["batch_id"]), "cells": batch,
+                "age_hours": age}
+
+    def sheet_write_batch(self, batch_id: str) -> list[dict]:
+        """Every cell in one batch, in the order it was written."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM sheet_writes WHERE batch_id = ? ORDER BY id ASC",
+                (str(batch_id),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_sheet_write_undone(
+        self, *, batch_id: str, undone_by: str = "", undone_at: str = ""
+    ) -> int:
+        """Mark a batch reverted. Returns how many rows were marked.
+
+        The rows stay. A write that was made and then reversed is a different
+        history from a write that never happened, and audit.jsonl carries both.
+        """
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE sheet_writes SET undone_at = ?, undone_by = ? "
+                "WHERE batch_id = ? AND undone_at = ''",
+                (str(undone_at or ""), str(undone_by or ""), str(batch_id)),
+            )
+        return int(cur.rowcount or 0)
+
+    def list_sheet_writes(self, limit: int = 50) -> list[dict]:
+        """The most recent written cells, newest first. For the audit answer."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT batch_id, company, poc, role, header, cell, old_value, "
+                "new_value, trigger, requested_by, written_at, undone_at, undone_by "
+                "FROM sheet_writes ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- event reminders and conversion decisions --------------------------
+
+    @staticmethod
+    def event_key(event: str, event_date: str) -> str:
+        """"<normalised name>|<date>". An event that MOVES earns a fresh
+        reminder — the new date is new information — while re-reading the same
+        row tomorrow does not."""
+        name = re.sub(r"[^a-z0-9]+", " ", str(event or "").lower()).strip()
+        return f"{name}|{str(event_date or '')}"
+
+    def event_reminder_sent(self, event_key: str) -> bool:
+        """Has this event already had its one reminder?
+
+        FAILS CLOSED — a database error returns True, meaning "assume it went".
+        This is a once-forever reminder, so the cost of the two directions is
+        asymmetric: losing one is a conference nobody was reminded about, and
+        sending a duplicate is the bot doing the exact thing this table exists
+        to prevent. On an error the bot stays quiet and logs loudly.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT 1 FROM event_reminders WHERE event_key = ?",
+                    (str(event_key),),
+                ).fetchone()
+        except Exception:
+            log.exception(
+                "[db] could not check the event reminder log for %r — assuming it "
+                "already went, rather than risking a duplicate", event_key,
+            )
+            return True
+        return bool(row)
+
+    def record_event_reminder(
+        self, *, event_key: str, event: str, event_date: str,
+        location: str = "", sent_on: str = "",
+    ) -> bool:
+        """Record that an event's one reminder has gone. False if it already had."""
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO event_reminders (event_key, event, event_date, "
+                    "location, sent_on) VALUES (?, ?, ?, ?, ?)",
+                    (str(event_key), str(event), str(event_date),
+                     str(location or ""), str(sent_on or "")),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        log.info("[db] event reminder recorded: %s (%s)", event, event_date)
+        return True
+
+    def list_event_reminders(self, limit: int = 100) -> list[dict]:
+        """Every event already reminded about, newest event first."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT event, event_date, location, sent_on FROM event_reminders "
+                "ORDER BY event_date DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_conversion(
+        self, *, on_date: str, group_key: str = "", action_type: str,
+        company: str = "", owner_label: str = "", source: str,
+        evidence: str, citation: str = "", offered: str = "",
+    ) -> int:
+        """Log one nudge turned into a record-offer, with its evidence."""
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT INTO nudge_conversions (on_date, group_key, action_type, "
+                "company, owner_label, source, evidence, citation, offered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(on_date), str(group_key or ""), str(action_type),
+                 str(company or ""), str(owner_label or ""), str(source),
+                 str(evidence)[:1000], str(citation or ""), str(offered or "")),
+            )
+        log.info(
+            "[convert] %s x %s -> record-offer (%s: %s)",
+            action_type, company or owner_label or "?", source, str(evidence)[:120],
+        )
+        return int(cur.lastrowid)
+
+    def list_conversions(self, limit: int = 50) -> list[dict]:
+        """Recent conversions, newest first. For "why did you offer that?"."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT on_date, action_type, company, owner_label, source, "
+                "evidence, citation FROM nudge_conversions ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_drip_offer(self, *, on_date: str, slot: int, offer: str) -> bool:
+        """Attach the pending record-offer to a drip slot.
+
+        Stored so a reply of "yes" has something concrete to apply — without it
+        the extractor would have to invent what "yes" meant, which is the one
+        thing it must never do about a write.
+        """
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE drip_sends SET offer = ? WHERE on_date = ? AND slot = ?",
+                (str(offer or ""), str(on_date), int(slot)),
+            )
+        return bool(cur.rowcount)
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.conn() as c:

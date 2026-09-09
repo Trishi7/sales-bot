@@ -48,6 +48,7 @@ else; there is no per-channel variant and no second copy of the rule. It logs
 every verdict as `[gate] <responded|ignored> msg=<id> reason=<...>`.
 """
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -55,20 +56,27 @@ from typing import Optional
 
 import discord
 
+import activation
 import cadence
 import config
 import deadlines as dl
 import digest
+import drip
 import drive
+import events as events_mod
+import evidence
 import followups
 import gtm_sheet
 import guardrails
 import mapping_sheet
 import meetings
+import nextaction
 import notes
 import persona
 import prep
 import query
+import research
+import sheetwrite
 import sources
 import state
 import strategy
@@ -298,14 +306,18 @@ class SalesBot(discord.Client):
             "loaded" if pol["loaded"] else "MISSING", pol["path"], pol["chars"],
         )
 
-        # THE CADENCE DRY RUN, at boot. It reads the TRACKER tab, runs the
-        # phase-1 rules and LOGS what would fire today with the caps applied,
-        # after logging which real tab matched which role. It sends
-        # NOTHING — the digest still posts at SALES_DIGEST_TIME and only then.
-        # This exists so that a threshold nobody has tuned yet, or a column that
-        # turns out to be colour-coded, is visible on the first restart rather
-        # than in a week of empty digest sections.
-        await self._log_cadence_dry_run()
+        # THE SHEET-WORLD REPORT, at boot. It reads the CANONICAL "Outreach
+        # PoCs" tab and LOGS the four things that fail silently: which tab was
+        # found, its full discovered schema, how many of its rows are ACTIVE,
+        # and which named columns sit inside the writable window between the
+        # restricted bands. It sends NOTHING — the digest still posts at
+        # SALES_DIGEST_TIME and only then.
+        #
+        # It replaced the phase-1 cadence dry run, which printed which rows each
+        # lettered rule fired on. Those rules are retired, so that report would
+        # now be a page of zeroes; these four numbers are what actually decides
+        # whether the bot can see anything today.
+        await self._log_sheet_world()
 
         self._write_state_summary(trigger="startup")
         state.audit(
@@ -322,65 +334,100 @@ class SalesBot(discord.Client):
                 config.COS_FOLLOWUP_CHECK_INTERVAL_MINUTES,
             )
 
-    async def _log_cadence_dry_run(self) -> None:
-        """Log which rows each cadence rule fires on TODAY, with the cap applied.
+    async def _log_sheet_world(self) -> None:
+        """Log WHAT THE BOT IS READING at boot: tab, schema, activation, window.
 
-        READ-ONLY and SEND-FREE. It exists to make the phase-1 rules auditable
-        from the startup log: every firing is printed with the cells that caused
-        it, so a threshold can be argued about against real rows rather than in
-        the abstract.
+        READ-ONLY and SEND-FREE. Four things fail silently on a live sheet and
+        all four are printed here, on the first restart, rather than surfacing a
+        week later as a digest that says nothing:
 
-        Note this DOES advance the next-step clock for rule (j), which is
-        correct — the clock measures days observed, and a boot is an observation.
+          - the canonical tab was renamed, so there is no tab at all;
+          - a column was renamed, so a role is unmapped;
+          - the activation columns are colour-coded or empty, so every row reads
+            as inactive and the bot has nothing to talk about;
+          - the restricted bands have drifted, so the writable window points at
+            a column somebody is using.
         """
-        if not config.CADENCE_ENABLED:
-            return
         roles = []
         try:
-            # WHICH TAB GOT WHICH ROLE, before anything else: names drift, and
-            # "the cadence found no rows" is almost always "the tracker was read
-            # as something else today".
+            # WHICH TAB GOT WHICH ROLE, before anything else.
             roles = await asyncio.to_thread(gtm_sheet.SHEETS.role_assignment)
             for kind, label, titles in roles:
                 log.info("[gtm.roles] %-18s %-52s -> %s", kind, label, titles)
         except Exception:
-            log.info("[cadence] could not report the tab roles", exc_info=True)
+            log.info("[gtm] could not report the tab roles", exc_info=True)
+
+        tab = None
         try:
-            result = await self._run_cadence(today=dl.today_ist())
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.pocs_tab)
         except Exception:
-            log.exception("[cadence] the startup dry run failed; the digest is unaffected")
-            return
-        if result is None:
-            log.info("[cadence] startup dry run skipped — no readable cadence source")
-            return
+            log.info("[gtm] the canonical tab could not be read at boot", exc_info=True)
+
+        result = None
+        if config.CADENCE_ENABLED:
+            try:
+                result = await self._run_cadence(today=dl.today_ist())
+            except Exception:
+                log.exception(
+                    "[cadence] the startup pass failed; the digest is unaffected"
+                )
+
+        activated = 0
         try:
-            text = cadence.dry_run_text(
-                result, source=result.get("source", ""),
-                staleness=result.get("staleness", ""), roles=roles,
+            activated = len(await asyncio.to_thread(self.db.activated_row_keys))
+        except Exception:
+            log.debug("[activation] could not count the explicit activations", exc_info=True)
+
+        # THE QUEUE, COMPUTED AND LOGGED, SENT NOWHERE. Printing it at boot is
+        # how a threshold nobody has tuned, or a column that turns out to be
+        # colour-coded, is visible on the first restart rather than in a week of
+        # a queue that was quietly empty.
+        queue = None
+        try:
+            queue = await self._run_next_actions(today=dl.today_ist())
+        except Exception:
+            log.exception("[nextaction] the startup queue failed; nothing else is affected")
+        if queue is not None:
+            try:
+                for line in nextaction.preview_text(queue).splitlines():
+                    log.info("[nextaction.preview] %s", line)
+            except Exception:
+                log.exception("[nextaction] could not render the startup preview")
+            state.audit(
+                "next_action_queue",
+                reason="startup: the computed queue. NOTHING was sent.",
+                active_rows=queue.get("rows", 0),
+                inactive_rows=queue.get("inactive", 0),
+                actions=len(queue.get("actions") or []),
+                by_type={k: len(v) for k, v in (queue.get("by_type") or {}).items()},
+                silent=queue.get("silent", {}),
+                sent=False,
+            )
+
+        try:
+            text = cadence.boot_report_text(
+                result,
+                source=(result or {}).get("source", ""),
+                staleness=(result or {}).get("staleness", ""),
+                roles=roles, tab=tab, activated=activated,
             )
         except Exception:
-            log.exception("[cadence] could not render the dry run")
+            log.exception("[gtm] could not render the sheet-world report")
             return
         for line in text.splitlines():
-            log.info("[cadence.dryrun] %s", line)
+            log.info("[sheet.world] %s", line)
         state.audit(
-            "cadence_dry_run",
-            reason="startup: which rows the phase-1 rules fire on today",
-            source=result.get("source", ""),
+            "sheet_world",
+            reason="startup: which tab, which columns, how many rows are active",
+            tab=getattr(tab, "title", ""),
             tab_roles={kind: titles for kind, _label, titles in roles},
-            rows=result.get("rows", 0),
-            excluded_rejected=result.get("excluded", 0),
-            items=len(result.get("all") or []),
-            shown=len(result.get("items") or []),
-            held=len(result.get("held") or []),
-            cold=len(result.get("cold") or []),
-            cold_ceiling_days=config.CONNECT_REMINDER_MAX_DAYS,
-            update_asks=len(result.get("updates_all") or []),
-            update_shown=len(result.get("updates") or []),
-            urgent_cap=config.URGENT_MAX,
-            cap=config.DIGEST_MAX_ITEMS,
-            update_cap=config.UPDATE_TRACKER_MAX,
-            by_rule=result.get("counts", {}),
+            active_rows=(result or {}).get("rows", 0),
+            inactive_rows=(result or {}).get("inactive", 0),
+            excluded_rejected=(result or {}).get("excluded", 0),
+            explicit_activations=activated,
+            restricted_ranges=config.RESTRICTED_COLUMN_RANGES,
+            writable_window=config.writable_window_label(),
+            sheet_health_lines=len((result or {}).get("updates_all") or []),
         )
 
     def _ensure_todo_sheet(self) -> dict:
@@ -473,19 +520,16 @@ class SalesBot(discord.Client):
                 "(set GOOGLE_SERVICE_ACCOUNT_JSON)."
             )
 
-        for which in (gtm_sheet.ORIGINAL, gtm_sheet.COPY):
-            info = access.get(which, {})
-            if info.get("ok"):
-                log.info(
-                    "[bot] GTM %s sheet reachable: %r (%d tabs)",
-                    which, info.get("title"), len(info.get("tabs") or []),
-                )
-            else:
-                log.error(
-                    "[bot] GTM %s sheet NOT reachable: %s", which, info.get("error")
-                )
-                if info.get("remedy"):
-                    log.error("[bot] ACTION REQUIRED: %s", info["remedy"])
+        info = access.get(gtm_sheet.ORIGINAL, {})
+        if info.get("ok"):
+            log.info(
+                "[bot] GTM Playbook reachable: %r (%d tabs)",
+                info.get("title"), len(info.get("tabs") or []),
+            )
+        else:
+            log.error("[bot] GTM Playbook NOT reachable: %s", info.get("error"))
+            if info.get("remedy"):
+                log.error("[bot] ACTION REQUIRED: %s", info["remedy"])
 
         # Read once so the schema summary is logged and the cache is warm before
         # the first question arrives.
@@ -507,9 +551,9 @@ class SalesBot(discord.Client):
             "sheet_access_check",
             reason="startup verification of GTM spreadsheet access",
             service_account=email or None,
-            original_ok=bool(access.get(gtm_sheet.ORIGINAL, {}).get("ok")),
-            copy_ok=bool(access.get(gtm_sheet.COPY, {}).get("ok")),
-            write_target=config.SHEET_WRITE_TARGET,
+            playbook_ok=bool(access.get(gtm_sheet.ORIGINAL, {}).get("ok")),
+            writes_enabled=config.SHEET_WRITES_ENABLED,
+            writable_window=config.writable_window_label(),
         )
         return access
 
@@ -882,6 +926,16 @@ class SalesBot(discord.Client):
         if not text:
             # A bare "@bot" is a wave, not a malformed question.
             await self._send_social(message, "greeting", text="")
+            return True
+
+        # THE WRITE PATH, TRIED FIRST. Only two things reach it — a reply to one
+        # of the bot's own messages, or an explicit @-mention command — and it
+        # declines anything that is not clearly an update, a snooze or an undo,
+        # so a question addressed to the bot falls straight through to the
+        # engine below. It is first because "sent this morning" is an ANSWER,
+        # and routing it to the question engine would produce a reply about the
+        # sheet instead of a change to it.
+        if await self._maybe_apply_sheet_update(message, text):
             return True
 
         # Capability asks are answered from a regex first: this is the question
@@ -1719,7 +1773,7 @@ class SalesBot(discord.Client):
             except (TypeError, ValueError):
                 days = 7
             try:
-                tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
+                tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POCS)
             except Exception:
                 tab = None
             if tab is None:
@@ -1850,7 +1904,7 @@ class SalesBot(discord.Client):
             name = str(inp.get("company") or "").strip()
             if not name:
                 return {"error": "lookup_company needs a 'company'."}
-            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.TRACKER)
+            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.POCS)
             if err:
                 return err
             matches = tab.find_company(name)
@@ -1880,7 +1934,7 @@ class SalesBot(discord.Client):
             return out
 
         async def _query_tracker(inp: dict):
-            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.TRACKER)
+            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.POCS)
             if err:
                 return err
             rows = list(tab.rows)
@@ -1980,7 +2034,7 @@ class SalesBot(discord.Client):
             # "Which P1s have we never contacted" needs both tabs, so join here
             # rather than making the model do it across two calls.
             if inp.get("cross_check_contacted"):
-                tracker_tab, terr = await asyncio.to_thread(_tab_or_error, gtm_sheet.TRACKER)
+                tracker_tab, terr = await asyncio.to_thread(_tab_or_error, gtm_sheet.POCS)
                 if terr:
                     out["contact_cross_check"] = terr
                 else:
@@ -2051,149 +2105,628 @@ class SalesBot(discord.Client):
                 ),
             }
 
-        async def _cadence_list(inp: dict) -> dict:
-            """The uncapped cadence, for the question the digest's overflow line
-            invites. READ-ONLY — it re-runs the same rules against the same tab
-            and sends nothing. Both caps are lifted: the digest holds back
-            cadence items AND update-tracker asks, and "everything" means both.
+        # THE cadence_list AND cold_list TOOLS ARE RETIRED WITH THE RULES THAT
+        # FED THEM. `cadence_list` answered "what did the digest hold back" for
+        # the phase-1 lettered rules; `cold_list` answered "who never connected"
+        # for the phase-1 cold ceiling. Both rules are gone, so both tools would
+        # now return an empty list with a confident description attached — which
+        # is worse than not having them, because a tool that always says
+        # "nothing" reads as "nothing is wrong".
+        #
+        # `sheet_status` below is what replaces them, and it answers the question
+        # people were really asking through them: what is this bot looking at,
+        # and why is it quiet.
 
-            The data-quality flags are computed WITHOUT their dedup here, on
-            purpose: this is somebody asking what is wrong with the sheet, and
-            "I already mentioned that on Tuesday" is not an answer to that
-            question.
+        async def _sheet_status(inp: dict) -> dict:
+            """WHAT THE BOT IS READING — tab, rows, activation, write window.
+
+            READ-ONLY. The verification tool for the phase-2 move: it names the
+            canonical tab, counts the rows and the ACTIVE rows separately, and
+            lists the named columns inside the writable window between the
+            restricted bands.
+
+            THE TWO COUNTS ARE THE POINT. "886 rows, 12 active" is the honest
+            answer to "why has the digest gone quiet", and it is an answer
+            nobody could give while the only visible number was the row count.
             """
-            result = await self._run_cadence(
-                today=dl.today_ist(), limit=0, update_limit=0
-            )
-            if result is None:
+            try:
+                tab = await asyncio.to_thread(gtm_sheet.SHEETS.pocs_tab)
+            except gtm_sheet.SheetAccessError as e:
+                return {
+                    "ok": False,
+                    "reason": f"I could not read the spreadsheet: {e}. {e.remedy}".strip(),
+                }
+            except Exception:
+                log.exception("[sheet-status] the canonical tab could not be read")
+                return {"ok": False, "reason": "the spreadsheet could not be read just now"}
+            if tab is None:
                 return {
                     "ok": False,
                     "reason": (
-                        "The cadence could not be computed - either CADENCE_ENABLED is "
-                        "off, or no tab carries the tracker signature ('Last followed up "
-                        "date' + 'Total follow-ups till date'). Say so plainly."
+                        "There is no tab named "
+                        + (" / ".join(repr(t) for t in config.GTM_POCS_TAB_TITLES)
+                           or "(nothing configured)")
+                        + " in the GTM Playbook. That tab is the canonical source and it "
+                        "is found by NAME, so nothing proactive has anything to run "
+                        "against until it exists or GTM_POCS_TAB_TITLES is pointed at "
+                        "the right title. Say this plainly."
                     ),
                 }
-            wanted = str((inp or {}).get("rule") or "").strip().lower()[:1]
-            items = (result.get("all") or []) + (result.get("updates_all") or [])
-            if wanted:
-                items = [i for i in items if i.get("letter") == wanted]
-            log.info(
-                "[cadence] full list requested%s -> %d item(s)",
-                f" (rule {wanted})" if wanted else "", len(items),
+
+            active, inactive = await asyncio.to_thread(
+                self._split_active, tab.rows, "a sheet status question"
             )
+            try:
+                explicit = await asyncio.to_thread(self.db.list_activated_rows, 25)
+            except Exception:
+                log.debug("[sheet-status] could not list the activations", exc_info=True)
+                explicit = []
+
+            window = gtm_sheet.SHEETS.writable_window_columns(tab)
             return {
                 "ok": True,
-                "source": result.get("source", ""),
-                "staleness": result.get("staleness", ""),
-                "rows_considered": result.get("rows", 0),
-                "rejected_excluded": result.get("excluded", 0),
-                "digest_cap": config.DIGEST_MAX_ITEMS,
-                "update_tracker_cap": config.UPDATE_TRACKER_MAX,
-                "shown_in_digest": len(result.get("items") or []),
-                "held_back": len(result.get("held") or []),
-                "update_asks": len(result.get("updates_all") or []),
-                "counts_by_rule": result.get("counts", {}),
-                "items": [
-                    {
-                        "rule": i["rule"], "letter": i["letter"], "priority": i["priority"],
-                        "company": i["company"], "poc": i["poc"], "owner": i.get("owner", ""),
-                        "text": i["text"], "why": i.get("detail", ""),
-                    }
-                    for i in items[: max(1, config.CADENCE_FULL_LIST_MAX)]
+                "tab": tab.title,
+                "spreadsheet": "the GTM Playbook (GTM_SHEET_ORIGINAL_ID)",
+                "total_rows": len(tab.rows),
+                "active_rows": len(active),
+                "inactive_rows": len(inactive),
+                "activation_rule": (
+                    "A row is ACTIVE only when a first-contact date OR a connection "
+                    "date is present. Inactive rows are never mentioned, chased or "
+                    "counted in anything I say unprompted — but I still answer about "
+                    "one in full if you ask me by name."
+                ),
+                "explicit_activations": [
+                    {"company": r["company"], "poc": r["poc"], "reason": r["reason"],
+                     "since": r["created_at"]}
+                    for r in explicit
                 ],
-                "truncated": len(items) > max(1, config.CADENCE_FULL_LIST_MAX),
+                "columns_discovered": len(tab.headers),
+                "restricted_column_ranges": config.RESTRICTED_COLUMN_RANGES,
+                "writable_window": config.writable_window_label() or "(none)",
+                "writable_window_columns": window,
+                "writes_enabled": config.SHEET_WRITES_ENABLED,
+                "undo_window_hours": config.SHEET_WRITE_UNDO_HOURS,
+                "staleness": gtm_sheet.SHEETS.staleness_note(tab),
                 "note": (
-                    "Rows a human marked rejected are excluded from every rule by design - "
-                    "they are revisited offline, not chased; the one exception is the "
-                    "single per-company 'try another PoC' suggestion (rule g). Rows whose "
-                    "rule inputs are blank become 'update the tracker' asks (letter "
-                    "'fill'), never chases."
+                    "Reading is unrestricted — the restricted bands are a WRITE lock "
+                    "only. The phase-1 cadence rules (a-j) are retired, so the digest's "
+                    "cadence sections carry sheet-health lines and nothing else until a "
+                    "phase-2 rule set exists."
                 ),
             }
 
-        async def _cold_list(inp: dict) -> dict:
-            """The UNCAPPED cold list — every never-connected row past the cold
-            ceiling, which the digest reports only as a count.
+        async def _activate_rows(inp: dict) -> dict:
+            """Activate the rows an explicit mention-request names.
 
-            READ-ONLY. This is the other half of the ceiling: the rows are
-            suppressed from individual chases precisely so that this question can
-            answer them all at once, per company, rather than as 756 identical
-            nudges spread over fifty digests.
+            THE ONE EXCEPTION TO THE ACTIVATION RULE, and the only thing in this
+            file that can make an undated row visible to the proactive features.
+            It WRITES — to SQLite, never to the sheet — so it reports exactly
+            what it changed and never implies more.
+
+            A name that matches no row is returned as `not_found` rather than
+            silently dropped: "I activated them" when one of the three people
+            named does not exist in the sheet is the kind of quiet inaccuracy
+            that gets a bot distrusted.
             """
-            result = await self._run_cadence(today=dl.today_ist(), limit=0, update_limit=0)
-            if result is None:
+            org = str((inp or {}).get("org") or "").strip()
+            names = [str(n).strip() for n in ((inp or {}).get("names") or []) if str(n).strip()]
+            reason = str((inp or {}).get("reason") or "").strip() or (
+                f"explicit request for {org or 'unnamed org'}"
+            )
+            if not org and not names:
                 return {
                     "ok": False,
                     "reason": (
-                        "The cadence could not be computed - either CADENCE_ENABLED is "
-                        "off, or no tab carries the tracker signature. Say so plainly."
+                        "I need an organisation (and optionally the people) to activate. "
+                        "Ask again naming the company."
                     ),
                 }
-            rows = result.get("cold") or []
-            today = result.get("today")
-            by_company: dict = {}
-            for row in rows:
-                company, poc = cadence.row_identity(row)
-                by_company.setdefault(company, []).append({
-                    "poc": poc,
-                    "designation": str(row.get("poc_designation") or ""),
-                    "first_contacted": str(row.get("first_contacted") or ""),
-                    "days_since_contact": cadence.contact_age(row, today=today),
+
+            try:
+                tab = await asyncio.to_thread(gtm_sheet.SHEETS.pocs_tab)
+            except Exception:
+                log.exception("[activation] the canonical tab could not be read")
+                return {"ok": False, "reason": "the spreadsheet could not be read just now"}
+            if tab is None:
+                return {
+                    "ok": False,
+                    "reason": "there is no canonical Outreach PoCs tab to activate rows on",
+                }
+
+            matched = activation.matching_rows(tab.rows, org=org, names=names)
+            if not matched:
+                return {
+                    "ok": False,
+                    "org": org, "names": names,
+                    "reason": (
+                        f"No row on {tab.title!r} matches "
+                        + (f"{names!r} at " if names else "")
+                        + f"{org!r}. I have not activated anything. Say so rather than "
+                        "guessing at a different spelling."
+                    ),
+                }
+
+            today_iso = dl.iso(dl.today_ist())
+            activated: list[dict] = []
+            already_dated: list[dict] = []
+            already_activated: list[dict] = []
+            for row in matched:
+                entry = {
+                    "company": gtm_sheet.clean_cell(row.get("company")),
+                    "poc": gtm_sheet.clean_cell(row.get("poc")),
                     "sheet_row": row.get("_row"),
-                })
-            ordered = sorted(
-                by_company.items(),
-                key=lambda kv: -max(
-                    [p["days_since_contact"] or 0 for p in kv[1]] or [0]
-                ),
+                    "why": activation.why_active(row),
+                }
+                if activation.has_activating_date(row):
+                    already_dated.append(entry)
+                    continue
+                made = await asyncio.to_thread(
+                    lambda r=row, e=entry: self.db.activate_row(
+                        row_key=activation.row_key(r),
+                        company=e["company"], poc=e["poc"],
+                        reason=reason, on_date=today_iso,
+                    )
+                )
+                (activated if made else already_activated).append(entry)
+
+            not_found = [
+                n for n in names
+                if not any(
+                    gtm_sheet.normalise_header(n)
+                    in gtm_sheet.normalise_header(r.get("poc", ""))
+                    for r in matched
+                )
+            ]
+            log.info(
+                "[activation] explicit request for %r: %d activated, %d already dated, "
+                "%d already activated, %d not found",
+                org, len(activated), len(already_dated), len(already_activated),
+                len(not_found),
             )
-            log.info("[cadence] cold list requested -> %d row(s) across %d companies",
-                     len(rows), len(ordered))
+            state.audit(
+                "rows_activated",
+                reason=reason,
+                org=org, names=names,
+                activated=[f"{e['company']}/{e['poc']}" for e in activated],
+                already_active=len(already_dated) + len(already_activated),
+                not_found=not_found,
+            )
             return {
                 "ok": True,
-                "source": result.get("source", ""),
-                "staleness": result.get("staleness", ""),
-                "cold_ceiling_days": config.CONNECT_REMINDER_MAX_DAYS,
-                "total_rows": len(rows),
-                "total_companies": len(ordered),
-                "companies": [
-                    {"company": name, "pocs": pocs[:25], "poc_count": len(pocs)}
-                    for name, pocs in ordered[: max(1, config.CADENCE_FULL_LIST_MAX)]
-                ],
-                "truncated": len(ordered) > max(1, config.CADENCE_FULL_LIST_MAX),
+                "tab": tab.title,
+                "org": org,
+                "activated": activated,
+                "already_active_by_date": already_dated,
+                "already_activated_before": already_activated,
+                "not_found": not_found,
                 "note": (
-                    "These are NOT rejected and NOT written off - they are leads first "
-                    "contacted more than the ceiling ago that never connected. The digest "
-                    "counts them in one line instead of chasing each one, because 'start "
-                    "interacting' is the wrong sentence six months on. Their other rules "
-                    "still fire normally."
+                    "Activated rows are now visible to the proactive features and stay "
+                    "that way across restarts. Rows listed under "
+                    "'already_active_by_date' needed no activation — they already carry "
+                    "a first-contact or connection date. Nothing was written to the "
+                    "spreadsheet; this is my own record."
                 ),
             }
 
-        async def _row_flags(inp: dict):
-            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.TRACKER)
+        # THE row_flags TOOL IS RETIRED WITH THE FLAGS BEHIND IT. HOT / STALLED
+        # / DEAD-DEAL were the old per-row "what next" logic and the NEXT-ACTION
+        # STATE MACHINE replaces them. The four tools below are what answer the
+        # questions row_flags used to: `cadence_preview` for "what needs
+        # attention", `next_action` for one company, and the two that let a
+        # person change what the queue will say.
+
+        async def _research_brief(inp: dict) -> dict:
+            """Gather the material and write the brief. Sends nothing, writes nothing."""
+            person = str((inp or {}).get("person") or "").strip()
+            org = str((inp or {}).get("org") or "").strip()
+            if not person:
+                return {"ok": False, "reason": "research_brief needs a person's name."}
+
+            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.POCS)
             if err:
                 return err
-            flagged = tracker.all_flags(tab.rows)
-            return {
-                "available": True,
-                "tab": tab.title,
-                "counts": {
-                    kind: sum(1 for f in flagged if f["_flag"] == kind)
-                    for kind in (tracker.FLAG_HOT, tracker.FLAG_STALLED, tracker.FLAG_DEAD)
-                },
-                "flags": [
-                    {
-                        "flag": tracker.FLAG_LABELS.get(f["_flag"], f["_flag"]),
-                        "company": f.get("company", ""),
-                        "poc": f.get("poc", ""),
-                        "why": f.get("_why", ""),
-                        "sheet_row": f.get("_row"),
-                    }
-                    for f in flagged[:30]
+            matched = activation.matching_rows(tab.rows, org=org, names=[person])
+            if not matched and org:
+                matched = activation.matching_rows(tab.rows, org=person)
+            if not matched:
+                return {
+                    "ok": False, "person": person, "org": org,
+                    "reason": (
+                        f"I have no row for {person}"
+                        + (f" at {org}" if org else "")
+                        + ". I only brief on people who are already on the tab — I do "
+                          "not search for someone I have never heard of."
+                    ),
+                }
+            if len(matched) > 1:
+                names = ", ".join(
+                    gtm_sheet.clean_cell(r.get("company")) or "?" for r in matched[:6]
+                )
+                return {
+                    "ok": False, "person": person,
+                    "reason": f"There are {len(matched)} rows matching that ({names}) — "
+                              f"which org do you mean?",
+                }
+
+            row = matched[0]
+            gathered = await asyncio.to_thread(lambda: research.gather(row))
+
+            # THE LANES COME FROM THE TEAM'S OWN DOCUMENTS, read at brief time.
+            lanes = persona.load_policy()
+            try:
+                if sources.STRATEGY_DOC.connected:
+                    lanes += "\n\n=== STRATEGY DOC ===\n" + (
+                        await asyncio.to_thread(sources.STRATEGY_DOC.text)
+                    )[:12000]
+            except Exception:
+                log.debug("[research] no strategy doc for the lanes", exc_info=True)
+
+            refusal = research.refusal_note(gathered["links_refused"])
+            material = "\n\n".join(filter(None, [
+                f"PERSON: {gathered['person']}\nORG: {gathered['org']}",
+                "WHAT THE SHEET HOLDS:\n" + "\n".join(
+                    f"  {k}: {v}" for k, v in gathered["sheet_facts"].items()
+                ) if gathered["sheet_facts"] else "",
+                "LINKEDIN: " + gathered["linkedin"]["note"],
+                ("REFUSED LINKS (put this line in the brief verbatim): " + refusal)
+                if refusal else "",
+                "NO RESEARCH LINKS ARE ON THIS ROW — say so rather than inventing work."
+                if gathered["no_links"] else "",
+                *[
+                    f"FETCHED {f['url']} (from the {f['column']} column):\n"
+                    + (f["text"][:6000] if f["ok"] else f"could not read it: {f['error']}")
+                    for f in gathered["links_fetched"]
                 ],
-                "staleness": gtm_sheet.SHEETS.staleness_note(tab),
+                "=== OUR LANES (the team's own words — use these) ===\n" + lanes[:20000],
+            ]))
+
+            brief = "(no model available)"
+            if self.llm is not None:
+                brief = await self.llm.research_brief(material=material)
+
+            state.audit(
+                "research_brief",
+                reason=f"brief requested on {gathered['person']}",
+                person=gathered["person"], org=gathered["org"],
+                fetched=[f["url"] for f in gathered["links_fetched"] if f["ok"]],
+                refused=[r.get("url") or r.get("why") for r in gathered["links_refused"]],
+                linkedin_available=gathered["linkedin"]["available"],
+                sent_anything=False, written_to_sheet=False,
+            )
+            log.info(
+                "[research] brief on %s (%s): %d link(s) fetched, %d refused, "
+                "linkedin=%s. Nothing sent, nothing written.",
+                gathered["person"], gathered["org"],
+                sum(1 for f in gathered["links_fetched"] if f["ok"]),
+                len(gathered["links_refused"]), gathered["linkedin"]["available"],
+            )
+            return {
+                "ok": True,
+                "sent_anything": False,
+                "written_to_sheet": False,
+                "person": gathered["person"],
+                "org": gathered["org"],
+                "brief": brief,
+                "links_fetched": [
+                    {"url": f["url"], "column": f["column"], "ok": f["ok"],
+                     "error": f["error"]}
+                    for f in gathered["links_fetched"]
+                ],
+                "refusal_line": refusal,
+                "linkedin": gathered["linkedin"],
+                "no_links_on_row": gathered["no_links"],
+                "note": (
+                    "COPY MATERIAL. Hand the brief back as a draft for them to edit — it "
+                    "is never sent and never written to the sheet. Repeat the "
+                    "refusal_line verbatim if it is non-empty, and say plainly if "
+                    "LinkedIn access is pending."
+                ),
+            }
+
+        async def _cadence_preview(inp: dict) -> dict:
+            """TODAY'S QUEUE, computed and returned. NOTHING IS SENT.
+
+            The whole point of this tool is that it is safe: it runs the same
+            state machine the digest would, and hands the result back to the
+            asker instead of to a channel. It can be run with the digest kill
+            switch off, on a Sunday, mid-deploy.
+            """
+            result = await self._run_next_actions(today=dl.today_ist())
+            if result is None:
+                return {
+                    "ok": False,
+                    "reason": (
+                        "The queue could not be computed — either NEXT_ACTION_ENABLED is "
+                        "off, or there is no canonical Outreach PoCs tab to read. Say "
+                        "which rather than implying there is nothing to do."
+                    ),
+                }
+            want_type = str((inp or {}).get("type") or "").strip().lower()
+            want_owner = gtm_sheet.normalise_header((inp or {}).get("owner") or "")
+            actions = result.get("actions") or []
+            if want_type:
+                actions = [a for a in actions if a["type"] == want_type]
+            if want_owner:
+                actions = [
+                    a for a in actions
+                    if want_owner in gtm_sheet.normalise_header(a.get("owner") or "")
+                ]
+            cap = max(1, config.NEXT_ACTION_PREVIEW_MAX)
+            log.info(
+                "[nextaction] preview requested%s -> %d action(s). Nothing sent.",
+                f" (type={want_type or '-'} owner={want_owner or '-'})"
+                if (want_type or want_owner) else "",
+                len(actions),
+            )
+            return {
+                "ok": True,
+                "sent_anything": False,
+                "tab": getattr(result.get("tab"), "title", ""),
+                "today": dl.iso(result.get("today")),
+                "active_rows": result.get("rows", 0),
+                "inactive_rows": result.get("inactive", 0),
+                "total_actions": len(result.get("actions") or []),
+                "shown": min(len(actions), cap),
+                "filtered_to": {"type": want_type, "owner": want_owner},
+                "bands_in_order": [
+                    nextaction.BAND_LABELS[b] for b in sorted(nextaction.BAND_LABELS)
+                ],
+                "queue": [
+                    {
+                        "type": a["type"], "label": a["label"], "owner": a["owner"] or "(unassigned)",
+                        "company": a["company"], "poc": a["poc"],
+                        "due_date": a["due_iso"], "overdue_days": a["overdue_days"],
+                        "priority": a["priority"], "priority_label": a["priority_label"],
+                        "text": a["text"], "why": a["why"], "sheet_row": a["sheet_row"],
+                    }
+                    for a in actions[:cap]
+                ],
+                "truncated": len(actions) > cap,
+                "no_action_for": result.get("silent", {}),
+                "no_action_labels": nextaction.SILENT_LABELS,
+                "stopped_rows": result.get("stopped", [])[:20],
+                "snoozed_rows": result.get("snoozed", [])[:20],
+                "staleness": result.get("staleness", ""),
+                "note": (
+                    "One action per row, never two: the triggers are evaluated in a fixed "
+                    "order and the first match wins. NOTHING WAS SENT — this is a preview. "
+                    "Quote the 'no_action_for' counts too; a queue that lists only what it "
+                    "found looks complete when it is not."
+                ),
+            }
+
+        async def _next_action_for(inp: dict) -> dict:
+            """The one next action for a named company, or WHY there isn't one."""
+            company = str((inp or {}).get("company") or "").strip()
+            poc = str((inp or {}).get("poc") or "").strip()
+            if not company:
+                return {"ok": False, "reason": "next_action needs a 'company'."}
+            result = await self._run_next_actions(today=dl.today_ist())
+            if result is None:
+                return {
+                    "ok": False,
+                    "reason": (
+                        "The queue could not be computed — either NEXT_ACTION_ENABLED is "
+                        "off, or there is no canonical Outreach PoCs tab."
+                    ),
+                }
+            tab = result.get("tab")
+            matched = activation.matching_rows(
+                getattr(tab, "rows", []) or [], org=company, names=[poc] if poc else None
+            )
+            if not matched:
+                return {
+                    "ok": False, "company": company,
+                    "reason": (
+                        f"No row on {getattr(tab, 'title', 'the tab')!r} matches "
+                        f"{company!r}" + (f" / {poc!r}" if poc else "")
+                        + ". Say so rather than guessing at a different spelling."
+                    ),
+                }
+
+            active_keys = {a["row_key"] for a in (result.get("actions") or [])}
+            by_key = {a["row_key"]: a for a in (result.get("actions") or [])}
+            snoozes = await asyncio.to_thread(self.db.snoozes)
+            scheduled = await asyncio.to_thread(self.db.scheduled_reminders_by_row)
+
+            out: list = []
+            for row in matched:
+                key = activation.row_key(row)
+                if key in active_keys:
+                    a = by_key[key]
+                    out.append({
+                        "company": a["company"], "poc": a["poc"],
+                        "action": a["type"], "label": a["label"],
+                        "owner": a["owner"] or "(unassigned)",
+                        "due_date": a["due_iso"], "overdue_days": a["overdue_days"],
+                        "priority": a["priority"], "priority_label": a["priority_label"],
+                        "text": a["text"], "why": a["why"], "sheet_row": a["sheet_row"],
+                    })
+                    continue
+                # No action: say WHICH kind of nothing this is.
+                if not activation.is_active(row):
+                    reason, detail = "inactive", activation.why_active(row)
+                else:
+                    _a, silent = nextaction.next_action(
+                        row, today=result.get("today"), snoozes=snoozes,
+                        scheduled=scheduled,
+                    )
+                    reason = silent
+                    detail = nextaction.SILENT_LABELS.get(silent, silent)
+                    if silent == nextaction.SILENT_STOPPED:
+                        detail = nextaction.stop_reason(row) + " — never chased again"
+                    elif silent == nextaction.SILENT_SNOOZED:
+                        entry = snoozes.get(activation.row_key(row)) or {}
+                        detail = (
+                            f"snoozed until {entry.get('until_date')}"
+                            + (f" ({entry.get('note')})" if entry.get("note") else "")
+                        )
+                out.append({
+                    "company": gtm_sheet.clean_cell(row.get("company")),
+                    "poc": gtm_sheet.clean_cell(row.get("poc")),
+                    "action": None, "no_action_because": reason, "detail": detail,
+                    "sheet_row": row.get("_row"),
+                })
+            return {
+                "ok": True,
+                "sent_anything": False,
+                "tab": getattr(tab, "title", ""),
+                "company": company,
+                "rows": out,
+                "note": (
+                    "Exactly one action per row, or a specific reason for none. "
+                    "'stopped' means the row is finished and will never be chased again; "
+                    "'snoozed' means somebody asked me to wait; 'not_due' means the "
+                    "cadence has not come round yet. Those are three different answers."
+                ),
+            }
+
+        async def _snooze_row(inp: dict) -> dict:
+            """Snooze a row until a date. WRITES to SQLite, never to the sheet."""
+            company = str((inp or {}).get("company") or "").strip()
+            poc = str((inp or {}).get("poc") or "").strip()
+            note = str((inp or {}).get("note") or "").strip()
+            if not company:
+                return {"ok": False, "reason": "snooze_row needs a 'company'."}
+
+            today = dl.today_ist()
+            until = None
+            raw_date = str((inp or {}).get("date") or "").strip()
+            if raw_date:
+                until = dl.parse_date(raw_date)
+                if until is None:
+                    return {
+                        "ok": False,
+                        "reason": f"I could not read {raw_date!r} as a date. Use YYYY-MM-DD.",
+                    }
+            else:
+                try:
+                    days = int((inp or {}).get("days") or 0)
+                except (TypeError, ValueError):
+                    days = 0
+                if days < 1:
+                    return {
+                        "ok": False,
+                        "reason": "Tell me how long: either 'days' or an explicit 'date'.",
+                    }
+                until = today + timedelta(days=days)
+
+            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.POCS)
+            if err:
+                return err
+            matched = activation.matching_rows(
+                tab.rows, org=company, names=[poc] if poc else None
+            )
+            if not matched:
+                return {
+                    "ok": False, "company": company,
+                    "reason": (
+                        f"No row on {tab.title!r} matches {company!r}"
+                        + (f" / {poc!r}" if poc else "")
+                        + ". Nothing was snoozed."
+                    ),
+                }
+
+            snoozed: list = []
+            for row in matched:
+                result = await asyncio.to_thread(
+                    lambda r=row: self.db.set_snooze(
+                        row_key=activation.row_key(r),
+                        company=gtm_sheet.clean_cell(r.get("company")),
+                        poc=gtm_sheet.clean_cell(r.get("poc")),
+                        until_date=dl.iso(until), note=note,
+                        on_date=dl.iso(today),
+                    )
+                )
+                snoozed.append({
+                    "company": gtm_sheet.clean_cell(row.get("company")),
+                    "poc": gtm_sheet.clean_cell(row.get("poc")),
+                    "action": result["action"], "previous_date": result["previous"],
+                    "sheet_row": row.get("_row"),
+                })
+            state.audit(
+                "rows_snoozed", reason=note or "no reason given",
+                company=company, poc=poc, until=dl.iso(until), rows=len(snoozed),
+            )
+            log.info("[nextaction] snoozed %d row(s) at %r until %s",
+                     len(snoozed), company, dl.iso(until))
+            return {
+                "ok": True,
+                "sent_anything": False,
+                "until": dl.iso(until),
+                "until_pretty": dl.format_date(until),
+                "rows": snoozed,
+                "note": (
+                    "Those rows produce no action until that date. On and after it, the "
+                    "action comes back with its due date set to the date that was asked "
+                    "for — so if the date passes it shows as overdue rather than "
+                    "disappearing. Nothing was written to the spreadsheet."
+                ),
+            }
+
+        async def _schedule_reminder(inp: dict) -> dict:
+            """A one-off reminder at a specific time. The weekend exception."""
+            company = str((inp or {}).get("company") or "").strip()
+            poc = str((inp or {}).get("poc") or "").strip()
+            what = str((inp or {}).get("what") or "").strip()
+            when = str((inp or {}).get("time") or "").strip()
+            raw_date = str((inp or {}).get("date") or "").strip()
+            if not company or not what or not raw_date:
+                return {
+                    "ok": False,
+                    "reason": "schedule_reminder needs a 'company', a 'date' and a 'what'.",
+                }
+            due = dl.parse_date(raw_date)
+            if due is None:
+                return {
+                    "ok": False,
+                    "reason": f"I could not read {raw_date!r} as a date. Use YYYY-MM-DD.",
+                }
+
+            tab, err = await asyncio.to_thread(_tab_or_error, gtm_sheet.POCS)
+            if err:
+                return err
+            matched = activation.matching_rows(
+                tab.rows, org=company, names=[poc] if poc else None
+            )
+            row = matched[0] if matched else None
+            row_key = activation.row_key(row) if row is not None else ""
+            today = dl.today_ist()
+            reminder_id = await asyncio.to_thread(
+                lambda: self.db.add_scheduled_reminder(
+                    row_key=row_key,
+                    company=(gtm_sheet.clean_cell(row.get("company")) if row is not None
+                             else company),
+                    poc=(gtm_sheet.clean_cell(row.get("poc")) if row is not None else poc),
+                    due_date=dl.iso(due), due_time=when, what=what,
+                    on_date=dl.iso(today),
+                )
+            )
+            state.audit(
+                "reminder_scheduled", reason=what, company=company, poc=poc,
+                due_date=dl.iso(due), due_time=when, matched_a_row=bool(row),
+            )
+            weekend = due.weekday() >= 5
+            return {
+                "ok": True,
+                "sent_anything": False,
+                "id": reminder_id,
+                "company": company, "poc": poc,
+                "due_date": dl.iso(due), "due_pretty": dl.format_date(due),
+                "time": when, "what": what,
+                "matched_sheet_row": row.get("_row") if row is not None else None,
+                "is_weekend": weekend,
+                "note": (
+                    ("That is a Saturday/Sunday and I have LEFT IT THERE — scheduled "
+                     "reminders keep the date they were asked for; every other date I "
+                     "compute is moved to the Monday. " if weekend else "")
+                    + "It appears in 'cadence preview' on the day. I do not send it on my "
+                    "own, and nothing was written to the spreadsheet."
+                    + ("" if row is not None else
+                       " I could not match that to a row on the tab, so it is recorded "
+                       "against the company name alone — say so.")
+                ),
             }
 
         async def _set_deadline(inp: dict):
@@ -2341,70 +2874,213 @@ class SalesBot(discord.Client):
             },
             {
                 "schema": {
-                    "name": "cadence_list",
+                    "name": "sheet_status",
                     "description": (
-                        "THE FULL CADENCE LIST — every item the phase-1 rules fire on "
-                        "today, UNCAPPED, ranked urgent first. The digest carries every "
-                        "URGENT item plus the top DIGEST_MAX_ITEMS of the rest, and closes "
-                        "with 'N more held'; this is what that line points at. Use it for "
-                        "'full cadence list', 'what did the digest leave out', 'show me "
-                        "everything', 'what else is pending', or any question about the "
-                        "follow-ups / intros / meetings / update-tracker / assets sections. "
-                        "Each line carries its rule letter (a-j) and its priority (urgent / "
-                        "waiting / intro / suggestion). Rows marked rejected are excluded by "
-                        "design, and the cold contacts have their own tool (cold_list). "
-                        "Optionally filter to one rule letter."
+                        "WHAT I AM ACTUALLY READING. Use this for 'sheet status', 'what "
+                        "sheet are you on', 'which tab', 'how many rows can you see', "
+                        "'what can you write', 'why aren't you chasing X'. Returns the "
+                        "canonical tab name, total rows, ACTIVE rows (a row is active "
+                        "only when a first-contact date or a connection date is present "
+                        "— inactive rows are invisible to everything I say unprompted, "
+                        "though I will still answer about one by name), the restricted "
+                        "column bands I may never write to, and the NAMED columns inside "
+                        "the writable window between them. Quote the tab name and both "
+                        "counts; if active is far below total, say so plainly — that is "
+                        "usually the answer to 'why is the digest so quiet'."
+                    ),
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                "handler": _sheet_status,
+            },
+            {
+                "schema": {
+                    "name": "activate_rows",
+                    "description": (
+                        "ACTIVATE rows that have no first-contact or connection date, so "
+                        "they become visible to the proactive features. This is the ONE "
+                        "exception to the activation rule and it exists for exactly this "
+                        "request: 'set connection reminders for the others at <org>', "
+                        "'start chasing the rest of the people at <org>', 'include "
+                        "<person> at <org>'. Pass 'org' always; pass 'names' to activate "
+                        "particular PoCs rather than every row at that org. The "
+                        "activation is REMEMBERED across restarts. Report back exactly "
+                        "which rows were activated, which were already active and why, "
+                        "and name anything asked for that does not exist rather than "
+                        "implying it was activated."
                     ),
                     "input_schema": {
                         "type": "object",
                         "properties": {
-                            "rule": {
+                            "org": {
+                                "type": "string",
+                                "description": "The company / organisation named in the request.",
+                            },
+                            "names": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Optional PoC names. Omit for 'the others at <org>', "
+                                    "which means every row at that org."
+                                ),
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "The request in the asker's own words, for the record.",
+                            },
+                        },
+                        "required": ["org"],
+                    },
+                },
+                "handler": _activate_rows,
+            },
+            {
+                "schema": {
+                    "name": "research_brief",
+                    "description": (
+                        "A RESEARCH BRIEF on ONE person, as COPY MATERIAL for whoever "
+                        "asked. Use for 'brief me on <person>', 'brief me on <person> "
+                        "(<org>)', 'what should I say to <person>', 'who is <person> and "
+                        "what do we open with'. Returns who they are, how much their role "
+                        "weighs (someone who can say yes vs someone who has to ask), "
+                        "which of their work maps to our lanes, an angle, and a DRAFT "
+                        "message. "
+                        "IT IS NEVER SENT AND NEVER WRITTEN TO THE SHEET — hand it back "
+                        "as a draft for them to edit. "
+                        "It fetches ONLY the URLs already on that person's row, and only "
+                        "from the allowed domains; if it refused any link, REPEAT the "
+                        "refusal line verbatim so nobody reads a partial brief as a "
+                        "complete one. If it says LinkedIn access is pending, SAY THAT — "
+                        "a career history quietly missing reads as 'they have none'."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "person": {"type": "string", "description": "The PoC's name."},
+                            "org": {"type": "string", "description": "Their company, if they said one."},
+                        },
+                        "required": ["person"],
+                    },
+                },
+                "handler": _research_brief,
+            },
+            {
+                "schema": {
+                    "name": "cadence_preview",
+                    "description": (
+                        "TODAY'S COMPUTED QUEUE — the ONE next action for every active "
+                        "row, grouped by type and owner. Use this for 'cadence preview', "
+                        "'what's the queue', 'what needs doing today', 'what needs "
+                        "attention', 'what's slipping', 'anything urgent', 'what would "
+                        "you chase'. NOTHING IS SENT by this: it is a read-only preview "
+                        "of what the state machine currently holds. Each line carries its "
+                        "due date, whether it is overdue, and the cells that produced it "
+                        "— repeat the reason so the team can check it. The bands are, in "
+                        "order: positive overrides (someone replied), meetings and demo "
+                        "chases, 7-day follow-ups, slow lane. Also quote the closing line "
+                        "accounting for rows that produced NO action (stopped, snoozed, "
+                        "nothing due) — a queue that only lists what it found looks "
+                        "complete when it is not."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
                                 "type": "string",
                                 "description": (
-                                    "Optional single rule letter a-j to filter to: a stale "
-                                    "follow-up, b intro pending, c start interacting, d try "
-                                    "another channel, e mark unresponsive, f lock a meeting, "
-                                    "g try another PoC at a rejected company, h meeting soon, "
-                                    "i post-meeting gap, j next-step stall."
+                                    "Optional: one action type to filter to — "
+                                    "meeting_proposal, scheduled_reminder, quote_chase, "
+                                    "progress_check, dm_check, dm_sent_check, "
+                                    "mark_unresponsive, channel_switch, pulse_check, "
+                                    "followup."
                                 ),
+                            },
+                            "owner": {
+                                "type": "string",
+                                "description": "Optional: one owner, as the sheet names them.",
                             },
                         },
                         "required": [],
                     },
                 },
-                "handler": _cadence_list,
+                "handler": _cadence_preview,
             },
             {
                 "schema": {
-                    "name": "cold_list",
+                    "name": "next_action",
                     "description": (
-                        "THE COLD CONTACTS — every never-connected row first contacted more "
-                        "than CONNECT_REMINDER_MAX_DAYS ago, UNCAPPED and grouped by company. "
-                        "The daily digest reports these as a single count line ('N cold "
-                        "contacts ... ask cold list to see them') rather than chasing each "
-                        "one; this is what that line points at. Use it for 'cold list', "
-                        "'show me the cold contacts', 'who never connected', 'what about the "
-                        "March outreach', 'which leads went quiet'. They are NOT rejected - "
-                        "say so if it matters to the question."
+                        "THE ONE NEXT ACTION for a named company (or one PoC at it). Use "
+                        "for 'what's next for X', 'what should I do about X', 'why aren't "
+                        "you chasing X', 'when is X due'. Returns exactly one action per "
+                        "row — type, owner, due date, priority band — or, when a row "
+                        "produces none, WHY: stopped (0% / Dead / Unresponsive / Won / "
+                        "Lost, and never chased again), snoozed until a date, no readable "
+                        "date to count from, or simply nothing due yet. Those four are "
+                        "different answers and you must give the specific one rather than "
+                        "'nothing'."
                     ),
-                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "company": {"type": "string", "description": "Company name; partial is fine."},
+                            "poc": {"type": "string", "description": "Optional PoC name to narrow to one row."},
+                        },
+                        "required": ["company"],
+                    },
                 },
-                "handler": _cold_list,
+                "handler": _next_action_for,
             },
             {
                 "schema": {
-                    "name": "row_flags",
+                    "name": "snooze_row",
                     "description": (
-                        "Rows the hygiene rules currently flag: HOT (replied, no follow-up "
-                        "since), STALLED (open, no response, last touch older than the "
-                        "cadence) and DEAD-DEAL (no next step and no future date). Use for "
-                        "'what needs attention', 'what's slipping', 'anything urgent'. Each "
-                        "flag carries the reason it fired, in terms of the cells it read — "
-                        "repeat that reason so the team can check it."
+                        "SNOOZE a row: 'follow up in 5 days', 'come back to Acme on the "
+                        "20th', 'leave them alone until next month'. The row produces NO "
+                        "action until that date; on and after it, the row's action comes "
+                        "back with its due date set to the date that was asked for. Pass "
+                        "either 'days' or 'date' (YYYY-MM-DD). This WRITES to my own "
+                        "records — never to the spreadsheet. Report the date back so the "
+                        "person can correct it."
                     ),
-                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "company": {"type": "string", "description": "Company name; partial is fine."},
+                            "poc": {"type": "string", "description": "Optional PoC, to snooze one row rather than all of them at that company."},
+                            "days": {"type": "integer", "description": "Calendar days from today."},
+                            "date": {"type": "string", "description": "An explicit date, YYYY-MM-DD."},
+                            "note": {"type": "string", "description": "The request in the asker's own words."},
+                        },
+                        "required": ["company"],
+                    },
                 },
-                "handler": _row_flags,
+                "handler": _snooze_row,
+            },
+            {
+                "schema": {
+                    "name": "schedule_reminder",
+                    "description": (
+                        "A ONE-OFF REMINDER at a specific time: 'remind me about Acme on "
+                        "Saturday morning', 'ping me about the Beta quote on the 14th at "
+                        "10'. Unlike every other date I compute, THIS ONE IS NEVER MOVED "
+                        "OFF A WEEKEND — somebody asking for a Saturday has decided about "
+                        "their own Saturday. It takes precedence over the row's ordinary "
+                        "follow-up but not over a positive reply. This WRITES to my own "
+                        "records, never to the spreadsheet, and it does not send anything "
+                        "on its own — it appears in 'cadence preview' on the day."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "company": {"type": "string", "description": "Company the reminder is about."},
+                            "poc": {"type": "string", "description": "Optional PoC."},
+                            "date": {"type": "string", "description": "The date asked for, YYYY-MM-DD."},
+                            "time": {"type": "string", "description": "Free text as asked: 'morning', '10:00'."},
+                            "what": {"type": "string", "description": "What to be reminded about, in their words."},
+                        },
+                        "required": ["company", "date", "what"],
+                    },
+                },
+                "handler": _schedule_reminder,
             },
             {
                 "schema": {
@@ -2754,7 +3430,7 @@ class SalesBot(discord.Client):
             # The tracker half. A failure here must not take the mapping half
             # down with it — half an answer, clearly labelled, beats none.
             try:
-                tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
+                tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POCS)
                 matches = tab.find_company(company) if tab else []
                 out["tracker"] = {
                     "available": True,
@@ -3057,7 +3733,7 @@ class SalesBot(discord.Client):
         sheet_row_no = None
         if row is None:
             try:
-                tab = gtm_sheet.SHEETS.tab(gtm_sheet.TRACKER)
+                tab = gtm_sheet.SHEETS.tab(gtm_sheet.POCS)
                 matches = tab.find_company(company) if tab else []
                 row = matches[0] if matches else None
             except gtm_sheet.SheetAccessError:
@@ -3073,26 +3749,29 @@ class SalesBot(discord.Client):
 
         due, rule, _n = dl.compute_due(kind, anchor=anchor, strategy_text=strategy_text)
 
-        # THE CONFLICT RULE: a human date already in the sheet wins outright.
-        # Adopt it into SQLite and stop — no new date, no write, no announcement.
+        # THE CONFLICT RULE, now read off the row's own MEETING DATE rather than
+        # off a bot-owned column. The "Next Deadline (bot)" column is retired
+        # with the sandbox era, so there is no cell that is "the bot's date" to
+        # compare against — but a date a person typed still wins, and the place
+        # they type one is the sheet's own date columns.
         if row is not None:
-            existing_cell = (row.get("bot_deadline") or "").strip()
-            if existing_cell and not dl.is_bot_written(existing_cell):
+            existing_cell = (row.get("meeting_date") or "").strip()
+            if existing_cell:
                 human_date = dl.parse_date(existing_cell)
-                if human_date:
+                if human_date and kind == dl.KIND_MEETING_PREP:
                     self.db.upsert_deadline(
                         company=company, kind=kind, due_date=dl.iso(human_date),
-                        rule="entered by a person in the sheet", source="human",
+                        rule="taken from the meeting date in the sheet", source="human",
                         sheet_row=sheet_row_no, sheet_target="original",
                         channel_id=getattr(channel, "id", None),
                     )
                     log.info(
-                        "[deadline] %s already has a human date (%s); adopting it, not overwriting",
+                        "[deadline] %s has a meeting date in the sheet (%s); adopting it",
                         company, dl.iso(human_date),
                     )
                     state.audit(
                         "deadline_adopted_human",
-                        reason="a person had already entered a date in the sheet; theirs wins",
+                        reason="a person had already entered the date in the sheet; theirs wins",
                         company=company, kind=kind, due_date=dl.iso(human_date),
                     )
                     return {
@@ -3103,7 +3782,7 @@ class SalesBot(discord.Client):
 
         result = self.db.upsert_deadline(
             company=company, kind=kind, due_date=dl.iso(due), rule=rule, source="bot",
-            sheet_row=sheet_row_no, sheet_target=config.SHEET_WRITE_TARGET,
+            sheet_row=sheet_row_no, sheet_target="sqlite",
             channel_id=getattr(channel, "id", None),
         )
         action = result["action"]
@@ -3123,35 +3802,15 @@ class SalesBot(discord.Client):
                 ),
             }
 
-        # Mirror to the sheet. Best-effort by construction.
-        sheet_result = {"ok": False, "cell": "", "error": "no tracker row to write to"}
-        if sheet_row_no and config.SHEET_WRITE_TARGET != "off":
-            sheet_result = await asyncio.to_thread(
-                gtm_sheet.SHEETS.write_deadline_cell,
-                row=int(sheet_row_no),
-                value=dl.sheet_cell_value(due, rule=rule),
-                # The row number came from the ORIGINAL; the write goes to
-                # SHEET_WRITE_TARGET. Pass the company so the write is refused
-                # rather than misplaced if the two sheets have drifted.
-                expect_company=company,
-            )
-            if sheet_result["ok"]:
-                self.db.mark_deadline(
-                    record["id"], sheet_cell=sheet_result["cell"],
-                    sheet_target=sheet_result["target"],
-                )
-            else:
-                log.warning(
-                    "[deadline] sheet mirror failed for %s: %s", company, sheet_result["error"]
-                )
-            state.audit(
-                "sheet_write",
-                reason=f"mirroring the {kind} deadline for {company}",
-                company=company, cell=sheet_result.get("cell"),
-                target=sheet_result.get("target"), ok=sheet_result["ok"],
-                error=sheet_result.get("error") or None,
-                value=dl.sheet_cell_value(due, rule=rule),
-            )
+        # NO SHEET MIRROR. The deadline lives in SQLite and is announced here;
+        # there is no bot-owned column to copy it into any more, and inventing a
+        # place for it inside the team's own writable window would be the bot
+        # deciding which of THEIR columns means "the bot's deadline".
+        #
+        # Writes into that window happen only through the two triggers in
+        # sheetwrite.py — a reply to the bot, or an explicit command — because
+        # those are the two cases where a human has actually said what should be
+        # in the cell.
 
         # Announce. This is the consent mechanism, so it happens whenever a date
         # was actually set — even if the sheet write failed.
@@ -3160,9 +3819,6 @@ class SalesBot(discord.Client):
             thing=f"the {label}", company=company, due=due, rule=rule,
             mentions=dl.notify_mentions(), unprompted=unprompted,
         )
-        if not sheet_result["ok"] and config.SHEET_WRITE_TARGET != "off":
-            text += f" (I couldn't write it to the sheet: {sheet_result['error']}; I'm holding it here.)"
-
         sent = await guardrails.send(
             channel, text,
             reason=f"setting a {kind} deadline for {company} ({'unprompted' if unprompted else 'asked'})",
@@ -3345,33 +4001,473 @@ class SalesBot(discord.Client):
     async def _sweep_once(self) -> None:
         """One tick.
 
-        The ONLY thing a tick can put into Discord is the daily digest, and only
-        once a day. Every other proactive path — the deadline reminder, the
-        deadline chase, the promise nudge, the give-up flag, the row-hygiene
-        flag, the weekly funnel post — was removed, not disabled behind a knob,
-        so there is nothing here that could start speaking again by accident.
+        The ONLY thing a tick can put into Discord is a DRIP MESSAGE, and at
+        most DAILY_MESSAGE_CAP of those a weekday. Every other proactive path —
+        the daily digest, the deadline reminder, the deadline chase, the promise
+        nudge, the give-up flag, the row-hygiene flag, the weekly funnel post —
+        was removed, not disabled behind a knob, so there is nothing here that
+        could start speaking again by accident.
 
-        Guarded so a failing digest never stops the state summary being written.
+        Guarded so a failing drip never stops the state summary being written.
         """
         try:
-            await self._maybe_post_daily_digest()
+            await self._maybe_send_drip()
         except Exception:
-            log.exception("[digest] tick raised; continuing")
+            log.exception("[drip] tick raised; continuing")
         self._maybe_write_daily_summary()
 
     # ======================================================================
-    # THE ONE DAILY DIGEST
+    # WRITING TO THE SHEET
     # ======================================================================
-    # Everything below is the entire proactive voice of this bot. What used to
-    # be six kinds of message scattered through the day is one message, once a
-    # day, in grouped sections, hot first.
+    # THE ONLY PLACE A CELL CHANGES. Two triggers, and nothing else in this file
+    # can reach `gtm_sheet.write_cells`:
     #
-    # IF YOU ARE ADDING SOMETHING THE BOT SHOULD TELL THE TEAM: add a section
-    # here. Do not add a `guardrails.send`. The value of this design is entirely
-    # in the fact that there is exactly one of them.
+    #   (a) a team member REPLIES to one of the bot's own messages;
+    #   (b) a team member @-mentions the bot with an explicit command.
     #
-    # The exceptions, both of which are answers rather than interruptions:
-    #   - a REPLY to a question someone asked (`_reply`);
+    # There is no scheduled write, no write from the sweep, and no inference
+    # from a passing remark. A cell changes because a person addressed the bot
+    # and said something that answers what that cell holds.
+    #
+    # The tiers, the fill rule, the restricted bands and the terminal-word gate
+    # are all in sheetwrite.py, which is pure — this method does the I/O and the
+    # talking, and it applies whatever that module decided, never more.
+
+    async def _maybe_apply_sheet_update(
+        self, message: discord.Message, text: str
+    ) -> bool:
+        """Try to treat this message as an update / snooze / undo.
+
+        Returns True when it was handled (and answered). False means "this is
+        not a write" and the caller carries on to the question engine — which is
+        the common case, because most things said to the bot are questions.
+        """
+        is_reply = await self._is_reply_to_self(message)
+        trigger = sheetwrite.TRIGGER_REPLY if is_reply else sheetwrite.TRIGGER_COMMAND
+
+        # CONTEXT FROM THE MESSAGE THEY REPLIED TO. "Sent this morning" names no
+        # company and no column; the nudge it answers names both. Without this
+        # the extractor would have to guess, and guessing is how a correct value
+        # lands in the wrong row.
+        context = await self._drip_context_for(message) if is_reply else {}
+
+        try:
+            parsed = await self.llm.extract_sheet_update(
+                text=text,
+                today=dl.iso(dl.today_ist()),
+                company_hint=context.get("companies", ""),
+                poc_hint=context.get("poc", ""),
+                asked_about=context.get("asked_about", ""),
+                requester=_display(message.author),
+            )
+        except Exception:
+            log.exception("[sheetwrite] extraction raised; treating as not an update")
+            return False
+        # ACCEPTING A RECORD-OFFER. "Yes" carries no fields, so the extractor
+        # correctly reports nothing — but the message it replies to proposed
+        # something specific, and that proposal is on the drip row. This is the
+        # only place a bare affirmative can produce a write, and only ever the
+        # write that was already shown to them in the offer.
+        if is_reply and context.get("offer") and sheetwrite.is_affirmative(text):
+            return await self._apply_pending_offer(message, context, text)
+
+        if parsed is None or parsed["intent"] == "none":
+            return False
+
+        if parsed["intent"] == "undo":
+            await self._undo_last_sheet_write(message)
+            return True
+
+        if parsed["intent"] == "snooze":
+            return await self._apply_snooze(message, text, parsed, context)
+
+        return await self._apply_sheet_update(message, text, parsed, context, trigger)
+
+    async def _drip_context_for(self, message: discord.Message) -> dict:
+        """What the message being replied to was about.
+
+        Looks the parent Discord message id up in `drip_sends`, which records
+        the companies and the action type of every drip message. A reply to
+        something else the bot said (an answer, an echo) simply has no context
+        and the extractor works from the reply alone.
+        """
+        ref = message.reference
+        parent_id = getattr(ref, "message_id", None) if ref else None
+        if not parent_id:
+            return {}
+        try:
+            row = await asyncio.to_thread(self.db.find_drip_by_message_id, str(parent_id))
+        except Exception:
+            log.debug("[sheetwrite] could not look up the drip context", exc_info=True)
+            return {}
+        if not row:
+            return {}
+        return {
+            "companies": str(row.get("companies") or ""),
+            "asked_about": str(row.get("action_type") or ""),
+            "poc": "",
+            "offer": str(row.get("offer") or ""),
+        }
+
+    async def _apply_pending_offer(
+        self, message: discord.Message, context: dict, text: str
+    ) -> bool:
+        """Apply the record-offer this reply is saying yes to.
+
+        THE OFFER IS THE PROPOSAL, NOT THE REPLY. The bot writes exactly what it
+        showed them and nothing else — the affirmative is consent to a specific
+        change they have already read, which is the only way a one-word reply can
+        safely produce a write at all.
+
+        It goes through `plan_writes` like every other update, so the tiers, the
+        bands, the fill rule and the ceiling all still apply. An offer cannot
+        reach a cell an ordinary reply could not.
+        """
+        try:
+            offer = json.loads(context.get("offer") or "{}")
+        except (TypeError, ValueError):
+            log.warning("[convert] the stored offer was unreadable; ignoring it")
+            return False
+        fields = offer.get("fields") or []
+        if not fields:
+            return False
+        parsed = {
+            "intent": "update", "company": offer.get("company", ""),
+            "poc": "", "fields": fields, "confidence": 1.0,
+        }
+        log.info(
+            "[convert] %s accepted the record-offer for %r",
+            _display(message.author), offer.get("company", ""),
+        )
+        state.audit(
+            "offer_accepted",
+            reason=f"{_display(message.author)} said yes to a record-offer",
+            company=offer.get("company", ""),
+            fields=[f.get("role") for f in fields],
+            reply=text[:200],
+        )
+        return await self._apply_sheet_update(
+            message, text, parsed, context, sheetwrite.TRIGGER_REPLY,
+        )
+
+    async def _resolve_write_row(self, parsed: dict, context: dict):
+        """(tab, row) for the row an update is about, or (None, reason).
+
+        THE COMPANY MUST RESOLVE TO EXACTLY ONE ROW. Two rows at the same
+        company is normal — the tab holds one row per PoC — so an update that
+        names only a company and matches several is REFUSED with a question
+        rather than applied to whichever came first. A correct value in the
+        wrong person's row is worse than no value.
+        """
+        try:
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.pocs_tab)
+        except Exception:
+            log.exception("[sheetwrite] the canonical tab could not be read")
+            return None, "I could not read the sheet just now."
+        if tab is None:
+            return None, "I have no Outreach PoCs tab to write to."
+
+        company = parsed.get("company") or ""
+        poc = parsed.get("poc") or ""
+        if not company and context.get("companies"):
+            # A reply with no company named: the nudge it answers had exactly
+            # one, or the reply is ambiguous and we say so.
+            names = [c.strip() for c in context["companies"].split(",") if c.strip()]
+            if len(names) == 1:
+                company = names[0]
+            elif names:
+                return None, (
+                    "That message was about " + context["companies"]
+                    + " — which one do you mean?"
+                )
+        if not company:
+            return None, "I could not tell which company you meant."
+
+        matched = activation.matching_rows(
+            tab.rows, org=company, names=[poc] if poc else None
+        )
+        if not matched:
+            return None, f"I have no row for {company}" + (f" / {poc}" if poc else "") + "."
+        if len(matched) > 1:
+            people = ", ".join(
+                gtm_sheet.clean_cell(r.get("poc")) or "(no name)" for r in matched[:6]
+            )
+            return None, (
+                f"There are {len(matched)} rows for {company} ({people}) — "
+                f"which person do you mean?"
+            )
+        return (tab, matched[0]), ""
+
+    async def _apply_sheet_update(
+        self, message: discord.Message, text: str, parsed: dict,
+        context: dict, trigger: str,
+    ) -> bool:
+        """Plan, write, record and echo ONE update."""
+        resolved, why = await self._resolve_write_row(parsed, context)
+        if resolved is None:
+            await self._reply(message, why, reason="could not resolve the row to update")
+            return True
+        tab, row = resolved
+
+        plan = sheetwrite.plan_writes(
+            tab=tab, row=row, fields=parsed["fields"], trigger=trigger, reply_text=text,
+        )
+        company = gtm_sheet.clean_cell(row.get("company"))
+        poc = gtm_sheet.clean_cell(row.get("poc"))
+
+        if not plan["writes"]:
+            # Nothing writable. Still ANSWER — silence after somebody told the
+            # bot something reads as the bot ignoring them.
+            line = sheetwrite.echo_line(
+                company=company, poc=poc, applied=[], asks=plan["asks"],
+                skipped=plan["skipped"], undo_hours=config.SHEET_WRITE_UNDO_HOURS,
+            )
+            if plan["asks"] or plan["skipped"]:
+                state.audit(
+                    "sheet_write_declined",
+                    reason="nothing in that message was mine to write",
+                    company=company, poc=poc, trigger=trigger,
+                    asks=plan["asks"], skipped=plan["skipped"],
+                    requested_by=_display(message.author),
+                )
+                await self._reply(message, line or "Noted.", reason="update acknowledged")
+                return True
+            return False
+
+        if not config.SHEET_WRITES_ENABLED:
+            preview = sheetwrite.echo_line(
+                company=company, poc=poc, applied=plan["applied"], asks=plan["asks"],
+                skipped=plan["skipped"], undo_hours=config.SHEET_WRITE_UNDO_HOURS,
+            )
+            await self._reply(
+                message,
+                preview + " (Sheet writing is off right now, so I have not actually "
+                          "changed anything.)",
+                reason="sheet writes disabled",
+            )
+            return True
+
+        result = await asyncio.to_thread(
+            lambda: gtm_sheet.SHEETS.write_cells(
+                row=int(row["_row"]), values=plan["writes"], expect_company=company,
+                reason=f"{trigger} from {_display(message.author)}",
+            )
+        )
+        if not result["ok"]:
+            await self._reply(
+                message,
+                f"I could not write that: {result['error'] or 'the sheet refused it'}. "
+                f"Nothing has changed.",
+                reason="sheet write failed",
+            )
+            state.audit(
+                "sheet_write_failed", reason=result["error"], company=company,
+                poc=poc, trigger=trigger, values=plan["writes"],
+                requested_by=_display(message.author),
+            )
+            return True
+
+        batch_id = f"{message.id}"
+        written_at = dl.now_ist().isoformat(timespec="seconds")
+        await asyncio.to_thread(
+            lambda: self.db.record_sheet_write(
+                batch_id=batch_id, tab=tab.title, sheet_row=int(row["_row"]),
+                row_key=activation.row_key(row), company=company, poc=poc,
+                cells=result["written"], trigger=trigger,
+                requested_by=_display(message.author), source_msg=str(message.id),
+                written_at=written_at,
+            )
+        )
+        state.audit(
+            "sheet_write",
+            reason=f"{trigger} from {_display(message.author)}",
+            batch_id=batch_id, tab=tab.title, sheet_row=int(row["_row"]),
+            company=company, poc=poc, trigger=trigger,
+            cells=[{"cell": c["cell"], "header": c["header"],
+                    "old": c["old"], "new": c["new"]} for c in result["written"]],
+            refused=plan["skipped"], asks=plan["asks"],
+            requested_by=_display(message.author),
+        )
+
+        applied = [
+            a for a in plan["applied"]
+            if a["role"] in {c["role"] for c in result["written"]}
+        ]
+        line = sheetwrite.echo_line(
+            company=company, poc=poc, applied=applied, asks=plan["asks"],
+            skipped=plan["skipped"], undo_hours=config.SHEET_WRITE_UNDO_HOURS,
+        )
+        await self._reply(message, line, reason="echoing a sheet write")
+        log.info(
+            "[sheetwrite] %s wrote %d cell(s) on row %s (%s) via %s",
+            _display(message.author), len(result["written"]), row["_row"], company,
+            trigger,
+        )
+        return True
+
+    async def _undo_last_sheet_write(self, message: discord.Message) -> None:
+        """Revert the most recent write, if it is still inside the window.
+
+        ANY TEAM MEMBER MAY UNDO ANY WRITE. Not just whoever caused it: the
+        person who notices a wrong cell is usually not the person who typed the
+        sentence that produced it, and making them find that person first is how
+        a wrong value stays in the sheet all week.
+        """
+        now_iso = dl.now_ist().isoformat(timespec="seconds")
+        try:
+            batch = await asyncio.to_thread(
+                lambda: self.db.latest_undoable_write(
+                    within_hours=config.SHEET_WRITE_UNDO_HOURS, now_iso=now_iso,
+                )
+            )
+        except Exception:
+            log.exception("[sheetwrite] could not look up the last write")
+            batch = None
+        if not batch:
+            await self._reply(
+                message,
+                f"I have not changed anything in the last "
+                f"{config.SHEET_WRITE_UNDO_HOURS}h that I can put back.",
+                reason="nothing to undo",
+            )
+            return
+
+        cells = batch["cells"]
+        first = cells[0]
+        restore = [
+            {"role": c["role"], "old": c["old_value"], "cell": c["cell"],
+             "header": c["header"], "new": c["new_value"]}
+            for c in cells
+        ]
+        result = await asyncio.to_thread(
+            lambda: gtm_sheet.SHEETS.undo_cells(
+                row=int(first["sheet_row"]), cells=restore,
+                expect_company=str(first["company"]),
+            )
+        )
+        if not result["ok"]:
+            await self._reply(
+                message,
+                f"I could not put that back: {result['error'] or 'the sheet refused it'}. "
+                f"The cells are as they were after my change.",
+                reason="undo failed",
+            )
+            state.audit(
+                "sheet_undo_failed", reason=result["error"],
+                batch_id=batch["batch_id"], company=first["company"],
+                requested_by=_display(message.author),
+            )
+            return
+
+        await asyncio.to_thread(
+            lambda: self.db.mark_sheet_write_undone(
+                batch_id=batch["batch_id"], undone_by=_display(message.author),
+                undone_at=now_iso,
+            )
+        )
+        state.audit(
+            "sheet_undo",
+            reason=f"undo requested by {_display(message.author)}",
+            batch_id=batch["batch_id"], tab=first["tab"],
+            sheet_row=int(first["sheet_row"]), company=first["company"],
+            poc=first["poc"],
+            cells=[{"cell": c["cell"], "header": c["header"],
+                    "restored_to": c["old_value"], "was": c["new_value"]}
+                   for c in cells],
+            age_hours=round(batch["age_hours"], 2),
+            requested_by=_display(message.author),
+        )
+        what = " and ".join(
+            f"{c['header'].lower()} back to {c['old_value'] or 'empty'}" for c in cells
+        )
+        await self._reply(
+            message,
+            f"Done — I put {first['company']}'s {what}.",
+            reason="echoing an undo",
+        )
+        log.info(
+            "[sheetwrite] UNDO by %s: %d cell(s) on row %s restored",
+            _display(message.author), len(cells), first["sheet_row"],
+        )
+
+    async def _apply_snooze(
+        self, message: discord.Message, text: str, parsed: dict, context: dict
+    ) -> bool:
+        """"follow up in 15 days" / "remind me Saturday 6pm about X".
+
+        Parsed HERE rather than by the model: a date is a thing a regex can be
+        held to, and a snooze quietly entered for the wrong day would make the
+        bot go silent about an account for reasons nobody could reconstruct.
+        """
+        plan = sheetwrite.parse_snooze(text, today=dl.today_ist())
+        if plan is None:
+            return False
+        resolved, why = await self._resolve_write_row(parsed, context)
+        if resolved is None:
+            await self._reply(message, why, reason="could not resolve the row to snooze")
+            return True
+        _tab, row = resolved
+        company = gtm_sheet.clean_cell(row.get("company"))
+        poc = gtm_sheet.clean_cell(row.get("poc"))
+        today_iso = dl.iso(dl.today_ist())
+
+        if plan["kind"] == "scheduled":
+            await asyncio.to_thread(
+                lambda: self.db.add_scheduled_reminder(
+                    row_key=activation.row_key(row), company=company, poc=poc,
+                    due_date=dl.iso(plan["date"]), due_time=plan["time"],
+                    what=plan["about"] or text.strip()[:200],
+                    requested_by=_display(message.author), on_date=today_iso,
+                )
+            )
+            state.audit(
+                "reminder_scheduled", reason=plan["quote"], company=company, poc=poc,
+                due_date=dl.iso(plan["date"]), due_time=plan["time"],
+                requested_by=_display(message.author),
+            )
+        else:
+            await asyncio.to_thread(
+                lambda: self.db.set_snooze(
+                    row_key=activation.row_key(row), company=company, poc=poc,
+                    until_date=dl.iso(plan["date"]), note=plan["quote"],
+                    requested_by=_display(message.author), on_date=today_iso,
+                )
+            )
+            state.audit(
+                "rows_snoozed", reason=plan["quote"], company=company, poc=poc,
+                until=dl.iso(plan["date"]), rows=1,
+                requested_by=_display(message.author),
+            )
+        await self._reply(
+            message,
+            sheetwrite.snooze_confirmation(plan, company=company),
+            reason="confirming a snooze",
+        )
+        return True
+
+    # ======================================================================
+
+    # ======================================================================
+    # THE DRIP — the entire proactive voice of this bot
+    # ======================================================================
+    # THE ONE DAILY DIGEST IS RETIRED. What used to be one long message of
+    # grouped sections at 10:00 is now at most DAILY_MESSAGE_CAP short messages
+    # across a weekday, time-spaced, ONE PER (ACTION TYPE x OWNER).
+    #
+    # IF YOU ARE ADDING SOMETHING THE BOT SHOULD TELL THE TEAM: add an action
+    # TYPE in nextaction.py. Do not add a `guardrails.send`. The value of this
+    # design is entirely in the fact that there is exactly one send path and a
+    # hard cap on how often it runs.
+    #
+    # THE KILL SWITCH IS UNCHANGED — same name, same semantics, same log line.
+    # `SALES_DIGEST_ENABLED=false` (the current server state) suppresses all of
+    # this. The drip inherits the switch; it does not get one of its own, because
+    # an operator who turned the bot off should not have to learn a new variable
+    # to keep it off.
+    #
+    # The exceptions, both of which are answers rather than interruptions and
+    # neither of which is spaced or capped:
+    #   - a REPLY to a question someone asked (`_reply`) — IMMEDIATE, always;
     #   - the ask-time deadline announcement in `_set_deadline_for`, which is
     #     the answer to "when's the follow-up for X?" and carries the "shout to
     #     change" consent mechanism.
@@ -3393,164 +4489,457 @@ class SalesBot(discord.Client):
 
     # -- posting -----------------------------------------------------------
 
-    async def _maybe_post_daily_digest(self) -> None:
-        """Post the digest if it is time and it hasn't gone out today.
+    # -- sending -----------------------------------------------------------
 
-        THE ONCE-A-DAY GUARANTEE is the `sales_digest_date` marker in SQLite,
-        written after the message posts. It is a DATE, not a timer, so a
-        redeploy at 10:05 reads back "already sent today" and stays quiet —
-        which is the whole point of persisting it. If the marker can't be read
-        we do NOT post: a duplicate digest is worse than a missed one, and the
-        failure is loud in the log either way.
+    async def _maybe_send_drip(self) -> None:
+        """Send whichever drip slots are due, and no more than that.
 
-        "At or after the digest time" rather than "in that minute", because the
-        sweeper ticks every COS_FOLLOWUP_CHECK_INTERVAL_MINUTES and an
-        exact-minute test would simply never fire. A consequence worth knowing:
-        on a day where the 10:00 digest would have been empty and something
-        turns up at 14:00, the digest goes out at 14:00. That is still one
-        digest, and holding a hot lead for twenty hours to protect a schedule
-        would be the wrong trade.
+        THE WHOLE DAY IS RE-PLANNED ON EVERY TICK, deterministically, and the
+        slots already recorded in `drip_sends` fall away. That is the restart
+        guard: a redeploy at 11:40 recomputes the identical schedule, sees slots
+        1 and 2 in SQLite, and resumes at slot 3. It replaces the digest's
+        single `sales_digest_date` marker, which only had to answer "did today's
+        one message go out".
 
-        THE KILL SWITCH LIVES HERE AND NOWHERE ELSE. `SALES_DIGEST_ENABLED=false`
-        is checked below, at the one point every unprompted message in this bot
-        has to pass through, which is what lets one boolean silence the digest
-        and every section riding in it without any collector having to know the
-        switch exists. Collectors keep computing while it is off, so nothing has
-        to be rebuilt when it goes back on and `--dry-run-digest` stays honest.
+        THE KILL SWITCH LIVES HERE AND NOWHERE ELSE, exactly as it did for the
+        digest: read live, checked after the cheap gates and before anything is
+        composed or sent, logged once a day in the same words. Nothing is
+        written when it is off, so there is no state to unwind to end the
+        silence and no backlog to replay when it comes back.
+
+        EMPTY QUEUE MEANS SILENCE. There is no "nothing to report" message and
+        there must never be one.
         """
         now = dl.now_ist()
-        hour, minute = config.digest_time_ist()
-        if not digest.is_due(now, hour=hour, minute=minute):
-            return
-
         today = now.date()
         marker = dl.iso(today)
 
-        try:
-            if self.db.get_meta("sales_digest_date") == marker:
-                return
-        except Exception:
-            log.exception(
-                "[digest] could not read the once-a-day marker; staying quiet rather than "
-                "risking a second digest"
-            )
+        if not drip.is_sending_day(today):
             return
 
-        # THE KILL SWITCH, read here rather than at boot so flipping it takes
-        # effect on the next sweep tick without a restart.
-        #
-        # Checked LAST of the cheap gates — after "is it time" and after "has
-        # today's already gone out" — so it fires only where a digest was
-        # genuinely about to be posted and wasn't. That is what makes the log
-        # line below mean something: one line per digest actually withheld, not
-        # one for a day whose digest went out before the switch was flipped.
-        #
-        # Checked BEFORE anything is collected, so the suppressed path does no
-        # sheet reads, no LLM calls and, crucially, no ageing: carry-forward
-        # rows must not get a day older for a digest nobody saw.
-        #
-        # NOTHING IS WRITTEN HERE. `sales_digest_date` is deliberately left
-        # alone, so the switch owns the silence and no state has to be unwound
-        # to end it. Re-enabling resumes at the next scheduled digest and never
-        # replays the days that were skipped — there is no backlog to replay,
-        # because a suppressed day computed nothing and queued nothing. What
-        # does come back is whatever is outstanding at that moment, which is the
-        # same thing the digest would have said anyway.
+        hour, minute = config.drip_start_ist()
+        if not digest.is_due(now, hour=hour, minute=minute):
+            return
+
+        # THE RESTART GUARD, read before anything else that costs money. Fails
+        # CLOSED: if we cannot tell what has already gone out, we send nothing.
+        # A duplicate nudge is worse than a missed one.
+        try:
+            already = self.db.drip_sent_today(marker)
+        except Exception:
+            log.exception(
+                "[drip] could not read today's sent slots; staying quiet rather than "
+                "risking a duplicate message"
+            )
+            return
+        if len(already) >= max(0, config.DAILY_MESSAGE_CAP):
+            return
+
+        # THE SPACING HOLDS EVEN WHEN CATCHING UP. After a quiet morning — the
+        # kill switch off until 14:00, a long outage, a clock jump — slots 1, 2
+        # and 3 are all past their planned times at once. Sending "everything
+        # that is due" would then put three messages into one hour on three
+        # consecutive sweep ticks, which is precisely what the spacing exists to
+        # prevent. So the gap is measured from the LAST ACTUAL SEND, not from
+        # the planned time, and a backlog drains at the drip's own pace.
+        floor = drip.min_gap_minutes()
+        last_sent = self._last_drip_sent_at(already)
+        if last_sent is not None:
+            waited = (now - last_sent).total_seconds() / 60.0
+            if waited < floor:
+                return
+
+        # THE KILL SWITCH. Same name, same live read, same line in the log as
+        # the digest used — see config.digest_enabled().
         if not config.digest_enabled():
             if self._digest_suppressed_on != marker:
                 self._digest_suppressed_on = marker
                 log.info("[digest] suppressed — SALES_DIGEST_ENABLED=false")
             return
 
+        planned = await self._plan_drip(today=today, already=already)
+        if planned is None:
+            return
+
+        due = [m for m in planned["messages"] if m["send_at"] <= now]
+        if not due:
+            return
+
         channel_id = config.digest_channel_id()
         channel = self.get_channel(channel_id) if channel_id else None
         if channel is None or not guardrails.may_read(channel_id):
             log.warning(
-                "[digest] no reachable sales channel (%s) to post the daily digest in",
-                channel_id,
+                "[drip] no reachable sales channel (%s) to send in", channel_id
             )
             return
 
-        collected = await self._collect_digest(today=today)
-        sections = collected["sections"]
-
-        if not digest.total_items(sections):
-            # EMPTY DAY = NO DIGEST. The marker is deliberately NOT set, so if
-            # something turns up this afternoon it still gets said today.
-            log.info("[digest] nothing outstanding for %s — no digest today", marker)
-            return
-
-        self._age_digest_items(sections, on_date=marker)
-
-        body = digest.render(
-            day=today,
-            sections=sections,
-            unowned_mention=dl.notify_mentions(),
-            escalate_mention=self._escalate_mention(),
-            staleness=collected.get("staleness", ""),
+        # ONE MESSAGE PER TICK. The next slot is not due yet by construction —
+        # the gap is 75 minutes at minimum and the sweeper ticks far more often
+        # than that — but sending one and returning makes it impossible for a
+        # backlog (a long outage, a clock jump) to arrive as a burst.
+        message = due[0]
+        await self._send_drip_message(
+            channel, message, marker=marker, channel_id=channel_id
         )
 
-        sent_first = await self._post_digest(channel, body, marker=marker)
-        if sent_first is None:
-            log.warning("[digest] the digest for %s was refused or failed to post", marker)
-            return
+    @staticmethod
+    def _last_drip_sent_at(already: list):
+        """When the most recent drip message actually went out today, or None.
 
-        self._apply_digest_effects(
-            collected["effects"], channel_id=channel_id, message_id=sent_first.id
+        Reads the recorded `sent_at`, not the planned time: the guard above is
+        about how long ago the channel last heard from this bot, which is a fact
+        about the clock rather than about the schedule.
+        """
+        best = None
+        for row in already or []:
+            raw = str((row or {}).get("sent_at") or "").strip()
+            if not raw:
+                continue
+            try:
+                when = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=dl.IST)
+            if best is None or when > best:
+                best = when
+        return best
+
+    async def _plan_drip(self, *, today, already: list):
+        """Today's plan, or None when there is nothing to plan against.
+
+        Pure up to this point: it reads the queue and the two SQLite clocks and
+        hands them to `drip.plan`, which sends nothing.
+        """
+        queue = await self._run_next_actions(today=today)
+        if queue is None:
+            return None
+        actions = list(queue.get("actions") or [])
+
+        # EVENTS AND THE WEEKLY LINE RIDE THE SAME QUEUE. They are appended as
+        # ordinary actions so the drip groups, ranks, spaces and caps them
+        # exactly like everything else — a feature with its own send path would
+        # be re-introducing the problem the drip exists to solve.
+        actions.extend(await self._event_actions(today=today))
+        funnel = await self._funnel_action(today=today)
+        if funnel is not None:
+            actions.append(funnel)
+
+        if not actions and not already:
+            # EMPTY QUEUE = SILENCE. Logged once so a quiet day is visibly a
+            # quiet day rather than a broken one.
+            log.info("[drip] nothing due for %s — no messages today", dl.iso(today))
+            return None
+        history = await asyncio.to_thread(self.db.drip_group_history)
+        return await asyncio.to_thread(
+            lambda: drip.plan(
+                actions, day=today, history=history, already_sent=already
+            )
         )
 
+    async def _event_actions(self, *, today) -> list:
+        """Events whose single T-minus reminder is due. [] when off or unreadable.
+
+        The dedup lookup FAILS CLOSED (see `db.event_reminder_sent`): if the
+        table cannot be read the event is treated as already reminded and stays
+        quiet. This is a once-forever message, so a duplicate is the exact thing
+        it exists to prevent and silence is the recoverable direction.
+        """
+        if not config.EVENTS_ENABLED:
+            return []
         try:
-            self.db.set_meta("sales_digest_date", marker)
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.EVENTS)
         except Exception:
-            log.exception(
-                "[digest] POSTED but could not record the once-a-day marker for %s — a "
-                "restart today may post a second digest",
-                marker,
+            log.info("[events] no events tab to read", exc_info=True)
+            return []
+        if tab is None:
+            return []
+        try:
+            return await asyncio.to_thread(
+                lambda: events_mod.due_events(
+                    tab.rows, today=today, already_sent=self.db.event_reminder_sent,
+                )
+            )
+        except Exception:
+            log.exception("[events] could not compute the due events")
+            return []
+
+    async def _funnel_action(self, *, today):
+        """The one Friday numbers line, or None. Off by default."""
+        if not config.WEEKLY_FUNNEL_ENABLED:
+            return None
+        rows, _tab = await self._active_rows_of_canonical_tab("the weekly funnel line")
+        if not rows:
+            return None
+        try:
+            counts = await asyncio.to_thread(
+                lambda: tracker.funnel_metrics(
+                    rows, since=today - timedelta(days=7), today=today
+                )
+            )
+        except Exception:
+            log.exception("[funnel] could not compute the weekly counts")
+            return None
+        return events_mod.funnel_action(counts, today=today)
+
+    async def _convert_if_already_done(self, message: dict) -> Optional[dict]:
+        """Has the nudged thing already happened? Returns the evidence, or None.
+
+        SUPPRESS-OR-CONVERT, and the name matters: evidence does NOT silence the
+        message, it changes what the message is. A suppressed nudge leaves the
+        row wrong AND tells nobody, and a bot that goes quiet is
+        indistinguishable from one that has broken.
+
+        Both sources the answer path already uses are reused here — the synced
+        meeting notes and the sales-channel history — rather than re-implemented.
+        """
+        if not config.SUPPRESS_OR_CONVERT_ENABLED:
+            return None
+        if not evidence.stage_of(message.get("type")):
+            # A type with no notion of "already done" (mark unresponsive, a
+            # parked deal's pulse) is never converted. Guessing there would
+            # produce an offer to record something the bot invented.
+            return None
+
+        days = max(1, int(config.NOTES_LOOKBACK_DAYS))
+
+        # ONE (company, poc) PAIR PER ROW in the group. The PoC matters as much
+        # as the company: people write "meeting booked with Sahaj", not "meeting
+        # booked with Sahaj Labs", and searching only on the sheet's full company
+        # string is how the first version of this found nothing.
+        seen: set = set()
+        pairs: list = []
+        for action in (message.get("actions") or []):
+            key = (action.get("company", ""), action.get("poc", ""))
+            if key[0] and key not in seen:
+                seen.add(key)
+                pairs.append(key)
+        for company in (message.get("companies") or []):
+            if company and not any(p[0] == company for p in pairs):
+                pairs.append((company, ""))
+
+        for company, poc in pairs[:6]:
+            history: list = []
+            try:
+                found = await query.search_channel_history(
+                    self, terms=evidence.identifiers(company, poc)[:4],
+                    days_back=days, context_window=0,
+                )
+                history = found.get("matches") or []
+            except Exception:
+                log.info("[convert] channel search failed for %r", company, exc_info=True)
+
+            try:
+                hit = await asyncio.to_thread(
+                    lambda c=company, p=poc, h=history: evidence.gather(
+                        action_type=message["type"], company=c, poc=p,
+                        notes_module=notes, history=h,
+                    )
+                )
+            except Exception:
+                log.exception("[convert] evidence gathering failed for %r", company)
+                hit = None
+            if hit:
+                hit["company"] = company
+                hit["poc"] = poc
+                return hit
+        return None
+
+    async def _send_drip_message(self, channel, message: dict, *, marker: str,
+                                 channel_id: int) -> None:
+        """Compose ONE message and send it. The only proactive send in this bot.
+
+        THE SLOT IS CLAIMED BEFORE THE SEND, not after. `record_drip_send` is
+        guarded by UNIQUE (on_date, slot), so two ticks racing on the same slot
+        cannot both get through — the loser stops here rather than sending a
+        duplicate. The cost is that a failed send burns its slot for the day,
+        which is the right way round: the drip speaks less on a bad day rather
+        than more.
+        """
+        # HOW THE MESSAGE NAMES ITS OWNER is decided once, here, and threaded
+        # into both composers. It used to be prefixed to whatever came back,
+        # which produced "Vaishnavi Vaishnavi - ..." the moment the roster gate
+        # fell back to a plain name — two things naming the same person, neither
+        # aware of the other.
+        address = self._drip_mention(message)
+
+        # SUPPRESS-OR-CONVERT, immediately before the send and not before. The
+        # queue is planned hours ahead; the evidence has to be as fresh as the
+        # message, or the bot would chase something the team recorded at 11am
+        # because it decided at 10.
+        hit = None
+        try:
+            hit = await self._convert_if_already_done(message)
+        except Exception:
+            log.exception("[convert] the check failed; sending the nudge as a task")
+
+        offer_json = ""
+        if hit:
+            body, used_model = evidence.offer_text(
+                company=hit.get("company", ""), poc=hit.get("poc", ""),
+                hit=hit, address=address,
+            ), False
+            fields = evidence.proposed_fields(hit)
+            offer_json = json.dumps({
+                "company": hit.get("company", ""), "fields": fields,
+            })
+            await asyncio.to_thread(
+                lambda: self.db.record_conversion(
+                    on_date=marker, group_key=message["group_key"],
+                    action_type=message["type"], company=hit.get("company", ""),
+                    owner_label=message.get("owner", ""), source=hit.get("source", ""),
+                    evidence=hit.get("quote", ""), citation=hit.get("citation", ""),
+                    offered=offer_json,
+                )
+            )
+            state.audit(
+                "nudge_converted",
+                reason="evidence says this already happened; offering to record it",
+                date=marker, slot=message["slot"], action_type=message["type"],
+                company=hit.get("company", ""), source=hit.get("source", ""),
+                evidence=hit.get("quote", ""), citation=hit.get("citation", ""),
+                offered=[f["role"] for f in fields],
+            )
+            log.info(
+                "[convert] slot %d: %s x %s CONVERTED to a record-offer — %s (%s)",
+                message["slot"], message["type"], message.get("owner") or "-",
+                hit.get("quote", "")[:120], hit.get("citation", ""),
+            )
+        else:
+            fallback = drip.compose_fallback(message, address=address)
+            body, used_model = fallback, False
+            if self.llm is not None:
+                try:
+                    body, used_model = await self.llm.proactive_message(
+                        prompt=drip.compose_prompt(message, address=address),
+                        fallback=fallback,
+                    )
+                except Exception:
+                    log.exception("[drip] composing failed; sending the template instead")
+                    body, used_model = fallback, False
+
+        claimed = await asyncio.to_thread(
+            lambda: self.db.record_drip_send(
+                on_date=marker, slot=int(message["slot"]),
+                group_key=message["group_key"], action_type=message["type"],
+                owner_key=message["owner_key"], owner_label=message["owner"],
+                companies=", ".join(message["companies"]),
+                stage=message["stage"], planned_at=message["send_at_hhmm"],
+                channel_id=channel_id, message_id=None,
+                sent_at=dl.now_ist().isoformat(timespec="seconds"),
+            )
+        )
+        if not claimed:
+            return
+
+        sent = await guardrails.send(
+            channel, body,
+            reason=(f"drip slot {message['slot']} for {marker}: "
+                    f"{message['type']} x {message['owner'] or 'the team'}"),
+            kind="drip_message",
+            extra={
+                "date": marker, "slot": message["slot"], "type": message["type"],
+                "owner": message["owner"], "stage": message["stage"],
+                "companies": message["companies"], "composed_by_model": used_model,
+            },
+        )
+        if sent is None:
+            log.warning(
+                "[drip] slot %d for %s was refused or failed to send. The slot is "
+                "spent for today — the drip says less on a bad day rather than more.",
+                message["slot"], marker,
+            )
+            return
+
+        # THE MESSAGE ID, recorded now that there is one. A reply to this
+        # message is one of only two things that may write to the sheet, and
+        # this is what lets that reply find out which companies it was about.
+        await asyncio.to_thread(
+            lambda: self.db.attach_drip_message_id(
+                on_date=marker, slot=int(message["slot"]), message_id=sent.id,
+            )
+        )
+        if offer_json:
+            # THE PENDING OFFER, so a reply of "yes" has something concrete to
+            # apply. Without it the extractor would have to invent what "yes"
+            # meant, which is the one thing it must never do about a write.
+            await asyncio.to_thread(
+                lambda: self.db.set_drip_offer(
+                    on_date=marker, slot=int(message["slot"]), offer=offer_json,
+                )
             )
 
-        counts = digest.counts(sections)
+        # AN EVENT'S ONE REMINDER IS RECORDED ONLY ONCE IT HAS ACTUALLY LANDED.
+        # Recorded before the send, a refused message would burn the event's
+        # single reminder forever — and "forever" is not a word to be careless
+        # with.
+        for action in message.get("actions") or []:
+            key = action.get("event_key")
+            if not key:
+                continue
+            await asyncio.to_thread(
+                lambda a=action, k=key: self.db.record_event_reminder(
+                    event_key=k, event=a.get("company", ""),
+                    event_date=a.get("event_date", ""),
+                    location=a.get("location", ""), sent_on=marker,
+                )
+            )
+
         state.audit(
-            "daily_digest",
-            reason="the one scheduled proactive message of the day",
-            date=marker,
-            channel_id=channel_id,
-            message_id=sent_first.id,
-            items=digest.total_items(sections),
-            **{f"n_{k}": v for k, v in counts.items()},
+            "drip_message",
+            reason="one proactive message: one action type, one owner",
+            date=marker, slot=message["slot"], channel_id=channel_id,
+            message_id=sent.id, action_type=message["type"],
+            owner=message["owner"] or "(unassigned)", stage=message["stage"],
+            companies=message["companies"], planned_at=message["send_at_hhmm"],
+            composed_by_model=used_model,
         )
         log.info(
-            "[digest] POSTED %s — hot=%d deadlines=%d overdue=%d escalations=%d hygiene=%d "
-            "| cadence: follow-ups=%d intros=%d meetings=%d update-tracker=%d assets=%d "
-            "prep-briefs=%d | tracker-reminder=%d todos=%d plan=%d. This is the ONE "
-            "unprompted message of the day.",
-            marker,
-            counts[digest.SECTION_HOT], counts[digest.SECTION_DEADLINES],
-            counts[digest.SECTION_OVERDUE], counts[digest.SECTION_ESCALATIONS],
-            counts[digest.SECTION_HYGIENE],
-            counts[digest.SECTION_CADENCE_FOLLOWUPS], counts[digest.SECTION_CADENCE_INTROS],
-            counts[digest.SECTION_CADENCE_MEETINGS], counts[digest.SECTION_CADENCE_UPDATES],
-            counts[digest.SECTION_CADENCE_ASSETS], counts[digest.SECTION_PREP],
-            counts[digest.SECTION_TRACKER_REMINDER], counts[digest.SECTION_TODOS],
-            counts[digest.SECTION_PLAN],
+            "[drip] SENT slot %d/%d at %s (planned %s) — %s x %s — %s [%s%s]",
+            message["slot"], config.DAILY_MESSAGE_CAP,
+            dl.now_ist().strftime("%H:%M"), message["send_at_hhmm"],
+            message["type"], message["owner"] or "(unassigned)",
+            ", ".join(message["companies"]), message["stage"],
+            ", model" if used_model else ", template",
         )
 
-        try:
-            # A sheet row that disappeared should not keep a next-step clock
-            # running forever. Same 30-day window as the carry-forward table.
-            gone = self.db.prune_next_steps(before_date=dl.iso(today - timedelta(days=30)))
-            if gone:
-                log.info("[cadence] pruned %d stale next-step clock(s)", gone)
-        except Exception:
-            log.exception("[cadence] could not prune the next-step clocks")
+    def _drip_mention(self, message: dict) -> str:
+        """How a drip message addresses its owner.
 
-        try:
-            cutoff = dl.iso(today - timedelta(days=30))
-            dropped = self.db.prune_digest_items(before_date=cutoff)
-            if dropped:
-                log.info("[digest] pruned %d carry-forward row(s) last seen before %s",
-                         dropped, cutoff)
-        except Exception:
-            log.exception("[digest] could not prune the carry-forward table")
+        The roster gate decides whether that is a ping or a plain name; an
+        unowned group falls back to the notify line rather than pinging nobody
+        in particular. Deliberately at most ONE mention per message — the
+        grouping rule already guarantees one owner, so a second mention would
+        mean the grouping had failed.
+        """
+        mention, _key = self._cadence_owner({"owner": message.get("owner", "")})
+        return mention or dl.notify_mentions()
+
+    async def dry_run_drip(self, *, today) -> str:
+        """Plan a day and RENDER it without sending. For `--dry-run-drip`.
+
+        The replacement for `--dry-run-digest`, and it answers a better
+        question: not "what would the one message say" but "how many messages,
+        to whom, about what, at what times". It connects to nothing, sends
+        nothing, and writes nothing.
+        """
+        planned = await self._plan_drip(today=today, already=[])
+        if planned is None:
+            return (
+                "Nothing to send today. (An empty queue means silence — there is no "
+                "'nothing to report' message.)"
+            )
+        report = drip.contract_report(planned)
+        lines = [drip.preview_text(planned), "", "VOLUME CONTRACT (plan section 8)"]
+        lines.append(
+            f"  messages {report['messages']}/{report['cap']} "
+            f"({'ok' if report['within_cap'] else 'OVER CAP'}) · "
+            f"gaps {report['gaps_minutes']} min, floor {report['gap_floor_minutes']} "
+            f"({'ok' if report['spacing_ok'] else 'TOO CLOSE'}) · "
+            f"grouping {'ok' if report['grouping_ok'] else 'MIXED TYPES OR OWNERS'} · "
+            f"{report['rolled']} rolling to tomorrow"
+        )
+        return "\n".join(lines)
 
     def _escalate_mention(self) -> str:
         """Who the ESCALATIONS section is addressed to. Empty when ESCALATE_TO_ID
@@ -3562,374 +4951,6 @@ class SalesBot(discord.Client):
             config.ESCALATE_TO_ID,
             str(config.ROSTER_DISPLAY_NAMES.get(str(config.ESCALATE_TO_ID)) or ""),
         )
-
-    async def _post_digest(self, channel, body: str, *, marker: str):
-        """Send the digest, splitting on line boundaries if it exceeds Discord's
-        limit.
-
-        The parts are CONSECUTIVE PARTS OF ONE DIGEST, not separate messages:
-        they go out back to back, in order, and each is audited with its part
-        number. Nothing is clipped — a digest that dropped its HYGIENE section
-        to fit would be lying about what it found, and the per-section caps have
-        already bounded the length honestly.
-
-        Returns the FIRST message (the one the audit record and the chase
-        bookkeeping point at), or None when nothing went out at all.
-        """
-        chunks = _split_for_discord(body)
-        first = None
-        for i, chunk in enumerate(chunks):
-            sent = await guardrails.send(
-                channel,
-                chunk,
-                reason=f"the daily sales digest for {marker}"
-                       + (f" (part {i + 1} of {len(chunks)})" if len(chunks) > 1 else ""),
-                kind="daily_digest",
-                extra={"date": marker, "part": i + 1, "parts": len(chunks)},
-            )
-            if sent is None:
-                # A refused or failed part. Stop rather than posting the rest
-                # out of order; the first part (if it went) still stands.
-                log.warning(
-                    "[digest] part %d of %d failed; stopping there", i + 1, len(chunks)
-                )
-                break
-            if first is None:
-                first = sent
-        return first
-
-    # -- building ----------------------------------------------------------
-
-    async def _collect_digest(self, *, today) -> dict:
-        """Gather every outstanding item into sections.
-
-        Each source is independently guarded: an unreadable sheet must not cost
-        the team its deadline reminders, and a database hiccup must not hide the
-        hot rows. A section that couldn't be built is simply absent — the digest
-        never asserts "nothing stalled" when it means "I couldn't look".
-
-        Returns {"sections": {...}, "effects": [...], "staleness": str}. The
-        EFFECTS are applied only after the message actually posts, so a refused
-        send never burns a chase attempt.
-        """
-        sections: dict[str, list[dict]] = {key: [] for key in digest.SECTION_ORDER}
-        effects: list[dict] = []
-        staleness = ""
-
-        if config.COS_FOLLOWUP_ENABLED:
-            for label, build in (
-                ("deadlines", lambda: self._collect_deadlines(today=today)),
-                ("chases", lambda: self._collect_chases(today=today)),
-            ):
-                try:
-                    build_sections, build_effects = build()
-                except Exception:
-                    log.exception("[digest] could not collect %s; that section is omitted", label)
-                    continue
-                for key, items in build_sections.items():
-                    sections[key].extend(items)
-                effects.extend(build_effects)
-        else:
-            log.info("[digest] COS_FOLLOWUP_ENABLED=false — no deadlines or chases in the digest")
-
-        try:
-            sheet_sections, staleness = await self._collect_sheet_sections(today=today)
-            for key, items in sheet_sections.items():
-                sections[key].extend(items)
-        except Exception:
-            log.exception("[digest] could not collect the sheet sections; they are omitted")
-
-        # THE PHASE-1 CADENCE. Independently guarded like every other source: a
-        # tracker tab that cannot be read costs the team its cadence sections and
-        # nothing else. It is capped by cadence.run() itself rather than by the
-        # per-section clip below, because the budgets are ACROSS the five
-        # sections rather than per section, and there are three of them:
-        # URGENT_MAX (a hard ceiling; the urgent items are never truncated),
-        # DIGEST_MAX_ITEMS (everything else in the cadence), and
-        # UPDATE_TRACKER_MAX (the tracker asks, so a sparse sheet's fill-in
-        # requests cannot eat the work list). The cold summary is outside all
-        # three — one line, and the line that keeps the cold ceiling honest.
-        cadence_stats: dict = {}
-        try:
-            cadence_sections, cadence_effects, cadence_staleness, cadence_stats = (
-                await self._collect_cadence_sections(today=today)
-            )
-            for key, items in cadence_sections.items():
-                sections[key].extend(items)
-            effects.extend(cadence_effects)
-            staleness = staleness or cadence_staleness
-        except Exception:
-            log.exception("[digest] could not collect the cadence sections; they are omitted")
-
-        # THE TWICE-WEEKLY TRACKER REMINDER. A SECTION, on its days, inside this
-        # one message — there is no other path by which it can reach the
-        # channel. It is collected AFTER the cadence so it can quote the cadence's
-        # own count of rows missing the dates every rule depends on.
-        try:
-            sections[digest.SECTION_TRACKER_REMINDER].extend(
-                self._collect_tracker_reminder(today=today, stats=cadence_stats)
-            )
-        except Exception:
-            log.exception("[digest] could not build the tracker reminder; it is omitted")
-
-        # The to-do sheet: the one-time link announcement, or the refresh line
-        # on TODO_REFRESH_DAY. One line either way.
-        try:
-            todo_items, todo_effects = await self._collect_todo_section(today=today)
-            sections[digest.SECTION_TODOS].extend(todo_items)
-            effects.extend(todo_effects)
-        except Exception:
-            log.exception("[digest] could not build the to-do section; it is omitted")
-
-        # Outreach against the plan, and how current the plan is. Weekly.
-        try:
-            sections[digest.SECTION_PLAN].extend(await self._collect_plan_section(today=today))
-        except Exception:
-            log.exception("[digest] could not run the outreach-vs-plan check; it is omitted")
-
-        # Cap each section, saying how many were left out. Escalations are NOT
-        # capped: there are never many, and an escalation that scrolled off is
-        # the one thing in here nobody would notice was missing.
-        limit = max(1, config.SALES_DIGEST_MAX_PER_SECTION)
-        for key, what in (
-            (digest.SECTION_HOT, "hot"),
-            (digest.SECTION_DEADLINES, "deadline"),
-            (digest.SECTION_OVERDUE, "overdue"),
-            (digest.SECTION_HYGIENE, "hygiene"),
-        ):
-            sections[key] = digest.clip(sections[key], limit, what=what)
-
-        return {"sections": sections, "effects": effects, "staleness": staleness}
-
-    def _collect_deadlines(self, *, today) -> tuple[dict, list[dict]]:
-        """Deadlines, split across DEADLINES / OVERDUE / ESCALATIONS.
-
-        Due today or on the next working day is a reminder to the owner. Past
-        due is a chase, with its age in working days. Past
-        COS_NUDGE_MAX_ATTEMPTS chases it stops being the owner's problem and
-        becomes a decision for whoever ESCALATE_TO_ID names.
-        """
-        out = {k: [] for k in digest.SECTION_ORDER}
-        effects: list[dict] = []
-        tomorrow = dl.add_working_days(today, 1)
-
-        for item in self.db.list_open_deadlines(limit=500):
-            due = dl.parse_date(item["due_date"])
-            if due is None:
-                log.warning(
-                    "[digest] deadline %s for %s has an unreadable date %r; skipping",
-                    item["id"], item["company"], item["due_date"],
-                )
-                continue
-
-            label = dl.KINDS.get(item["kind"], {}).get("label", "next step")
-            mention = self._deadline_owner_mention(item)
-            owner_key = self._owner_key(mention, item.get("owner_name", ""))
-
-            if due > tomorrow:
-                continue
-
-            if due >= today:
-                when = "today" if due == today else "tomorrow"
-                out[digest.SECTION_DEADLINES].append({
-                    "key": f"deadline:{item['id']}",
-                    "text": (
-                        f"{item['company']} — the {label} is due {when} "
-                        f"({dl.format_date(due)})."
-                    ),
-                    "owner_mention": mention,
-                    "owner_key": owner_key,
-                })
-                if not item["reminded"]:
-                    effects.append({"type": "deadline_reminded", "id": item["id"]})
-                continue
-
-            overdue = digest.working_days_overdue(due, today, dl=dl)
-            if item["chases_sent"] >= self._max_attempts():
-                out[digest.SECTION_ESCALATIONS].append({
-                    "key": f"deadline:{item['id']}",
-                    "text": (
-                        f"{item['company']} — the {label} was due "
-                        f"{dl.format_date(due)} ({digest.overdue_phrase(overdue)}) and "
-                        f"I've asked {item['chases_sent']} time(s) with nothing back."
-                    ),
-                    "owner_mention": "",
-                    "owner_key": owner_key,
-                })
-                if not item["escalated"]:
-                    effects.append({
-                        "type": "deadline_escalated",
-                        "id": item["id"],
-                        "company": item["company"],
-                        "kind": item["kind"],
-                        "due_date": item["due_date"],
-                        "chases_sent": item["chases_sent"],
-                    })
-                continue
-
-            out[digest.SECTION_OVERDUE].append({
-                "key": f"deadline:{item['id']}",
-                "text": f"{item['company']} {label} {digest.overdue_phrase(overdue)}",
-                "owner_mention": mention,
-                "owner_key": owner_key,
-            })
-            effects.append({
-                "type": "deadline_attempt",
-                "id": item["id"],
-                "company_key": item["company_key"],
-                "company": item["company"],
-                "kind": item["kind"],
-                "due_date": item["due_date"],
-            })
-
-        return out, effects
-
-    def _collect_chases(self, *, today) -> tuple[dict, list[dict]]:
-        """Overdue promises ("I'll send Acme the deck tomorrow"), split between
-        OVERDUE and ESCALATIONS.
-
-        `reminder_cutoff` is passed as NOW, which switches off the per-promise
-        cooldown that used to pace individual nudges. It has nothing left to
-        pace: the digest itself is once a day, and that is a stricter limit than
-        COS_NUDGE_WINDOW_HOURS ever was. The ATTEMPT CAP still applies — an
-        appearance in OVERDUE is one attempt.
-        """
-        out = {k: [] for k in digest.SECTION_ORDER}
-        effects: list[dict] = []
-        now = followups.now_utc()
-        now_ts = followups.to_ts(now)
-
-        items = self.db.list_due_chases(now=now_ts, reminder_cutoff=now_ts)
-        for item in items:
-            mention = guardrails.mention_for(item["person_id"], item["person_name"])
-            owner_key = self._owner_key(mention, item["person_name"])
-            try:
-                due_date = followups.from_ts(item["due_at"]).astimezone(dl.IST).date()
-            except Exception:
-                due_date = today
-            overdue = digest.working_days_overdue(due_date, today, dl=dl)
-            what = (item["what"] or "what they promised").strip()
-
-            if item["reminders_sent"] >= self._max_attempts():
-                jump = f" {item['jump_url']}" if item["jump_url"] else ""
-                out[digest.SECTION_ESCALATIONS].append({
-                    "key": f"chase:{item['id']}",
-                    "text": (
-                        f"{item['person_name']} owed {what} "
-                        f"({digest.overdue_phrase(overdue)}); asked "
-                        f"{item['reminders_sent']} time(s) with no reply, so I've "
-                        f"stopped chasing it.{jump}"
-                    ),
-                    "owner_mention": "",
-                    "owner_key": owner_key,
-                })
-                if not item.get("flagged"):
-                    effects.append({
-                        "type": "chase_escalated",
-                        "id": item["id"],
-                        "person": item["person_name"],
-                        "what": what,
-                        "reminders_sent": item["reminders_sent"],
-                    })
-                continue
-
-            out[digest.SECTION_OVERDUE].append({
-                "key": f"chase:{item['id']}",
-                "text": f"{what} {digest.overdue_phrase(overdue)}",
-                "owner_mention": mention,
-                "owner_key": owner_key,
-            })
-            effects.append({
-                "type": "chase_attempt",
-                "id": item["id"],
-                "person_id": item["person_id"],
-                "person_name": item["person_name"],
-                "what": what,
-                "attempt": item["reminders_sent"] + 1,
-            })
-
-        return out, effects
-
-    async def _collect_sheet_sections(self, *, today) -> tuple[dict, str]:
-        """HOT and HYGIENE, read live from the tracker.
-
-        `tracker.all_flags` already dedups a row across the three finders and
-        orders them hot → dead → stalled, so a row appears exactly once. Here
-        that single list is split: HOT leads the digest on its own, because a
-        prospect who replied and got silence is a different order of problem
-        from a row with an untidy Next Steps cell, and burying it under the
-        hygiene rows is how it gets missed.
-        """
-        out = {k: [] for k in digest.SECTION_ORDER}
-        if not config.SHEET_FLAGS_ENABLED:
-            return out, ""
-
-        try:
-            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
-        except gtm_sheet.SheetAccessError as e:
-            log.info("[digest] no tracker to read flags from: %s", e)
-            return out, ""
-        if tab is None:
-            return out, ""
-
-        staleness = ""
-        try:
-            staleness = gtm_sheet.SHEETS.staleness_note(tab) or ""
-        except Exception:
-            log.debug("[digest] no staleness note available", exc_info=True)
-
-        for row in tracker.all_flags(tab.rows, today=today):
-            kind = row.get("_flag")
-            company = (row.get("company") or "").strip()
-            key = (
-                f"{kind}:{self.db.company_key(company)}:"
-                f"{self.db.company_key(str(row.get('poc') or row.get('_row') or ''))}"
-            )
-            section = (
-                digest.SECTION_HOT if kind == tracker.FLAG_HOT else digest.SECTION_HYGIENE
-            )
-            out[section].append({
-                "key": key,
-                "text": tracker.digest_flag_line(row),
-                "owner_mention": "",
-                "owner_key": "",
-            })
-
-        # The weekly funnel numbers, on their weekday only. They used to be
-        # their own scheduled post; a second unprompted message a week is still
-        # a second unprompted message, so they ride along here instead.
-        #
-        # THE FUNNEL DEFINITION IS THE PLAYBOOK'S OWN, from the "Sales Funnel"
-        # pivot tab: Contacted -> Connected -> Intro Sent -> Positive (P/Y) ->
-        # Meeting Done -> Assets Shared, counted off the master tab the pivot is
-        # a pivot of. The older leading/lagging block still follows it, because
-        # it reads the tracker's DATES and answers a different question — what
-        # happened this week, rather than where the pipeline stands.
-        if config.WEEKLY_DIGEST_ENABLED:
-            weekday = max(0, min(6, config.WEEKLY_DIGEST_WEEKDAY))
-            if today.weekday() == weekday:
-                funnel_lines: list[str] = []
-                try:
-                    master = await asyncio.to_thread(
-                        gtm_sheet.SHEETS.tab, gtm_sheet.MASTER
-                    )
-                    if master is not None:
-                        funnel_lines = tracker.stage_funnel_lines(
-                            tracker.stage_funnel(master.rows)
-                        )
-                except Exception:
-                    log.exception("[digest] could not compute the funnel stages")
-                try:
-                    metrics = tracker.funnel_metrics(
-                        tab.rows, since=today - timedelta(days=7), today=today
-                    )
-                    funnel_lines.extend(tracker.funnel_lines(metrics))
-                except Exception:
-                    log.exception("[digest] could not compute the weekly funnel metrics")
-                if funnel_lines:
-                    out[digest.SECTION_FUNNEL] = [{"text": line} for line in funnel_lines]
-
-        return out, staleness
 
     # -- the phase-1 cadence -----------------------------------------------
 
@@ -4026,15 +5047,23 @@ class SalesBot(discord.Client):
     async def _run_cadence(
         self, *, today, limit=None, urgent_limit=None, update_limit=None
     ) -> Optional[dict]:
-        """Run the phase-1 rules against the TRACKER. None when it cannot be read.
+        """THE ONE PROACTIVE PASS over the canonical "Outreach PoCs" tab.
 
-        This is the ONLY place the cadence is computed, and it computes nothing
-        else: it returns cadence.run()'s result, and the caller decides whether
-        that becomes a digest section or an answer to a question.
+        None when the tab cannot be read. This is the ONLY place the proactive
+        pass is computed, and it computes nothing else: it returns
+        cadence.run()'s result and the caller decides whether that becomes a
+        digest section or an answer to a question.
 
-        THE TRACKER, NOT THE MASTER TAB. The master tab is read too, but only as
-        the cross-check's other side and as the source of the misaligned-row
-        flag: it has no dates, so it cannot answer a single date-based rule.
+        ACTIVATION IS APPLIED HERE, BEFORE cadence.run() SEES ANYTHING. A row
+        with no first-contact date and no connection date is not passed on, so
+        no downstream code has to remember to exclude it — the filter is one
+        call in one place rather than a rule every future feature must
+        re-implement correctly. The count of what was filtered travels with the
+        result so the digest can say so.
+
+        THE MASTER TAB is still read, but only as the source of the
+        misaligned-row sheet-health flag. The phase-1 master/tracker cross-check
+        that used to be its other job is retired.
         """
         if not config.CADENCE_ENABLED:
             log.info("[cadence] CADENCE_ENABLED=false — the cadence sections are omitted")
@@ -4042,16 +5071,16 @@ class SalesBot(discord.Client):
         try:
             tab, source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
         except gtm_sheet.SheetAccessError as e:
-            log.info("[cadence] no sheet to run the cadence against: %s", e)
+            log.info("[cadence] no sheet to run the proactive pass against: %s", e)
             return None
         except Exception:
-            log.exception("[cadence] the cadence source could not be read")
+            log.exception("[cadence] the canonical tab could not be read")
             return None
         if tab is None:
             log.error(
-                "[cadence] no tab carries the tracker signature ('Last followed up "
-                "date' + 'Total follow-ups till date'), so there is no cadence today. "
-                "See the [gtm.roles] lines for what each tab was read as."
+                "[cadence] no tab is named %s, so there is nothing proactive to run "
+                "today. See the [gtm.roles] lines for what each tab was read as.",
+                " / ".join(repr(t) for t in config.GTM_POCS_TAB_TITLES) or "(nothing)",
             )
             return None
 
@@ -4061,21 +5090,29 @@ class SalesBot(discord.Client):
         except Exception:
             log.debug("[cadence] no staleness note available", exc_info=True)
 
-        # The master tab: the other side of the cross-check, and the rows the
-        # misaligned-row flag reads. Its absence costs those two things and
-        # nothing else.
+        # THE ACTIVATION GATE. Everything downstream of this line sees ACTIVE
+        # rows only, so nothing downstream can mention, chase or count a row
+        # that was never started.
+        active, inactive_rows = await asyncio.to_thread(
+            self._split_active, tab.rows, "the daily proactive pass"
+        )
+
+        # The master tab: the rows the misaligned-row sheet-health flag reads.
+        # Its absence costs that one flag and nothing else.
         master_rows = None
         try:
             master = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.MASTER)
             master_rows = list(master.rows) if master else None
         except Exception:
-            log.info("[cadence] no master tab for the cross-check", exc_info=True)
+            log.info("[cadence] no master tab for the sheet-health flag", exc_info=True)
 
         # Broken formulas, from EVERY tab the bot recognises — a #REF! in the
-        # researcher lines is worth one line even though no rule reads it.
+        # researcher lines is worth one line even though nothing reads it. NOT
+        # activation-filtered: a broken formula is a property of the tab, and
+        # whoever has to fix it needs the whole count.
         errors: dict = {}
         try:
-            for kind in (gtm_sheet.TRACKER, gtm_sheet.MASTER, gtm_sheet.RESEARCHER_LINES,
+            for kind in (gtm_sheet.POCS, gtm_sheet.MASTER, gtm_sheet.RESEARCHER_LINES,
                          gtm_sheet.PIPELINE, gtm_sheet.FUNNEL, gtm_sheet.POSITIONING):
                 for t in await asyncio.to_thread(gtm_sheet.SHEETS.tabs_of, kind):
                     if t.error_cells:
@@ -4085,7 +5122,7 @@ class SalesBot(discord.Client):
 
         result = await asyncio.to_thread(
             lambda: cadence.run(
-                tab.rows, today=today,
+                active, today=today,
                 mapping_lookup=self._cadence_mapping_lookup(),
                 stall_days=self._cadence_stall_clock(today),
                 limit=limit,
@@ -4094,542 +5131,145 @@ class SalesBot(discord.Client):
                 master_rows=master_rows,
                 error_cells_by_tab=errors,
                 quality_seen=self.db.quality_flag_seen,
+                inactive=len(inactive_rows),
             )
         )
         result["source"] = source + " tab " + repr(tab.title)
         result["staleness"] = staleness
         result["tab"] = tab
+        result["total_rows"] = len(tab.rows)
         return result
 
-    async def _collect_cadence_sections(
-        self, *, today
-    ) -> tuple[dict, list[dict], str, dict]:
-        """The five cadence sections, the tracker asks, the prep briefs, and their
-        effects.
+    # -- the next-action queue ---------------------------------------------
 
-        Returns (sections, effects, staleness, stats). Every failure is
-        contained: a cadence that cannot be computed leaves its sections empty
-        and the rest of the digest posts, because a broken sheet must not cost
-        the team its deadline reminders.
+    async def _run_next_actions(self, *, today) -> Optional[dict]:
+        """THE QUEUE: one next action per ACTIVE row. None when it cannot run.
 
-        `stats` carries the two numbers the tracker-reminder section quotes —
-        how many rows the cadence read and how many of them are missing the
-        dates every rule depends on. They are returned rather than recomputed so
-        the reminder can never disagree with the section above it.
+        READ-ONLY AND SEND-FREE, and that is the point of this whole layer. It
+        reads the canonical tab, applies the activation gate, reads the snoozes
+        and the explicitly scheduled reminders out of SQLite, and hands all of
+        it to `nextaction.run`, which is pure. Nothing here posts, and nothing
+        here writes — so it is safe to run on every boot and on every question
+        with the digest kill switch off.
         """
-        out = {k: [] for k in digest.SECTION_ORDER}
-        effects: list[dict] = []
-        stats: dict = {}
-
-        result = await self._run_cadence(today=today)
-        if result is None:
-            return out, effects, "", stats
-
-        stats = {
-            "rows": int(result.get("rows") or 0),
-            "fill_in": sum(
-                1 for u in (result.get("updates_all") or [])
-                if u.get("rule") == cadence.RULE_FILL_IN
-            ),
-        }
-
-        # WHAT THE MEETINGS SAID ABOUT THESE COMPANIES. A company a meeting put
-        # on hold still appears — suppressing it would be the bot deciding a
-        # minute outranks the pipeline, and the row's owner would never learn why
-        # the row vanished — but its line SAYS SO AND CITES THE MEETING. See
-        # meetings.py: a meeting-derived claim with no citation is a bug.
-        held: dict = {}
-        try:
-            held = await asyncio.to_thread(
-                meetings.holds,
-                companies=[
-                    str(i.get("company") or "")
-                    for i in (result.get("all") or []) + (result.get("updates_all") or [])
-                ],
+        if not config.NEXT_ACTION_ENABLED:
+            log.info(
+                "[nextaction] NEXT_ACTION_ENABLED=false — no queue is computed. "
+                "'cadence preview' will say so rather than returning an empty list."
             )
-        except Exception:
-            log.info("[digest] no meeting knowledge available to annotate the cadence",
-                     exc_info=True)
-
-        # The cadence items (urgent on their own never-truncated budget, the
-        # rest on DIGEST_MAX_ITEMS, the cold summary on neither) and the
-        # separately-capped UPDATE-TRACKER asks. All are rendered as ordinary
-        # owner-grouped bullets; the only difference between them is which
-        # budget they came out of. `result["items"]` already carries the cold
-        # summary at its head.
-        for item in list(result["items"]) + list(result.get("updates") or []):
-            mention, owner_key = self._cadence_owner(item)
-            out[item["section"]].append({
-                "key": item["key"],
-                "text": meetings.annotate_hold(
-                    item["text"], str(item.get("company") or ""), held
-                ),
-                "owner_mention": mention,
-                "owner_key": owner_key,
-            })
-
-        line = cadence.overflow_line(
-            len(result.get("held") or []), len(result.get("updates_held") or [])
-        )
-        if line:
-            out[digest.SECTION_CADENCE_OVERFLOW] = [{"text": "_" + line + "_"}]
-
-        # Sheet-health flags are recorded as EFFECTS, applied only once the
-        # digest has actually posted. A refused send must not mark a flag as
-        # "already reported" and silence it for good.
-        for item in result.get("updates") or []:
-            if item.get("rule") == cadence.RULE_DATA_QUALITY and item.get("flag_key"):
-                effects.append({
-                    "type": "quality_flag_reported",
-                    "flag_key": item["flag_key"],
-                    "signature": item.get("signature", ""),
-                    "on_date": dl.iso(today),
-                    "text": item.get("text", ""),
-                })
-
-        briefs, brief_effects = await self._collect_prep_briefs(result, today=today)
-        if briefs:
-            out[digest.SECTION_PREP] = briefs
-            effects.extend(brief_effects)
-
-        return out, effects, result.get("staleness") or "", stats
-
-    # -- the tracker reminder, the to-do sheet, and the plan check ---------
-
-    def _collect_tracker_reminder(self, *, today, stats: dict) -> list[dict]:
-        """THE MON/FRI TRACKER REMINDER — as a SECTION of this digest.
-
-        There is deliberately no `_post_tracker_reminder` anywhere in this file
-        and there must never be one. The reminder cannot reach the channel
-        except through the digest, which is what makes "exactly one unprompted
-        message a day" a property of the code rather than a promise. On a day
-        with nothing else outstanding it still posts, because it is a real ask —
-        that is what the `forces_digest` flag on its items does.
-        """
-        # Only TRACKER_REMINDER_ENABLED is consulted here. The kill switch is
-        # NOT: this is a collector, and collectors must keep computing while
-        # unprompted posting is off — otherwise `--dry-run-digest` would quietly
-        # print a digest missing its reminder, and the one place that decides
-        # whether anything reaches Discord would no longer be the only place.
-        # `_maybe_post_daily_digest` is that place.
-        if not config.TRACKER_REMINDER_ENABLED:
-            return []
-        if today.weekday() not in config.tracker_reminder_weekdays():
-            return []
-
-        facts: list[dict] = []
+            return None
         try:
-            facts = meetings.facts()
+            tab, _source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
+        except gtm_sheet.SheetAccessError as e:
+            log.info("[nextaction] no sheet to compute the queue from: %s", e)
+            return None
         except Exception:
-            log.info("[digest] no meeting facts for the tracker reminder", exc_info=True)
-
-        items = tracker.reminder_items(
-            today=today,
-            fill_in_count=int(stats.get("fill_in") or 0),
-            rows_total=int(stats.get("rows") or 0),
-            facts=facts,
-        )
-        mention, owner_key = self._cadence_owner({})
-        for item in items:
-            item["owner_mention"] = mention
-            item["owner_key"] = owner_key
-        log.info("[digest] tracker reminder: %d line(s) as a section of today's digest",
-                 len(items))
-        return items
-
-    async def _collect_todo_section(self, *, today) -> tuple[list[dict], list[dict]]:
-        """The to-do sheet's ONE line, and the effects that follow it.
-
-        Two things can appear, and never more than those two:
-          - the FIRST-RUN announcement (the link, and who it was shared with),
-            flagged `forces_digest` because a link nobody receives is the same
-            as no sheet at all;
-          - on TODO_REFRESH_DAY, "To-do sheet updated: +N new · <link>".
-
-        The refresh WRITES to Google before the digest posts, which is the one
-        ordering that could not be avoided: the line has to report a real
-        number. That is safe because the sheet is append-only and a refused
-        Discord send leaves the appended rows exactly where they belong —
-        whereas holding the append until after the send would mean a failed
-        digest silently dropped a week of action items.
-        """
-        items: list[dict] = []
-        effects: list[dict] = []
-        if not todos.enabled():
-            return items, effects
-
-        # The sheet may not exist yet (a boot where Drive was down, or the very
-        # first run). Re-ensure here rather than assuming startup succeeded.
-        if not todos.sheet_id(self.db):
-            await asyncio.to_thread(self._ensure_todo_sheet)
-
-        announced = False
-        try:
-            announced = await asyncio.to_thread(todos.needs_announcement, self.db)
-        except Exception:
-            log.exception("[todos] could not check whether the link has been posted")
-
-        if announced:
-            state_now = self._todo_state or {}
-            if not state_now.get("ok"):
-                state_now = await asyncio.to_thread(self._ensure_todo_sheet)
-            for line in todos.announcement_lines(state_now):
-                items.append({"text": line, "forces_digest": True})
-            if items:
-                effects.append({"type": "todo_announced", "on_date": dl.iso(today)})
-
-        if todos.is_refresh_day(today):
-            if self._dry_run:
-                # Say what WOULD be appended, without appending it.
-                try:
-                    companies = await self._tracker_company_names()
-                    found = await asyncio.to_thread(
-                        meetings.action_items,
-                        days=config.TODO_NOTES_DAYS, companies=companies,
-                    )
-                    items.append({
-                        "text": f"[dry run] To-do refresh would consider {len(found)} "
-                                f"action item(s) from the last {config.TODO_NOTES_DAYS} "
-                                "days of meeting notes; nothing was written.",
-                    })
-                except Exception:
-                    log.exception("[todos] dry-run extraction failed")
-                return items, effects
-            try:
-                companies = await self._tracker_company_names()
-                result = await asyncio.to_thread(
-                    todos.refresh, self.db, today=today, companies=companies
-                )
-                items.append({"text": todos.refresh_line(result, db=self.db)})
-            except Exception:
-                log.exception("[todos] the weekly refresh failed; the digest says nothing "
-                              "about it rather than claiming it ran")
-        return items, effects
-
-    async def dry_run_digest(self, *, today) -> str:
-        """BUILD the digest for `today` and return it as text. Send nothing.
-
-        THE VERIFICATION PATH, and the answer to "what will Monday look like".
-        It writes nothing anywhere: no Discord message, no carry-forward ageing
-        (so tomorrow's real digest is not one day older than it should be), no
-        sheet created, no to-do row appended. The one side effect it cannot
-        avoid is the cadence's next-step clock, which counts days OBSERVED and
-        which the startup dry run already advances for the same reason.
-        """
-        was, self._dry_run = self._dry_run, True
-        try:
-            collected = await self._collect_digest(today=today)
-        finally:
-            self._dry_run = was
-        sections = collected["sections"]
-        if not digest.total_items(sections):
-            return (
-                f"(no digest for {dl.iso(today)} — nothing outstanding. An empty day is "
-                "never posted: 'nothing to report' is a message with no information in "
-                "it.)"
-            )
-        return digest.render(
-            day=today,
-            sections=sections,
-            unowned_mention=dl.notify_mentions(),
-            escalate_mention=self._escalate_mention(),
-            staleness=collected.get("staleness", ""),
-        )
-
-    async def _tracker_company_names(self) -> list[str]:
-        """Every company name on the tracker.
-
-        The meeting layer matches facts against THIS list and nothing else, so
-        the bot can never announce a hold on a company that is not in the
-        pipeline, or mistake a person's surname for an account.
-        """
-        try:
-            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
-        except Exception:
-            log.info("[digest] no tracker to take company names from", exc_info=True)
-            return []
+            log.exception("[nextaction] the canonical tab could not be read")
+            return None
         if tab is None:
-            return []
-        return [str(r.get("company") or "").strip() for r in tab.rows]
+            return None
 
-    async def _collect_plan_section(self, *, today) -> list[dict]:
-        """OUTREACH AGAINST THE PLAN, plus the plan's currency. Weekly.
+        active, inactive = await asyncio.to_thread(
+            self._split_active, tab.rows, "the next-action queue"
+        )
+        snoozes = await asyncio.to_thread(self.db.snoozes)
+        scheduled = await asyncio.to_thread(self.db.scheduled_reminders_by_row)
 
-        On WEEKLY_DIGEST_WEEKDAY only. Plan drift is a weekly question, and a
-        daily line about a document nobody edits daily is a daily line nobody
-        reads. It is a BLOCK section and never an item, so it can never be the
-        reason a digest posts.
-        """
-        if not config.STRATEGY_CHECK_ENABLED:
-            return []
-        if not config.WEEKLY_DIGEST_ENABLED:
-            return []
-        if today.weekday() != max(0, min(6, config.WEEKLY_DIGEST_WEEKDAY)):
-            return []
-
-        lines: list[str] = []
-        currency = await asyncio.to_thread(strategy.currency_line, today=today)
-        if currency:
-            lines.append(currency)
-
-        rows: list[dict] = []
-        try:
-            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.TRACKER)
-            rows = list(tab.rows) if tab else []
-        except Exception:
-            log.info("[digest] no tracker for the outreach-vs-plan check", exc_info=True)
-
-        if rows:
-            check = await asyncio.to_thread(
-                strategy.plan_check, rows,
-                since=today - timedelta(days=7), today=today,
+        result = await asyncio.to_thread(
+            lambda: nextaction.run(
+                active, today=today, snoozes=snoozes, scheduled=scheduled,
+                inactive=len(inactive),
             )
-            if check["ok"]:
-                lines.extend(check["lines"])
-            elif check.get("reason"):
-                # Say WHY there is no comparison, AND how to fix it. "No drift"
-                # and "I could not compare" are different statements and only
-                # one of them is good news, so the digest never lets the second
-                # read as the first.
-                reason = str(check["reason"]).strip()
-                lines.append(
-                    "I could not check outreach against the plan: "
-                    + reason[0].lower() + reason[1:]
-                    + ". " + str(check.get("remedy") or "").strip()
-                )
-        elif not lines:
-            return []
-
-        return [{"text": line} for line in lines if line]
-
-    async def _collect_prep_briefs(self, result: dict, *, today) -> tuple[list[dict], list[dict]]:
-        """ONE brief per meeting inside the prep window, deduped in SQLite.
-
-        The dedup is CHECKED here but RECORDED as an effect, applied only after
-        the digest actually posts — a refused send must not consume the single
-        brief a meeting gets.
-        """
-        if not config.CADENCE_PREP_BRIEFS_ENABLED:
-            return [], []
-
-        wanted = cadence.meetings_needing_prep(result.get("all") or [])
-        if not wanted:
-            return [], []
-
-        positioning_rows: list[dict] = []
+        )
+        result["tab"] = tab
+        result["total_rows"] = len(tab.rows)
         try:
-            ptab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POSITIONING)
-            positioning_rows = list(ptab.rows) if ptab else []
+            result["staleness"] = gtm_sheet.SHEETS.staleness_note(tab) or ""
         except Exception:
-            log.info("[prep] no positioning matrix available for the briefs", exc_info=True)
+            result["staleness"] = ""
+        return result
 
-        briefs: list[dict] = []
-        effects: list[dict] = []
-        for item in wanted:
-            if len(briefs) >= max(1, config.CADENCE_PREP_MAX_PER_DIGEST):
-                log.info(
-                    "[prep] %d meeting(s) in the window; capped at %d brief(s) this digest",
-                    len(wanted), config.CADENCE_PREP_MAX_PER_DIGEST,
-                )
-                break
-            company, poc = item.get("company") or "", item.get("poc") or ""
-            meeting_date = item.get("meeting_date") or ""
-            key = self.db.prep_key(company, poc, meeting_date)
-            try:
-                if self.db.prep_brief_sent(key):
-                    log.info(
-                        "[prep] brief for %s / %s on %s already written — not repeating it",
-                        company, poc or "(no PoC)", meeting_date,
-                    )
-                    continue
-            except Exception:
-                log.exception("[prep] dedup check failed; skipping this brief to be safe")
-                continue
+    # -- row activation ----------------------------------------------------
 
-            try:
-                body = await asyncio.to_thread(
-                    prep.build,
-                    item["_row"], meeting_date=meeting_date, today=today,
-                    mapping=mapping_sheet.MAPPING,
-                    positioning_rows=positioning_rows,
-                    notes_module=notes,
-                )
-            except Exception:
-                log.exception("[prep] could not build the brief for %s", company)
-                continue
+    def _split_active(self, rows: list, why: str) -> tuple[list, list]:
+        """(active, inactive) for one set of canonical-tab rows.
 
-            briefs.append({"text": body})
-            effects.append({
-                "type": "prep_brief_sent", "meeting_key": key, "company": company,
-                "poc": poc, "meeting_date": meeting_date, "sent_on": dl.iso(today),
-            })
-        return briefs, effects
+        THE SINGLE GATE EVERY PROACTIVE PATH GOES THROUGH. It is a method rather
+        than a bare call to activation.split so that reading the explicit
+        activations — which is a database hit, and which FAILS CLOSED — happens
+        in exactly one place. A path that forgot to read them would quietly
+        ignore an instruction somebody gave out loud.
 
-    def _age_digest_items(self, sections: dict, *, on_date: str) -> None:
-        """Stamp each item with how many digests it has now appeared in.
-
-        This is CARRY-FORWARD: an unresolved item comes back tomorrow wearing
-        its age, and one that got resolved during the day just isn't collected
-        any more. Idempotent per day, so a retry after a refused send doesn't
-        age everything twice.
-
-        AN ITEM'S KEY IS THE THING, NOT THE SECTION. A deadline that was "due
-        tomorrow" on Monday, "due today" on Tuesday and overdue on Wednesday is
-        one item on its third day — keying it per section would restart the age
-        at every transition, and an age that resets exactly when a problem gets
-        worse is worse than useless.
-
-        An item the store can't age is shown WITHOUT an age rather than dropped
-        — losing the marker is a cosmetic failure, losing the item is not.
+        Blocking (it touches SQLite); call it from a thread.
         """
-        for key in digest.ITEM_SECTIONS:
-            for item in sections.get(key) or []:
-                item_key = item.get("key")
-                if not item_key or item.get("overflow"):
-                    item["age"] = 1
-                    continue
-                try:
-                    item["age"] = self.db.note_digest_item(
-                        item_key=item_key, section=key, on_date=on_date
-                    )
-                except Exception:
-                    log.exception("[digest] could not age item %s", item_key)
-                    item["age"] = 1
+        try:
+            keys = self.db.activated_row_keys()
+        except Exception:
+            log.exception(
+                "[activation] could not read the explicit activations; falling back to "
+                "the date rule alone for %s", why,
+            )
+            keys = frozenset()
+        active, inactive = activation.split(list(rows or []), activated_keys=keys)
+        log.info(
+            "[activation] %s: %d of %d row(s) ACTIVE, %d inactive (no first-contact or "
+            "connection date — invisible to proactive output)%s",
+            why, len(active), len(rows or []), len(inactive),
+            f"; {len(keys)} explicit activation(s) in force" if keys else "",
+        )
+        return active, inactive
 
-    # -- effects (applied only once the digest has actually posted) ---------
+    async def _active_rows_of_canonical_tab(self, why: str) -> tuple[list, object]:
+        """(active rows, tab) for the canonical tab. ([], None) when unreadable.
 
-    def _apply_digest_effects(
-        self, effects: list[dict], *, channel_id: int, message_id: int
-    ) -> None:
-        """Record what the digest just did: attempts spent, escalations raised.
-
-        Ordering is deliberate — this runs AFTER the send. A digest that was
-        refused (out-of-scope channel, Discord outage) must not burn a chase
-        attempt, or a week of outages would silently escalate everything.
-
-        `reminder_message_id` is deliberately NOT set to the digest's message
-        id: one message covers many chases, so pointing all of them at it would
-        make a ✅ on the digest close an arbitrary one. Closing a chase is done
-        by replying to (or ✅-ing) the promise itself, which is unambiguous.
+        The async front door to `_split_active`, used by the proactive
+        collectors that read the tab directly rather than through the cadence.
         """
-        now_ts = followups.to_ts(followups.now_utc())
+        try:
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.pocs_tab)
+        except Exception:
+            log.info("[activation] no canonical tab for %s", why, exc_info=True)
+            return [], None
+        if tab is None:
+            return [], None
+        active, _inactive = await asyncio.to_thread(self._split_active, tab.rows, why)
+        return active, tab
 
-        for eff in effects:
-            kind = eff.get("type")
-            try:
-                if kind == "prep_brief_sent":
-                    # Recorded only now, after the digest actually posted, so a
-                    # refused send does not consume the one brief a meeting gets.
-                    self.db.record_prep_brief(
-                        meeting_key=eff["meeting_key"], company=eff["company"],
-                        poc=eff["poc"], meeting_date=eff["meeting_date"],
-                        sent_on=eff["sent_on"],
-                    )
-                    state.audit(
-                        "meeting_prep_brief",
-                        reason="a meeting inside MEETING_PREP_DAYS; one brief per meeting",
-                        company=eff["company"], poc=eff["poc"],
-                        meeting_date=eff["meeting_date"],
-                        web_research="not included - pending web access decision",
-                    )
 
-                elif kind == "todo_announced":
-                    # The to-do sheet's link gets ONE announcement, and this is
-                    # what spends it — after the digest actually posted, so a
-                    # refused send leaves the link still to be announced
-                    # tomorrow rather than silently never.
-                    todos.mark_announced(self.db, on_date=eff.get("on_date", ""))
-                    state.audit(
-                        "todo_sheet_announced",
-                        reason="the to-do sheet's link went out with the daily digest",
-                        url=todos.link(self.db), date=eff.get("on_date", ""),
-                        shared=(self._todo_state or {}).get("shared", []),
-                    )
+    # THE MEETING-PREP BRIEF COLLECTOR IS REMOVED, not disabled.
+    #
+    # It selected its meetings from phase-1 rule (h) items ("a meeting inside
+    # MEETING_PREP_DAYS"), and that rule is retired with the rest of the
+    # phase-1 set — so the collector had no input left and would have run every
+    # digest to produce nothing. prep.py still builds a brief and is unchanged;
+    # what is gone is the PROACTIVE TRIGGER that chose which meeting got one.
+    # Re-wiring it is a phase-2 rule against the "Outreach PoCs" tab, not a
+    # resurrection of the phase-1 rule that fed it.
+    #
+    # The `prep_brief_sent` effect and its SQLite dedup are deliberately left in
+    # place: they cost nothing while nothing emits the effect, and throwing away
+    # the record of which meetings were already briefed would mean re-briefing
+    # all of them the day a phase-2 rule turns this back on.
+    # `_age_digest_items` is REMOVED. It stamped every item with "(3rd day)" out
+    # of the `digest_items` table — a marker that only means something in a list
+    # a reader scans top to bottom. A drip message is one thought about one
+    # subject; "(3rd day)" on it would be the bot keeping score out loud, which
+    # is the opposite of the voice. The table stays, unread, so the history is
+    # not thrown away.
 
-                elif kind == "quality_flag_reported":
-                    # "Deduped until fixed": the signature of what was found is
-                    # stored, and the flag stays quiet until that changes.
-                    self.db.record_quality_flag(
-                        flag_key=eff["flag_key"], signature=eff["signature"],
-                        on_date=eff["on_date"],
-                    )
-                    state.audit(
-                        "sheet_quality_flag",
-                        reason="reported once in the digest; not repeated until it changes",
-                        flag_key=eff["flag_key"], signature=eff["signature"],
-                        detail=eff.get("text", "")[:300],
-                    )
-
-                elif kind == "deadline_reminded":
-                    self.db.mark_deadline(eff["id"], reminded=True)
-
-                elif kind == "deadline_attempt":
-                    self.db.mark_deadline(eff["id"], bump_chases=True)
-                    self.db.record_nudge(
-                        target_key=f"deadline:{eff['company_key']}",
-                        subject_key=f"deadline:{eff['id']}",
-                        kind="deadline",
-                        channel_id=channel_id,
-                        message_id=message_id,
-                        sent_at=now_ts,
-                    )
-                    state.audit(
-                        "deadline_chase",
-                        reason="carried in the daily digest's OVERDUE section",
-                        company=eff["company"], kind=eff["kind"],
-                        due_date=eff["due_date"],
-                    )
-
-                elif kind == "deadline_escalated":
-                    self.db.mark_deadline(eff["id"], escalated=True)
-                    state.audit(
-                        "deadline_escalated",
-                        reason=(
-                            f"no response after {eff['chases_sent']} chase(s); the cap is "
-                            f"{self._max_attempts()}"
-                        ),
-                        company=eff["company"], kind=eff["kind"],
-                        due_date=eff["due_date"],
-                    )
-
-                elif kind == "chase_attempt":
-                    # No reminder id: see the docstring.
-                    self.db.mark_chase_reminded(
-                        eff["id"], reminder_message_id=None, at=now_ts
-                    )
-                    self.db.record_nudge(
-                        target_key=f"person:{eff['person_id'] or eff['person_name']}",
-                        subject_key=f"chase:{eff['id']}",
-                        kind="chase",
-                        channel_id=channel_id,
-                        message_id=message_id,
-                        sent_at=now_ts,
-                    )
-                    state.audit(
-                        "chase_nudged",
-                        reason=(
-                            f"carried in the daily digest's OVERDUE section "
-                            f"(attempt {eff['attempt']} of {self._max_attempts()})"
-                        ),
-                        person=eff["person_name"], what=eff["what"], chase_id=eff["id"],
-                    )
-
-                elif kind == "chase_escalated":
-                    self.db.mark_chase_flagged(eff["id"])
-                    state.audit(
-                        "chase_given_up",
-                        reason=(
-                            f"no reply after {eff['reminders_sent']} attempt(s); the cap "
-                            f"is {self._max_attempts()}. It stays in the digest's "
-                            f"ESCALATIONS section until it is resolved."
-                        ),
-                        person=eff["person"], what=eff["what"], chase_id=eff["id"],
-                    )
-
-                else:
-                    log.warning("[digest] unknown effect %r; ignoring", kind)
-            except Exception:
-                log.exception("[digest] could not apply effect %r for id %s", kind, eff.get("id"))
+    # THE DIGEST EFFECTS ARE REMOVED WITH THE DIGEST.
+    #
+    # `_apply_digest_effects` applied, after a successful post, the things that
+    # must not happen for a message nobody saw: a spent chase attempt, an
+    # escalation raised, a prep brief marked written, a sheet-health flag marked
+    # reported. It existed because ONE message carried all of them and the
+    # write had to wait for that one send to succeed.
+    #
+    # The drip sends up to three independent messages, each recorded in
+    # `drip_sends` the moment it lands, so "did this go out" is answered
+    # per-message by the slot row rather than by a batch of deferred effects.
+    # The underlying SQLite state (chases, quality_flags, prep_briefs) is
+    # untouched — what is gone is the batching, not the records.
 
     # -- state contract ----------------------------------------------------
 

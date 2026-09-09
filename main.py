@@ -6,14 +6,16 @@ SOURCES: the two things most likely to be misconfigured are a channel id that th
 bot's role can't actually see and a source everyone assumes is connected. Both
 are silent failures at runtime, so they get named here.
 
-    python -m main                                run the bot
-    python -m main --dry-run-digest               print TODAY's digest, send nothing
-    python -m main --dry-run-digest 2026-09-07    print that day's digest
+    python -m main                              run the bot
+    python -m main --dry-run-drip               plan TODAY's drip, send nothing
+    python -m main --dry-run-drip 2026-09-07    plan that day's drip
 
-THE DRY RUN EXISTS TO BE CHECKED BEFORE A DEPLOY, and it is the answer to "is the
-Monday tracker reminder really a section of the one message, or is it a second
-message?" — you can read the whole message, on a Monday, without waiting for one.
-It connects to nothing, sends nothing, creates nothing and ages nothing.
+THE DRY RUN EXISTS TO BE CHECKED BEFORE A DEPLOY. It answers the question the
+volume contract is written in terms of: how many messages would go out, to whom,
+about what, at what times, and does the spacing hold. `--dry-run-digest` is kept
+as an alias for the same thing — the digest it named is retired.
+
+It connects to nothing, sends nothing and creates nothing.
 """
 import asyncio
 import logging
@@ -29,12 +31,13 @@ from bot import SalesBot
 log = logging.getLogger(__name__)
 
 
-def _dry_run_digest(argv: list[str]) -> int:
-    """Build one day's digest and print it. Sends nothing, writes nothing.
+def _dry_run_drip(argv: list[str]) -> int:
+    """Plan one day's drip and print it. Sends nothing, writes nothing.
 
     The date is optional and is parsed strictly: a typo must not silently become
     "today", because the whole point is to look at a SPECIFIC day (a Monday, a
-    Friday) and a digest for the wrong day would answer a question nobody asked.
+    Friday, a Saturday to prove it stays quiet) and a plan for the wrong day
+    would answer a question nobody asked.
     """
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -53,15 +56,18 @@ def _dry_run_digest(argv: list[str]) -> int:
             return 2
 
     log.info(
-        "[dry-run] building the digest for %s (%s). NOTHING will be sent, written or "
+        "[dry-run] planning the drip for %s (%s). NOTHING will be sent, written or "
         "created.", dl.iso(day), day.strftime("%A"),
     )
     bot = SalesBot()
-    body = asyncio.run(bot.dry_run_digest(today=day))
+    body = asyncio.run(bot.dry_run_drip(today=day))
 
     print()
     print("=" * 78)
-    print(f"DRY-RUN DIGEST — {day.strftime('%A %d %b %Y')} — this is ONE message")
+    print(
+        f"DRY-RUN DRIP — {day.strftime('%A %d %b %Y')} — up to "
+        f"{config.DAILY_MESSAGE_CAP} message(s), one per (type x owner)"
+    )
     print("=" * 78)
     print(body)
     print("=" * 78)
@@ -132,7 +138,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if "--dry-run-digest" in sys.argv:
-        i = sys.argv.index("--dry-run-digest")
-        sys.exit(_dry_run_digest(sys.argv[i + 1:]))
+    # --dry-run-digest is kept as an alias: the digest it named is retired, but
+    # an operator's muscle memory and any deploy script that used it should not
+    # break on a rename.
+    for flag in ("--dry-run-drip", "--dry-run-digest"):
+        if flag in sys.argv:
+            i = sys.argv.index(flag)
+            sys.exit(_dry_run_drip(sys.argv[i + 1:]))
     main()

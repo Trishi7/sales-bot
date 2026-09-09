@@ -4,9 +4,11 @@ A Discord bot that acts as a sales & marketing chief of staff for the NFThing
 team. It reads the sales channels, answers questions from what it can actually
 see, and chases the deadlines people commit to in passing.
 
-**It speaks unprompted exactly once a day.** Everything it has to chase, flag or
-escalate goes out in [one daily digest](#the-one-daily-digest) at
-`SALES_DIGEST_TIME`. Everything else it says is a reply to a person.
+**It speaks unprompted at most three times a weekday.** Everything it has to
+raise goes out as a [drip](#the-drip--a-few-short-messages-a-day): short,
+time-spaced messages, **one per (action type × owner)**, first at
+`SALES_DRIP_START`. Everything else it says is a reply to a person, and replies
+are immediate.
 
 It is a **separate bot from the PM bot** — its own Discord application, its own
 token, its own channels, its own database, its own venv, its own PM2 process.
@@ -28,30 +30,42 @@ champions"), searches the sales channels' history, reads the meeting notes, and
 triangulates across all of them — citing the tab and the company, and saying
 plainly when a cell is empty.
 
-**Runs the daily cadence (phase 1).** Ten rules (a–j) from Vaishnavi's *Steps for
-Sales Bot* doc run once a day against the GTM Playbook's **outreach tracker** —
-the hidden "Outreach Updates" tab, and the only one with dates in it. Cold
-follow-ups, connections with no intro behind them, positive replies with no next
-step, meetings that left nothing behind. Rows whose rule inputs are blank become
-*"update the tracker"* asks rather than false chases, and never-connected rows
-older than the cold ceiling become **one counted line** rather than 756 nudges —
-both on their own budgets. Everything becomes sections of the **existing** daily
-digest, ranked urgent-first, with the urgent items **never truncated**. See
-[The daily cadence](#the-daily-cadence-phase-1).
+**Reads one canonical tab: "Outreach PoCs".** Everything the bot says on its own
+initiative comes from that tab of the GTM Playbook, found **by name**
+(`GTM_POCS_TAB_TITLES`) with its columns discovered dynamically. A row is
+**ACTIVE** only when a first-contact date or a connection date is present in it,
+and an inactive row is invisible to every proactive feature — never mentioned,
+chased or counted. Ask about one by name and it still answers in full. See
+[Row activation](#row-activation--which-rows-the-bot-may-raise-unprompted).
+
+**Never writes outside a narrow window.** `RESTRICTED_COLUMN_RANGES` (default
+`A:I,S:X`) names bands of columns denied to every write path in the code; the
+named columns in the writable window between them are logged at startup so a
+shifted column is visible before a write lands in the wrong place. Reading is
+unrestricted. See [Writes](#writes--deliberately-tiny-and-locked-to-a-window).
+
+**The phase-1 cadence rules (a–j) are retired.** They ran on the old outreach
+tracker tab, which is retired with them. Their evaluation is removed, not
+disabled — the digest's cadence sections carry sheet-health lines only until a
+phase-2 rule set exists, and the log says so rather than going quietly empty. See
+[The cadence](#the-cadence--the-phase-1-rules-are-retired).
 
 **Chases deadlines — and sets them.** When someone says "I'll send Acme the deck
 tomorrow" in a sales channel, that becomes a *chase*. When a deal has **no**
 deadline, the bot sets one itself, announces it with the rule it used, and invites
 anyone to change it (see [Deadline authority](#deadline-authority)). Once a chase
-is overdue it becomes a **line in the next daily digest** — never its own message
-— for at most `COS_NUDGE_MAX_ATTEMPTS` digests, after which it moves to the
-digest's ESCALATIONS section and the owner stops being chased. Stopping is
-deliberate: a bot that keeps asking gets muted, and a muted bot enforces nothing.
+is overdue it is **recorded** — the promise, the age, the attempt count, the
+escalation threshold — and answerable on demand. The digest's OVERDUE and
+ESCALATIONS sections that used to announce it are retired with the digest, and
+the drip does not yet carry chases: it groups the next-action queue, and a chase
+is not an action type on it.
 
-**Keeps the sheet honest.** Three row-hygiene judgements — HOT, STALLED,
-DEAD-DEAL — and the weekly funnel numbers. None of them is its own message
-either: HOT leads the daily digest, STALLED and DEAD-DEAL are its HYGIENE
-section, and the funnel numbers ride along on Fridays.
+**Decides one next action per row.** A state machine turns each active row into
+**exactly one** thing to do — type, owner, due date, priority — or nothing, with
+a reason. Positive replies jump the queue, closed rows stop for good, snoozes are
+honoured, and no due date lands on a weekend. It **sends nothing**: read it by
+asking for `cadence preview`. See
+[The next-action state machine](#the-next-action-state-machine).
 
 **Maps buyers to accounts.** The third sheet says *who* to pitch inside an
 account, with the tier, the confidence, the ICP lane and the hook — and enforces
@@ -141,9 +155,9 @@ something else:
 2. **Share the strategy doc with the service account as Viewer**, and set
    `STRATEGY_DOC_ID`. See [The strategy doc](#the-strategy-doc).
 
-Before a deploy, `python -m main --dry-run-digest 2026-09-07` prints that day's
-whole digest and **sends nothing** — the fastest way to see what the team will
-actually read.
+Before a deploy, `python -m main --dry-run-drip 2026-09-07` prints that day's
+whole plan — how many messages, to whom, about what, at what times — and **sends
+nothing**. `--dry-run-digest` still works as an alias.
 
 The Discord application needs the **Message Content Intent** enabled (Developer
 Portal → your app → Bot → Privileged Gateway Intents). Without it every message
@@ -228,7 +242,7 @@ rest of the file can stay as-is.
 
 | Source | Status | What it's for |
 |---|---|---|
-| `sales_spreadsheet` | **wired up** (Sheets API) | the GTM Playbook: outreach tracker, positioning matrix, prospect priority |
+| `sales_spreadsheet` | **wired up** (Sheets API) | the GTM Playbook: the canonical **Outreach PoCs** tab, plus master data, positioning matrix, prospect priority |
 | `researcher_mapping` | **wired up** (Sheets API, **read-only**) | which researcher to pitch at each org, in which ICP lane, with what hook — and who must not be pitched |
 | `sales_meeting_notes` | **wired up** (rclone sync + standup exclusion) | what was said, decided and committed to in the team's meetings — every synced note except the product standups. Everything derived from them carries a **citation** |
 | `strategy_doc` | **wired up** (Drive API, **read-only**) | the current strategy, how current it is, and what outreach is checked against |
@@ -338,40 +352,80 @@ The sales team's system of record. Read **live** through the Google Sheets API a
 answer time (cached 60s to stay inside quota) — there is no sync interval and no
 local copy.
 
-### The two spreadsheets
+### One spreadsheet
 
 | | Sheet | Role |
 |---|---|---|
-| `GTM_SHEET_ORIGINAL_ID` | *NFThing <> GTM Playbook* | **READ-ONLY** source of truth |
-| `GTM_SHEET_COPY_ID` | *… — BOT COPY (sandbox)* | the bot's writable mirror, and the default write target |
+| `GTM_SHEET_ORIGINAL_ID` | *NFThing <> GTM Playbook* | read **and written** — see [Writes](#writes--into-the-real-sheet-now-inside-one-window) |
+
+`GTM_SHEET_COPY_ID` is gone with the sandbox era.
 
 ### Auth, and the one setup step people miss
 
 `GOOGLE_SERVICE_ACCOUNT_JSON` points at a service-account key file. Creating the
-key is not enough — **both sheets must be shared with the service account's
-address**: the original as *Viewer*, the sandbox copy as *Editor*.
+key is not enough — the playbook must be **shared with the service account's
+address as EDITOR**, and the mapping sheet as *Viewer*.
+
+**Editor, not Viewer, and that is a change.** The bot writes into the real
+playbook now. A Viewer share reads perfectly and fails on the first write, which
+is a bad thing to discover on the day somebody replies to a nudge.
 
 Without that, every read is a `403` and the bot reports the spreadsheet as
 awaiting-access. It does not crash, and it does not answer sheet questions from
 guesswork; it logs the exact line to fix:
 
 ```
-[bot] GTM original sheet NOT reachable: the service account cannot open the original sheet (permission denied)
-[bot] ACTION REQUIRED: Share "NFThing <> GTM Playbook" with sales-bot@… as Viewer (open the sheet, click Share, paste the address, set Viewer, Send).
+[bot] GTM Playbook NOT reachable: the service account cannot open the original sheet (permission denied)
+[bot] ACTION REQUIRED: Share "NFThing <> GTM Playbook" with sales-bot@… as Editor (open the sheet, click Share, paste the address, set Editor, Send).
 ```
 
 The key file is a secret: `.gitignore` covers the usual key filenames. If one is
 ever committed, **revoke it in Google Cloud** — deleting the file is not enough.
 
-### The tabs, identified by header signature
+### The canonical tab: "Outreach PoCs", found **by name**
 
-Tabs are recognised **by the columns they carry, never by their names** — names
-in this playbook drift, signatures don't. Each kind is defined by a small
-signature of headers only that tab has:
+**The bot's sheet world is the "Outreach PoCs" tab of the GTM Playbook.**
+Everything it says on its own initiative comes from that tab and no other. The
+spreadsheet is unchanged — `GTM_SHEET_ORIGINAL_ID` still points at the same
+playbook.
+
+**It is found by NAME, not by header signature**, which is the exact opposite of
+how every other tab is found — and it is deliberate. The retired outreach
+tracker tab carries near-identical columns, so a header signature would happily
+re-adopt it as the canonical tab and undo the move. Naming the tab is what makes
+the retirement real.
+
+```bash
+GTM_POCS_TAB_TITLES=Outreach PoCs,Outreach POCs,Outreach PoC,Outreach Pocs
+```
+
+If no tab has that name, the bot logs at **ERROR**, lists every tab title it did
+find, and every proactive feature has nothing to run against. That is the honest
+failure: it never quietly falls back to another tab.
+
+**Its columns are still discovered dynamically.** Nothing about the tab's header
+text is compiled in — headers are read at parse time, matched to roles by alias,
+and anything unmatched is carried as `_extra` so a question about a column this
+code has never heard of is still answerable. The **full discovered schema of
+every tab** is logged at startup (`GTM_LOG_FULL_SCHEMA`, on by default), and the
+canonical tab's schema is printed again in the boot report with each column's
+letter, header, role and whether it falls inside a restricted band.
+
+#### The old tracker tab is retired
+
+The hidden "Outreach Updates" tab and the phase-1 cadence rules that ran on it
+are **retired**. It is no longer recognised as any kind, nothing evaluates
+against it, and no proactive output path is wired to it. See
+[The cadence](#the-cadence--the-phase-1-rules-are-retired).
+
+### The other tabs, identified by header signature
+
+Every tab apart from the canonical one is recognised **by the columns it
+carries, never by its name** — names in this playbook drift, signatures don't:
 
 | Kind | Signature (all required) | Live tab, 1 Sep |
 |---|---|---|
-| `outreach_tracker` | `Last followed up date` + `Total follow-ups till date` | **"Outreach Updates"** (hidden, 886 rows) |
+| `outreach_pocs` | **matched by NAME** (`GTM_POCS_TAB_TITLES`) | **"Outreach PoCs"** |
 | `master_data` | `Response Status` + `Intro Sent` + `Meeting Done` | **"Master Data"** (587 rows) |
 | `lead_pipeline` | `Lead Stage` + `Estimated Value (INR)` | **"Lead Master Sheet"** (hidden, 333 rows) |
 | `funnel_pivot` | `Vertical / Stage` | **"Sales Funnel - March-June 2026"** (hidden) |
@@ -379,25 +433,23 @@ signature of headers only that tab has:
 | `positioning_matrix` | `Use Case` + Problem / Offering / ICP / Business Impact | **"Sales Outreach Matrix"** (hidden) |
 | `prospect_priority` | `Company` + `Priority` (+ score / rationale) | Fortune 500 and AI-agent lists |
 
-**The tracker is the cadence source, and it is the only tab with dates in it.**
-The master tab is status-only: Connected / Intro Sent / Response Status / Meeting
-Done / Assets Shared and a `Month` that is a month, not a date. It answers
-aggregate questions, defines the weekly funnel and is cross-checked against the
-tracker — it cannot drive a single date rule.
+The master tab is status-only: Connected / Intro Sent / Response Status /
+Meeting Done / Assets Shared and a `Month` that is a month, not a date. It
+answers aggregate questions and defines the weekly funnel.
 
 **Which real tab got which role is logged at startup**, so that question is one
 log line rather than a guess:
 
 ```
-[gtm.roles] outreach_tracker   TRACKER — the cadence source (the only tab with dates) -> 'Outreach Updates' (886 rows, HIDDEN)
+[gtm.roles] outreach_pocs     OUTREACH PoCs — THE CANONICAL TAB (found by name)      -> 'Outreach PoCs' (886 rows)
 [gtm.roles] master_data        MASTER — status only (aggregates, funnel, cross-check) -> 'Master Data' (587 rows)
 [gtm.roles] lead_pipeline      PIPELINE — lead stage / estimated value                -> 'Lead Master Sheet' (333 rows, HIDDEN)
 [gtm.roles] funnel_pivot       FUNNEL PIVOT — the funnel stage definition             -> 'Sales Funnel - March-June 2026' (38 rows, HIDDEN)
 [gtm.roles] researcher_lines   RESEARCHER LINES — outreach lines for researchers      -> 'Master Pipeline' (271 rows)
 ```
 
-**Hidden tabs are read** (`worksheets(exclude_hidden=False)`), and that is not
-optional here: the cadence source itself is a hidden tab.
+**Hidden tabs are read** (`worksheets(exclude_hidden=False)`). The canonical
+tab is taken by name whether it is hidden or not.
 
 **Headers are discovered at parse time** and matched to roles by alias, because
 the tabs keep evolving. Nothing is positional. Specific aliases beat loose ones
@@ -414,14 +466,87 @@ one as text made a date column unparseable and a status column read as
 When wording is genuinely ambiguous, override it:
 
 ```bash
-GTM_COLUMN_MAP={"outreach_tracker":{"company":"Client Name","owner":"Owned By"}}
+GTM_COLUMN_MAP={"outreach_pocs":{"company":"Client Name","owner":"Owned By"}}
 ```
+
+The two roles worth checking first are **`first_contacted`** and
+**`connected`** on the canonical tab: they are the *activation* columns, and a
+row is invisible to every proactive feature unless one of them holds a date. If
+the startup log shows almost no active rows, check that those two mapped to the
+right headers before checking anything else.
 
 A one-line schema summary is logged per tab at startup:
 
 ```
-[gtm] original tab 'Outreach Updates' kind=outreach_tracker rows=886 cols=18 mapped=[assets_shared, company, …] [HIDDEN TAB]
+[gtm] original tab 'Outreach PoCs' kind=outreach_pocs rows=886 cols=23 mapped=[assets_shared, company, connected, first_contacted, …]
 ```
+
+### Row activation — which rows the bot may raise unprompted
+
+**A row of the canonical tab is ACTIVE only when a first-contact date OR a
+connection date is present in it.** An **inactive** row is invisible to every
+*proactive* feature: never mentioned, never chased, never counted.
+
+That covers the next-action queue, the daily digest's cadence sections, the
+weekly funnel numbers, the outreach-vs-plan check, the company list the meeting
+layer is allowed to name, and the twice-weekly tracker reminder's counts.
+
+**Why.** The tab is a working list of people somebody *might* contact, not a
+list of people somebody *has* contacted; most of it is research — a name, an
+organisation, a designation, and nothing else. A bot that chases those rows is
+not chasing outreach, it is chasing a spreadsheet, and it buries the handful of
+rows actually in flight under two hundred that were never started. The dates are
+the sheet's own record of *"this one is real"*, so they are the signal and
+nothing else is.
+
+**A cell that is not a date does not activate.** `Yes` in a connection column is
+somebody's shorthand, not a record of *when*. Any of the sheet's own date
+formats counts, including a cell holding two dates (a meeting that moved) — the
+latest readable one wins.
+
+**Reading is unaffected.** Ask about an inactive row by name and you get the
+whole row, including *"we have no record of contacting them"*. The rule governs
+what the bot brings up on its own initiative, not what it is allowed to know.
+`lookup_company` and `query_tracker` read the tab unfiltered.
+
+**Rejection is a second, narrower gate.** Activation asks *"has this ever
+started"*; `CADENCE_REJECTED_MARKERS` asks *"was it deliberately stopped"*. They
+are counted and reported separately, because *"we never contacted them"* and
+*"they said no"* are not the same answer to any question.
+
+#### The one exception: an explicit mention-request
+
+> *"Set connection reminders for the others at Acme."*
+
+That activates those rows by name. It is a person deciding those rows are real —
+exactly the judgement the date columns were standing in for.
+
+- The activation is **persisted in SQLite** (the `row_activations` table), so it
+  survives a restart. A bot that forgot, on the next reboot, an instruction it
+  was given out loud would be worse than one that never took it.
+- It is keyed on **company + PoC, never on the sheet row number**, which moves
+  the moment somebody sorts the tab and would silently transfer the activation
+  to whoever landed in that row next.
+- **Nothing is written to the spreadsheet.** This is the bot's own record.
+- A name that matches no row comes back as `not_found` rather than being
+  silently dropped — *"I activated them"* when one of the three people named
+  doesn't exist in the sheet is the kind of quiet inaccuracy that gets a bot
+  distrusted.
+
+#### Checking it: "sheet status"
+
+```
+you: @bot sheet status
+```
+
+Returns the canonical tab name, the total rows, the **active** rows, the
+inactive count, any explicit activations in force, the restricted bands, and the
+**named columns inside the writable window**. `886 rows, 12 active` is the
+honest answer to *"why has the digest gone quiet"* — and it is an answer nobody
+could give while the only visible number was the row count.
+
+The same four facts are logged at boot under `[sheet.world]`, so they are
+visible on the first restart rather than a week later.
 
 ### Reads, and what happens when the API is down
 
@@ -441,46 +566,188 @@ read** and the answer carries an explicit staleness note:
 A sheet outage never takes the bot down, and never silently passes stale data off
 as current.
 
-### Writes — deliberately tiny
+### Writes — into the real sheet now, inside one window
 
-`SHEET_WRITE_TARGET` = `copy` (default) · `original` · `off`.
+**The sandbox-copy era is over.** `GTM_SHEET_COPY_ID`, `SHEET_WRITE_TARGET` and
+`BOT_DEADLINE_COLUMN` are removed; setting any of them does nothing.
 
-The entire write surface:
+**What they were.** The bot owned one column — `Next Deadline (bot)`, appended at
+the far right of the tab — and wrote single cells into it, on a **sandbox copy**
+of the playbook by default. Around it sat `ensure_bot_column()`,
+`write_deadline_cell()`, `_row_mismatch()`, `read_cell()` and
+`verify_write_roundtrip()`. All removed.
 
-- **One column**, `Next Deadline (bot)`, appended at the **far right** of the
-  tracker tab. Appending a header is the only structural change the bot ever
-  makes, and only at the right-hand edge, so no existing column moves.
-- **One cell at a time**, via `values.update` on a single-cell range. Never a
-  full row, never a full sheet, never any other column.
-- **A human-entered date always wins.** Cells the bot writes are marked
-  `2026-08-26 (bot)`; anything without that marker is treated as human-entered,
-  is **adopted** into the bot's own store, and is **never overwritten**.
-- **The target row must still name the company we think it does.** Row numbers
-  are discovered on the ORIGINAL but written to whatever `SHEET_WRITE_TARGET`
-  names — sound only while the two sheets stay row-aligned, and nothing
-  guarantees they do. Every write re-checks the company in the target row and is
-  **refused**, logged and audited if it disagrees, rather than stamping a
-  deadline onto the wrong company in a column nobody is watching.
-- Every write — success or failure — is logged to `state/audit.jsonl` as
-  `sheet_write`.
+That was the right shape while nobody had agreed what the bot may touch, and it
+was useless for exactly as long. A column on a copy nobody opens is a write into
+a drawer. The team works in the real sheet, and the two were only ever
+row-aligned by luck — which is why every single write had to re-check the company
+name first.
 
-SQLite is authoritative; the sheet is a mirror. A deadline exists once it is in
-the `deadlines` table, so a failed sheet write loses nothing.
+**What replaces it**, per Vaishnavi's walkthrough: `write_cells()` — cells in the
+**real** Outreach PoCs tab, in the columns the team already keeps, and only
+inside the **writable window** between the restricted bands.
+
+> The service account now needs **Editor**, not Viewer. A Viewer share reads
+> perfectly and fails on the first write, with a 403 the bot translates into
+> *"shared read-only, needs Editor"*.
+
+### Two triggers, and nothing else writes
+
+| | |
+|---|---|
+| **(a) Reply** | a team member replies to one of the bot's own messages |
+| **(b) Command** | a team member @-mentions it with an instruction — *"update Sahaj's meeting to Friday"* |
+
+No scheduled writes. No inference from a passing remark in the channel. A cell
+changes because a person addressed the bot and said something that answers what
+that cell holds.
+
+A reply is resolved against the nudge it answers: `drip_sends` records the
+Discord message id and the companies of every drip message, so *"sent this
+morning"* — which names no company and no column — resolves to exactly one row.
+**If a company matches more than one row, the write is refused with a question**
+rather than applied to whichever came first.
+
+### The fill rule
+
+> An **empty** cell is filled.
+> A **non-empty** cell changes only when the reply **clearly supersedes** it.
+
+That asymmetry is the whole design. Filling a blank costs nothing if it is wrong
+— the cell was empty and the echo shows what went in. Overwriting a value
+somebody typed destroys information, so it needs the reply to actually say the
+new thing (*"moved to Friday"*, *"actually it went Tuesday"*), not merely to
+mention the subject. The extractor sets `supersedes`; `sheetwrite.plan_writes`
+enforces that nothing without it can overwrite.
+
+### Three tiers
+
+| Tier | Columns |
+|---|---|
+| **Reply-loop** | first-contact type, first-contact date, connection date, DM-sent date, Responded?, meeting status, meeting date, next steps, notes, package sent, assets shared, prospect status |
+| **Command-only** | closure probability, deal size, deal status |
+| **Never** | anything in a restricted band (`A:I`, `S:X`) |
+
+Command-only exists because those are **commercial judgements**. Somebody
+mentioning a number in a sentence is not somebody committing it to the sheet, and
+the difference between those two things is a forecast nobody agreed to.
+
+**The bands outrank the tiers**, and that has a consequence worth knowing: if a
+command-only column physically sits inside a restricted band on the real sheet,
+**no instruction can write it** and the bot says so by name. That is the correct
+precedence — the bands are a promise about what the bot cannot touch at all, and
+a promise a sufficiently explicit instruction could override would not be one. To
+let the bot maintain those columns they move into the window, or the bands
+change; both are decisions somebody makes on purpose in `.env`.
+
+**Dead and Unresponsive need the actual words.** Those values stop a row for good
+in the [next-action engine](#the-next-action-state-machine), so the bot never
+infers one — the message has to contain one of `TERMINAL_STATUS_WORDS` verbatim,
+matched against the **raw text**, not against the model's reading of it.
+
+**A ceiling of `SHEET_WRITE_MAX_CELLS` (4).** One sentence should touch one or
+two cells; an extraction that wants nine has misread something. Past the ceiling
+the write is refused **whole** — never half-applied — and the bot asks for one
+thing at a time.
+
+### Contact details are acknowledged, never written
+
+Somebody replies *"sure, her email is ann@acme.com"*. The email column is in the
+identity band.
+
+```
+Noted — I set Acme · Ann's next steps to send the deck. I have got the email
+(ann@acme.com) — that column is one I never write to, so could you drop it in
+yourself? Say undo any time in the next 24h and I will put it back.
+```
+
+Refusing silently would lose the information; writing it would break the one
+guarantee the bands exist to make. Email, phone and LinkedIn have **mapped
+roles** precisely so the bot can name the column it is declining, rather than
+saying *"I have no rule for that"*.
+
+### Echo and undo
+
+**Every write is echoed in one friendly line**, in the drip's voice, naming the
+columns as the sheet names them and always offering the undo. A write nobody was
+told about is a write nobody can catch.
+
+**`undo` reverts the exact cells**, within `SHEET_WRITE_UNDO_HOURS` (24), **by
+any team member** — not just whoever caused it, because the person who spots a
+wrong cell is usually not the person who typed the sentence that produced it.
+
+The prior value of every cell is stored in `sheet_writes` when the write happens,
+so the restore is exact rather than a guess. Rows are marked `undone_at` rather
+than deleted: a write that was made and reversed is a different history from one
+that never happened, and `audit.jsonl` carries both events.
+
+**The undo is a write like any other** and goes through the same three locks. An
+undo that skipped the band check would be a way to write anywhere by writing
+there first and then "undoing" something else. The row interlock matters more
+here than on the way out: the undo may be a day later, and restoring an old value
+into whatever now sits in that row would be a second, worse mistake dressed as a
+correction.
+
+### The three locks, still
+
+1. **Read-only sheet ids** — never the mapping sheet, whatever the config says.
+2. **Restricted bands** — never a column in `A:I` or `S:X`. Fails closed: a
+   column index that cannot be read as a number is refused.
+3. **The row interlock** — the target row must still name the company the caller
+   believes it does. Rows get sorted and inserted between a read and a write, and
+   a correct value in the wrong row is worse than no value, because nobody goes
+   looking for it.
+
+### Snooze parsing rides here too
+
+> *"follow up in 15 days"* · *"on the 24th"* · *"remind me Saturday 6pm about the pilot"*
+
+**The kind is decided by whether they gave a time.** *"In 15 days"* is a cadence
+instruction and goes to the `snoozes` table, where the next-action engine re-arms
+the due date to it. *"Saturday 6pm"* is somebody asking to be reminded at a
+moment — that is `scheduled_reminders`, the one thing exempt from the weekend
+shift. Collapsing those would either move somebody's Saturday or turn a soft
+*"sometime in a fortnight"* into an alarm.
+
+Parsed by regex rather than by the model: a date is a thing a regex can be held
+to, and a snooze quietly entered for the wrong day would make the bot go silent
+about an account for reasons nobody could reconstruct. Confirmed once, in the
+plan's voice:
+
+```
+Got it — I will bring Acme back up on Sat 12 Sep at 6pm. Nothing from me on it
+before then.
+```
+
+### SQLite is still the brain
+
+The sheet is what the **team** reads; SQLite is what the **bot** knows. Deadlines,
+snoozes, scheduled reminders, activations, the drip's slot log and the write/undo
+history all live there and are authoritative. A failed sheet write loses nothing
+the bot needed.
+
+Deadlines are no longer mirrored to a sheet at all — there is no bot-owned column
+to copy them into, and inventing a place inside the team's own window would be
+the bot deciding which of *their* columns means "the bot's deadline".
 
 #### Verifying the write path
 
 ```bash
-python -m gtm_sheet            # access check + schema dump for both sheets
-python -m gtm_sheet --write    # ... and a full write round-trip on the SANDBOX
+python sheetwrite.py          # the tiers, the fill rule, the gates, the parsing — offline
+python -m gtm_sheet           # access check, schema dump, and the writable window by name
+python -m gtm_sheet --write --row 14 --role next_steps
 ```
 
-`--write` writes one cell, reads it back and confirms it matches, so the whole
-path — auth, the column, the cell address, the value — is proven end to end. It
-**refuses to run unless `SHEET_WRITE_TARGET=copy`**: the check writes a real
-cell, and the only sheet this bot may experiment on is the sandbox. The
-read-back is retried a few times, because Sheets occasionally returns the
-pre-write value immediately after an update and reporting that as a failed write
-would be a lie about the one thing the check exists to establish.
+`--write` writes one real cell and **puts the old value straight back**. It
+refuses unless given **both** `--row` and `--role`: there is no sandbox to hide
+in any more, so it will not pick a row to scribble on for you.
+
+`python sheetwrite.py` runs 34 assertions offline — that an empty cell is filled
+and a full one is not, that `supersedes` is what unlocks an overwrite, that a
+reply cannot set closure but a command can, that an email becomes an ask naming
+the sheet's own column, that Dead is refused until somebody says the word, that a
+role with no column is named rather than silently dropped, and that going over
+the ceiling writes nothing at all.
 
 ---
 
@@ -505,9 +772,9 @@ independent locks, any one of which is sufficient:
    itself refuses a write with that token, whatever the code asks for.
 3. **Every write path refuses the id.** `config.is_read_only_sheet_id()` names
    this spreadsheet, and `gtm_sheet.py` checks it before touching a cell. Point
-   `GTM_SHEET_COPY_ID` at this sheet by mistake and the write is refused with an
-   explanation; `config.validate()` additionally forces `SHEET_WRITE_TARGET=off`
-   and says so at ERROR.
+   `GTM_SHEET_ORIGINAL_ID` at this sheet by mistake and the write is refused with
+   an explanation; `config.validate()` additionally forces
+   `SHEET_WRITES_ENABLED=false` and says so at ERROR.
 
 Share it as **Viewer**. Editor is not needed and the startup remedy line asks for
 Viewer precisely so nobody widens it out of habit.
@@ -636,53 +903,219 @@ answer, carrying the "shout to change" invitation that makes the date
 consent-based rather than imposed. Holding it until the next morning's digest
 would answer a question a day late, so it goes out immediately.
 
-The bot no longer sets deadlines **unprompted**. It used to do that for
-dead-deal rows during the sweep, and announcing each one was exactly the kind of
-scattered proactive message the digest replaced. Those rows are named in the
-digest's HYGIENE section instead, and a person — or the bot, when asked — sets
-the date.
+The bot never sets deadlines **unprompted**, and it no longer announces them
+unprompted either.
 
-**Chasing** happens entirely inside the daily digest: due today or on the next
-working day appears under DEADLINES, past due under OVERDUE with its
-working-days age, and once `COS_NUDGE_MAX_ATTEMPTS` appearances are spent the
-item moves to ESCALATIONS addressed to `ESCALATE_TO_ID` and the owner stops
-being chased. An "attempt" is an appearance in a digest, so the digest's
-once-a-day guarantee is itself the rate limit.
+**Deadlines are still tracked in full** — the date, the rule that produced it,
+whether a human's date won, the attempt count, the escalation threshold — and
+they are answered on demand (`list_deadlines`, `set_deadline`) and mirrored to
+the sheet within the [restricted bands](#writes--deliberately-tiny-and-locked-to-a-window).
+
+**What is gone is the announcing.** The DEADLINES / OVERDUE / ESCALATIONS
+sections were the digest's, and the digest is retired; the drip carries the
+next-action queue, where a chase is not an action type. Re-surfacing them means
+deciding who a chase message is *for* under the one-type-one-owner rule, which is
+a product question rather than a config one.
 
 ---
 
-## Row hygiene flags
+## The next-action state machine
 
-Three judgements read off the tracker. **None of them posts a message of its
-own**: HOT is the first section of [the daily digest](#the-one-daily-digest) and
-STALLED / DEAD-DEAL are its HYGIENE section, so each is surfaced once a day by
-construction rather than by a per-row rate limit.
+**For every ACTIVE row, exactly one next action** — a type, an owner, a due date
+and a priority — **or nothing at all, with a reason.** That is the whole
+contract.
 
-| Flag | Fires when | Why it matters |
+It **replaces** the per-row *"what next"* logic that came before it: the three
+row-hygiene flags (HOT / STALLED / DEAD-DEAL) in `tracker.py`, and the ad-hoc
+deadline kinds in `deadlines.py` that stood in for a cadence. Between them a
+single row could be HOT *and* DEAD-DEAL *and* carry an outreach deadline, and
+`tracker.all_flags` held an ordering to pick which of those to say out loud. That
+is a system with three opinions and a tie-break, not an answer.
+
+> **It sends nothing.** `nextaction.py` is pure computation — rows in, dicts out.
+> It has no send path, it is **not** wired into the daily digest, and the only
+> ways to see it are asking the bot (`cadence preview`) or the startup log. It is
+> safe to deploy with the digest kill switch off, which is what it was built for.
+
+### The triggers, in evaluation order
+
+**The first match wins.** The order *is* the product decision: a row with a
+positive reply, a pending demo quote and four silent touches gets the meeting
+proposal, because that is what a human would do first. Nothing downstream has to
+break a tie, because no tie is ever produced.
+
+| # | Trigger | Fires when | Band |
+|---|---|---|---|
+| 0 | *stopped* | closure `0%` / Dead / Unresponsive / Won / Lost | **STOP** — no action, ever |
+| 1 | *snoozed* | a live snooze | silent until its date |
+| 2 | `meeting_proposal` | **any** positive or replied row | P0 override |
+| 3 | `scheduled_reminder` | a one-off somebody asked for, due | P1 |
+| 4 | `quote_chase` | stage = Demo, nothing moved, `DEMO_QUOTE_DAYS` (3) | P1 |
+| 5 | `progress_check` | `dm_sent_date` + `DM_PROGRESS_CHECK_DAYS` (7) | P2 |
+| 6 | `dm_check` | connection + `CONNECTION_DM_CHECK_DAYS` (7), still no DM | P2 |
+| 7 | `dm_sent_check` | connection + `CONNECT_DM_CHECK_HOURS` (48) , no DM | P2 |
+| 8 | `mark_unresponsive` | silent touches ≥ `UNRESPONSIVE_SUGGEST_AT` (7) | P2 |
+| 9 | `channel_switch` | silent touches ≥ `CHANNEL_SWITCH_AT` (4) | P2 |
+| 10 | `pulse_check` | deal On Hold, `ON_HOLD_PULSE_DAYS` (30) apart | P3 |
+| 11 | `followup` | the lane cadence, off the last touch | P1 / P2 / P3 |
+
+### Priority within a day
+
+```
+P0  positive overrides      a reply is the most expensive thing to sit on
+P1  meetings & demo chases  a booked thing, or a quote somebody is waiting for
+P2  seven-day follow-ups    the ordinary cadence
+P3  slow lane               closure below the threshold, and parked deals
+```
+
+Two rows in the same band are ordered by **due date, oldest first**, then by
+company so the list is stable day to day. Band beats date deliberately: a reply
+due tomorrow outranks a slow-lane follow-up that went overdue three weeks ago,
+because the reply is the thing that decays.
+
+### The rules that need saying out loud
+
+**Stop means stop.** A row whose closure cell says `0%`, Dead, Unresponsive, Won
+or Lost produces no action, ever, from any trigger — **the priority override
+included**. A won deal does not need a meeting proposal and a dead one does not
+need a follow-up. A **blank** closure cell is *not* a stop: most rows have never
+had the column filled in, and reading a blank as 0% would silence the whole
+sheet on the first run.
+
+**The priority override** (strategy §5.1) is the one band that jumps everything.
+Any row that replied — positively **or unclassifiably**, because somebody wrote
+*something* in the cell so they did answer — gets a meeting proposal due within
+`MEETING_PROPOSAL_WORKING_DAYS` **working** days of the reply. A reply sitting
+for a week produces a date **in the past**, and it is left there: the queue shows
+it as overdue, which is the true statement. Nothing is quietly restamped "due
+today".
+
+**The type-aware ask** is the only place first-contact type is read. The progress
+check asks for an email address or a phone number — unless the first contact was
+already by email (`EMAIL_CONTACT_TYPES`), in which case we have the email and
+asking for it reads as a bot that does not read its own sheet. A blank or
+unreadable type **includes** the ask, which is the safe direction.
+
+**The two lanes.** Closure above `CLOSURE_HOT_THRESHOLD` (50), or a deal marked
+In Progress, is chased every `HOT_DEAL_DAYS` (7) near the front of the queue.
+Closure at or below it is chased every `SLOW_LANE_DAYS` (20) at the back. **On
+the threshold counts as slow** — "50%" is not "more likely than not", and a
+coin-flip deal does not earn a weekly chase.
+
+**On hold means don't chase.** The pulse-check trigger sits **above** the
+follow-up, so no chase, channel counsel or unresponsive suggestion can reach a
+parked deal. It gets one check-in a month and nothing else.
+
+**The bot never marks anyone Unresponsive.** It suggests it, and says so on the
+line. Marking somebody unresponsive stops the row for good — trigger 0 takes it
+from then on — and a judgement with that consequence belongs to whoever owns the
+row, not to a counter.
+
+**Alternate PoCs.** Once a row has been followed up at least once with nothing
+back, the follow-up line reads *"…if they stay quiet, try a different PoC at
+&lt;company&gt;"*. It stays **one** action; the suggestion is part of its text.
+
+### Snooze
+
+> *"Follow up in 5 days."* · *"Come back to Acme on the 20th."*
+
+A snoozed row emits **nothing** until its date. On and after it, the row's normal
+action returns with its **due date re-armed to the snooze date** rather than to
+whatever the trigger would have computed — the person who said *"the 20th"* said
+when, and a bot recomputing a different date would be overruling them.
+
+A snooze whose date has passed is therefore **overdue, and stays visible** until
+somebody acts on it. It is not silently dropped: an instruction that expires into
+nothing is an instruction the bot took and then ignored.
+
+Stored in the `snoozes` table, keyed on company + PoC (never a sheet row number,
+which moves when anybody sorts the tab). Set it with the `snooze_row` tool; it
+writes to SQLite and **never** to the spreadsheet.
+
+### Weekends
+
+**No computed due date ever lands on a Saturday or a Sunday** — each is shifted
+forward to the Monday (`NEXT_ACTION_WEEKEND_SHIFT`).
+
+**The one exception is an explicitly scheduled reminder**: a one-off somebody
+asked for at a specific time (*"remind me about Acme on Saturday morning"*).
+Those live in the `scheduled_reminders` table and keep the **exact** date they
+were asked for. A person asking for their own Saturday has decided about their
+own Saturday, and a bot that "corrects" it to Monday has thrown the instruction
+away without saying so. Set one with the `schedule_reminder` tool.
+
+A scheduled reminder outranks the row's ordinary follow-up but **not** a positive
+reply — the override still comes first.
+
+### `cadence preview`
+
+Mention the bot and ask for **"cadence preview"**. It computes today's queue and
+prints it grouped by **type × owner**, and **sends nothing**:
+
+```
+**Cadence preview — Wed 09 Sep 2026**
+_8 action(s) across 11 active row(s). Nothing has been sent; this is what the
+queue holds right now._
+
+__POSITIVE OVERRIDE (1)__
+**Propose a meeting (they replied)** (1)
+  _Vaishnavi_
+    • [2026-08-04 — 36d OVERDUE] Acme · Ann (CTO) — they replied (P). Propose a
+      meeting. This is front of the queue however old anything else on the row is.
+      why: response cell says 'P'; due 2 working day(s) after the first contact
+           date (Sat 01 Aug 2026)
+
+__MEETINGS & DEMO CHASES (2)__
+**Quote chases (demo given)** (1)
+  _Vaishnavi_
+    • [2026-08-24 — 16d OVERDUE] Fathom · Fay (CTO) — demo done 20d ago and
+      nothing has moved since. Send the quote, or write down what is blocking it.
+      why: stage is 'Demo', nothing recorded since the first contact date
+           (Thu 20 Aug 2026), and 3d have passed
+…
+_No action for 2 closed (0% / Dead / Unresponsive / Won / Lost) — never chased
+again; 1 snoozed._
+```
+
+Grouped by type first because the question behind it is *what kind of work is
+waiting*; owner is the sub-grouping so each person can still find their own rows.
+Every line carries its due date, whether it is overdue, and **the cells that
+produced it** — a queue nobody can check is a queue nobody will act on.
+
+**The closing line is the receipt.** Every active row that produced *no* action
+is accounted for by category — stopped, snoozed, no readable date, nothing due —
+because a queue that lists only what it found looks complete when it is not.
+
+Three more tools sit alongside it: **`next_action`** (the one action for a named
+company, or the specific reason there isn't one), **`snooze_row`** and
+**`schedule_reminder`**.
+
+### Where per-row state lives
+
+| State | Where | Note |
 |---|---|---|
-| **HOT** | `Response?` = yes, and the last follow-up is missing or predates the reply | Speed to lead. A prospect who answered and heard nothing back is a deal lost to silence. Same-day. |
-| **STALLED** | open, no response, nothing scheduled, last touch older than `STALLED_AFTER_DAYS` (5 working days) | Silence kills deals. |
-| **DEAD-DEAL** | open, empty Next Steps **and** no future date anywhere on the row | No next step = dead deal. Asks for the next action or a park **with a Reason**. |
+| The action itself | **nowhere** | recomputed on every run; a preview that wrote to the database would not be a preview |
+| Snoozes | `snoozes` | keyed company + PoC |
+| One-off reminders | `scheduled_reminders` | the only dates exempt from the weekend shift |
+| Explicit activations | `row_activations` | see [Row activation](#row-activation--which-rows-the-bot-may-raise-unprompted) |
+| Deadlines the bot announced | `deadlines` | unchanged; the reactive `set_deadline` tool still owns these |
+| Digest carry-forward ages | `digest_items` | unchanged |
+| Sheet-health dedup | `quality_flags` | unchanged |
 
-Each flag states the cells it read, so the team can check it rather than argue
-with it. A row with a booked future meeting is never flagged stalled or dead — it
-is waiting, not drifting. A row with a `Reason` is parked, and is never flagged at
-all. Each row gets at most one flag; when a row qualifies for several, the most
-actionable framing wins (hot → dead → stalled).
+### Checking it offline
 
-Only **engaged** rows can stall or go dead: a row where something came back or
-something real went out (an intro, a reply, a meeting, assets shared, or at least
-one recorded follow-up). A cold name emailed once is an *unworked lead*, not a
-dead deal. Without that gate "no next step = dead deal" fired on 756 of the live
-sheet's 886 rows — a wall of noise that would get the bot muted on day one.
+```bash
+python nextaction.py     # the state machine on fixtures: no sheet, no network, no database
+```
 
-Deduplication is by **sheet row**, not by company. The tracker holds one row per
-PoC, so a single company legitimately owns dozens of rows; keying the dedup by
-company meant the first flagged OpenAI row silenced every other OpenAI row in
-every category, which on the live sheet hid all 70 stalled rows behind rows
-already claimed by the hot and dead-deal finders. Volume is bounded by
-`SALES_DIGEST_MAX_PER_SECTION` instead, which — unlike the old per-sweep cap —
-says how many rows it left out rather than silently deferring them.
+39 assertions covering every trigger: that a closed row stops even when it has a
+reply, that a blank closure does **not** stop it, that the override beats
+everything, that the connection pair fires in the right order, that the
+type-aware ask appears and disappears with the contact type, that 50% is the slow
+lane, that a reply resets the silent-touch count, that a live snooze silences and
+an expired one re-arms and reads as overdue, that no computed date lands on a
+weekend and a scheduled one keeps its Saturday, and — the one that matters most —
+that a row matching five triggers yields exactly **one** action.
 
 ---
 
@@ -723,255 +1156,138 @@ lagging is reported, not acted on. Rows whose dates can't be read are counted
 under HYGIENE rather than dropped, so a shrinking denominator stays visible
 instead of quietly flattering the numbers.
 
-These used to be their own scheduled Friday post. They aren't any more — a second
-unprompted message a week is still a second unprompted message. They ride along
-as a **section of the daily digest** on `WEEKLY_DIGEST_WEEKDAY` (Friday by
-default), which means they appear only if that day's digest has something in it.
-`WEEKLY_DIGEST_HOUR_IST` is retired: their time is `SALES_DIGEST_TIME`.
+**The full block above has no proactive outlet.** It was its own scheduled Friday
+post, then a section of the daily digest — and the digest is retired. It is still
+computed and still answered on demand.
+
+**What does go out, if you opt in**, is the much shorter
+[weekly funnel line](#the-weekly-funnel-line--opt-in): leading counts, then
+lagging, one sentence, behind `WEEKLY_FUNNEL_ENABLED` (default **false**). The
+conversion percentages, the stage funnel and the hygiene counts stay on-demand —
+a block of numbers addressed to nobody is not a per-(type × owner) ask, and the
+drip only carries those.
+
+`WEEKLY_DIGEST_HOUR_IST` is retired, and so is the block it timed.
 
 ---
 
-## The daily cadence (phase 1)
+## The cadence — the phase-1 rules are retired
 
-Ten rules (**a–j**) from Vaishnavi's **"Steps for Sales Bot"** doc, plus the
-priority and cap decisions from the **27 Aug alignment meeting**. They run once a
-day against the **outreach tracker** and feed the **existing** daily digest.
+Phase 1 ran ten lettered rules (**a–j**) from Vaishnavi's *"Steps for Sales
+Bot"* doc against the **outreach tracker** tab. Phase 2 moved the bot's sheet
+world to the **"Outreach PoCs"** tab and retired both the tab and the rules.
+
+**The rule evaluation is gone** — not disabled behind a flag, not left in place
+returning nothing. Removed.
+
+### What was removed
+
+| Rule | What it did | Threshold, also removed |
+|---|---|---|
+| **a** `stale_followup` | last-followed-up date older than *n*, no response | `FOLLOWUP_STALE_DAYS` |
+| **b** `intro_pending` | Connected = Y but the intro date is blank | — |
+| **c** `start_interacting` | first contacted, never connected, *n* days on — **and its cold ceiling, `cold_summary` and the `cold list` tool** | `CONNECT_REMINDER_DAYS`, `CONNECT_REMINDER_MAX_DAYS` |
+| **d** `alt_channel` | follow-ups ≥ *n* with no response → another channel | `ALT_CHANNEL_AT` |
+| **e** `unresponsive` | follow-ups ≥ *n* with no response → mark them so | `UNRESPONSIVE_AT` |
+| **f** `lock_meeting` | positive response, Next Steps blank | — |
+| **g** `try_another_poc` | one alternative-PoC suggestion per rejected company | — |
+| **h** `meeting_soon` | a meeting inside `MEETING_PREP_DAYS` | — |
+| **i** `post_meeting` | meeting past, assets or next steps missing | — |
+| **j** `nextstep_stall` | Next Steps unchanged for *n* days | `NEXTSTEP_STALL_DAYS` |
+
+…plus two things that existed only to serve them:
+
+- the **UPDATE-TRACKER fill-in asks** (`fill_in_gaps`) and their budget
+  `UPDATE_TRACKER_MAX`;
+- the **nightly master/tracker cross-check** (`crosscheck`),
+  `CADENCE_CROSSCHECK_ENABLED` and `CADENCE_CROSSCHECK_MAX`.
+
+**Every one of those environment variables is gone from `config.py`.** Setting
+one now does nothing at all — a threshold left behind for a rule that no longer
+exists is a lie in the config, and somebody would eventually tune it and wonder
+why the digest never changed.
+
+Two tools went with the rules that fed them: **`cadence_list`** (*"what did the
+digest hold back"*) and **`cold_list`** (*"who never connected"*). A tool that
+always returns an empty list with a confident description attached is worse than
+no tool, because *"nothing"* reads as *"nothing is wrong"*. **`sheet_status`**
+replaces them and answers what people were really asking through them.
+
+The **meeting-prep briefs** are unwired for the same reason: they were selected
+by rule (h). `prep.py` is unchanged and still builds a brief; what is gone is the
+proactive trigger that chose which meeting got one. The `prep_briefs` SQLite
+dedup is deliberately kept, so a phase-2 rule can re-wire it without re-briefing
+every meeting already covered.
+
+### What survives, and why
+
+**The sheet-health flags.** They are a property of the *spreadsheet* rather than
+of any cadence rule, they were never lettered, and they are the one thing here
+that still has something true to say about a tab whose rules have not been
+written yet.
+
+**The plumbing** a phase-2 rule set will need: the rejection test
+(`CADENCE_REJECTED_MARKERS`), the response vocabulary, the item shape, the
+ranking, the two budgets (`URGENT_MAX`, `DIGEST_MAX_ITEMS`) and the owner
+resolution (`SALES_DEFAULT_OWNER_ID`).
+
+`cadence.evaluate_row()` still exists and still returns `[]`. It is the single
+place a rule set plugs in, and it keeps its signature so that the day rules
+return, one call site changes rather than five. **It is not a disabled rule set:
+there is nothing behind it to enable.**
+
+### What is left of it
+
+The five cadence sections went with the digest format. What `cadence.py` still
+computes is the **sheet-health flags**, and they have no proactive outlet — they
+are logged and answerable, not announced.
+
+That emptiness is deliberate and **visible**, never quiet:
+
+```
+[cadence] 12 ACTIVE row(s) considered (874 inactive row(s) never looked at — no
+first-contact or connection date), 1 excluded as rejected; 0 item(s) and 1
+sheet-health line(s); showing 0 + 1, 0 held. The phase-1 rules (a-j) are RETIRED,
+so an empty item list is expected until a phase-2 rule set exists.
+```
+
+`quiet` and `broken` are different states and the log tells them apart.
 
 > **No rule in `cadence.py` can make the bot speak.** There is no
 > `guardrails.send` in that file and there must never be one. Every finding is
 > handed to `_maybe_post_daily_digest`, which is still the only proactive send
-> path in the codebase. The mention-only gate is untouched — the cadence changes
-> what the one daily message *says*, not how often the bot talks.
+> path in the codebase.
 
-### It runs on the tracker, not the master tab
+### Zero proactive paths remain wired to the old rules
 
-The cadence source is the tab whose headers carry **`Last followed up date`** and
-**`Total follow-ups till date`** — live, the hidden **"Outreach Updates"** tab.
-It is the only tab in the spreadsheet with dates in it.
+Every proactive output path, and what feeds it now:
 
-The **master tab** ("Master Data": `Response Status` + `Intro Sent` + `Meeting
-Done`) is **status only**. It has no last-followed-up date, no follow-up count,
-no meeting date and no next steps, and its `Month` is a month, not a date.
-Pointed at it, rules **a, c, h, i and j** read a blank and silently never fired —
-the cadence looked calm because it was blind. The master tab now does the three
-jobs it can actually do:
-
-- **aggregate and pivot answers** — 587 rows of clean status;
-- **the weekly funnel definition** (below);
-- **a nightly consistency cross-check against the tracker**. Where the two
-  disagree, the bot reports **both values** as an UPDATE-TRACKER line and
-  **never infers a winner** — picking one silently would be a bot rewriting a
-  status nobody asked it to touch.
-
-**Statuses conveyed by cell colour are invisible to this bot.** It reads cell
-*values* only — the Sheets values API does not return fills. That failure is
-silent by nature, so at startup any mapped column that is empty on nearly every
-row is named in a warning:
-
-```
-WARNING [gtm] tab 'Outreach Updates': the meeting_date column ('Meeting Date') is
-filled on 9 of 886 rows. It MAY BE COLOR-CODED — this bot reads cell VALUES only
-and cannot see fills, so every rule that reads meeting_date will see a blank.
-```
-
-### Vocabulary normalisation
-
-The two tabs say the same things in different words, so everything goes through
-one normaliser before a rule sees it:
-
-| | Values | Reads as |
+| Proactive path | Was | Is |
 |---|---|---|
-| **Response** | `Y`, `P`, `Did Respond`, `P - Positive/In Progress` | POSITIVE |
-| | `N`, `N - Rejected`, `No` | REJECTED |
-| | blank, `No Response`, `Awaited` | NONE |
-| | anything else | *replied, polarity unclear* — never chased as silent, and **listed once** so the sheet can be standardised |
-| **Connected** | tracker `Y` / blank · master `Yes` / `No` | yes / no |
-| **Dates** | `9-Jun-2026`, `17-Mar-2026`, `22/05/2026`, `24-06-2026` | parsed |
-| | two dates in one cell (a meeting that moved) | the **latest** wins |
-| | `#REF!`, `#N/A`, `#VALUE!` | **empty**, and flagged |
-| **Follow-up count** | blank | **0 *and* "not recorded"** — see below |
+| Digest cadence sections | rules a–j on the tracker tab | sheet-health lines on the **Outreach PoCs** tab, **active rows only** |
+| UPDATE-TRACKER asks | `fill_in_gaps` + `crosscheck` | removed; sheet-health only |
+| Cold-cohort summary line | rule (c)'s ceiling | removed |
+| HOT / STALLED / DEAD-DEAL flags | all tracker rows | **retired** — replaced by the [next-action state machine](#the-next-action-state-machine), which sends nothing |
+| Next-action queue | — | **active rows only**, and it has **no proactive outlet**: `cadence preview` and the startup log |
+| Weekly funnel numbers | all tracker rows | **active rows only** |
+| Outreach-vs-plan check | all tracker rows | **active rows only** |
+| Meeting layer's company list | all tracker rows | **active rows only** |
+| Twice-weekly tracker reminder | counted rows missing follow-up cells | counts rows missing **both activation dates** |
+| Meeting-prep briefs | rule (h) | **unwired** |
+| Deadline announcements | unchanged | unchanged (SQLite-driven, not rule-driven) |
 
-### Missing data is an ask, not a chase
-
-The tracker is sparse: the follow-up count is blank on 800 of 886 rows, next
-steps on 871. So **a rule fires as a CHASE only when every cell it depends on is
-actually filled.** When a required cell is blank the row becomes an
-**UPDATE-TRACKER fill-in ask** instead:
-
-```
-• OpenAI · Mark Chen (Chief Research Officer) — no last-followed-up date. Update the tracker.
-```
-
-Rules **(b)** and **(f)** are the exceptions — an empty cell *is* the signal
-there, which is the whole point of them.
-
-Without this split the digest would read a blank counter as "0 follow-ups" and
-chase a row nobody had touched, using the sheet's own gaps as evidence against
-the team. A gap is only asked about on a row that is **actually in play**: the
-missing last-followed-up date only when the row shows engagement, the missing
-count only when there is evidence of following up. "We never started" is rule
-(c)'s business, not a bookkeeping gap.
-
-### Re-pointing at a new sheet is an env change plus a restart
-
-This was promised in the meeting, so it is a property of the code. Nothing about
-the sheet's identity or its column names is compiled in:
-
-| Setting | What it moves |
-|---|---|
-| `GTM_SHEET_ORIGINAL_ID` | which spreadsheet |
-| `GTM_COLUMN_MAP` | which header means which rule field |
-| `SALES_DEFAULT_OWNER_ID` | who every cadence line is addressed to |
-| `GTM_MASTER_TAB_TITLES` | an optional *name hint* for the master tab — a hint, never an authority |
-| `FOLLOWUP_STALE_DAYS`, `CONNECT_REMINDER_DAYS`, `CONNECT_REMINDER_MAX_DAYS`, `ALT_CHANNEL_AT`, `UNRESPONSIVE_AT`, `NEXTSTEP_STALL_DAYS`, `MEETING_PREP_DAYS`, `URGENT_MAX`, `DIGEST_MAX_ITEMS`, `UPDATE_TRACKER_MAX` | every threshold |
-
-Change those, restart, done. No migration and no code edit. `GTM_COLUMN_MAP`
-accepts every rule field as a role — for `outreach_tracker`: `company`,
-`industry`, `poc`, `poc_designation`, `poc_vertical`, `first_contacted`,
-`use_case`, `connected`, `intro_date`, `last_followed_up`, `followups_count`,
-`response`, `reason`, `meeting_date`, `assets_shared`, `next_steps`,
-`other_updates`, `owner`, `status`.
+The single gate is `SalesBot._split_active`, which is the only place the
+persisted activations are read — a path that forgot to read them would quietly
+ignore an instruction somebody gave out loud.
 
 ### Who a line is addressed to
 
-**The tracker has no owner column.** Every row is worked by the same person
-today, so a cadence line resolves its owner in two steps: the row's own owner
-cell *if a column ever appears* (or `GTM_COLUMN_MAP` names one), then
-`SALES_DEFAULT_OWNER_ID`. A ping still needs roster membership — an id that isn't
-in `TEAM_ROSTER_IDS` gets named in plain text instead, which is the roster gate
-failing closed.
+The row's own `owner` cell when the canonical tab has one (or `GTM_COLUMN_MAP`
+names one: `{"outreach_pocs":{"owner":"Owned By"}}`), resolved against the
+roster by display name; otherwise **`SALES_DEFAULT_OWNER_ID`**.
 
-### The ten rules
-
-**Every `n` is a placeholder.** Vaishnavi's numbers were left unset in the doc;
-the defaults below are guesses she will tune once the digest has been read for a
-week — which is a restart, not a deploy.
-
-| | Rule | Fires when | Needs filled | Threshold | Priority | Section |
-|---|---|---|---|---|---|---|
-| **a** | stale follow-up | Last followed-up date older than *n* **and** no response | the date | `FOLLOWUP_STALE_DAYS=5` | waiting | FOLLOW-UPS |
-| **b** | intro pending | Connected = Y but membrane Intro Date blank | — *(blank is the signal)* | — | intro | INTROS |
-| **c** | start interacting | First Contacted set, never Connected, and **inside the window** | the date | `CONNECT_REMINDER_DAYS=7` … `CONNECT_REMINDER_MAX_DAYS=30` | waiting | FOLLOW-UPS |
-| | *cold summary* | the never-connected rows **past** the ceiling — one line for all of them, **never capped** | the date | `CONNECT_REMINDER_MAX_DAYS=30` | — | FOLLOW-UPS |
-| **d** | another channel | Follow-ups ≥ *n*, no response → email / WhatsApp / call | the count | `ALT_CHANNEL_AT=4` | waiting | FOLLOW-UPS |
-| **e** | mark unresponsive | Follow-ups ≥ *n*, no response → **ask the owner** to mark the PoC unresponsive | the count | `UNRESPONSIVE_AT=7` | waiting | UPDATE TRACKER |
-| **f** | lock a meeting | Response positive, Next Steps blank, no meeting on the row | — *(blank is the signal)* | — | **urgent** | MEETINGS |
-| **g** | another PoC | a **rejected** company with nothing else live there — **once per company** | — | — | suggestion | FOLLOW-UPS |
-| **h** | meeting soon | Meeting Date within *n* days → earns the prep brief | the date | `MEETING_PREP_DAYS=4` | **urgent** | MEETINGS |
-| **i** | post-meeting gap | Meeting Date past **and** Assets Shared **or** Next Steps blank | the date | — | **urgent** | ASSETS |
-| **j** | next-step stall | Next Steps present but unchanged for *n* days | the cell | `NEXTSTEP_STALL_DAYS=10` | waiting | FOLLOW-UPS |
-
-Four details that are load-bearing:
-
-- **Rule (e) asks. It never writes.** The bot's only writable cell anywhere
-  remains its own `BOT_DEADLINE_COLUMN`. Marking a person unresponsive is a
-  judgement with consequences for the relationship, and it stays with the human
-  who owns the row. The digest line says so out loud: *"Please mark Rob N
-  'unresponsive' in the tracker (I don't write that cell)."*
-- **Rules (f) and (g) were in conflict, and are reconciled.** Her doc says
-  *"response = N / no response → suggest another PoC"*; the 27 Aug meeting
-  excluded rejected leads from the cadence entirely. Both survive, split by what
-  each was for: a rejected row is **never chased**, and instead the **company**
-  gets **one** suggestion line naming an alternative PoC — skipped when somebody
-  else at that company is still in play. "No response" with a high follow-up
-  count is not a rejection at all; (d) and (e) already own that row.
-- **Rule (g) pulls candidates from the researcher/buyer mapping** when the org is
-  mapped — **with its usual caveats** folded into the line (staleness verdict,
-  departure check, org flags). A mapped name quoted without them is exactly the
-  mistake that sheet's legend warns about.
-- **Rule (j) needs history the sheet doesn't have.** A spreadsheet cell does not
-  know when it last changed, so the bot keeps its own: `nextstep_state` in SQLite
-  holds a hash of each row's Next Steps text and the date that text first
-  appeared. A fresh database earns these findings over the following days rather
-  than firing a wall of them on day one, and editing the cell resets the clock.
-
-### Exclusions and priority
-
-**Rejected rows are excluded from every rule and every digest section** — dropped
-before any rule is evaluated, not filtered out afterwards. They are revisited
-offline by humans. A row counts as rejected when its **Response** says so (`N`,
-`N - Rejected`, `No`) or when any of its cells contains one of
-`CADENCE_REJECTED_MARKERS` (`rejected`, `not interested`, `closed lost`, …). The
-one thing such a row still produces is rule (g)'s single per-company suggestion.
-
-| Bucket | What's in it |
-|---|---|
-| **URGENT** | a positive response awaiting our action (f) · meetings within `MEETING_PREP_DAYS` (h) · post-meeting gaps (i) — **never truncated**, own budget |
-| **WAITING** | a, c, d, e, j |
-| **INTRO** | b — connected with no intro behind it |
-| **SUGGESTION** | g — a "no" is real work, but it must never push a booked meeting off the digest |
-
-### The cold ceiling: why rule (c) needed a maximum, not a bigger minimum
-
-Rule (c) matched **756 of the live sheet's 886 rows**. Most of the tracker is
-March–July outreach that never connected, and *"first contacted 158d ago and
-still not connected — start interacting"* is not a task, it is an accusation
-about last quarter.
-
-**Raising `CONNECT_REMINDER_DAYS` is the wrong lever.** Those rows are older
-than any threshold you could set, so a higher floor still lets every one of them
-through. A **ceiling** is the only thing that separates the two populations:
-
-| | Window | What it means | What the digest does |
-|---|---|---|---|
-| chase | `CONNECT_REMINDER_DAYS` … `CONNECT_REMINDER_MAX_DAYS` (7–30) | contacted recently, hasn't connected yet | one line per row: *"start interacting"* |
-| **cold** | older than `CONNECT_REMINDER_MAX_DAYS` (30) | contacted long ago, never got anywhere | **one line for all of them** |
-
-```
-• 756 cold contacts across 209 companies (never connected, first contacted
-  Mar-Jul 2026) — ask 'cold list' to see them.
-```
-
-**That line is not capped.** It sits outside `URGENT_MAX`, `DIGEST_MAX_ITEMS` and
-`UPDATE_TRACKER_MAX` alike, because a count of suppressed rows that could itself
-be suppressed would be worse than not suppressing anything — it would just be a
-bot quietly hiding 756 rows. Asking **`cold list`** returns the whole thing,
-uncapped and grouped by company, oldest first, since the decision it supports is
-per-company (*"do we go back at OLX at all?"*) rather than per person.
-
-**Only rule (c) is suppressed, not the row.** A March row that is still being
-followed up every week is live work, and its (a), (d) and (e) lines still fire.
-What's wrong on it is specifically the nudge to *start*, which is five months out
-of date. Cold rows are also **not rejected** — nobody said no, they just never
-answered — and the `cold_list` tool says so, because the two get confused.
-
-`CONNECT_REMINDER_MAX_DAYS=0` turns the ceiling off and goes back to chasing all
-756 individually.
-
-### Three budgets, and the urgent items are never truncated
-
-One number could not serve them, so there are three:
-
-| Budget | Default | Covers | Truncates? |
-|---|---|---|---|
-| `URGENT_MAX` | **25** | (f) positive replies awaiting a next step, (h) meetings inside `MEETING_PREP_DAYS`, (i) post-meeting gaps | **No** — a hard ceiling against a broken sheet, not a target |
-| `DIGEST_MAX_ITEMS` | **15** | everything else in the cadence — a, b, c, d, e, g, j | yes, counted in the closing line |
-| `UPDATE_TRACKER_MAX` | **5** | the fill-in asks, the master/tracker disagreements, the sheet-health flags | yes, counted in the closing line |
-
-**The urgent items are what Vaishnavi prioritised, so truncating them defeats the
-digest.** Sharing one fifteen-item budget with the rest of the cadence, the live
-sheet's sixteen urgent rows filled the entire digest on day one — and one row
-later would have started cutting the positives themselves. `URGENT_MAX` exists
-only so that a broken sheet (a column that suddenly reads as positive on every
-row) cannot produce a thousand-line message; if it is ever actually hit the bot
-logs a warning saying so, because that is a bug to look at rather than a number
-to raise.
-
-The **cold summary** is outside all three, as above.
-
-### The cap is honest
-
-What doesn't fit is counted in one closing line:
-
-```
-_218 more held — ask 'full cadence list' for everything._
-```
-
-Asking that returns the **uncapped** list — cadence items *and* tracker asks,
-ranked, with every item's rule letter and priority — the `cadence_list` tool,
-which obeys the same mention-only gate as every other answer. `cold list` does
-the same for the cold cohort. A silently truncated list would read as "there were
-only fifteen things", and that is a lie the digest cannot afford to tell.
+A ping needs **both** an id and roster membership — `guardrails.mention_for` is
+the roster gate and it fails closed by naming the person in plain text instead.
 
 ### Sheet-health flags, deduped until fixed
 
@@ -992,374 +1308,454 @@ reported is **not repeated** — a daily reminder about a `#REF!` everybody alre
 knows about is exactly the drip that gets a digest muted. Fix half of it and the
 signature changes, so the remaining half is reported again. The recording happens
 **after** the digest actually posts, so a refused send can't silence a flag for
-good. `full cadence list` ignores the dedup entirely: somebody asking what is
-wrong with the sheet wants the whole answer.
+good.
 
-### Meeting-prep briefs
+The row-level checks (misaligned rows, stray response values) run on **active
+rows only** — a response value nobody standardised is worth reporting on a row
+somebody is working, not on two hundred nobody has contacted. Broken formulas
+are counted across the whole tab: a `#REF!` belongs to the tab rather than to a
+row's readiness, and whoever fixes it needs the full count.
 
-A meeting inside `MEETING_PREP_DAYS` earns **one** brief, attached to that day's
-digest and **deduped in SQLite** (`prep_briefs`) so it is written once per meeting
-rather than every day until the meeting happens. Moving the meeting to a new date
-legitimately earns a fresh brief.
+### Meeting-prep briefs — dormant
 
-It assembles — and asserts nothing beyond — these four sources:
+A brief is company + PoC, the mapped researcher row **with its caveats**, the
+matching pitch from the positioning matrix, and anything on file from past
+meeting notes — deduped in SQLite (`prep_briefs`) so it is written once per
+meeting rather than every day until the meeting happens.
 
-| Source | What it contributes |
-|---|---|
-| Outreach tracker | company, PoC, designation, vertical, industry, the full history, assets shared, next steps |
-| Researcher Buyer Mapping | the PoC's mapped row: role, evidence, pitch hook, watch-outs — **with its caveats**, via `MAPPING.enrich()` |
-| Positioning matrix | the matching use case, problem statement, offering and business impact |
-| Meeting notes | anything on file about the same company, **each line carrying its meeting citation**, and an opening `⚠ ON HOLD — …` line when a meeting parked the account |
+**Nothing triggers one today.** The brief was selected by phase-1 rule (h), which
+is retired, so the MEETING PREP section of the digest is always empty. `prep.py`
+is unchanged and still builds a brief; only the proactive trigger is gone.
 
-**Online research is not included, and the brief says so.** This bot has no web
-access, so every brief carries:
-
-```
-**External / online research — pending web access decision**
-  · Not included. This bot has no web access, so nothing here comes from outside
-    the sheets and the meeting notes above. Recent news, funding, headcount and
-    product launches have NOT been checked — look them up yourself before the call.
-```
-
-That section is deliberate rather than an omission: a brief that quietly left
-external research out would read as *"there was nothing to find"*. Nothing
-external is inferred, guessed or filled in from the model's own knowledge, and a
-blank cell renders as **"not recorded"** — never as a confident sentence. The
-person reading a brief is about to repeat it out loud in a meeting.
+The settings (`CADENCE_PREP_*`) and the SQLite dedup record are kept: throwing
+that record away would mean re-briefing every meeting already covered the day a
+phase-2 rule turns this back on.
 
 ### Seeing it before you trust it
 
-At every startup the bot runs the cadence and **logs which rows each rule fires
-on today**, with the cap applied and the reason in terms of the cells it read. It
-sends nothing.
-
-It opens with **which real tab matched which role**, because "the cadence found
-no rows" is almost always "the tracker was read as something else today":
+At every startup the bot logs **what it is actually reading**, and sends nothing.
+Four things fail silently on a live sheet, and all four are in this one report:
 
 ```
-[gtm.roles] outreach_tracker   TRACKER — the cadence source (the only tab with dates) -> 'Outreach Updates'
-[gtm.roles] master_data        MASTER — status only (aggregates, funnel, cross-check) -> 'Master Data'
-
-[cadence.dryrun] (a) stale_followup          65 item(s)
-[cadence.dryrun]       · Acme Labs / Priya R [row 2] [waiting]
-[cadence.dryrun]         why: Last followed up date is '2026-08-10'; threshold is 5d.
-[cadence.dryrun] (cold) cold_summary            1 item(s)
-[cadence.dryrun]         why: Past the 30d cold ceiling, so rule (c) does not chase
-[cadence.dryrun]              them individually; the oldest was first contacted 166d ago.
+[sheet.world] CANONICAL TAB: 'Outreach PoCs'   (found by NAME, from GTM_POCS_TAB_TITLES)
+[sheet.world]   rows: 886   columns: 23   header row: 1
+[sheet.world]   discovered schema:
+[sheet.world]       A  Sr. No.                -> sr_no             [RESTRICTED]
+[sheet.world]       B  Company                -> company           [RESTRICTED]
+[sheet.world]       J  First Contact Date     -> first_contacted
+[sheet.world]       K  Connection Date        -> connected
+[sheet.world]       S  Formula2                  (no role)         [RESTRICTED]
+[sheet.world]
+[sheet.world] WRITE LOCK
+[sheet.world]   restricted (never written): 'A:I,S:X'  -> A:I, S:X
+[sheet.world]   writable window between the bands: J:R
+[sheet.world]   reading is UNRESTRICTED — this is a write lock only.
+[sheet.world]   named columns inside the window (9):
+[sheet.world]     J='First Contact Date' [first_contacted]
+[sheet.world]     K='Connection Date' [connected]
+[sheet.world]
+[sheet.world] ROW ACTIVATION — a row is ACTIVE only with a first-contact or connection date
+[sheet.world]   active rows considered:   12
+[sheet.world]   inactive (never looked at): 874
+[sheet.world]   active but rejected:      1
+[sheet.world]   explicit activations held: 3
+[sheet.world]
+[sheet.world] CADENCE
+[sheet.world]   The phase-1 rules (a-j), the cold ceiling, the fill-in asks and the
+[sheet.world]   master cross-check are RETIRED.
 ```
 
-The same report runs standalone, against the live sheet or against built-in
-fixture rows:
+1. **the canonical tab was renamed** → there is no tab at all;
+2. **a column was renamed** → a role is unmapped in the schema dump;
+3. **the activation columns are colour-coded or empty** → every row reads as
+   inactive and the bot has nothing to talk about;
+4. **the restricted bands have drifted** → the writable window points at a
+   column somebody is using.
+
+It replaced the phase-1 cadence dry run, which printed which rows each lettered
+rule fired on. Those rules are retired, so that report would now be a page of
+zeroes; these four numbers are what actually decides whether the bot can see
+anything today.
+
+The module's own checks run standalone, offline:
 
 ```bash
-python cadence.py            # the real tracker tab; read-only, sends nothing
-python cadence.py --demo     # fixture rows: no sheet, no network, no database
+python cadence.py            # rejection, the retired rules, run(), the bands
 ```
 
-`--demo` is a real test of the rules rather than of the network: it asserts that
-every rule fires on its row, that a rejected row produces **no chase** (only its
-one per-company suggestion), that a blank follow-up count becomes an ask rather
-than a chase, that a row past the cold ceiling produces **no individual item** but
-**does** produce the uncapped summary line, that no urgent item was truncated,
-and that the cross-check and sheet-health flags fire.
+It asserts that a rejected row is excluded, that `evaluate_row` fires **nothing**,
+that `run()` reports the active / inactive / rejected counts separately, that a
+stray response value is still flagged, and that the restricted-band check
+classifies A, J and S correctly.
 
-Everything also lands in `audit.jsonl` as usual — a `cadence_dry_run` record at
-startup (carrying the tab-role map), a `meeting_prep_brief` record per brief
-written, and a `sheet_quality_flag` record per sheet-health flag reported.
+Everything also lands in `audit.jsonl` — a `sheet_world` record at startup
+(carrying the tab, both row counts and the writable window), a `rows_activated`
+record per explicit activation, and a `sheet_quality_flag` record per
+sheet-health flag reported.
 
 ---
 
-## The one daily digest
+## The drip — a few short messages a day
 
-**Every proactive thing this bot has to say goes out once a day, in one message,
-at `SALES_DIGEST_TIME` (default `10:00`, wall-clock IST), in the sales channel.**
+**The one daily digest is retired.** One message at 10:00 carrying HOT /
+DEADLINES / OVERDUE / ESCALATIONS / HYGIENE plus five cadence sections, a
+tracker reminder, a to-do line and a funnel block, every item stamped
+*"(3rd day)"* — that format is gone, and so is `SALES_DIGEST_MAX_PER_SECTION`.
 
-This is not a preference expressed in a prompt and it is not a rate limit that
-could be relaxed. The individual deadline-reminder, deadline-chase, promise-nudge,
-give-up-flag, row-flag and weekly-funnel send paths were **deleted** from
-`bot.py`. What each of them used to say is now a *line* in one message, and
-`_maybe_post_daily_digest` is the only proactive send left in the file. If you
-want the bot to tell the team something new, add a section in `digest.py` — do
-not add a `guardrails.send`.
+**Why.** The digest existed because six kinds of scattered message got the bot
+muted. It solved that and created the opposite problem: a wall of sections reads
+like a report, gets skimmed, and asks a person to find their own name in it and
+work out which three of forty lines are theirs.
 
-The reason is not tidiness. A bot that drips six kinds of message through the day
-gets muted, and a muted bot enforces nothing — which makes every rule in this
-README decorative.
+The drip keeps the volume contract that made the digest worth having and spends
+it differently:
 
-### What's in it, hot first
+> **One message per (action type × owner). Companies comma-separated, in one
+> sentence. Never two types in a message. Never two owners.**
 
-The five cadence sections are in **Vaishnavi's daily-cadence order** — *"Follow-ups
-for this week · Intros to be done this week · Meetings for this week · Update
-tracker · Assets to be shared this week"*.
+That rule is the whole design. A message with one subject and one owner is
+answerable — *"yes, done"* means something. A document is not.
 
-```
-**Daily sales digest — Tue 25 Aug 2026**
+### The volume contract (plan §8)
 
-**HOT — they replied, nothing has gone back (1)**
-• HOT — OpenAI · Sam Altman, CTO: they replied on Mon 18 Aug and the last follow-up
-  (Fri 15 Aug) predates it. (3rd day)
-
-**FOLLOW-UPS for this week (4)**
-@Vaishnavi
-• 756 cold contacts across 209 companies (never connected, first contacted
-  Mar-Jul 2026) — ask 'cold list' to see them.
-• Cinder · Dev M — first contacted 27d ago and still not connected. Start interacting.
-• Acme Labs · Priya R — last followed up 18d ago, still no response. Follow up or park it.
-• Gantry — Ivan S said no. Nobody else there is in play; try a different PoC.
-  Mapped alternatives: Dr Ada Vance (mapped 5 wks ago).
-
-**INTROS to be done this week (1)**
-@Vaishnavi
-• Borealis · Sam K — connected, but no membrane intro date recorded. Intro pending.
-
-**MEETINGS for this week (2)**
-@Vaishnavi
-• Fathom · Lea W — responded (P) with no next step recorded. Lock a meeting.
-• Ionic · Tara B — meeting in 2d (Sun 30 Aug 2026). Prep it.
-
-**UPDATE TRACKER (4)**
-@Vaishnavi
-• Everest · Rob N — 8 follow-ups, no response. Please mark Rob N "unresponsive"
-  in the tracker (I don't write that cell).
-• Tab 'Master Pipeline' has 1 cell(s) holding a spreadsheet error (#REF!) in
-  'Outreach Line - Researchers'. I read those as EMPTY — a broken formula is not
-  a value.
-• Anthropic · Sandeep Jha — master and tracker disagree: Intro Sent / membrane
-  Intro Date: master says 'No', tracker says yes. Please fix whichever is wrong
-  (I don't guess which).
-• OpenAI · Mark Chen — no last-followed-up date. Update the tracker.
-
-**ASSETS to be shared this week (1)**
-@Vaishnavi
-• Halcyon · Mei L — met 7d ago, no next steps. Send what you promised and write
-  the next step.
-
-_218 more held — ask 'full cadence list' for everything._
-
-**DEADLINES — due today or tomorrow (2)**
-• @Vaishnavi — Emami — the follow-up is due today (Tue 25 Aug 2026).
-• @Kushal — Nykaa — the reply chase is due tomorrow (Wed 26 Aug 2026).
-
-**OVERDUE (3)**
-• @Vaishnavi — OpenAI follow-up overdue 2 wd (3rd day); Emami deck due today
-• @team — Nykaa reply chase overdue 4 wd (2nd day)
-
-**ESCALATIONS — asked enough, needs a decision (1)**
-@Kushal
-• Zomato — the meeting prep was due Fri 21 Aug (overdue 2 wd) and I've asked
-  2 time(s) with nothing back. (4th day)
-
-**WEEKLY FUNNEL**
-Window 2026-08-18 → 2026-08-25
-LEADING — outreach sent 12 · replies 3 (25.0%) · meetings booked 2 · follow-ups done 8 vs 5 due
-LAGGING — pilots 1 · paid 0 · repeats 0
-
-**HYGIENE — stalled and dead-deal rows (6)**
-• STALLED — Acme · Priya, VP Eng: no response and the last touch (Last followed up
-  date: Mon 11 Aug) was 9 working days ago.
-• …and 15 more hygiene item(s) — ask me for the full list.
-```
-
-| Section | What it holds |
+| | |
 |---|---|
-| **HOT** | Inbound replied, no follow-up from us. First, because a prospect who answered and heard nothing back is the most expensive failure in the sheet. |
-| **FOLLOW-UPS this week** | Cadence rules a, c, d, g — cold follow-ups, never-connected rows, rows worth another channel, companies where the PoC said no. |
-| **INTROS to be done** | Cadence rule b — connected, no membrane intro date. |
-| **MEETINGS this week** | Cadence rule f and meetings inside `MEETING_PREP_DAYS`. |
-| **ASSETS to be shared** | Cadence rule h — a meeting happened and nothing followed it. |
-| **UPDATE-TRACKER reminders** | Cadence rules e and i — gaps the row's owner should fill, including the ask to mark a PoC unresponsive. |
-| **DEADLINES** | Due today or on the next working day, addressed to the owner. |
-| **OVERDUE** | Chases and deadlines past due, **grouped per owner with one @mention each**, every item carrying its working-days-overdue age. |
-| **ESCALATIONS** | Past `COS_NUDGE_MAX_ATTEMPTS` → addressed to `ESCALATE_TO_ID` (Kushal), at the bottom, because it is the only part written for one person. |
-| **HYGIENE** | Stalled and dead-deal rows — the flags that used to post separately. |
-| **MEETING PREP** | One brief per meeting inside `MEETING_PREP_DAYS`, written once. Reference material, not a task — which is why it sits last and does not count towards "is there anything to post today". |
+| **At most** | `DAILY_MESSAGE_CAP` (3) proactive messages per **weekday** |
+| **First at** | `SALES_DRIP_START` (10:00 IST) |
+| **Then** | gaps of `MESSAGE_GAP_MINUTES` (90) ± `MESSAGE_JITTER_MINUTES` (15) |
+| **Floor** | 90 − 15 = **75 minutes**, never less |
+| **Overflow** | **rolls to tomorrow** — never dropped |
+| **Empty queue** | **silence.** There is no "nothing to report" message |
 
-**One @mention per person.** Someone with four overdue items gets one line and
-one ping, not four. That grouping is the anti-nag rule in code
-(`digest.group_by_owner`); items nobody owns fall into a single trailing line
-addressed to `DEADLINE_NOTIFY_IDS`.
+**The positive-override exception to the roll.** Overflow normally waits. A group
+in the override band does not: it is ranked first, so it takes a slot today by
+construction — and a group that rolled yesterday and has since become an override
+leads the next morning rather than queuing behind the same groups again. No
+special case; just an ordering that re-evaluates daily.
 
-### Once a day, across restarts
+**Replies are immediate.** The spacing is for *proactive* sends only. Someone
+asking a question gets an answer straight away, and so does the ask-time deadline
+announcement.
 
-The date of the last digest is persisted in SQLite (`meta.sales_digest_date`),
-written **after** the message posts. It is a date, not a timer, so a redeploy at
-10:05 reads it back and stays quiet. If the marker can't be read at all the bot
-does not post: a duplicate digest is worse than a missed one.
+### The jitter is deterministic, and that is a correctness property
 
-The digest can only go out on a sweeper tick, so it posts at the first tick at or
-after `SALES_DIGEST_TIME` (keep `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` well under
-an hour). One consequence worth knowing: if a day would have been empty at 10:00
-and a hot row turns up at 14:00, the digest goes out at 14:00. That is still one
-digest, and holding a replied-to prospect for twenty hours to protect a schedule
-would be the wrong trade.
-
-### Carry-forward, and why there is no "resolved" line
-
-An unresolved item **reappears in the next digest wearing its age** — `(3rd day)`.
-An item resolved during the day (a date filled in, a reply sent, a promise kept)
-simply isn't collected any more and drops out silently. There is no "resolved"
-message: announcing resolutions would double the volume of the thing the digest
-exists to reduce, and the team already knows what they fixed.
-
-The age lives in the `digest_items` table, not in memory, so a redeploy doesn't
-reset every item to day one — an item's age is the most useful thing on its line,
-and one that silently restarts after every push is worse than no age at all.
-`db.note_digest_item` is idempotent per day, so a retry after a refused send
-doesn't age everything twice, and an item that vanished for more than a week and
-came back starts again at day one (a deal that went quiet in March and stalled
-again in August is on its first day of *this* problem).
-
-### Empty day = no digest
-
-If nothing is outstanding, nothing is posted. The bot never says "nothing to
-report" — that is a message with no information in it, and posting one teaches
-people the digest can be skipped. The once-a-day marker is deliberately *not*
-written on an empty day, so something that turns up in the afternoon still gets
-said that day.
-
-### The kill switch: `SALES_DIGEST_ENABLED`
-
-Setting `SALES_DIGEST_ENABLED=false` stops **every unprompted message**: the daily
-digest and, because none of them has a send path of its own, every section that
-rides inside it — cadence lines, the tracker-update reminder, meeting-prep briefs,
-escalations, the weekly funnel block. Nothing else changes. Deadlines are still
-tracked, cadence is still evaluated, SQLite state and `state/audit.jsonl` are still
-written, and the bot still answers normally when someone @-mentions it ("full
-cadence list", "run a hygiene check", any sheet question), including the ask-time
-deadline announcement, which is a reply rather than an interruption; `--dry-run-digest`
-still prints the whole digest, so you can read what is being held back. The flag is
-read **at digest time, not at boot** — the `.env` file first, then the process
-environment — so flipping it takes effect on the next sweep tick without a restart.
-Each skipped digest logs exactly one line, `[digest] suppressed — SALES_DIGEST_ENABLED=false`,
-once per day rather than once per tick, so the silence reads as deliberate in
-`pm2 logs sales-bot` instead of looking like a dead bot. Turning it back on **resumes
-at the next scheduled digest and never replays the missed days**: a suppressed day
-builds nothing and queues nothing, and the once-a-day marker is left untouched while
-the switch is off, so there is no backlog to unwind — the first digest afterwards
-simply reports what is outstanding then, which carry-forward already keeps accurate.
-
-### One message, even when it's long
-
-If the body exceeds Discord's 2000-char limit it is split on line boundaries by
-the same splitter the answer path uses and posted as **consecutive parts of one
-digest** — `part 1 of 2`, `part 2 of 2`, back to back, in order, each audited
-with its part number. Nothing is clipped: the per-section caps
-(`SALES_DIGEST_MAX_PER_SECTION`, default 15; ESCALATIONS is never capped) have
-already bounded the length, and they say how many items they left out rather than
-dropping them silently.
-
-### The tracker reminder is a **section**, not a message
-
-Vaishnavi's twice-weekly *"update the tracker"* prompt goes out on
-`TRACKER_REMINDER_DAYS` (**Mon and Fri** by default) as a **section of that day's
-digest**, immediately after `UPDATE TRACKER`:
+The offset for each slot is seeded on **(date, slot)** and nothing else — never
+the clock, never the process. Every sweep tick recomputes the identical
+schedule, which is what makes the restart guard work:
 
 ```
-**UPDATE THE TRACKER — the twice-weekly check (3)**
-@Vaishnavi
-• Monday tracker check — update the outreach tracker: last followed-up date,
-  total follow-ups, response, meeting date, next steps. 110 row(s) of 886 have
-  no follow-up count or last-followed date, so no date rule can fire on them
-  at all.
-• The outreach tracker must be updated at the start and end of every week.
-  (Sales Bot Discussion, 2 Sep)
-• Update the tracker with last-followed-up dates for every open row.
-  (Sales Bot Discussion, 2 Sep)
+drip_sends  (on_date, slot) UNIQUE
 ```
 
-**There is no `_post_tracker_reminder` anywhere in the code, and there must
-never be one.** The reminder cannot reach the channel except through the digest.
-That is what keeps "exactly one unprompted message a day" a property of the code
-rather than a promise — and it also means the reminder and the `UPDATE TRACKER`
-section above it arrive together instead of as two prompts about the tracker
-minutes apart, which is how a channel gets muted.
+One row per message that actually went out. A redeploy at 11:40 recomputes the
+same times, sees slots 1 and 2 in SQLite, and resumes at slot 3. It replaces the
+digest's single `sales_digest_date` marker, which only had to answer *"did
+today's one message go out"*. `UNIQUE (on_date, slot)` also means two ticks
+racing on a slot cannot both send: the loser's INSERT fails and it stops.
 
-The count in the lead line comes from the cadence that ran seconds earlier
-(`fill_in`), not from a second read, so the reminder can never disagree with the
-section above it. The lines that quote a meeting carry **that meeting's
-citation** — see [Citing meetings](#citing-meetings).
+**Catch-up is paced too.** After a quiet morning — the kill switch off until
+14:00, an outage — slots 1, 2 and 3 are all past due at once. The gap is measured
+from the **last actual send**, not the planned time, so the backlog drains at the
+drip's own pace instead of arriving as a burst. *(This was a real bug found by
+the simulation below and fixed.)*
 
-It posts even on a day with nothing else outstanding. That is the one exception
-to *empty day = no digest*, and it is deliberate: the reminder is a real ask, so
-it is worth the day's one message. Mechanically it is an item carrying
-`forces_digest`, which `digest.total_items` counts but `_age_digest_items` never
-ages — *"(3rd day)"* on a standing twice-weekly reminder would be nonsense.
+### One gentle re-ask, and only one
 
-### Audit trail for the whole one-message rule
+| State | What happens |
+|---|---|
+| never asked | **nudge** |
+| asked < `DRIP_REASK_DAYS` (2) ago | **hold** — they have not had time |
+| asked ≥ 2 days ago, never re-asked | **one re-ask**, softer, saying it is the last |
+| already re-asked | clock resets — the next ask is an ordinary nudge |
 
-Three send sites exist in `bot.py`, and only one of them is proactive:
+The reset is what stops this becoming an escalation ladder. A subject that stays
+undone for a month is asked about every few days in the same tone, not louder
+each time. Two asks is a reminder; three is nagging — which is where this whole
+design started.
 
-| Where | What | Proactive? |
+### Suppress-or-convert — check before you nudge
+
+**Before any proactive message sends**, the bot looks for evidence that the thing
+it is about to ask for has already happened — in the synced meeting notes and in
+what the team said in the sales channels.
+
+**Evidence does not silence the nudge. It changes what the nudge is.**
+
+| | |
+|---|---|
+| **task** | *"Vaishnavi — has the DM to Sahaj gone out?"* |
+| **offer** | *"Looks like Sahaj Labs · Sahaj is already handled — meeting booked with Sahaj Friday 3pm (Vaishnavi in channel, Tue 08 Sep 2026). Want me to mark the meeting as booked on the row? Just say yes, or ignore me if I have got it wrong."* |
+
+Suppressing would leave the row wrong **and** tell nobody, and a bot that goes
+quiet is indistinguishable from one that has broken. The offer closes the loop
+with one word back.
+
+**"Yes" applies exactly what it showed you.** The proposed fields are stored on
+the drip row when the offer goes out, so a bare affirmative has something
+concrete to apply — and it goes through `sheetwrite.plan_writes` like any other
+update, so the tiers, the bands, the fill rule and the ceiling all still hold. An
+offer cannot reach a cell an ordinary reply could not. `is_affirmative` is
+anchored at both ends: *"yes, but change the date to Friday"* does **not** match,
+because that is a different instruction and belongs to the extractor.
+
+#### Evidence is a ladder, not a lookup
+
+| Stage | Means | Converts |
 |---|---|---|
-| `_post_digest` | the daily digest | **yes — the only one** |
-| `_reply` | an answer to a question | no — someone asked |
-| `_set_deadline_for` | the ask-time deadline announcement | no — someone asked, and it carries the "shout to change" consent |
+| 4 · quoted | quote / proposal / pricing sent | quote chases |
+| 3 · meeting | meeting or call booked, invite sent | meeting proposals, and everything below |
+| 2 · replied | they replied, came back, heard back | progress checks, and everything below |
+| 1 · touched | DM sent, followed up, chased, emailed | DM checks, follow-ups, channel switches |
 
-Everything the bot has to say proactively is a **section** of the first one. If
-you are adding something, add a section to `digest.py`; do not add a
-`guardrails.send`.
+Evidence **at or above** a nudge's stage converts it. That is the case that
+matters most: chasing a DM the morning after the meeting was booked is not
+slightly wrong, it is the thing everyone in the channel can see is wrong.
 
-### The exceptions
+`mark_unresponsive` and `pulse_check` are deliberately **not** convertible —
+"they are unresponsive" is a judgement nobody records in passing, and a parked
+deal has nothing that would count as already done.
 
-Two things are still immediate, because both are **answers rather than
-interruptions**:
+#### Two things it took a real test to get right
 
-1. **A reply to a question.** Someone asked; the bot answers.
-2. **The ask-time deadline announcement.** "Setting the follow-up for Emami to
-   Wed 26 Aug … shout to change" is what someone just asked for, and the
-   "shout to change" invitation is the consent mechanism — see
-   [Deadline authority](#deadline-authority). Holding it for the next morning
-   would answer a question a day late.
+**The phrases are past tense.** *"Will send"* and *"should book"* are the
+opposite of evidence — they are the thing the nudge is about — and a matcher that
+caught them would convert exactly the nudges that most need to go out as tasks.
 
-### Audit
+**It matches on how people actually name an account.** The sheet says *"Sahaj
+Labs"*; the channel says *"Sahaj"*. The first version matched only the full
+company string and found **nothing** on a realistic message. It now builds an
+identifier set — the company, its distinctive words (4+ characters, skipping
+generic suffixes like *labs*, *inc*, *technologies*), and the PoC's name and
+first name — and any of them counts.
 
-Every digest writes one `daily_digest` line to `state/audit.jsonl` with the date,
-the channel, the message id, the total item count and a per-section count
-(`n_hot`, `n_deadlines`, `n_overdue`, `n_escalations`, `n_hygiene`, `n_funnel`,
-`n_tracker_reminder`, `n_todos`, `n_plan`),
-so an operator can see the shape of a day without reading the message. The
-attempts and escalations the digest spends are audited individually too
-(`chase_nudged`, `deadline_chase`, `chase_given_up`, `deadline_escalated`) — and
-they are recorded **after** the send, so a refused digest never burns a chase
-attempt.
+#### Everything is quoted, and everything is logged
 
-### Settings
+Every conversion names **what it found and where**: the meeting and its date, or
+the author and theirs. A bot that says *"I think this is done"* without saying why
+is asking to be trusted on a guess, and the first time it is wrong it will not be
+trusted again.
 
-| Var | Default | What it does |
-|---|---|---|
-| `SALES_DIGEST_ENABLED` | `true` | The kill switch. `false` → the bot sends **no** unprompted messages at all, while still computing and still answering when asked. Read at digest time, so no restart is needed. See [the kill switch](#the-kill-switch-sales_digest_enabled). |
-| `SALES_DIGEST_TIME` | `10:00` | Wall-clock IST (Asia/Kolkata, computed explicitly — never the server clock). |
-| `SALES_DIGEST_MAX_PER_SECTION` | `15` | Items shown per section; the overflow is counted, not dropped. |
-| `SALES_DIGEST_CHANNEL_ID` | unset | Must be in `SALES_CHANNEL_IDS`; unset → `SALES_ASK_CHANNEL_ID`, else the first sales channel. |
-| `URGENT_MAX` | `25` | Hard ceiling on the urgent items (f, h, i). They are **never truncated** in practice — this only guards against a broken sheet. |
-| `DIGEST_MAX_ITEMS` | `15` | **Non-urgent** cadence items carried, across all five sections combined. |
-| `CONNECT_REMINDER_MAX_DAYS` | `30` | The cold ceiling: never-connected rows older than this are counted in one line instead of chased. `0` turns it off. |
-| `UPDATE_TRACKER_MAX` | `5` | A **separate** budget for the "update the tracker" asks, so a sparse sheet's fill-in requests can't eat the fifteen. |
-| `SALES_DEFAULT_OWNER_ID` | unset | Who every cadence line is addressed to, since the tracker has no owner column. Must also be in `TEAM_ROSTER_IDS` to be pinged. |
-| `CADENCE_CROSSCHECK_ENABLED` | `true` | The nightly master/tracker consistency check. Reports disagreements; never picks a winner. |
-| `CADENCE_DATA_QUALITY_ENABLED` | `true` | The sheet-health flags (broken formulas, misaligned master rows, stray response values), deduped until they change. |
-| `TRACKER_REMINDER_ENABLED` | `true` | The twice-weekly tracker reminder **section**. It has no send path of its own, so `SALES_DIGEST_ENABLED=false` also silences it — it is still built on those days, so it reappears the moment the switch goes back on. |
-| `TRACKER_REMINDER_DAYS` | `mon,fri` | Which days carry it. `mon`..`sun` or `0`–`6`, comma separated. |
-| `TODO_REFRESH_DAY` | `fri` | Which day's digest refreshes the to-do sheet and carries its one line. |
-| `STRATEGY_CHECK_ENABLED` | `true` | The weekly `AGAINST THE PLAN` block, on `WEEKLY_DIGEST_WEEKDAY`. A report, never an item — it can't make the digest post. |
+Each one writes a `nudge_conversions` row (the sentence, the source, the
+citation, the fields offered) and a `nudge_converted` line in `audit.jsonl`. A
+conversion is a judgement, and a wrong one is otherwise invisible — the symptom
+is a nudge that arrived as a strange offer instead of a question.
 
-### Seeing tomorrow's digest before it goes out
+Only ever looks back **`NOTES_LOOKBACK_DAYS` (7)**. A note from three weeks ago
+saying *"we'll book something"* is not evidence that a meeting exists now.
+
+The check runs **immediately before the send**, not at plan time: the queue is
+planned hours ahead, and evidence has to be as fresh as the message.
+
+### Research briefs — mention-triggered, and copy material
+
+> *"brief me on Sahaj (Sahaj Labs)"*
+
+Five things, in order: **who they are** · **how much the role weighs** ·
+**what of their work maps to our lanes** · **the angle** · **a draft message**.
+
+**It is never sent and never written to the sheet.** The bot has no outbound
+channel to a prospect and this does not give it one — it hands a human a draft to
+edit. There is no scheduled brief and no brief attached to a nudge; somebody
+asks, or nothing happens.
+
+**Role weight is a judgement made explicit.** Someone who has led a lab since its
+inception can say yes; a recent MTS has to ask, and the outreach should be written
+to be forwarded upward. The brief states which it thinks it is looking at **and
+why, in one sentence**, so a wrong read is arguable rather than buried.
+
+**The lanes come from the team's own documents** — `sales_policy.md` and the
+strategy doc, read at brief time. Re-writing the positioning changes the briefs
+with no code change.
+
+#### What it may fetch
+
+1. **Only URLs already on that person's row.** No web search, no following links
+   out of a fetched page, no guessing a URL from a name. No links on the row and
+   the brief says so and stops.
+2. **Only `RESEARCH_ALLOWED_DOMAINS`** (default `arxiv.org`). Matched on the
+   registered domain and its subdomains — `export.arxiv.org` passes,
+   `notarxiv.org` does not. Anything else is **refused with a one-line note
+   naming the domain**, repeated verbatim in the brief:
+
+   ```
+   I did not fetch: https://linkedin.com/in/x — linkedin.com is not in
+   RESEARCH_ALLOWED_DOMAINS (arxiv.org).
+   ```
+
+   Named rather than skipped, because nobody should read a partial brief as a
+   complete one.
+3. **Bounded** — `RESEARCH_FETCH_TIMEOUT_SECONDS`, `RESEARCH_FETCH_MAX_BYTES`,
+   `RESEARCH_MAX_LINKS`. A slow or enormous page degrades the brief instead of
+   hanging an answer somebody is waiting on. The allow-list is re-checked inside
+   `fetch()` itself, not trusted from the caller.
+
+#### LinkedIn is API-or-nothing
+
+With `LINKEDIN_API_*` credentials the LinkedIn half runs. Without them — the
+current state — the brief says so, **in those words**:
+
+> LinkedIn access is pending — no API credentials are configured. I have NOT
+> scraped anything to fill the gap and will not: their terms forbid it. So the
+> role and tenure below come from the sheet alone, and may be out of date.
+
+There is no scraping fallback and there must not be one. A career history quietly
+missing from a brief reads as *"this person has no notable history"*, which is a
+different and wrong claim.
+
+### Events & summits
+
+The playbook's **Events & Summits** tab. Each event earns **one** reminder, at
+**`EVENT_LEAD_DAYS` (20)** out, and never another.
+
+**Once, forever.** The dedup is a permanent `event_reminders` row, not a per-day
+marker: a conference the team has already decided about does not need reminding
+twice, and *"we mentioned it in March"* is not a reason to mention it again in
+April. The key is the event's **name and its date**, so an event that **moves**
+earns a fresh reminder — the new date is new information — while re-reading the
+same row tomorrow does not.
+
+**T-20 is a window, not an exact day** (the event falls between today and T+20).
+The drip can only speak when a slot is free, and an exact-day test would drop a
+once-forever reminder entirely on a busy Tuesday.
+
+**The reminder is recorded only once the message has landed.** Recorded before
+the send, a refused message would burn an event's single reminder forever — and
+*forever* is not a word to be careless with. The lookup **fails closed**: if the
+table cannot be read the event is treated as already reminded, because a
+duplicate is the exact thing it exists to prevent.
+
+**A past event is never reminded about.** Obvious, and worth stating: the sheet
+keeps last year's conferences.
+
+It **rides the drip** — grouped, ranked, spaced and counted against
+`DAILY_MESSAGE_CAP`, with the kill switch applying. The event's name goes in the
+company slot, so a message about three summits reads exactly like one about three
+accounts.
+
+### The weekly funnel line — opt-in
+
+One short Friday message: leading counts, then lagging. Nothing else.
 
 ```
-python -m main --dry-run-digest              # today
-python -m main --dry-run-digest 2026-09-07   # a Monday
+This week: 12 outreach, 3 replies, 2 meetings booked and 8 follow-ups.
+Landed: 1 pilots, 0 paid and 0 repeats. Nothing needed from you — just so it is
+written down somewhere.
 ```
 
-Builds the whole message for that day and prints it. It connects to nothing,
-**sends nothing, creates nothing and ages nothing** — no Discord message, no
-carry-forward ageing (so tomorrow's real digest isn't a day older than it should
-be), no sheet created, no to-do row appended. This is how you check that the
-Monday reminder really is a section of one message rather than a second message,
-without waiting for a Monday.
+**Counts only.** No commentary, no trend, no *"up 12% on last week"* — the bot
+does not have enough weeks of clean data to say anything about a trend, and a
+confident sentence about noise is worse than a number. **Zeros stay in**:
+dropping them would turn a bad week into a short sentence and a good week into a
+long one, which is exactly the quiet editorialising a counts-only line exists to
+avoid.
 
-The one side effect it cannot avoid is the cadence's next-step clock, which
-counts days *observed* — the startup dry run already advances it for the same
-reason.
+**`WEEKLY_FUNNEL_ENABLED` defaults to false**, per the plan. A weekly number
+nobody asked for gets skimmed, and it spends one of the day's three slots. It is
+ranked **last** in the queue, so it can never take a slot from a reply somebody is
+waiting on.
+
+### The kill switch: `SALES_DIGEST_ENABLED` — unchanged
+
+**Same name, same semantics, same log line.** The drip *inherits* the switch; it
+does not get one of its own.
+
+That is deliberate. The switch is currently `false` on the server, and an
+operator who set it that way to stop the bot talking must not discover that a
+rewrite quietly re-armed it under a new variable.
+
+```
+[digest] suppressed — SALES_DIGEST_ENABLED=false
+```
+
+One line per suppressed day, in the words it always used. Read **live** at send
+time, so flipping it takes effect on the next sweep tick without a restart, and
+checked after the cheap gates and **before** anything is composed or sent — so a
+suppressed day makes no model call and writes no slot row. Nothing is written
+while it is off, so there is no state to unwind to end the silence and no backlog
+to replay when it comes back.
+
+`false` still leaves everything computing: deadlines tracked, the next-action
+queue evaluated, SQLite and `audit.jsonl` written, `cadence preview` and
+`sheet status` answered on demand.
+
+### The voice
+
+Every proactive message — and every event reminder — is written as a **warm
+sales head** who has already looked at the sheet and is mentioning one thing on
+the way past. **One thought per message. Always an out.** Thanks where earned.
+No headers, no bullets, no labels, no stacked imperatives, no emojis.
+
+The rules live in `persona.PROACTIVE_VOICE`; the **ten voice exemplars** live in
+`sales_policy.md` under `### Voice exemplars` and are read **fresh on every
+message**. Rewriting the bot's proactive voice is a markdown edit — no restart,
+no deploy.
+
+> The ten exemplars are written to the Cadence Plan v2 §4 style description. If
+> the plan's own samples differ in wording, paste them over the list in
+> `sales_policy.md` and they are live immediately.
+
+**The model's output is checked, not trusted.** A composed message containing a
+bulleted list, a header, an emoji or more than two paragraphs is rejected and the
+deterministic template goes out instead — shipping it would teach the team that
+the voice rules are decorative. The template is still one sentence, still names
+every company, and still ends with an out, so a model outage costs polish and
+never the message.
+
+### Seeing a day before it goes out
+
+```bash
+python -m main --dry-run-drip               # today
+python -m main --dry-run-drip 2026-09-12    # a Saturday, to prove it stays quiet
+python drip.py                              # the contract, on fixtures, offline
+```
+
+`--dry-run-digest` still works as an alias. `python drip.py` runs 28 assertions:
+the grouping rule, the cap, the 75-minute floor, determinism across two plans, a
+restart resuming at slot 2, weekend silence, all five states of the re-ask clock,
+and that the fallback text has no bullets, names its owner once and gives an out.
+
+### A seeded day, checked against §8
+
+7 due items · 2 owners · 3 types:
+
+```
+GROUPS (one message per type × owner)
+  P0  meeting_proposal  Vaishnavi  Acme and Borealis
+  P1  quote_chase       Kushal     Delta
+  P1  quote_chase       Vaishnavi  Cinder
+  P2  followup          Kushal     Echo, Fathom and Gantry
+
+PLANNED
+  10:00  slot 1  meeting_proposal -> Vaishnavi
+    Vaishnavi — Acme and Borealis came back to us and there is no meeting on the
+    books yet. Worth proposing a time while it is warm — no rush if you are
+    mid-something, just tell me when you have.
+  11:24  slot 2  quote_chase -> Kushal
+  12:48  slot 3  quote_chase -> Vaishnavi
+  [rolls to tomorrow] followup × Kushal — Echo, Fathom and Gantry
+
+CONTRACT   messages 3/3 · gaps [84, 84] min (floor 75) · mixed types 0 ·
+           mixed owners 0 · 1 rolled          -> HONOURED
+```
+
+### What went with the format
+
+The digest was the only outlet these had, and they lost it:
+
+| Section | State now |
+|---|---|
+| HOT / HYGIENE | already retired with the row-hygiene flags |
+| DEADLINES / OVERDUE / ESCALATIONS | **still tracked in SQLite, no longer announced.** The drip groups the next-action queue, and a chase is not an action type on it |
+| Tracker reminder (Mon/Fri) | retired with the format |
+| To-do sheet line | retired; the sheet is still created, shared and answered on demand |
+| Weekly funnel block | retired; the numbers are still computed and answered on demand |
+| Outreach-vs-plan check | retired; still answered on demand |
+| Sheet-health flags | still computed; no proactive outlet |
+| Carry-forward "(3rd day)" ages | removed. `digest_items` is kept, unread, so the history is not thrown away |
+
+**Re-surfacing any of them means deciding who the message is *for*** — the drip's
+contract is one type, one owner, one ask — which is a product question rather
+than a config one.
 
 ---
 
@@ -1709,10 +2105,17 @@ guardrails forbid.
 
 | File | Role |
 |---|---|
-| `main.py` | entry point; validates env, logs scope and source statuses, connects. `--dry-run-digest [YYYY-MM-DD]` prints a day's digest and sends nothing |
+| `main.py` | entry point; validates env, logs scope and source statuses, connects. `--dry-run-drip [YYYY-MM-DD]` prints a day's whole plan and sends nothing (`--dry-run-digest` is an alias) |
 | `bot.py` | the Discord client: routing, question answering, chasing, and the one daily digest — its only proactive send |
-| `digest.py` | the daily digest: sections, per-owner grouping, carry-forward ages, rendering |
-| `cadence.py` | **the ten phase-1 rules (a–j)**, exclusion, the missing-data routing, the master/tracker cross-check, the sheet-health flags, priority, the two caps, and the dry run. Pure: rows in, dicts out — no sheet reads, no writes, no Discord |
+| `digest.py` | **the digest format is retired.** What is left is the clock: `parse_time` and `is_due` |
+| `evidence.py` | **suppress-or-convert**: the staged evidence ladder, the identifier matching, and the record-offer text. Almost pure — only `gather` does I/O |
+| `events.py` | **events & summits and the weekly funnel line**: the T-minus window, the permanent dedup key, and the counts-only Friday message. Pure — rows in, action dicts out |
+| `research.py` | **research briefs**: link extraction, the domain allow-list, the bounded fetch, the LinkedIn status, and the brief prompt. Copy material only — never sent, never written |
+| `sheetwrite.py` | **what the bot may write, and when**: the three tiers, the fill rule, the contact-detail ask, the terminal-word gate, the cell ceiling, the echo line, and the snooze/reminder parsing. Pure — plans in, plans out, no I/O |
+| `drip.py` | **the drip scheduler**: grouping by (type × owner), the deterministic schedule, the re-ask clock, the fallback message text, the preview and the volume-contract report. Pure — it sends nothing |
+| `cadence.py` | **the phase-1 rules (a–j) are removed from here** — what is left is exclusion, the sheet-health flags, priority, the two caps, and the boot report. `evaluate_row()` returns `[]` and is the single place a phase-2 rule set plugs in. Pure: rows in, dicts out — no sheet reads, no writes, no Discord |
+| `activation.py` | **the activation rule**: a row is active only with a first-contact or connection date; the mention-request matcher; the split every proactive path goes through. Pure — the persisted activations are passed in |
+| `nextaction.py` | **the next-action state machine**: eleven triggers in a fixed order, exactly ONE action per active row, the priority bands, the snooze re-arm, the weekend shift, and the `cadence preview` renderer. Pure: rows in, dicts out — no sheet reads, no writes, no Discord, **no send path** |
 | `prep.py` | the meeting-prep brief: tracker row + mapping (with caveats) + positioning + **cited** notes, an opening hold line when a meeting parked the account, and the explicit "no web access" section |
 | `meetings.py` | **the meeting knowledge layer and the citation rule**: holds, decisions and commitments read out of the notes, each carrying `"<meeting>, <date>"`. Pure and send-free |
 | `todos.py` | **Membrane Sales To-Dos**: create, share, header, weekly extract + dedup + append, the digest's one line, and the "show the to-dos" answer. Append-only; no Discord |
@@ -1725,7 +2128,7 @@ guardrails forbid.
 | `sources.py` | the five sources and their connected / degraded / awaiting-access status |
 | `gtm_sheet.py` | the Sheets API layer: auth, schema discovery, cached reads, the narrow write path |
 | `mapping_sheet.py` | the researcher/buyer mapping — **read-only**: no write method, read-only scope, and the legend loaded as enforced rules |
-| `tracker.py` | the tracker read as a pipeline: the three flags, the playbook's six-stage funnel definition, and the week's leading/lagging metrics |
+| `tracker.py` | the canonical tab read as a pipeline: last touch, open/engaged, the twice-weekly reminder, the playbook's six-stage funnel definition, and the week's leading/lagging metrics. **The three flags are removed** — see `nextaction.py` |
 | `deadlines.py` | IST working-day maths, cadence resolution, the announcement |
 | `notes.py` | syncs the Drive meeting notes into `NOTES_DIR`, filters them to the sales ones, reads those |
 | `query.py` | Discord read primitives, scoped to the sales channels |

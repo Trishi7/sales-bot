@@ -74,6 +74,130 @@ This persona changes ONLY your voice. It does not change what you are allowed to
 do — that is the POLICY below and the guardrails enforced in code."""
 
 
+
+
+# -- the PROACTIVE voice (drip messages and event reminders) ------------------
+#
+# THE VOICE THE BOT SPEAKS IN WHEN NOBODY ASKED. Different from the answer voice
+# and deliberately so: an answer is a response to a question somebody chose to
+# ask, and can be as brisk as it likes. A proactive message is an interruption.
+# It arrives in the middle of somebody's afternoon and asks them for something,
+# and the difference between one that gets acted on and one that gets muted is
+# almost entirely tone.
+#
+# THE EXEMPLARS ARE NOT IN THIS FILE. They live in sales_policy.md, which is
+# re-read on every message — so the team can rewrite the bot's voice by editing
+# a markdown file, with no restart and no deploy. That is the whole point of
+# keeping them there: a voice nobody but a developer can change is a voice that
+# never gets fixed.
+
+PROACTIVE_VOICE = """You are writing a PROACTIVE message: nobody asked for it. It
+will arrive in the middle of someone's afternoon. Everything below is about
+making that welcome rather than annoying.
+
+SOUND LIKE A WARM SALES HEAD who has already looked at the sheet and is
+mentioning one thing on the way past. Not a dashboard. Not a ticketing system.
+
+ONE THOUGHT PER MESSAGE. One subject, one person, one ask. If you find yourself
+writing "and also", stop — the second thing is a different message on a
+different day.
+
+ALWAYS GIVE AN OUT. End somewhere the person can step off without guilt: "no
+rush", "tell me when", "if it is handled just say", "your call". A nudge with no
+exit is a demand, and people stop reading demands.
+
+THANK WHERE IT IS EARNED, and only there. If something got done, say so once and
+move on. Manufactured gratitude for ordinary work is worse than none.
+
+NEVER:
+- headers, bullets, bold, or a "Company - status - action" shape. Prose only.
+- STACKED IMPERATIVES. "Follow up with Acme. Send the deck. Update the tracker."
+  is three demands wearing one message.
+- emojis. Not one.
+- "just checking in", "circling back to see if", "any update on" as an opener.
+  Filler tells the reader you have nothing to say.
+- restating what you are about to do before doing it.
+- a sign-off, a subject line, or quotes around the message.
+
+LENGTH: one or two sentences. Three at the absolute most, and only when the
+third is the out.
+
+NAME EVERY COMPANY YOU ARE GIVEN, comma-separated inside the sentence. Do not
+summarise them as "a few accounts" — the person needs to know which.
+
+ADDRESS THE OWNER BY NAME ONCE, at the start, if you are given one. Never twice.
+
+Write the message and nothing else."""
+
+
+def _exemplars_from_policy(text: str) -> str:
+    """The "Voice exemplars" section of sales_policy.md, verbatim.
+
+    Pulled out of the policy rather than duplicated here so there is exactly ONE
+    place the team edits the bot's voice. Returns "" when the section is absent
+    — the message generator then runs on the rules alone, which is worse but not
+    broken, and the miss is logged so a renamed heading is visible.
+    """
+    if not text:
+        return ""
+    marker = "### Voice exemplars"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    rest = text[start + len(marker):]
+    # Up to the next heading of the same level or higher, or the horizontal rule
+    # that closes the Tone section.
+    end = len(rest)
+    for stop in ("\n## ", "\n### ", "\n---"):
+        found = rest.find(stop)
+        if found >= 0:
+            end = min(end, found)
+    return rest[:end].strip()
+
+
+def proactive_voice_prompt() -> str:
+    """The full system prompt for composing ONE proactive message.
+
+    Voice rules, then the exemplars read live out of the policy file, then the
+    honesty rules that are not negotiable in any voice.
+    """
+    parts = [PROACTIVE_VOICE]
+
+    exemplars = _exemplars_from_policy(load_policy())
+    if exemplars:
+        parts.append(
+            "\n\n=== VOICE EXEMPLARS (match their length, warmth and shape — never "
+            "their content; these are examples of HOW to write, not WHAT to say) ===\n"
+            + exemplars
+        )
+    else:
+        log.warning(
+            "[persona] sales_policy.md has no '### Voice exemplars' section, so "
+            "proactive messages are composed from the voice rules alone. Check the "
+            "heading has not been renamed."
+        )
+
+    parts.append(
+        "\n\n=== NOT NEGOTIABLE ===\n"
+        "Everything you write must be true of the facts you were given. Do not "
+        "invent a company, a date, a number or a person. Do not claim anything "
+        "happened that you were not told happened. If the facts are thin, say less "
+        "— a short honest nudge beats a warm invented one."
+    )
+    return "".join(parts)
+
+
+def fallback_proactive_message(text: str) -> str:
+    """What goes out when the model is unreachable.
+
+    The caller has already built a complete sentence from a template (see
+    `drip.compose_fallback`); this exists so there is one named place that says
+    what happens on a model outage. A proactive message must never be lost to an
+    API blip — losing polish is acceptable, losing the nudge is not.
+    """
+    return (text or "").strip()
+
+
 # -- the policy file ---------------------------------------------------------
 
 # Cache keyed on (mtime, size) so an edit is picked up on the very next query
