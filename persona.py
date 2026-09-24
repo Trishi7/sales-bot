@@ -1,16 +1,26 @@
-"""The bot's voice, and the POLICY it answers under.
+"""The bot's voice, the STRATEGY it thinks with, and the POLICY it answers under.
 
-Two things live here, and the split matters:
+Three things live here, and the split matters:
 
   THE PERSONA (`COS_PERSONA`) — hard-coded voice rules. Direct, brief, no emojis,
   first person. This is style, and style shouldn't need a file edit.
+
+  THE STRATEGY (`sales_strategy.md`) — THE CORE BRAIN. What the team is trying to
+  do and how: the motions, the targets, the segments, the judgement calls. It
+  goes into the system prompt of EVERY model call this bot makes — answers,
+  proactive composition, extraction, research — and it is re-read on each one.
 
   THE POLICY (`sales_policy.md`) — what the bot is FOR: the role, what it
   enforces, its hard limits. That is Sid's to write and to change, so it lives in
   a markdown file at the repo root and is RE-READ ON EVERY QUERY. Edit the file,
   ask the next question, and the new policy is already in force — no restart, no
-  redeploy. `load_policy()` caches on the file's mtime+size, so re-reading costs
-  a stat() call, not a disk read, on every turn.
+  redeploy. Both loaders cache on the file's mtime+size, so re-reading costs a
+  stat() call, not a disk read, on every turn.
+
+WHERE THE TWO DOCUMENTS DISAGREE, THE STRATEGY DOC WINS, and the prompt says so
+in those words. That precedence is stated rather than engineered because it has
+to hold for rules nobody has got round to de-duplicating by hand: a conflict
+that survives an edit is resolved the same way as one that was never spotted.
 
 `system_preamble()` is what every reply-path prompt is built on: persona, then
 policy, then the live source statuses. The last of those is why the bot can
@@ -155,13 +165,36 @@ def _exemplars_from_policy(text: str) -> str:
     return rest[:end].strip()
 
 
-def proactive_voice_prompt() -> str:
+def proactive_voice_prompt(*, recent_openers=None) -> str:
     """The full system prompt for composing ONE proactive message.
 
-    Voice rules, then the exemplars read live out of the policy file, then the
-    honesty rules that are not negotiable in any voice.
+    THE STRATEGY FIRST, then the TONE SETTINGS, then the voice rules, then the
+    exemplars read live out of the policy file, then the honesty rules that are
+    not negotiable in any voice.
+
+    `recent_openers` is the last few openings the bot used, so the composer can
+    be told not to start with any of them again. Repeating an opening is the
+    single clearest tell that a human is not writing these.
+
+    The strategy belongs here for the same reason it belongs in an answer: a
+    nudge is a claim about what matters this week, and the document that decides
+    what matters this week is the plan. A composer that has the voice but not
+    the plan writes a warm, well-shaped chase about an account the strategy
+    dropped a month ago.
     """
-    parts = [PROACTIVE_VOICE]
+    # TONE FIRST, AFTER THE STRATEGY. The five dials are read from the
+    # environment on every call — a change to SALEY_WARMTH is in force on the
+    # next message with no restart — and they come before the fixed voice rules
+    # so a setting reads as the specific instruction and the voice block as the
+    # standing one.
+    import tone as _tone
+
+    parts = [
+        strategy_preamble(),
+        _tone.prompt_block(recent_openers=recent_openers),
+        "\n\n",
+        PROACTIVE_VOICE,
+    ]
 
     exemplars = _exemplars_from_policy(load_policy())
     if exemplars:
@@ -196,6 +229,130 @@ def fallback_proactive_message(text: str) -> str:
     API blip — losing polish is acceptable, losing the nudge is not.
     """
     return (text or "").strip()
+
+
+# -- the strategy doc: THE CORE BRAIN ----------------------------------------
+#
+# Same mechanism as the policy below, same reasoning, one difference: this one
+# is loaded into EVERY model call rather than only the reply paths. A prompt
+# that shapes what the bot says about a deal should also shape what it says when
+# it writes a nudge about that deal, and the two drifting apart is how a bot
+# ends up chasing something the plan dropped last month.
+
+_strategy_cache: dict = {"key": None, "text": ""}
+
+_STRATEGY_MISSING_NOTE = (
+    "NOTE FOR YOU: the sales STRATEGY document ({path}) is not readable right "
+    "now. It is normally the document you think with, so you are working without "
+    "it. DO NOT INVENT A STRATEGY, do not describe targets, motions or segments "
+    "as though you had read them, and do not fill the gap from memory. If "
+    "someone asks about the plan, say the strategy doc is missing and name the "
+    "path so they can fix it."
+)
+
+# The marker every strategy block starts with. `LLM._create` and the query
+# engine look for it before prepending, so a prompt built from
+# `system_preamble()` — which already carries the block — is not given a second
+# copy. One string, checked in both places, so the two cannot disagree.
+STRATEGY_MARKER = "=== SALES STRATEGY"
+
+
+def load_strategy(path: Optional[str] = None) -> str:
+    """The current text of sales_strategy.md, re-read whenever the file changes.
+
+    Returns "" when there is no readable strategy file — callers get the
+    missing-file note from `strategy_preamble()` instead, so a deleted strategy
+    degrades into "I can't see the plan" rather than into the bot quietly
+    inventing one and stating it with confidence.
+    """
+    path = (path or config.STRATEGY_DOC_FILE or "").strip()
+    if not path:
+        return ""
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        if _strategy_cache["key"] is not None:
+            log.warning(
+                "[persona] strategy file %r became unreadable; dropping the cached copy. "
+                "Every prompt from here on says the strategy is missing.", path,
+            )
+            _strategy_cache.update({"key": None, "text": ""})
+        return ""
+
+    if key == _strategy_cache["key"]:
+        return _strategy_cache["text"]
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except OSError:
+        log.exception("[persona] could not read strategy file %r", path)
+        return ""
+
+    _strategy_cache.update({"key": key, "text": text})
+    log.info("[persona] loaded STRATEGY from %s (%d chars)", path, len(text))
+    return text
+
+
+def strategy_preamble() -> str:
+    """The strategy block that fronts EVERY model call. Never empty.
+
+    When the doc is missing this returns the missing-file note instead, because
+    silence is the one thing it must not return: a prompt with no strategy block
+    at all reads, to a model, exactly like a prompt whose strategy had nothing
+    to say.
+
+    TRUNCATION IS DECLARED, NOT HIDDEN. The doc rides in every system prompt, so
+    a very long one is paid for on every question and is cut at
+    STRATEGY_PROMPT_MAX_CHARS. A model told it is reading a truncated plan can
+    say so; one that is not told will answer as though it read the whole thing.
+    """
+    text = load_strategy()
+    if not text:
+        return (
+            _STRATEGY_MISSING_NOTE.format(
+                path=config.STRATEGY_DOC_FILE or "sales_strategy.md"
+            )
+            + "\n\n"
+        )
+
+    limit = int(getattr(config, "STRATEGY_PROMPT_MAX_CHARS", 0) or 0)
+    truncated = ""
+    if limit and len(text) > limit:
+        text = text[:limit]
+        truncated = (
+            f"\n\n[...TRUNCATED. This document is longer than the {limit} characters "
+            "carried in the prompt. You are reading the beginning of it only — say so "
+            "if a question turns on a part you cannot see.]"
+        )
+
+    return (
+        STRATEGY_MARKER + " — THE PLAN YOU THINK WITH (re-read on every call, so "
+        "this is always the current version) ===\n"
+        "This is the team's sales & marketing strategy: what we are trying to do, "
+        "who we are trying to do it with, and how. Reason from it. Quote it when "
+        "somebody asks what the plan says.\n\n"
+        "PRECEDENCE: WHERE THIS DOCUMENT AND THE SALES POLICY BELOW DISAGREE, THIS "
+        "DOCUMENT WINS. The policy governs what you are permitted to do; this "
+        "governs what the team is trying to achieve. If a rule appears in both and "
+        "they differ, follow this one and say plainly that the policy says "
+        "otherwise — do not silently average them.\n\n"
+        "IT DOES NOT OVERRIDE THE HARD LIMITS. Never contacting anyone outside the "
+        "team, never writing outside the writable window, never stating a number "
+        "you did not read — those are enforced in code and no document changes "
+        "them.\n\n"
+        + text + truncated + "\n\n"
+    )
+
+
+def strategy_status() -> dict:
+    """{path, loaded, chars} — what the bot is actually thinking with, so it can
+    answer "what are you working from" about its brain and not just its
+    sources."""
+    path = (config.STRATEGY_DOC_FILE or "").strip()
+    text = load_strategy(path)
+    return {"path": path, "loaded": bool(text), "chars": len(text)}
 
 
 # -- the policy file ---------------------------------------------------------
@@ -266,7 +423,7 @@ def cos_preamble() -> str:
 
 def system_preamble(*, include_sources: bool = True) -> str:
     """The full front matter for any reply-path system prompt: voice, then the
-    live policy, then what the bot can actually see right now.
+    STRATEGY, then the live policy, then what the bot can actually see right now.
 
     Every path that speaks to a human builds on this, so the policy and the
     source statuses can never apply to one reply and not another. `include_sources`
@@ -275,11 +432,17 @@ def system_preamble(*, include_sources: bool = True) -> str:
     """
     parts = [cos_preamble()]
 
+    # THE STRATEGY FIRST, THEN THE POLICY. Order is not cosmetic: the precedence
+    # rule is stated inside the strategy block and reads as an instruction about
+    # what follows it.
+    parts.append(strategy_preamble())
+
     policy = load_policy()
     if policy:
         parts.append(
             "=== SALES POLICY (the operating policy you work under; it is re-read on "
-            "every question, so this is always the current version) ===\n"
+            "every question, so this is always the current version. Where it conflicts "
+            "with the STRATEGY above, the strategy wins) ===\n"
             + policy
             + "\n\n"
         )

@@ -44,25 +44,45 @@ log = logging.getLogger(__name__)
 
 # The two columns that make a row active. Taken from gtm_sheet so the schema
 # layer and this rule cannot drift apart — that module's alias lists are what
-# decide which discovered header becomes `first_contacted` or `connected`.
+# decide which discovered header becomes `first_contact_date` or
+# `li_connected_date`.
 ACTIVATION_ROLES = gtm_sheet.ACTIVATION_ROLES
 
 # How each role reads in a sentence, for the lines that have to explain
 # themselves rather than assert.
 ROLE_LABELS = {
+    "first_contact_date": "first-contact date",
+    "li_connected_date": "LinkedIn connected date",
+    # The tracker-era spellings, kept so a label lookup during the migration
+    # returns a phrase rather than a raw role name. gtm_sheet.POCS_COMPAT_ALIASES
+    # is what still resolves them to a column.
     "first_contacted": "first-contact date",
-    "connected": "connection date",
+    "connected": "LinkedIn connected date",
 }
 
 
 def row_key(row: dict) -> str:
-    """The stable identity of a row: normalised company | normalised PoC.
+    """The stable identity of a row: normalised company | normalised name.
 
     NEVER the sheet row number. Sorting the tab renumbers every row, and an
     activation keyed on a number would quietly move to a different person.
+
+    READS THE CANONICAL ROLE FIRST, then the retired spelling. `name` is what
+    the Outreach PoCs tab calls column D; `poc` is the tracker-era alias that
+    `gtm_sheet.POCS_COMPAT_ALIASES` still fills on rows parsed from a sheet.
+
+    THE ORDER MATTERS MORE THAN IT LOOKS. This key is what the dedup ledger,
+    the snooze table, the explicit activations and the R9 ladder are all
+    written against. Reading only the alias worked on parsed rows and produced
+    "company|" — the SAME KEY FOR EVERY CONTACT AT ONE COMPANY — on any row
+    built without the shim. Three colleagues at one account would have
+    collapsed into one identity, and the dedup would have silently dropped two
+    of them.
     """
     company = gtm_sheet.normalise_header(gtm_sheet.clean_cell(row.get("company")))
-    poc = gtm_sheet.normalise_header(gtm_sheet.clean_cell(row.get("poc")))
+    poc = gtm_sheet.normalise_header(
+        gtm_sheet.clean_cell(row.get("name") or row.get("poc"))
+    )
     return f"{company}|{poc}"
 
 

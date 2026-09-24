@@ -50,6 +50,7 @@ every verdict as `[gate] <responded|ignored> msg=<id> reason=<...>`.
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -57,7 +58,9 @@ from typing import Optional
 import discord
 
 import activation
+import approvals
 import cadence
+import focus
 import config
 import deadlines as dl
 import digest
@@ -70,7 +73,10 @@ import gtm_sheet
 import guardrails
 import mapping_sheet
 import meetings
+import leave
 import nextaction
+import rules
+import simulation
 import notes
 import persona
 import prep
@@ -79,6 +85,7 @@ import research
 import sheetwrite
 import sources
 import state
+import tone
 import strategy
 import todos
 import tracker
@@ -219,6 +226,12 @@ class SalesBot(discord.Client):
         # silence would be buried in the noise announcing it. One line per
         # skipped digest, per day.
         self._digest_suppressed_on: str = ""
+        # The day the proposal sweep last ran. ONE sweep per day, in the
+        # first slot — a per-process marker rather than a database row,
+        # because a restart re-running it once is harmless (the nudged
+        # proposals are already marked and drop out of the next query)
+        # while a missed one would leave the queue growing unmentioned.
+        self._swept_proposals_on: str = ""
         log.info(
             "[bot.init] %s ready to connect. sales_channels=%s ask_channel=%s roster=%d",
             config.COS_NAME, config.SALES_CHANNEL_IDS, config.SALES_ASK_CHANNEL_ID,
@@ -348,6 +361,15 @@ class SalesBot(discord.Client):
           - the restricted bands have drifted, so the writable window points at
             a column somebody is using.
         """
+        # THE RULES FIRST, because everything below is only interesting if the
+        # schedule that consumes it loaded. A broken bot_rules.yaml means the
+        # bot says nothing on its own initiative, and that has to be the first
+        # thing in the boot log, not the last.
+        try:
+            await asyncio.to_thread(rules.log_startup)
+        except Exception:
+            log.exception("[rules] the rules file could not be reported at boot")
+
         roles = []
         try:
             # WHICH TAB GOT WHICH ROLE, before anything else.
@@ -935,6 +957,14 @@ class SalesBot(discord.Client):
         # engine below. It is first because "sent this morning" is an ANSWER,
         # and routing it to the question engine would produce a reply about the
         # sheet instead of a change to it.
+        # SIMULATIONS AND TEST HELPERS, BEFORE EVERYTHING. "simulate monday" is
+        # neither an update nor a question, and feeding it to the extractor
+        # would have it cheerfully read "monday" as a company. The handler is
+        # SILENT outside the test channel, so this costs a regex in the real
+        # channels and nothing else.
+        if await self._handle_simulation(message, text):
+            return True
+
         if await self._maybe_apply_sheet_update(message, text):
             return True
 
@@ -2118,16 +2148,24 @@ class SalesBot(discord.Client):
         # and why is it quiet.
 
         async def _sheet_status(inp: dict) -> dict:
-            """WHAT THE BOT IS READING — tab, rows, activation, write window.
+            """WHAT THE BOT IS READING — EVERY tab, rows, activation, write window.
 
-            READ-ONLY. The verification tool for the phase-2 move: it names the
-            canonical tab, counts the rows and the ACTIVE rows separately, and
-            lists the named columns inside the writable window between the
-            restricted bands.
+            READ-ONLY. The verification tool for the whole sheet layer: it lists
+            every tab discovered in the playbook with its row count and what the
+            bot reads it AS, names the canonical tab, counts its rows and its
+            ACTIVE rows separately, and lists the named columns inside the
+            writable window between the restricted bands.
 
-            THE TWO COUNTS ARE THE POINT. "886 rows, 12 active" is the honest
-            answer to "why has the digest gone quiet", and it is an answer
-            nobody could give while the only visible number was the row count.
+            EVERY TAB, INCLUDING THE ONES IT DOES NOT READ. A tab reported as
+            "not read" is the fastest possible diagnosis of a renamed sheet —
+            far faster than noticing, three days later, that a reminder stopped
+            arriving. The five context tabs are found by NAME, so a rename
+            silently un-finds them and nothing else would say so.
+
+            THE TWO ROW COUNTS ARE THE POINT. "886 rows, 12 active" is the
+            honest answer to "why has the digest gone quiet", and it is an
+            answer nobody could give while the only visible number was the row
+            count.
             """
             try:
                 tab = await asyncio.to_thread(gtm_sheet.SHEETS.pocs_tab)
@@ -2163,9 +2201,44 @@ class SalesBot(discord.Client):
                 explicit = []
 
             window = gtm_sheet.SHEETS.writable_window_columns(tab)
+
+            try:
+                discovered = await asyncio.to_thread(gtm_sheet.SHEETS.discovered_tabs)
+            except Exception:
+                log.debug("[sheet-status] could not list the discovered tabs",
+                          exc_info=True)
+                discovered = []
+
+            # The headers themselves are NOT carried into the answer: on a
+            # twenty-tab playbook that is several thousand characters of noise
+            # in a prompt, and the counts plus the kind are what the question is
+            # actually asking. The full headers are in the [gtm.schema] log.
+            tabs_found = [
+                {
+                    "tab": d["title"],
+                    "read_as": d["kind_label"] or d["kind"] or "not read",
+                    "rows": d["rows"],
+                    "columns": d["columns"],
+                    "hidden": d["hidden"],
+                    "unmapped_columns": len(d["unmapped_headers"]),
+                }
+                for d in discovered
+            ]
+
             return {
                 "ok": True,
                 "tab": tab.title,
+                "tabs_found": tabs_found,
+                "tabs_found_count": len(tabs_found),
+                "tabs_read_count": sum(1 for d in discovered if d["kind"]),
+                "tabs_not_read": [d["title"] for d in discovered if not d["kind"]],
+                "context_tabs_note": (
+                    "The Deliverables Checklist, Master Pipeline, Sales Packages, "
+                    "AI Events & Summits and goal-setting tabs are found BY NAME and "
+                    "are READ-ONLY — no write path can address them. If one is listed "
+                    "as 'not read', its title no longer matches the *_TAB_TITLES "
+                    "setting that finds it, and everything built on it has gone quiet."
+                ),
                 "spreadsheet": "the GTM Playbook (GTM_SHEET_ORIGINAL_ID)",
                 "total_rows": len(tab.rows),
                 "active_rows": len(active),
@@ -2446,7 +2519,14 @@ class SalesBot(discord.Client):
             want_owner = gtm_sheet.normalise_header((inp or {}).get("owner") or "")
             actions = result.get("actions") or []
             if want_type:
-                actions = [a for a in actions if a["type"] == want_type]
+                # Matches the trigger name or the rule id, because somebody
+                # asking for "R5" and somebody asking for "prospects" mean the
+                # same thing and neither should get an empty list.
+                actions = [
+                    a for a in actions
+                    if a["type"] == want_type
+                    or str(a.get("rule_id", "")).lower() == want_type
+                ]
             if want_owner:
                 actions = [
                     a for a in actions
@@ -2459,40 +2539,100 @@ class SalesBot(discord.Client):
                 if (want_type or want_owner) else "",
                 len(actions),
             )
+            # GROUPED BY RULE. Each section names the rule that produced it and
+            # carries the reason line the evaluator wrote, so the output can be
+            # checked against bot_rules.yaml line by line without the code.
+            by_rule: dict = {}
+            for a in actions[:cap]:
+                by_rule.setdefault(a.get("rule_id") or "—", []).append(a)
+
+            rules_status = rules.status()
             return {
                 "ok": True,
                 "sent_anything": False,
                 "tab": getattr(result.get("tab"), "title", ""),
                 "today": dl.iso(result.get("today")),
+                "weekday": (result.get("today") or dl.today_ist()).strftime("%A"),
+                "rules_file": rules_status.get("path", ""),
+                "rules_loaded": rules_status.get("count", 0),
                 "active_rows": result.get("rows", 0),
                 "inactive_rows": result.get("inactive", 0),
                 "total_actions": len(result.get("actions") or []),
                 "shown": min(len(actions), cap),
-                "filtered_to": {"type": want_type, "owner": want_owner},
+                "filtered_to": {"rule": want_type, "owner": want_owner},
                 "bands_in_order": [
                     nextaction.BAND_LABELS[b] for b in sorted(nextaction.BAND_LABELS)
                 ],
+                # WHICH RULES RAN AND WHICH DID NOT, AND WHY. "R4 produced
+                # nothing" and "R4 does not run on a Thursday" look identical in
+                # a list that shows only what fired, and only one of them is
+                # worth investigating.
+                "rules_run": result.get("rules_run", []),
+                "by_rule": {
+                    rule_id: {
+                        "rule": rule_id,
+                        "name": items[0].get("rule_name", ""),
+                        "items": len(items),
+                        "max_items_per_post": items[0].get("max_items_per_post"),
+                        "destination": items[0].get("destination"),
+                        "counts_toward_cap": items[0].get("counts_toward_cap"),
+                        "lines": [
+                            {
+                                "company": a["company"], "poc": a["poc"],
+                                "owner": a["owner"] or "(unassigned)",
+                                "due_date": a["due_iso"],
+                                "overdue_days": a["overdue_days"],
+                                "text": a["text"], "why": a["why"],
+                                "web_pending": a.get("web_pending", False),
+                                "sheet_row": a["sheet_row"],
+                            }
+                            for a in items
+                        ],
+                    }
+                    for rule_id, items in by_rule.items()
+                },
                 "queue": [
                     {
-                        "type": a["type"], "label": a["label"], "owner": a["owner"] or "(unassigned)",
+                        "rule": a.get("rule_id", ""), "rule_name": a.get("rule_name", ""),
+                        "type": a["type"], "label": a["label"],
+                        "owner": a["owner"] or "(unassigned)",
                         "company": a["company"], "poc": a["poc"],
                         "due_date": a["due_iso"], "overdue_days": a["overdue_days"],
                         "priority": a["priority"], "priority_label": a["priority_label"],
-                        "text": a["text"], "why": a["why"], "sheet_row": a["sheet_row"],
+                        "text": a["text"], "why": a["why"],
+                        "web_pending": a.get("web_pending", False),
+                        "sheet_row": a["sheet_row"],
                     }
                     for a in actions[:cap]
                 ],
                 "truncated": len(actions) > cap,
+                "deduped": [
+                    {"company": d.get("company"), "poc": d.get("poc"),
+                     "rule": d.get("rule_id"), "kept_by": d.get("dropped_for"),
+                     "why": d.get("dropped_why")}
+                    for d in (result.get("deduped") or [])[:20]
+                ],
+                "web_pending_count": result.get("web_pending", 0),
+                "web_pending_note": (
+                    "Items marked web_pending come from rules that need web research "
+                    "this bot cannot do yet (R1, R2, R3, R6's email search, R8 and R10's "
+                    "news, R11). They are SHOWN rather than skipped so a configured rule "
+                    "never looks like a quiet week — say which ones are waiting."
+                ),
                 "no_action_for": result.get("silent", {}),
                 "no_action_labels": nextaction.SILENT_LABELS,
                 "stopped_rows": result.get("stopped", [])[:20],
                 "snoozed_rows": result.get("snoozed", [])[:20],
                 "staleness": result.get("staleness", ""),
                 "note": (
-                    "One action per row, never two: the triggers are evaluated in a fixed "
-                    "order and the first match wins. NOTHING WAS SENT — this is a preview. "
-                    "Quote the 'no_action_for' counts too; a queue that lists only what it "
-                    "found looks complete when it is not."
+                    "GROUP THE ANSWER BY RULE and name each rule — 'R6 Connected, no DM "
+                    "yet: 4' — then give each line's reason, which says which cells "
+                    "produced it. ONE CONTACT IS NAMED AT MOST ONCE A DAY: anything in "
+                    "'deduped' was selected by a later rule and dropped in favour of an "
+                    "earlier one, and it is worth saying so. Quote 'rules_run' for the "
+                    "rules that did not run today and why. NOTHING WAS SENT — this is a "
+                    "preview. Quote the 'no_action_for' counts too; a queue that lists "
+                    "only what it found looks complete when it is not."
                 ),
             }
 
@@ -2548,10 +2688,16 @@ class SalesBot(discord.Client):
                 if not activation.is_active(row):
                     reason, detail = "inactive", activation.why_active(row)
                 else:
-                    _a, silent = nextaction.next_action(
-                        row, today=result.get("today"), snoozes=snoozes,
-                        scheduled=scheduled,
+                    # The two gates, asked directly. There is no longer a
+                    # single "next action for this row" to ask for — a row can
+                    # be selected by several rules, or by none — so the honest
+                    # question is why it is SILENT, which is what the gates
+                    # answer.
+                    _ok, silent, _until = nextaction.row_gate(
+                        row, today=result.get("today") or dl.today_ist(),
+                        snoozes=snoozes,
                     )
+                    silent = silent or nextaction.SILENT_NOT_DUE
                     reason = silent
                     detail = nextaction.SILENT_LABELS.get(silent, silent)
                     if silent == nextaction.SILENT_STOPPED:
@@ -2877,16 +3023,21 @@ class SalesBot(discord.Client):
                     "name": "sheet_status",
                     "description": (
                         "WHAT I AM ACTUALLY READING. Use this for 'sheet status', 'what "
-                        "sheet are you on', 'which tab', 'how many rows can you see', "
-                        "'what can you write', 'why aren't you chasing X'. Returns the "
-                        "canonical tab name, total rows, ACTIVE rows (a row is active "
-                        "only when a first-contact date or a connection date is present "
-                        "— inactive rows are invisible to everything I say unprompted, "
+                        "sheet are you on', 'which tab', 'which tabs can you see', 'how "
+                        "many rows can you see', 'what can you write', 'why aren't you "
+                        "chasing X'. Returns EVERY tab discovered in the playbook with "
+                        "its row count and what I read it as (`tabs_found`), the tabs I "
+                        "do NOT read (`tabs_not_read`), then for the canonical tab: "
+                        "total rows, ACTIVE rows (a row is active only when a "
+                        "first-contact date or a LinkedIn connected date is present — "
+                        "inactive rows are invisible to everything I say unprompted, "
                         "though I will still answer about one by name), the restricted "
                         "column bands I may never write to, and the NAMED columns inside "
-                        "the writable window between them. Quote the tab name and both "
-                        "counts; if active is far below total, say so plainly — that is "
-                        "usually the answer to 'why is the digest so quiet'."
+                        "the writable window between them. LIST THE TABS: name each one "
+                        "with its row count, and say plainly which ones I am not "
+                        "reading. Quote the canonical tab name and both counts; if "
+                        "active is far below total, say so — that is usually the answer "
+                        "to 'why is the digest so quiet'."
                     ),
                     "input_schema": {"type": "object", "properties": {}, "required": []},
                 },
@@ -2967,19 +3118,22 @@ class SalesBot(discord.Client):
                 "schema": {
                     "name": "cadence_preview",
                     "description": (
-                        "TODAY'S COMPUTED QUEUE — the ONE next action for every active "
-                        "row, grouped by type and owner. Use this for 'cadence preview', "
-                        "'what's the queue', 'what needs doing today', 'what needs "
-                        "attention', 'what's slipping', 'anything urgent', 'what would "
-                        "you chase'. NOTHING IS SENT by this: it is a read-only preview "
-                        "of what the state machine currently holds. Each line carries its "
-                        "due date, whether it is overdue, and the cells that produced it "
-                        "— repeat the reason so the team can check it. The bands are, in "
-                        "order: positive overrides (someone replied), meetings and demo "
-                        "chases, 7-day follow-ups, slow lane. Also quote the closing line "
-                        "accounting for rows that produced NO action (stopped, snoozed, "
-                        "nothing due) — a queue that only lists what it found looks "
-                        "complete when it is not."
+                        "TODAY'S DUE ITEMS FROM THE TWELVE RULES, grouped by rule. Use "
+                        "this for 'cadence preview', 'rules preview', 'what's the queue', "
+                        "'what needs doing today', 'what needs attention', 'what's "
+                        "slipping', 'anything urgent', 'what would you chase'. NOTHING IS "
+                        "SENT by this: it is a read-only preview. ANSWER GROUPED BY RULE "
+                        "— name each rule ('R5 Prospects to contact: 5 items') and give "
+                        "each line's reason, which names the cells that produced it, so "
+                        "the team can check the output against bot_rules.yaml. Quote "
+                        "'rules_run' for the rules that did NOT run today and why — 'R4 "
+                        "found nothing' and 'R4 does not run on a Thursday' look the same "
+                        "in a list of what fired and only one is worth chasing. Say which "
+                        "items are 'web_pending' (rules needing web research that does "
+                        "not exist yet) and name anything in 'deduped' — one contact is "
+                        "named at most once a day, so a later rule can lose to an earlier "
+                        "one. Also quote the counts for rows that produced NOTHING "
+                        "(stopped, snoozed, nothing due)."
                     ),
                     "input_schema": {
                         "type": "object",
@@ -2987,11 +3141,11 @@ class SalesBot(discord.Client):
                             "type": {
                                 "type": "string",
                                 "description": (
-                                    "Optional: one action type to filter to — "
-                                    "meeting_proposal, scheduled_reminder, quote_chase, "
-                                    "progress_check, dm_check, dm_sent_check, "
-                                    "mark_unresponsive, channel_switch, pulse_check, "
-                                    "followup."
+                                    "Optional: one rule's trigger to filter to — "
+                                    "ai_news, news_company_screen, events, deliverables, "
+                                    "prospects, li_no_dm, dm_no_meeting, meeting_prep, "
+                                    "meeting_followup, closure_support, "
+                                    "new_pipeline_company, sales_packages."
                                 ),
                             },
                             "owner": {
@@ -4042,6 +4196,19 @@ class SalesBot(discord.Client):
         not a write" and the caller carries on to the question engine — which is
         the common case, because most things said to the bot are questions.
         """
+        # A FOCUS COMMAND, BEFORE ANYTHING ELSE. "Prioritise only AI Voice
+        # Agents" is not an update and must not be fed to the extractor, which
+        # would cheerfully read "AI Voice Agents" as a company and propose
+        # something nobody asked for.
+        if await self._maybe_focus_command(message, text):
+            return True
+
+        # AN ANSWER TO A PROPOSAL. Checked before the extractor for the same
+        # reason: "yes" is not an update, and a bare "no" fed to an extractor is
+        # an invitation to invent one.
+        if await self._maybe_vote_on_proposal(message, text):
+            return True
+
         is_reply = await self._is_reply_to_self(message)
         trigger = sheetwrite.TRIGGER_REPLY if is_reply else sheetwrite.TRIGGER_COMMAND
 
@@ -4108,6 +4275,169 @@ class SalesBot(discord.Client):
             "poc": "",
             "offer": str(row.get("offer") or ""),
         }
+
+    async def _maybe_vote_on_proposal(
+        self, message: discord.Message, text: str
+    ) -> bool:
+        """Is this message a yes or a no to a proposal? Handle it if so.
+
+        FINDS THE PROPOSAL TWO WAYS, in order of confidence: the message it
+        REPLIES to, then the newest open one. A reply is unambiguous; a bare
+        "yes" in the channel is a guess, and the echo names what was applied so
+        a wrong guess is visible at once rather than silent.
+
+        A NON-APPROVER GETS A POLITE NO AND THE PROPOSAL STAYS OPEN. They were
+        trying to help; the answer is that this particular thing needs Sid or
+        Vaishnavi, not that they did something wrong.
+        """
+        vote = approvals.read_vote(text)
+        if not vote:
+            return False
+
+        proposal = None
+        ref = getattr(getattr(message, "reference", None), "message_id", None)
+        if ref:
+            proposal = await asyncio.to_thread(
+                self.db.open_proposal_for_message, str(ref)
+            )
+        if proposal is None:
+            proposal = await asyncio.to_thread(self.db.latest_open_proposal)
+        if proposal is None:
+            return False
+
+        author = _display(message.author)
+        if not config.is_approver(getattr(message.author, "id", 0)):
+            await self._reply(
+                message, approvals.not_an_approver_reply(author),
+                reason="a non-approver answered a proposal",
+            )
+            state.audit(
+                "proposal_vote_refused",
+                reason="only SALES_APPROVER_IDS may approve a write",
+                proposal_key=proposal["proposal_key"], voter=author, vote=vote,
+            )
+            return True
+
+        now = dl.now_ist().isoformat(timespec="seconds")
+        await asyncio.to_thread(
+            lambda: self.db.record_vote(
+                proposal_key=proposal["proposal_key"],
+                voter_id=int(getattr(message.author, "id", 0) or 0),
+                voter_label=author, vote=vote, voted_at=now,
+                message_id=str(message.id),
+            )
+        )
+        fresh = await asyncio.to_thread(self.db.proposal, proposal["proposal_key"])
+        decision, why, decided_by = approvals.decide((fresh or {}).get("votes") or [])
+        state.audit(
+            "proposal_vote",
+            reason=why, proposal_key=proposal["proposal_key"],
+            voter=author, vote=vote, decision=decision,
+        )
+
+        if decision == approvals.WAIT:
+            await self._reply(message, "Noted — holding until someone can approve it.",
+                              reason="vote recorded, still waiting")
+            return True
+
+        await asyncio.to_thread(
+            lambda: self.db.close_proposal(
+                proposal_key=proposal["proposal_key"],
+                status="applied" if decision == approvals.APPLY else "declined",
+                decision=why, decided_by=decided_by or author, decided_at=now,
+            )
+        )
+
+        if decision == approvals.DECLINE:
+            # A REVERSAL IS SAID OUT LOUD. If somebody else had already said
+            # yes, the person who said it needs to know it did not happen —
+            # silence here would leave them believing the sheet had changed.
+            others = [
+                v for v in ((fresh or {}).get("votes") or [])
+                if v.get("vote") == approvals.VOTE_YES
+                and str(v.get("voter_label")) != str(decided_by)
+            ]
+            line = f"Leaving that one then — {why}. Nothing has changed in the sheet."
+            if others:
+                line = (
+                    f"Not doing that one: {why}. "
+                    f"({', '.join(str(o.get('voter_label')) for o in others)} had said "
+                    "yes, so to be clear — the sheet is unchanged.)"
+                )
+            await self._reply(message, line, reason="a proposal was declined")
+            log.info("[approvals] %s DECLINED — %s",
+                     proposal["proposal_key"], why)
+            return True
+
+        await self._apply_approved_write(
+            message, fresh or proposal, decided_by=decided_by or author, why=why,
+        )
+        return True
+
+    async def _maybe_focus_command(
+        self, message: discord.Message, text: str
+    ) -> bool:
+        """Set, show or clear the prospecting focus. Only approvers may set it."""
+        parsed = focus.parse(text)
+        if not parsed:
+            return False
+
+        today = dl.today_ist()
+        author = _display(message.author)
+
+        if parsed["action"] == focus.SHOW:
+            live = await asyncio.to_thread(self.db.active_focus, today=dl.iso(today))
+            await self._reply(message, focus.describe(live, today=today),
+                              reason="showing the current focus")
+            return True
+
+        if not config.is_approver(getattr(message.author, "id", 0)):
+            await self._reply(message, focus.not_allowed_reply(author),
+                              reason="a non-approver tried to change the focus")
+            state.audit(
+                "focus_refused",
+                reason="only SALES_APPROVER_IDS may set or clear the focus",
+                who=author, command=parsed["raw"],
+            )
+            return True
+
+        if parsed["action"] == focus.CLEAR:
+            cleared = await asyncio.to_thread(
+                lambda: self.db.clear_focus(on_date=dl.iso(today), by=author)
+            )
+            if cleared:
+                await self._reply(
+                    message,
+                    f"Cleared the focus on {cleared.get('value')} — back to sheet order.",
+                    reason="focus cleared",
+                )
+                state.audit("focus_cleared", reason=f"cleared by {author}",
+                            value=cleared.get("value"), who=author)
+            else:
+                await self._reply(message, "There was no focus set.",
+                                  reason="nothing to clear")
+            return True
+
+        ends = focus.expiry(on=today, days=parsed["days"])
+        await asyncio.to_thread(
+            lambda: self.db.set_focus(
+                field="", value=parsed["value"], raw=parsed["raw"], set_by=author,
+                set_by_id=int(getattr(message.author, "id", 0) or 0),
+                set_on=dl.iso(today), expires_on=dl.iso(ends),
+            )
+        )
+        await self._reply(
+            message,
+            focus.confirmation(parsed["value"], days=parsed["days"], ends=ends),
+            reason="focus set",
+        )
+        state.audit(
+            "focus_set", reason=f"set by {author}", value=parsed["value"],
+            days=parsed["days"], expires_on=dl.iso(ends), who=author,
+        )
+        log.info("[focus] %s set a focus on %r until %s",
+                 author, parsed["value"], dl.iso(ends))
+        return True
 
     async def _apply_pending_offer(
         self, message: discord.Message, context: dict, text: str
@@ -4247,10 +4577,85 @@ class SalesBot(discord.Client):
             )
             return True
 
+        # PERMISSION BEFORE EVERY WRITE. The plan is complete and nothing has
+        # been written: the bot now SAYS what it would change and waits for a
+        # yes from an approver. `_apply_approved_write` is the only path that
+        # reaches `write_cells` from a reply.
+        return await self._propose_write(
+            message, plan=plan, tab=tab, row=row, company=company, poc=poc,
+            trigger=trigger, reply_text=text,
+        )
+
+    async def _propose_write(self, message, *, plan: dict, tab, row: dict,
+                             company: str, poc: str, trigger: str,
+                             reply_text: str) -> bool:
+        """Post the exact proposed change and record it. WRITES NOTHING.
+
+        THE ORIGINAL REPLY TEXT IS STORED WITH IT, and that is not bookkeeping.
+        `sheetwrite.said_terminal_words` is matched against what the HUMAN
+        WROTE, deliberately — once the write waits behind a yes, "yes" is the
+        message in hand and contains no terminal word at all. Re-deriving the
+        plan from the approval would silently disarm the one gate that stops a
+        row being marked Dead by inference.
+        """
+        proposed = approvals.proposal_text(
+            company=company, poc=poc, applied=plan["applied"],
+        )
+        extra = ""
+        if plan["asks"]:
+            extra = " " + sheetwrite.echo_line(
+                company=company, poc=poc, applied=[], asks=plan["asks"],
+                skipped=[], undo_hours=config.SHEET_WRITE_UNDO_HOURS,
+            )
+        body = f"{proposed} ({approvals.who_can_approve()}.){extra}"
+
+        sent = await self._reply(message, body, reason="proposing a sheet write")
+        key = f"prop:{message.id}"
+        opened = await asyncio.to_thread(
+            lambda: self.db.open_proposal(
+                proposal_key=key, kind="cell_update", tab=tab.title,
+                sheet_row=int(row["_row"]), row_key=activation.row_key(row),
+                company=company, poc=poc,
+                payload={"writes": plan["writes"], "applied": plan["applied"],
+                         "asks": plan["asks"], "skipped": plan["skipped"]},
+                reply_text=reply_text, trigger=trigger, proposed_text=proposed,
+                requested_by=_display(message.author),
+                channel_id=int(getattr(message.channel, "id", 0) or 0),
+                message_id=str(getattr(sent, "id", "") or message.id),
+                created_at=dl.now_ist().isoformat(timespec="seconds"),
+            )
+        )
+        state.audit(
+            "write_proposed",
+            reason="permission before every write: nothing is written until an "
+                   "approver says yes",
+            proposal_key=key, company=company, poc=poc, trigger=trigger,
+            cells=plan["writes"], proposed=proposed,
+            requested_by=_display(message.author), recorded=opened,
+        )
+        log.info(
+            "[approvals] proposed %d cell(s) on %s (%s) — waiting for an approver",
+            len(plan["writes"]), company, key,
+        )
+        return True
+
+    async def _apply_approved_write(self, message, proposal: dict, *,
+                                    decided_by: str, why: str) -> None:
+        """Apply a proposal an approver said yes to. THE ONLY WRITE PATH."""
+        payload = proposal.get("payload") or {}
+        writes = payload.get("writes") or {}
+        company = proposal.get("company") or ""
+        poc = proposal.get("poc") or ""
+        if not writes:
+            await self._reply(message, "There was nothing left to write on that one.",
+                              reason="approved proposal had no cells")
+            return
+
         result = await asyncio.to_thread(
             lambda: gtm_sheet.SHEETS.write_cells(
-                row=int(row["_row"]), values=plan["writes"], expect_company=company,
-                reason=f"{trigger} from {_display(message.author)}",
+                row=int(proposal.get("sheet_row") or 0), values=writes,
+                expect_company=company,
+                reason=f"approved by {decided_by}: {proposal.get('trigger') or 'reply'}",
             )
         )
         if not result["ok"]:
@@ -4262,48 +4667,53 @@ class SalesBot(discord.Client):
             )
             state.audit(
                 "sheet_write_failed", reason=result["error"], company=company,
-                poc=poc, trigger=trigger, values=plan["writes"],
-                requested_by=_display(message.author),
+                poc=poc, trigger=proposal.get("trigger") or "", values=writes,
+                requested_by=proposal.get("requested_by") or "",
             )
-            return True
+            return
 
         batch_id = f"{message.id}"
         written_at = dl.now_ist().isoformat(timespec="seconds")
         await asyncio.to_thread(
             lambda: self.db.record_sheet_write(
-                batch_id=batch_id, tab=tab.title, sheet_row=int(row["_row"]),
-                row_key=activation.row_key(row), company=company, poc=poc,
-                cells=result["written"], trigger=trigger,
-                requested_by=_display(message.author), source_msg=str(message.id),
+                batch_id=batch_id, tab=proposal.get("tab") or "",
+                sheet_row=int(proposal.get("sheet_row") or 0),
+                row_key=proposal.get("row_key") or "", company=company, poc=poc,
+                cells=result["written"], trigger=proposal.get("trigger") or "",
+                requested_by=decided_by, source_msg=str(message.id),
                 written_at=written_at,
             )
         )
         state.audit(
             "sheet_write",
-            reason=f"{trigger} from {_display(message.author)}",
-            batch_id=batch_id, tab=tab.title, sheet_row=int(row["_row"]),
-            company=company, poc=poc, trigger=trigger,
+            reason=f"approved by {decided_by} — {why}",
+            batch_id=batch_id, tab=proposal.get("tab") or "",
+            sheet_row=int(proposal.get("sheet_row") or 0),
+            company=company, poc=poc, trigger=proposal.get("trigger") or "",
+            proposal_key=proposal.get("proposal_key") or "",
             cells=[{"cell": c["cell"], "header": c["header"],
                     "old": c["old"], "new": c["new"]} for c in result["written"]],
-            refused=plan["skipped"], asks=plan["asks"],
-            requested_by=_display(message.author),
+            refused=(proposal.get("payload") or {}).get("skipped") or [],
+            asks=(proposal.get("payload") or {}).get("asks") or [],
+            requested_by=proposal.get("requested_by") or "",
+            approved_by=decided_by,
         )
 
         applied = [
-            a for a in plan["applied"]
-            if a["role"] in {c["role"] for c in result["written"]}
+            a for a in (payload.get("applied") or [])
+            if a.get("role") in {c["role"] for c in result["written"]}
         ]
         line = sheetwrite.echo_line(
-            company=company, poc=poc, applied=applied, asks=plan["asks"],
-            skipped=plan["skipped"], undo_hours=config.SHEET_WRITE_UNDO_HOURS,
+            company=company, poc=poc, applied=applied,
+            asks=payload.get("asks") or [], skipped=payload.get("skipped") or [],
+            undo_hours=config.SHEET_WRITE_UNDO_HOURS,
         )
-        await self._reply(message, line, reason="echoing a sheet write")
+        await self._reply(message, line, reason="echoing an approved sheet write")
         log.info(
-            "[sheetwrite] %s wrote %d cell(s) on row %s (%s) via %s",
-            _display(message.author), len(result["written"]), row["_row"], company,
-            trigger,
+            "[approvals] %s approved %s — wrote %d cell(s) on row %s (%s)",
+            decided_by, proposal.get("proposal_key"), len(result["written"]),
+            proposal.get("sheet_row"), company,
         )
-        return True
 
     async def _undo_last_sheet_write(self, message: discord.Message) -> None:
         """Revert the most recent write, if it is still inside the window.
@@ -4565,7 +4975,21 @@ class SalesBot(discord.Client):
         if not due:
             return
 
-        channel_id = config.digest_channel_id()
+        # LIVE TEST MODE REDIRECTS THE REAL OUTPUT. Normal state, real timing,
+        # real composition — only the audience changes. It is not a simulation
+        # and does not pretend to be: slots are claimed, events are marked sent,
+        # proposals are recorded. Point DB_PATH at a *_test.db first.
+        channel_id = (
+            config.test_channel_id() if config.SALES_TEST_MODE
+            else config.digest_channel_id()
+        )
+        if config.SALES_TEST_MODE and not channel_id:
+            log.error(
+                "[test-mode] SALES_TEST_MODE=true but SALES_TEST_CHANNEL_ID is unset, "
+                "so there is nowhere to redirect to. Staying quiet rather than posting "
+                "test output into the real sales channel."
+            )
+            return
         channel = self.get_channel(channel_id) if channel_id else None
         if channel is None or not guardrails.may_read(channel_id):
             log.warning(
@@ -4573,10 +4997,29 @@ class SalesBot(discord.Client):
             )
             return
 
+        # THE PROPOSAL SWEEP RIDES THE FIRST SLOT, once a working day. It is
+        # not a rule and does not take a slot — the day's messages are unchanged
+        # by it — but it needs a moment somebody is already reading the channel,
+        # and the first slot is that moment.
+        #
+        # BEFORE the message, not after: an approval the sweep prompts is worth
+        # more the earlier it lands, and the two posts arriving together reads
+        # as one glance rather than two interruptions.
+        if due[0].get("slot") == 1 and self._swept_proposals_on != marker:
+            self._swept_proposals_on = marker
+            try:
+                await self._sweep_proposals(today=today, channel=channel)
+            except Exception:
+                log.exception(
+                    "[approvals] the proposal sweep failed; the day's messages are "
+                    "unaffected"
+                )
+
         # ONE MESSAGE PER TICK. The next slot is not due yet by construction —
-        # the gap is 75 minutes at minimum and the sweeper ticks far more often
-        # than that — but sending one and returning makes it impossible for a
-        # backlog (a long outage, a clock jump) to arrive as a burst.
+        # the gap is at least MESSAGE_GAP_MIN_MINUTES and the sweeper ticks far
+        # more often than that — but sending one and returning makes it
+        # impossible for a backlog (a long outage, a clock jump) to arrive as a
+        # burst.
         message = due[0]
         await self._send_drip_message(
             channel, message, marker=marker, channel_id=channel_id
@@ -4620,6 +5063,17 @@ class SalesBot(discord.Client):
         # ordinary actions so the drip groups, ranks, spaces and caps them
         # exactly like everything else — a feature with its own send path would
         # be re-introducing the problem the drip exists to solve.
+        # THE WEB HALF, before the drip groups and caps anything. An item that
+        # got its research reads differently from one that did not, and the
+        # composer needs to know which it is holding.
+        try:
+            actions = await self._research_items(actions, today=today)
+        except Exception:
+            log.exception(
+                "[websearch] the research pass failed; the items go out with their "
+                "placeholders rather than not going out"
+            )
+
         actions.extend(await self._event_actions(today=today))
         funnel = await self._funnel_action(today=today)
         if funnel is not None:
@@ -4756,6 +5210,45 @@ class SalesBot(discord.Client):
         which is the right way round: the drip speaks less on a bad day rather
         than more.
         """
+        # IS THE OWNER OFF TODAY? Asked BEFORE the message is addressed, so a
+        # nudge to somebody on holiday becomes a nudge to whoever is covering
+        # rather than noise they come back to a week later.
+        #
+        # FAILS OPEN. An unreadable leave channel or a model outage resolves to
+        # "everybody is in" and the owner is addressed as usual — the cost is
+        # one nudge to somebody away, and the cost of failing the other way
+        # would be silently redirecting all of the team's work to Vaishnavi
+        # every time the API blinked.
+        original_owner = str(message.get("owner") or "")
+        leave_note = ""
+        try:
+            away = await leave.who_is_away(self, self.llm)
+        except Exception:
+            log.exception("[leave] the leave check failed; addressing the owner as usual")
+            away = {}
+        # THE TEST OVERRIDE, merged OVER the real read. "pretend Kushal is on
+        # leave today" has to win, because the whole point is to see the cover
+        # path without waiting for somebody to actually go away.
+        override = simulation.leave_override()
+        if override:
+            away = {**away, **override}
+            log.info("[leave] %d test override(s) applied: %s",
+                     len(override), ", ".join(v["name"] for v in override.values()))
+        if away and original_owner:
+            covering, why = leave.address_to(original_owner, away)
+            if covering and covering != original_owner:
+                leave_note = why
+                message = dict(message)
+                message["owner"] = covering
+                message["owner_key"] = gtm_sheet.normalise_header(covering)
+                message["covering_for"] = original_owner
+                log.info("[leave] slot %s: %s", message.get("slot"), why)
+                state.audit(
+                    "addressed_cover",
+                    reason=why, date=marker, slot=message.get("slot"),
+                    original_owner=original_owner, addressed=covering,
+                )
+
         # HOW THE MESSAGE NAMES ITS OWNER is decided once, here, and threaded
         # into both composers. It used to be prefixed to whatever came back,
         # which produced "Vaishnavi Vaishnavi - ..." the moment the roster gate
@@ -4808,15 +5301,56 @@ class SalesBot(discord.Client):
         else:
             fallback = drip.compose_fallback(message, address=address)
             body, used_model = fallback, False
+            # THE LAST FEW OPENINGS, so the composer can be told what not to
+            # start with. Read here rather than inside `llm` because it is a
+            # database hit and that class does no I/O beyond the model call.
+            openers = await asyncio.to_thread(self.db.recent_openers, 5)
             if self.llm is not None:
                 try:
                     body, used_model = await self.llm.proactive_message(
                         prompt=drip.compose_prompt(message, address=address),
                         fallback=fallback,
+                        recent_openers=openers,
                     )
                 except Exception:
                     log.exception("[drip] composing failed; sending the template instead")
                     body, used_model = fallback, False
+
+            # A REPEATED OPENING IS CAUGHT AFTER THE FACT TOO. The prompt asks
+            # the composer not to reuse one; this notices when it did anyway.
+            # NOT a rejection — the message is fine, it just opens the same way
+            # as a recent one, and throwing away a good nudge over a turn of
+            # phrase would cost more than the repetition does. It is logged so a
+            # composer that ignores the rule is visible.
+            if used_model:
+                opened = tone.opener_of(body)
+                if opened and opened in set(openers):
+                    log.warning(
+                        "[tone] slot %s reused the opening %r despite being told not "
+                        "to. Sending it anyway — a repeated opening is worse than a "
+                        "template, but not worse than no message.",
+                        message.get("slot"), opened,
+                    )
+
+        # THE TAGS GO ON LAST AND IN ONE PLACE. The model composes the BODY and
+        # is never asked to write a mention token: `guardrails.sanitize` strips
+        # any it invents, so a model-written tag would vanish silently and the
+        # message would go out addressed to nobody.
+        if leave_note:
+            body = f"{body}\n_({leave_note}.)_"
+        body = drip.with_tags(
+            body,
+            owner_id=config.roster_id_for_name(message.get("owner") or ""),
+            owner_name=message.get("owner") or "",
+        )
+
+        # IN TEST MODE A DM IS SHOWN, NOT SENT, exactly as in a simulation —
+        # and the whole message carries the prefix so nothing in the test
+        # channel can be mistaken for something the team received.
+        if config.SALES_TEST_MODE:
+            if str(message.get("destination") or "") in ("dm", "escalation"):
+                body = simulation.dm_line(message.get("owner") or "the owner", body)
+            body = simulation.prefix(body)
 
         claimed = await asyncio.to_thread(
             lambda: self.db.record_drip_send(
@@ -4850,6 +5384,19 @@ class SalesBot(discord.Client):
                 message["slot"], marker,
             )
             return
+
+        # THE OPENING, banked so the next few messages start differently.
+        # Recorded AFTER the send, like every other ledger in this file: an
+        # opening that never went out should not constrain the ones that do.
+        try:
+            await asyncio.to_thread(
+                lambda: self.db.record_opener(
+                    tone.opener_of(body), rule_id=message.get("rule_id", ""),
+                    sent_at=dl.now_ist().isoformat(timespec="seconds"),
+                )
+            )
+        except Exception:
+            log.debug("[tone] could not bank the opening", exc_info=True)
 
         # THE MESSAGE ID, recorded now that there is one. A reply to this
         # message is one of only two things that may write to the sheet, and
@@ -5170,15 +5717,61 @@ class SalesBot(discord.Client):
             return None
 
         active, inactive = await asyncio.to_thread(
-            self._split_active, tab.rows, "the next-action queue"
+            self._split_active, tab.rows, "the twelve rules"
         )
         snoozes = await asyncio.to_thread(self.db.snoozes)
         scheduled = await asyncio.to_thread(self.db.scheduled_reminders_by_row)
 
+        # THE OTHER FOUR TABS. Seven of the twelve rules are not about an
+        # Outreach PoCs row at all — R4 reads the checklist, R12 the packages,
+        # R3 the events tab, R2 and R11 the Master Pipeline. All four are
+        # read-only and all four are read here rather than inside the engine,
+        # which reads no sheet by design.
+        deliverables = await self._rule_tab_rows(gtm_sheet.DELIVERABLES, "R4")
+        packages = await self._rule_tab_rows(gtm_sheet.PACKAGES, "R12")
+        events = await self._rule_tab_rows(gtm_sheet.EVENTS, "R3")
+        pipeline = await self._rule_tab_rows(gtm_sheet.RESEARCHER_LINES, "R2/R11")
+        pipeline_companies = [
+            gtm_sheet.clean_cell(r.get("company")) for r in pipeline
+            if gtm_sheet.clean_cell(r.get("company"))
+        ]
+
+        # R11'S SNAPSHOT IS A WRITE, AND IT HAPPENS HERE. The engine cannot take
+        # it: computing the queue would advance the state the queue is derived
+        # from, and every `cadence preview` would consume the newness it was
+        # meant to be showing. So it is taken once per tick, here, and the
+        # result is passed in as ordinary input.
+        try:
+            new_companies = await asyncio.to_thread(
+                self.db.pipeline_snapshot, pipeline_companies, today=dl.iso(today),
+            )
+        except Exception:
+            log.exception("[rules] the pipeline snapshot failed; R11 produces nothing today")
+            new_companies = []
+
+        # R5's cross-day state, and R9's ladder. Both are read-only here.
+        iso_week = "%d-W%02d" % today.isocalendar()[:2]
+        try:
+            week_companies = await asyncio.to_thread(
+                self.db.prospect_week_companies, iso_week
+            )
+            prospect_repeats = await asyncio.to_thread(self.db.prospect_repeats)
+        except Exception:
+            log.exception("[rules] R5's weekly state could not be read")
+            week_companies, prospect_repeats = [], {}
+        try:
+            meeting_followups = await asyncio.to_thread(self.db.meeting_followups)
+        except Exception:
+            log.exception("[rules] R9's ladder could not be read")
+            meeting_followups = {}
+
         result = await asyncio.to_thread(
             lambda: nextaction.run(
-                active, today=today, snoozes=snoozes, scheduled=scheduled,
-                inactive=len(inactive),
+                today=today, rows=active, snoozes=snoozes, scheduled=scheduled,
+                deliverables=deliverables, packages=packages, events=events,
+                pipeline_companies=pipeline_companies, new_companies=new_companies,
+                prospect_repeats=prospect_repeats, week_companies=week_companies,
+                meeting_followups=meeting_followups, inactive=len(inactive),
             )
         )
         result["tab"] = tab
@@ -5188,6 +5781,629 @@ class SalesBot(discord.Client):
         except Exception:
             result["staleness"] = ""
         return result
+
+    async def _research_items(self, items: list, *, today) -> list:
+        """Fill in the web half of every item that is waiting on it.
+
+        WHICH ITEMS. Only those the rules marked `web_pending` — R1, R2, R3,
+        R6's email search, R8 and R10's news, and R11. Everything else is left
+        exactly as the engine produced it.
+
+        THE BUDGET IS CHECKED BEFORE EACH CALL AND BANKED AFTER IT. Before,
+        because a call made with nothing left is a call that bills anyway;
+        after, because the number that counts is what the API reported billing
+        (`usage.server_tool_use.web_search_requests`) and an errored search is
+        not billed. Reserving up front would spend a budget on searches that
+        never happened.
+
+        WHEN THE BUDGET IS SPENT THE ITEMS SURVIVE. Each keeps its text and its
+        place in the queue and carries "web research unavailable today — the
+        daily search budget is spent". Dropping them instead would make a
+        configured rule look exactly like a quiet week, which is the failure
+        this whole layer exists to avoid.
+
+        NOTHING HERE ACTS ON WHAT IT READS. The result becomes text and links on
+        an item. No row is written, no message is sent, no rule is re-evaluated
+        because of a page's contents — web content is data, and the only thing
+        downstream of this is a human reading a message.
+        """
+        import websearch
+
+        pending = [i for i in (items or []) if i.get("web_pending")]
+        if not pending:
+            return items or []
+        if not websearch.enabled():
+            for item in pending:
+                item["research_note"] = websearch.unavailable_note(
+                    "WEB_SEARCH_ENABLED is off"
+                )
+            return items
+
+        marker = dl.iso(today)
+        budget = max(0, int(config.WEB_SEARCH_DAILY_BUDGET))
+
+        for item in pending:
+            left = await asyncio.to_thread(self.db.web_search_budget_left, marker)
+            if left <= 0:
+                used = await asyncio.to_thread(self.db.web_searches_today, marker)
+                item["research_note"] = websearch.unavailable_note(
+                    websearch.budget_note(used=used, budget=budget)
+                )
+                continue
+
+            query = websearch.RULE_QUERIES.get(item.get("rule") or "")
+            if not query:
+                continue
+
+            result = await self.llm.web_research(
+                rule=item.get("rule_id") or item.get("rule") or "?",
+                prompt=query + "\n\n" + await self._research_context(item),
+                max_uses=min(int(config.WEB_SEARCH_MAX_USES), left),
+            )
+            await asyncio.to_thread(
+                lambda: self.db.record_web_search(
+                    on_date=marker, rule_id=item.get("rule_id") or "?",
+                    searches=int(result.get("searches") or 0),
+                    errors=len(result.get("errors") or []),
+                )
+            )
+            if result.get("ok"):
+                item["research"] = result.get("text") or ""
+                item["sources"] = result.get("sources") or []
+                item["research_note"] = ""
+                item["web_pending"] = False
+                # THE PLACEHOLDER COMES OUT OF THE TEXT once the research it was
+                # standing in for has arrived. Leaving it would put "web
+                # research pending" in a message that carries the research.
+                item["text"] = str(item.get("text") or "").replace(
+                    f" [{websearch.WEB_PENDING}]", ""
+                )
+            else:
+                item["research_note"] = result.get("note") or \
+                    websearch.unavailable_note()
+
+        done = sum(1 for i in pending if not i.get("web_pending"))
+        log.info(
+            "[websearch] %s: researched %d of %d pending item(s); %d search(es) left "
+            "of %d today",
+            marker, done, len(pending),
+            await asyncio.to_thread(self.db.web_search_budget_left, marker), budget,
+        )
+        return items
+
+    async def _research_context(self, item: dict) -> str:
+        """What the search needs to know about THIS item, and nothing more.
+
+        R1 and R2 get the companies and people already on the sheet, because
+        both rules are explicitly about ranking against what we already track —
+        R1 prioritises news about them, R2 screens for companies that are NOT
+        among them. Everything else gets its own row.
+        """
+        rule = item.get("rule") or ""
+        bits: list = []
+        if item.get("company"):
+            bits.append(f"Company: {item['company']}")
+        if item.get("poc"):
+            bits.append(f"Person: {item['poc']}"
+                        + (f" ({item['poc_designation']})"
+                           if item.get("poc_designation") else ""))
+        if rule in ("ai_news", "news_company_screen"):
+            known = await self._known_companies()
+            if known:
+                bits.append(
+                    "Companies and people already on our sheet:\n"
+                    + ", ".join(known[:120])
+                )
+        return "\n".join(bits) or "(no further context)"
+
+    async def _known_companies(self) -> list:
+        """Every company name the playbook tracks, for R1 and R2's ranking."""
+        names: list = []
+        seen: set = set()
+        for kind in (gtm_sheet.POCS, gtm_sheet.RESEARCHER_LINES):
+            try:
+                tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, kind)
+            except Exception:
+                continue
+            for row in (tab.rows if tab else []):
+                name = gtm_sheet.clean_cell(row.get("company"))
+                key = gtm_sheet.normalise_header(name)
+                if name and key not in seen:
+                    seen.add(key)
+                    names.append(name)
+        return names
+
+    async def _sweep_proposals(self, *, today, channel) -> bool:
+        """The once-a-working-day nudge-and-drop for proposals nobody answered.
+
+        Runs in the FIRST drip slot, once, and posts ONE combined message
+        however many proposals are waiting. Returns True when it posted.
+
+        TWO AGES, IN THIS ORDER AND NOT THE OTHER. Proposals past their DROP age
+        are closed FIRST, then what remains past the NUDGE age is listed — so a
+        proposal that is old enough for both is dropped rather than nudged and
+        then dropped on the same afternoon.
+
+        IT DOES NOT COUNT AGAINST THE DAILY CAP. A day that spent all its slots
+        on rules and therefore never mentioned four pending approvals would be a
+        day the approvals queue grew invisibly.
+
+        NOTHING IS SAID ON A DAY WITH NOTHING PENDING. Silence is the correct
+        output of an empty queue, and a daily "no approvals outstanding" post is
+        the fastest way to teach a team to skim.
+        """
+        marker = dl.iso(today)
+        nudge_age = max(0, int(config.PROPOSAL_NUDGE_AFTER_DAYS))
+        drop_age = max(0, int(config.PROPOSAL_DROP_AFTER_DAYS))
+
+        # WORKING DAYS, NOT CALENDAR DAYS. A proposal made on Friday afternoon
+        # is not stale on Saturday, and dropping it on Monday morning because
+        # two calendar days passed over a weekend nobody worked would be the
+        # bot punishing people for the weekend.
+        nudge_before = dl.iso(dl.subtract_working_days(today, nudge_age))
+        drop_before = dl.iso(dl.subtract_working_days(today, drop_age + nudge_age))
+
+        # (1) DROP what has already been nudged and is still unanswered.
+        try:
+            droppable = await asyncio.to_thread(
+                lambda: self.db.stale_proposals(before_iso=drop_before, nudged=True)
+            )
+        except Exception:
+            log.exception("[approvals] the drop sweep could not read its proposals")
+            droppable = []
+
+        for proposal in droppable:
+            if proposal is None:
+                continue
+            await asyncio.to_thread(
+                lambda p=proposal: self.db.close_proposal(
+                    proposal_key=p["proposal_key"], status="expired",
+                    decision="nobody answered after one nudge",
+                    decided_by="", decided_at=dl.now_ist().isoformat(timespec="seconds"),
+                )
+            )
+            state.audit(
+                "proposal_dropped",
+                reason="nobody answered after one nudge; not mentioned again",
+                proposal_key=proposal["proposal_key"],
+                company=proposal.get("company", ""), poc=proposal.get("poc", ""),
+                proposed=proposal.get("proposed_text", ""),
+                requested_by=proposal.get("requested_by", ""),
+                nudged_on=proposal.get("nudged_on", ""),
+            )
+            log.info(
+                "[approvals] dropped %s (%s) — nudged on %s, still unanswered. Nothing "
+                "was written and it will not be mentioned again.",
+                proposal["proposal_key"], proposal.get("company") or "?",
+                proposal.get("nudged_on") or "?",
+            )
+
+        # (2) NUDGE what is past the nudge age and has never been nudged.
+        try:
+            pending = await asyncio.to_thread(
+                lambda: self.db.stale_proposals(before_iso=nudge_before, nudged=False)
+            )
+        except Exception:
+            log.exception("[approvals] the nudge sweep could not read its proposals")
+            pending = []
+        pending = [p for p in pending if p]
+
+        if not pending:
+            if droppable:
+                log.info("[approvals] sweep: %d dropped, nothing left to nudge",
+                         len(droppable))
+            return False
+
+        body = approvals.pending_text(pending)
+        # THE SWEEP TAGS VAISHNAVI AND SID and nobody else: these are approvals,
+        # and only they can give one. Tagging the person who ASKED would be
+        # tagging somebody who cannot answer.
+        body = drip.with_tags(body)
+        sent = await guardrails.send(
+            channel, body,
+            reason=f"one nudge for {len(pending)} proposal(s) still awaiting approval",
+            kind="proposal_sweep",
+            extra={"date": marker, "pending": len(pending),
+                   "dropped": len(droppable)},
+        )
+        if sent is None:
+            log.warning(
+                "[approvals] the pending-approvals message was refused or failed. The "
+                "proposals are NOT marked nudged, so they will be offered again "
+                "tomorrow rather than dropped unmentioned."
+            )
+            return False
+
+        for proposal in pending:
+            await asyncio.to_thread(
+                lambda p=proposal: self.db.mark_proposal_nudged(
+                    p["proposal_key"], on_date=marker
+                )
+            )
+        state.audit(
+            "proposals_nudged",
+            reason="one combined nudge for everything awaiting approval",
+            date=marker, count=len(pending), dropped=len(droppable),
+            keys=[p["proposal_key"] for p in pending],
+        )
+        log.info(
+            "[approvals] sweep: nudged %d proposal(s) in one message, dropped %d. This "
+            "message does not count against the daily cap.",
+            len(pending), len(droppable),
+        )
+        return True
+
+    # -- SIMULATION --------------------------------------------------------
+
+    async def _handle_simulation(self, message, text: str) -> bool:
+        """Route a simulation or test-helper command. True when handled.
+
+        THE CHANNEL GATE IS SILENT. A "simulate week" typed in the real sales
+        channel does nothing at all — not a refusal, because a refusal there is
+        itself a message the team has to read.
+        """
+        cid = getattr(message.channel, "id", 0)
+        uid = getattr(message.author, "id", 0)
+
+        helper = await self._handle_test_helper(message, text)
+        if helper:
+            return True
+
+        parsed = simulation.parse(text)
+        if parsed is None:
+            return False
+
+        allowed, why = simulation.may_run(cid, uid)
+        if not allowed:
+            if why:
+                await self._reply(message, why, reason="simulation refused")
+                return True
+            return False
+
+        try:
+            await self._run_simulation(message, parsed)
+        except Exception:
+            log.exception("[sim] the simulation failed")
+            await self._reply(
+                message,
+                "The simulation failed partway through. Nothing was changed — it "
+                "runs on a throwaway copy of the database — but the log has the "
+                "detail.",
+                reason="simulation error",
+            )
+        return True
+
+    async def _handle_test_helper(self, message, text: str) -> bool:
+        """`pretend X is on leave`, `clear leave`, `advance clock`, `reset`."""
+        cid = getattr(message.channel, "id", 0)
+        uid = getattr(message.author, "id", 0)
+        low = (text or "").lower()
+        if not any(w in low for w in
+                   ("on leave", "clear leave", "advance clock", "reset clock",
+                    "reset test state")):
+            return False
+
+        allowed, why = simulation.may_run(cid, uid)
+        if not allowed:
+            if why:
+                await self._reply(message, why, reason="test helper refused")
+                return True
+            return False
+
+        m = simulation._LEAVE_RE.search(text)
+        if m:
+            await self._reply(message, simulation.pretend_on_leave(m.group("who")),
+                              reason="leave override set")
+            state.audit("test_leave_override", reason="set by a test command",
+                        who=m.group("who"), by=_display(message.author))
+            return True
+
+        if simulation._CLEAR_LEAVE_RE.search(text):
+            await self._reply(message, simulation.clear_leave_override(),
+                              reason="leave override cleared")
+            return True
+
+        m = simulation._ADVANCE_RE.search(text)
+        if m:
+            ok, line = simulation.set_clock_offset(int(m.group("n")))
+            await self._reply(message, line, reason="clock advanced")
+            if ok:
+                state.audit("test_clock_advanced", reason="advanced by a test command",
+                            days=int(m.group("n")), by=_display(message.author))
+            return True
+
+        if simulation._RESET_CLOCK_RE.search(text):
+            await self._reply(message, simulation.reset_clock(), reason="clock reset")
+            return True
+
+        if simulation._RESET_STATE_RE.search(text):
+            await self._reply(message, await self._reset_test_state(message),
+                              reason="test state reset")
+            return True
+
+        return False
+
+    async def _reset_test_state(self, message) -> str:
+        """Wipe the test database. REFUSES unless DB_PATH names a *_test.db.
+
+        THE NAME CHECK IS THE WHOLE SAFETY. "reset test state" typed against a
+        live bot would delete every deadline, snooze, proposal and event
+        reminder the team depends on, and there is no undo. Requiring the path
+        to END IN `_test.db` means an operator has to have deliberately pointed
+        the bot at a test database before the command does anything at all.
+        """
+        path = str(config.DB_PATH or "")
+        if not path.endswith("_test.db"):
+            return (
+                f"No — DB_PATH is {path!r}, which is not a *_test.db. I will not wipe "
+                "a database that might be the real one. Point DB_PATH at something "
+                "like ./sales_bot_test.db first."
+            )
+        try:
+            self.db.close() if hasattr(self.db, "close") else None
+        except Exception:
+            pass
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            self.db = DB(path)
+        except Exception as e:
+            log.exception("[sim] could not reset the test database")
+            return f"I could not reset it ({type(e).__name__}). Nothing was changed."
+        state.audit("test_state_reset", reason="wiped by a test command",
+                    path=path, by=_display(message.author))
+        log.warning("[sim] test database %s wiped by %s", path, _display(message.author))
+        return f"Wiped {path} and started a fresh one."
+
+    async def _run_simulation(self, message, parsed: dict) -> None:
+        """Run one simulation and post it. Changes nothing."""
+        mode = parsed["mode"]
+        if mode == simulation.MODE_WEEK:
+            days = simulation.week_of()
+            rule = ""
+        elif mode == simulation.MODE_RULE:
+            when = simulation.next_date_for_rule(parsed["rule"])
+            if when is None:
+                await self._reply(
+                    message,
+                    f"{parsed['rule']} is not a rule I have, or it is disabled in "
+                    "bot_rules.yaml.",
+                    reason="unknown rule",
+                )
+                return
+            days, rule = [when], parsed["rule"]
+        else:
+            days, rule = [parsed["date"]], ""
+
+        channel = message.channel
+        fast = bool(parsed["fast"])
+
+        opening = (
+            f"{config.SIMULATION_PREFIX} Simulating "
+            + (f"the week of {days[0].strftime('%d %b')}" if len(days) > 1
+               else days[0].strftime("%a %d %b"))
+            + (f", {rule} only" if rule else "")
+            + f" · {'fast' if fast else 'compressed real'} spacing"
+            + " · nothing will be written"
+        )
+        await guardrails.send(channel, opening, reason="simulation opening",
+                              kind="simulation")
+
+        # ONE SANDBOX FOR THE WHOLE RUN, so a simulated week behaves like a
+        # week: Tuesday sees what Monday did. Discarded at the end either way.
+        with simulation.SandboxDB(config.DB_PATH) as sandbox, simulation.simulating():
+            real_db = self.db
+            self.db = sandbox
+            try:
+                for day in days:
+                    await self._simulate_one_day(
+                        channel, day, rule=rule, fast=fast,
+                        is_week=len(days) > 1,
+                    )
+            finally:
+                self.db = real_db
+
+    async def _simulate_one_day(self, channel, day, *, rule: str, fast: bool,
+                                is_week: bool) -> None:
+        """One simulated day: header, the messages, the footer."""
+        import asyncio as _asyncio
+
+        if is_week:
+            await guardrails.send(
+                channel, simulation.header(day),
+                reason="simulation day header", kind="simulation",
+            )
+
+        skipped: list = []
+        notes: list = []
+
+        if not drip.is_sending_day(day) and day.weekday() != 6:
+            await guardrails.send(
+                channel,
+                simulation.footer({
+                    "day_label": day.strftime("%a %d %b"), "sent": 0,
+                    "skipped": [f"{day.strftime('%A')} is silent — the drip does not "
+                                "send at the weekend"],
+                }),
+                reason="simulation footer", kind="simulation",
+            )
+            return
+
+        queue = await self._run_next_actions(today=day)
+        if queue is None:
+            await guardrails.send(
+                channel,
+                simulation.footer({
+                    "day_label": day.strftime("%a %d %b"), "sent": 0,
+                    "skipped": ["the rules engine is off (NEXT_ACTION_ENABLED) or "
+                                "there is no canonical tab to read"],
+                }),
+                reason="simulation footer", kind="simulation",
+            )
+            return
+
+        actions = list(queue.get("actions") or [])
+        for entry in (queue.get("rules_run") or []):
+            if not entry.get("ran"):
+                skipped.append(f"{entry['id']} {entry['name']} — {entry['why']}")
+            elif not entry.get("items"):
+                skipped.append(f"{entry['id']} {entry['name']} — ran, found nothing")
+
+        if rule:
+            before = len(actions)
+            actions = [a for a in actions if str(a.get("rule_id", "")).upper() == rule]
+            notes.append(f"filtered to {rule}: {len(actions)} of {before} item(s)")
+
+        actions.extend(await self._event_actions(today=day))
+        planned = await asyncio.to_thread(
+            lambda: drip.plan(actions, day=day, history={}, already_sent=[])
+        )
+
+        messages = planned.get("messages") or []
+        cap = config.message_cap_for(day)
+        counted = sum(1 for m in messages if m.get("counts_toward_cap", True))
+        pace = simulation.pace_seconds(fast=fast, count=max(1, len(messages)))
+
+        for i, msg in enumerate(messages):
+            body = await self._simulated_body(msg, day=day)
+            await guardrails.send(
+                channel, body,
+                reason=f"simulated slot {msg.get('slot')} for {dl.iso(day)}",
+                kind="simulation",
+            )
+            # A SIMULATED SEND MARKS THE SANDBOX, so a simulated WEEK behaves
+            # like a week. Without this the events dedup — which is written
+            # only on a real send — never learns, and a conference reminded on
+            # Monday is reminded again every day to Friday. The write lands in
+            # the throwaway copy and is discarded with it, so the real
+            # `event_reminders` table is untouched.
+            for action in (msg.get("actions") or []):
+                key = action.get("event_key")
+                if not key:
+                    continue
+                await asyncio.to_thread(
+                    lambda a=action, k=key: self.db.record_event_reminder(
+                        event_key=k, event=a.get("company", ""),
+                        event_date=a.get("event_date", ""),
+                        location=a.get("location", ""), sent_on=dl.iso(day),
+                    )
+                )
+            if i < len(messages) - 1 and pace:
+                await _asyncio.sleep(pace)
+
+        # THE SWEEP RIDES SLOT 1 IN REAL LIFE, so it does here too — and it is
+        # rendered rather than sent, like everything else.
+        sweep_line = await self._simulated_sweep(day)
+        if sweep_line:
+            await guardrails.send(channel, sweep_line,
+                                  reason="simulated approvals sweep",
+                                  kind="simulation")
+            notes.append("the pending-approvals message rides slot 1 and takes no "
+                         "cap slot")
+
+        # TWO GROUPS OF THE SAME RULE ROLL SEPARATELY — the drip groups by
+        # (rule x owner), so "R4 Deliverables checklist" can legitimately
+        # appear twice. Naming the owner and the companies is what makes the
+        # two lines readable as two different things rather than a bug.
+        def _label(g, default):
+            head = f"{g.get('rule_id', '?')} {g.get('rule_name') or g.get('type')}"
+            who = str(g.get("owner") or "").strip()
+            names = [str(c) for c in (g.get("companies") or []) if c]
+            bits = []
+            if who:
+                bits.append(who)
+            if names:
+                bits.append(names[0] if len(names) == 1
+                           else f"{names[0]} +{len(names) - 1}")
+            if bits:
+                head += " (" + ", ".join(bits) + ")"
+            return head + " — " + str(g.get("why") or default)
+
+        rolled = [_label(g, "over the cap") for g in (planned.get("rolled") or [])]
+        held = [_label(g, "held") for g in (planned.get("held") or [])]
+
+        await guardrails.send(
+            channel,
+            simulation.footer({
+                "day_label": day.strftime("%a %d %b"),
+                "sent": len(messages), "counted": counted, "cap": cap,
+                "times": [m.get("send_at_hhmm", "") for m in messages],
+                "rolled": rolled, "skipped": skipped + held, "notes": notes,
+            }),
+            reason="simulation footer", kind="simulation",
+        )
+
+    async def _simulated_body(self, msg: dict, *, day) -> str:
+        """Compose one simulated message exactly as the real one would be.
+
+        THE MODEL COMPOSES IT. A simulation that showed the template would be
+        showing something the team will never receive — the point is to see the
+        actual wording, and the actual wording comes from the model.
+
+        A DM RUNG IS RENDERED, NOT SENT: "[DM to Vaishnavi] ...".
+        """
+        owner = str(msg.get("owner") or "")
+        address = self._drip_mention(msg)
+        fallback = drip.compose_fallback(msg, address=address)
+        body, _used = fallback, False
+        if self.llm is not None:
+            try:
+                body, _used = await self.llm.proactive_message(
+                    prompt=drip.compose_prompt(msg, address=address),
+                    fallback=fallback,
+                    recent_openers=await asyncio.to_thread(self.db.recent_openers, 5),
+                )
+            except Exception:
+                log.exception("[sim] composing failed; showing the template")
+
+        body = drip.with_tags(
+            body, owner_id=config.roster_id_for_name(owner), owner_name=owner,
+        )
+        if str(msg.get("destination") or "") in ("dm", "escalation"):
+            body = simulation.dm_line(owner or "the owner", body)
+        return simulation.prefix(simulation.strip_mentions(body))
+
+    async def _simulated_sweep(self, day) -> str:
+        """The pending-approvals message, rendered rather than sent."""
+        try:
+            cutoff = dl.iso(dl.subtract_working_days(
+                day, config.PROPOSAL_NUDGE_AFTER_DAYS))
+            pending = await asyncio.to_thread(
+                lambda: self.db.stale_proposals(before_iso=cutoff, nudged=False)
+            )
+        except Exception:
+            log.exception("[sim] could not read the proposal queue")
+            return ""
+        pending = [p for p in pending if p]
+        if not pending:
+            return ""
+        body = drip.with_tags(approvals.pending_text(pending))
+        return simulation.prefix(simulation.strip_mentions(body))
+
+    async def _rule_tab_rows(self, kind: str, for_rules: str) -> list:
+        """One read-only context tab's rows, or [] with a log line.
+
+        [] RATHER THAN AN EXCEPTION, and deliberately: a missing Sales Packages
+        tab must cost R12 and nothing else. The rule then produces no items and
+        `cadence preview` reports it as "ran, found nothing" — which is not the
+        same as "the tab is gone", so the miss is logged here by rule id.
+        """
+        try:
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, kind)
+        except gtm_sheet.SheetAccessError as e:
+            log.info("[rules] %s: the %s tab could not be read (%s)", for_rules, kind, e)
+            return []
+        except Exception:
+            log.exception("[rules] %s: the %s tab could not be read", for_rules, kind)
+            return []
+        if tab is None:
+            log.warning(
+                "[rules] %s: there is no %s tab in the playbook, so that rule produces "
+                "nothing. It is found BY NAME — check the matching *_TAB_TITLES setting "
+                "against the [gtm.schema] log.", for_rules, kind,
+            )
+            return []
+        return list(tab.rows)
 
     # -- row activation ----------------------------------------------------
 

@@ -1,0 +1,257 @@
+# =============================================================================
+# bot_rules.yaml — THE MACHINE COPY OF THE "Bot Rules" TAB
+# =============================================================================
+#
+# Source of truth:
+#   Google Sheet "Sales Bot_membrane", tab "Bot Rules"
+#   Drive file id: 1sVsqPLxkBBBUQJGPDx-3AydRjHIRO9WGT-kkULgdtpo
+#   + Vaishnavi 21 Sep
+#
+# This file is that tab, in a form the engine can read. It is loaded ONCE AT
+# STARTUP by rules.py. Editing it changes what the bot does after a restart,
+# with no code change — which is the whole point of it being a file.
+#
+# WHY A FILE AND NOT CODE. The twelve rules below are a product decision that
+# Vaishnavi and Sid own. Encoding them as Python meant every change to a
+# weekday, a cap or a destination was a developer's afternoon; encoding them
+# here means it is an edit and a restart. What stays in code is HOW a rule
+# decides something is due — the shape of the question — never WHETHER it runs
+# today or how much it may say.
+#
+# WHAT EACH FIELD MEANS
+#
+#   id                  stable identifier, R1..R12. NEVER renumber one: it is
+#                       the key the dedup ledger, the preview and the SQLite
+#                       state are all written against. Retire an id rather than
+#                       reusing it.
+#   name                what a human calls it. Shown in `cadence preview` and
+#                       in the "why" line of every item the rule produces.
+#   weekdays            which days it may run, as three-letter names
+#                       (mon tue wed thu fri sat sun). An EMPTY list means the
+#                       rule never runs on a schedule — R8 and R9 are anchored
+#                       to a meeting date instead and say so below.
+#   trigger             the evaluator in nextaction.py that computes due items.
+#                       A trigger this file names that does not exist is a
+#                       STARTUP ERROR, not a silent skip.
+#   max_items_per_post  the most contacts, deliverables or packages one post
+#                       may carry. Overflow rolls to the rule's next day.
+#   destination         "channel" | "dm" | "escalation". The drip enforces it;
+#                       guardrails.py still refuses a DM outright, so a rule
+#                       asking for one is reported, not sent. See the note at
+#                       the bottom of this file.
+#   counts_toward_cap   whether an item takes one of the day's DAILY_MESSAGE_CAP
+#                       slots. R8 and R9 are false: a meeting is time-critical
+#                       and must not be crowded out by a Monday chase.
+#   enabled             false takes the rule out of service without deleting
+#                       it, so the reason it existed is still readable.
+#
+# WEB-DEPENDENT RULES. R1, R2, R3, R6, R8, R10 and R11 need web research the
+# bot cannot do yet. They still produce their items, each carrying the
+# placeholder "web research pending", so the schedule is real and visible
+# before the research layer lands (R5 of this series). Nothing is silently
+# skipped waiting for it.
+# =============================================================================
+
+version: 1
+source:
+  sheet: "Sales Bot_membrane"
+  tab: "Bot Rules"
+  drive_file_id: "1sVsqPLxkBBBUQJGPDx-3AydRjHIRO9WGT-kkULgdtpo"
+  amended: "Vaishnavi 21 Sep"
+
+rules:
+
+  # ---------------------------------------------------------------- R1
+  # Funding rounds, AI/ML and leadership hires, papers by our PoCs, PoCs
+  # speaking at events, PoCs changing companies, job posts for evals /
+  # annotation / model-training roles, competitor news, major global AI news,
+  # AI regulation and compliance updates.
+  - id: R1
+    name: AI news
+    weekdays: [mon, tue, wed, thu, fri]
+    trigger: ai_news
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R2
+  # For companies in the news that are NOT in the Master Pipeline, say why each
+  # is or isn't relevant to membrane. Permission is asked before anything is
+  # added to the sheet — the bot never adds a row on its own.
+  - id: R2
+    name: News-company screen
+    weekdays: [tue, fri]
+    trigger: news_company_screen
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R3
+  # EVERY OTHER Wednesday, anchored to EVENTS_ANCHOR_DATE (2026-09-23). Remind
+  # until registration closes or the event happens; use the registration
+  # deadline when it is known, otherwise the event date. Events that have
+  # passed are skipped.
+  - id: R3
+    name: AI events and summits
+    weekdays: [wed]
+    trigger: events
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R4
+  # P1 items only, status blank or not done, deadline within
+  # DELIVERABLE_NEAR_DAYS (3) or already passed. The owner is the Functional
+  # Dependency cell; blank means Vaishnavi.
+  - id: R4
+    name: Deliverables checklist
+    weekdays: [mon]
+    trigger: deliverables
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R5
+  # Outreach PoCs rows where First Contact is FALSE or blank. Five contacts a
+  # post, in the role order founders > CXO > chief scientist > research. Two
+  # companies or universities a week, in sheet order — stay with a company
+  # until all its contacts have a first contact recorded. If the same contact
+  # comes up three times with no update, ask whether to skip it.
+  - id: R5
+    name: Prospects to contact
+    weekdays: [tue, thu]
+    trigger: prospects
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R6
+  # LinkedIn connected, no DM after 3 days. Says whether an email is on file;
+  # if not, the research layer will look for a verified public one and say
+  # where it was found, or that none was.
+  - id: R6
+    name: LinkedIn connected, no DM
+    weekdays: [tue, fri]
+    trigger: li_no_dm
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R7
+  # DM sent, no meeting after 7 days. Shows days since the DM and the last note
+  # logged against that contact.
+  - id: R7
+    name: DM sent, no meeting
+    weekdays: [mon]
+    trigger: dm_no_meeting
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R8
+  # ANCHORED TO THE MEETING, NOT TO A WEEKDAY — hence the empty weekday list.
+  # Touches at 5 days before, 3 days before, and MEETING_DAYOF_TIME (10:00) on
+  # the day. Touches already in the past are skipped, so a meeting booked with
+  # three days' notice gets the 3-day and day-of touches and not a late
+  # 5-day one. A reschedule re-anchors every touch on the new date.
+  #
+  # counts_toward_cap: false — a meeting is time-critical and must not be
+  # crowded out by a Monday chase.
+  - id: R8
+    name: Meeting preparation
+    weekdays: []
+    trigger: meeting_prep
+    max_items_per_post: 3
+    destination: channel
+    counts_toward_cap: false
+    enabled: true
+
+  # ---------------------------------------------------------------- R9
+  # ANCHORED TO THE MEETING. 3 days after a completed meeting with no next
+  # steps, then every 3 days: one channel post, then two DMs, then one
+  # escalation to Sid, then stop. Asks for next steps, the package discussed
+  # and an estimated deal size.
+  #
+  # destination is "channel" because that is where the FIRST touch goes; the
+  # engine escalates the later ones itself and records which stage each item is
+  # at. See the DM note at the bottom of this file.
+  - id: R9
+    name: Meeting done, no next steps
+    weekdays: []
+    trigger: meeting_followup
+    max_items_per_post: 3
+    destination: channel
+    counts_toward_cap: false
+    enabled: true
+
+  # ---------------------------------------------------------------- R10
+  # Prospect status deal / demo / quote AND closure probability strictly above
+  # CLOSURE_SUPPORT_MIN (50). Exactly 50 is EXCLUDED — "above 50" is the rule
+  # as written, and a boundary a bot decides for itself is a boundary nobody
+  # agreed to. Asks what is needed for the next stage and shares relevant news.
+  - id: R10
+    name: Closure support
+    weekdays: [mon]
+    trigger: closure_support
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R11
+  # One WORKING day after a company first appears in the Master Pipeline.
+  # THERE IS NO CREATED-DATE COLUMN on that tab, so "appears" is detected by
+  # comparing today's company names against a daily snapshot in SQLite. The
+  # snapshot is taken by the caller, not by the engine, so the engine stays
+  # pure — see nextaction.run's docstring.
+  #
+  # Fills in funding, location and industry, and suggests PoCs with name,
+  # designation, LinkedIn URL and research paper link. Permission is asked
+  # before anything is added to Outreach PoCs.
+  - id: R11
+    name: New company in Master Pipeline
+    weekdays: [mon, tue, wed, thu, fri]
+    trigger: new_pipeline_company
+    max_items_per_post: 3
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+  # ---------------------------------------------------------------- R12
+  # Every package on the Sales Packages tab where Ready? is No or blank. Asks
+  # for the status and the expected ready date. Blank reads as No — see
+  # gtm_sheet.ready_flag for why that direction and not the other.
+  - id: R12
+    name: Sales packages
+    weekdays: [thu]
+    trigger: sales_packages
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: true
+    enabled: true
+
+# =============================================================================
+# THE DM NOTE
+#
+# R9 escalates to DMs after its first touch, and the strategy doc's escalation
+# rule does the same for anything three or more days overdue. With
+# SALES_DMS_ENABLED off, an item whose rung resolves to "dm" or "escalation" is
+# still computed, still ranked and still shown in `cadence preview` — and it
+# POSTS IN THE CHANNEL as an ordinary follow-up. The escalation rung posts in
+# the channel ADDRESSED TO ESCALATION_ADDRESSEE (Sid).
+#
+# THE MESSAGE DOES NOT MENTION ANY OF THIS. It used to say "this would have
+# been a DM", and that was the wrong thing to tell anybody: the reader does not
+# care about the bot's delivery plumbing, and a nudge that spends a clause
+# apologising for its own channel reads as a bot with a problem rather than a
+# colleague with a question. The fallback is LOGGED instead —
+# `[dm] fallback-to-channel rung=N item=...` — where an operator sees it and
+# the team does not.
+# =============================================================================

@@ -127,6 +127,86 @@ def add_working_days(start: date, n: int) -> date:
     return d
 
 
+def ist_date_of(value, *, default: Optional[date] = None) -> Optional[date]:
+    """The IST CALENDAR DATE of a stored timestamp, whatever zone it carries.
+
+    THE PROBLEM THIS SOLVES IS A DAY-BOUNDARY ONE. Everything this bot schedules
+    is reckoned in IST, and IST is UTC+5:30 — so the 5.5 hours either side of
+    midnight are exactly where "which day is this?" has two answers. A proposal
+    made at 00:30 IST was made at 19:00 UTC THE PREVIOUS DAY, and a comparison
+    that took the date off the front of a UTC string would call it yesterday's.
+
+    WHY NOT `substr(created_at, 1, 10)` IN SQL. That reads the first ten
+    characters and calls them the date. It is right only while every writer
+    happens to store IST — which is today's convention (`dl.now_ist()`) but is
+    not enforced anywhere, and a single caller using `datetime.now(timezone.utc)`
+    would silently shift every comparison by up to 5.5 hours with nothing to
+    show for it. Parsing the offset costs a few microseconds on a handful of
+    rows and cannot be wrong.
+
+    ACCEPTS three shapes:
+      - offset-aware ISO: "2026-09-22T00:30:00+05:30", "2026-09-21T19:00:00Z"
+      - naive ISO:        "2026-09-22T00:30:00"  -> ASSUMED IST, the convention
+                          every writer in this codebase follows
+      - a bare date:      "2026-09-22"
+
+    Returns `default` (None unless given) for anything unparseable, so a
+    malformed row degrades to "not matched" rather than raising inside a sweep.
+    """
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        return dt.astimezone(IST).date()
+    if isinstance(value, date):
+        return value
+
+    text = str(value or "").strip()
+    if not text:
+        return default
+    # "...Z" is UTC; fromisoformat only learned to read it in 3.11.
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        # A bare date, or something we cannot read.
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return default
+    if dt.tzinfo is None:
+        # NAIVE MEANS IST HERE. Every timestamp this bot writes to SQLite comes
+        # from `now_ist()`, and reading a naive one as UTC would move it 5.5
+        # hours backwards — the exact error this function exists to prevent.
+        dt = dt.replace(tzinfo=IST)
+    return dt.astimezone(IST).date()
+
+
+def subtract_working_days(start: date, n: int) -> date:
+    """`n` working days BEFORE `start`, skipping weekends.
+
+    The mirror of `add_working_days`, and the one the proposal sweep needs: "was
+    this proposed more than one working day ago" must not count a weekend
+    nobody worked. A proposal made on Friday afternoon is not stale on Monday
+    morning — it is stale on Tuesday.
+
+    n=0 returns `start` itself, rolled BACK to the previous working day when it
+    falls on a weekend.
+    """
+    d = start
+    if n <= 0:
+        while not is_working_day(d):
+            d -= timedelta(days=1)
+        return d
+    remaining = int(n)
+    while remaining > 0:
+        d -= timedelta(days=1)
+        if is_working_day(d):
+            remaining -= 1
+    return d
+
+
 def previous_working_day(d: date) -> date:
     """The working day before `d` — when the "one day before due" reminder
     fires. Friday for a Monday deadline, never Sunday."""

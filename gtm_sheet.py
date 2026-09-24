@@ -100,6 +100,7 @@ import logging
 import re
 import threading
 import time
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import config
@@ -140,9 +141,27 @@ PRIORITY = "prospect_priority"
 PIPELINE = "lead_pipeline"
 FUNNEL = "funnel_pivot"
 RESEARCHER_LINES = "researcher_lines"
+# "Master Pipeline" is what the live sheet calls the researcher-lines tab, and
+# GTM_PIPELINE_TAB_TITLES is what finds it. Same kind, the sheet's own name.
+MASTER_PIPELINE = RESEARCHER_LINES
 # THE EVENTS & SUMMITS TAB. Conferences, summits and the like, each earning one
 # reminder at T-EVENT_LEAD_DAYS and never another.
 EVENTS = "events_summits"
+
+# -- THE READ-ONLY CONTEXT TABS ----------------------------------------------
+# Three more kinds, all claimed by NAME (see `_claimed_by_name`) and all
+# READ-ONLY: no write path addresses them, because every write is planned
+# against the canonical tab's writable window and nothing else.
+#
+# "Deliverables Checklist" — what the team owes, by when. Its deadlines carry no
+# year ("25-Sep"), which is why `parse_bare_deadline` exists.
+DELIVERABLES = "deliverables_checklist"
+# "Sales Packages" — what can actually be sold today, and how finished each
+# package is. The bot reads `ready` before it offers one.
+PACKAGES = "sales_packages"
+# "Q4-OND2026-Goal Setting" — the strategy motions and the goals, as CONTEXT for
+# answers. Nothing proactive runs off it and no rule evaluates against it.
+GOALS = "goal_setting"
 
 # TRACKER IS A RETIRED NAME KEPT AS AN ALIAS FOR THE CANONICAL KIND. The old
 # outreach tracker tab is no longer read as anything special; every call site
@@ -157,10 +176,13 @@ TRACKER = POCS
 # right tab got the right job without opening the spreadsheet.
 KIND_LABELS = {
     POCS: "OUTREACH PoCs — THE CANONICAL TAB (found by name)",
+    DELIVERABLES: "DELIVERABLES CHECKLIST — what is owed, by when (read-only)",
+    PACKAGES: "SALES PACKAGES — what can be sold, and how ready (read-only)",
+    GOALS: "GOAL SETTING — the quarter's motions and goals (read-only context)",
     MASTER: "MASTER — status only (aggregates, funnel, cross-check)",
     PIPELINE: "PIPELINE — lead stage / estimated value",
     FUNNEL: "FUNNEL PIVOT — the funnel stage definition",
-    RESEARCHER_LINES: "RESEARCHER LINES — outreach lines for researchers",
+    RESEARCHER_LINES: "MASTER PIPELINE — researcher outreach lines per company",
     EVENTS: "EVENTS & SUMMITS — one reminder each, T-minus the lead days",
     POSITIONING: "POSITIONING — the use-case / pitch matrix",
     PRIORITY: "PRIORITY — scored prospect lists",
@@ -174,26 +196,83 @@ KIND_LABELS = {
 # rename that loses either of them would make the whole tab look inactive. They
 # are checked by the colour-coding warning below for exactly that reason.
 CADENCE_ROLES = (
-    "company", "industry", "poc", "poc_designation", "poc_vertical",
-    "first_contacted", "first_contact_type", "connected", "dm_sent_date",
-    "prospect_stage", "closure", "deal_status", "intro_date", "last_followed_up",
-    "followups_count", "response", "meeting_date", "assets_shared", "next_steps",
+    "company", "industry", "name", "designation", "based",
+    "first_contact", "first_contact_type", "first_contact_date",
+    "sid_li_added", "li_connected_date", "li_dm_sent", "li_dm_date",
+    "meeting_date", "meeting_status", "next_steps", "package",
+    "prospect_status", "closure_prob", "deal_size", "deal_status",
 )
 
 # The roles whose presence makes a row ACTIVE. Named here rather than in
 # activation.py so that the schema layer and the activation rule cannot drift
 # apart: this is the list the startup schema log reports on.
-ACTIVATION_ROLES = ("first_contacted", "connected")
+ACTIVATION_ROLES = ("first_contact_date", "li_connected_date")
 
 # The roles the NEXT-ACTION STATE MACHINE reads, on top of the activation ones.
 # Named here for the same reason: nextaction.py decides what a row needs next,
 # and a header it silently failed to map is a trigger that silently never fires.
 # The startup report prints which of these mapped and which did not.
 NEXT_ACTION_ROLES = (
-    "first_contacted", "first_contact_type", "connected", "dm_sent_date",
-    "prospect_stage", "closure", "deal_status", "response", "followups_count",
-    "meeting_date", "next_steps", "last_followed_up", "owner",
+    "first_contact", "first_contact_type", "first_contact_date",
+    "sid_li_added", "li_connected_date", "li_dm_sent", "li_dm_date",
+    "meeting_date", "meeting_status", "next_steps", "package",
+    "prospect_status", "closure_prob", "deal_status",
 )
+
+# THE TRACKER-ERA ROLES, RETIRED. Every one of these named a column on the tab
+# phase 2 left behind, and NONE of them exists on the canonical tab any more.
+# They are listed rather than simply deleted so the retirement is LOUD: the
+# startup check below names any of them that a live tab still carries, and the
+# schema log shows the column as `_extra` instead of silently feeding a rule
+# that would then read a blank forever.
+#
+# The facts some of them carried did not disappear, they were RENAMED — those
+# are in `POCS_COMPAT_ALIASES` below, which is a read-side shim, not a role.
+RETIRED_POCS_ROLES = (
+    "poc_vertical", "phone", "use_case", "intro_date", "last_followed_up",
+    "followups_count", "response", "reason", "assets_shared", "other_updates",
+    "owner", "status",
+)
+
+# RENAMED, NOT RETIRED — the same fact under the column name the sheet now uses.
+# Applied to every parsed row and to `Tab.role_to_col` so that code written
+# against the old name keeps reading the right cell while it is migrated. It is
+# a COMPATIBILITY SHIM WITH A SHELF LIFE, not a second naming scheme: new code
+# uses the canonical names on the left-hand side of the sheet's own headers.
+#
+# It is deliberately one-directional (old -> new). Nothing writes through it:
+# `sheetwrite` resolves its target column from the canonical role, so a write
+# can never land via an alias nobody meant to keep.
+# The header wording each retired role used to answer to, so the startup notice
+# can recognise the column and name the role it used to feed.
+_RETIRED_ROLE_HEADERS: dict[str, tuple] = {
+    "poc_vertical": ("poc vertical", "vertical", "department", "function"),
+    "phone": ("phone", "phone number", "mobile", "contact number"),
+    "use_case": ("use case", "usecase", "pitch"),
+    "intro_date": ("membrane intro date", "intro date", "introduction date"),
+    "last_followed_up": ("last followed up date", "last followed up", "last follow up"),
+    "followups_count": ("total follow-ups till date", "total follow ups",
+                        "total followups", "number of follow-ups"),
+    "response": ("response?", "response", "responded", "replied"),
+    "reason": ("reason", "lost reason", "reason for no response"),
+    "assets_shared": ("assets shared", "assets", "collateral shared"),
+    "other_updates": ("other updates", "updates", "comments", "remarks"),
+    "owner": ("owner", "row owner", "assigned to", "assignee", "account owner"),
+    "status": ("status", "current status"),
+}
+
+POCS_COMPAT_ALIASES: dict[str, str] = {
+    "poc": "name",
+    "poc_designation": "designation",
+    "linkedin": "li_url",
+    "research_links": "paper_links",
+    "first_contacted": "first_contact_date",
+    "connected": "li_connected_date",
+    "dm_sent_date": "li_dm_date",
+    "prospect_stage": "prospect_status",
+    "closure": "closure_prob",
+    "package_sent": "package",
+}
 
 # SPREADSHEET ERROR VALUES ARE NOT DATA. A "#REF!" left behind by a broken
 # formula is the absence of a value, and reading it as text made a date column
@@ -306,100 +385,123 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "icp": ("icp", "ideal customer profile", "ideal customer"),
         "business_impact": ("business impact", "impact", "value", "outcome"),
     },
-    # THE CANONICAL TAB: "Outreach PoCs". Its headers are DISCOVERED, not
-    # assumed — the alias lists below are how a discovered header is given a
-    # role, and GTM_COLUMN_MAP overrides any of them without a code change.
+    # THE CANONICAL TAB: "Outreach PoCs", COLUMNS A-X.
     #
-    # `first_contacted` and `connected` carry extra date-shaped aliases
-    # ("connection date", "date connected") because they are the ACTIVATION
-    # columns: a row is invisible to every proactive feature unless one of them
-    # holds a date, so a header this list fails to recognise is not a cosmetic
-    # miss, it silently empties the bot's world.
+    # ITS HEADERS ARE DISCOVERED, NOT ASSUMED — the alias tuples below are how a
+    # discovered header is given a role, and GTM_COLUMN_MAP overrides any of
+    # them without a code change. What IS fixed is the set of roles: these are
+    # the twenty-four facts the tab carries, and the tracker-era roles that used
+    # to sit here are retired (see RETIRED_POCS_ROLES).
+    #
+    # THE FIRST ALIAS OF EACH ROLE IS THE LIVE HEADER, NORMALISED. `_map_headers`
+    # runs an EXACT pass across every role before it runs a substring pass, so
+    # the live schema maps one-to-one and the looser aliases below it only come
+    # into play on a sheet whose wording has drifted. That ordering is what keeps
+    # "First Contact", "First Contact Type" and "First Contact Date" — three
+    # headers, three facts, one prefix — from collapsing into each other.
+    #
+    # `first_contact_date` and `li_connected_date` are the two ACTIVATION roles
+    # (ACTIVATION_ROLES): a row is invisible to every proactive feature unless
+    # one of them holds a date, so a header this list fails to recognise does not
+    # degrade the bot's world, it empties it.
     POCS: {
-        "sr_no": ("sr. no.", "sr no", "s.no", "sno", "serial", "#"),
-        "company": ("company", "company name", "account", "client", "organisation", "organization"),
-        "industry": ("industry", "sector", "vertical (company)"),
-        "poc": ("poc", "point of contact", "contact name", "contact person", "champion"),
-        "poc_designation": ("poc designation", "designation", "title", "role"),
-        "poc_vertical": ("poc vertical", "vertical", "department", "function"),
-        # THE CONTACT DETAILS. Mapped so the bot can NAME the column when it
-        # refuses to write one — these live in the restricted identity band, and
-        # "I never write to Email" is a far better answer than "I have no rule
-        # for that". Reading them is unrestricted, as it always was.
-        "email": ("email", "e-mail", "email address", "email id", "mail"),
-        "linkedin": ("linkedin", "linkedin url", "linkedin profile", "profile",
-                     "profile link", "li url"),
-        "phone": ("phone", "phone number", "mobile", "contact number", "whatsapp number"),
-        # RESEARCH LINKS. Papers, profiles and publication pages somebody put on
-        # the row. The research brief fetches ONLY what is here, and only from
-        # RESEARCH_ALLOWED_DOMAINS — it never searches the web and never guesses
-        # a URL from a name.
-        "research_links": ("research", "research link", "research links", "papers",
-                           "paper", "publications", "publication", "arxiv",
-                           "google scholar", "scholar", "work", "portfolio"),
-        "first_contacted": ("first contact date", "date of first contact",
-                            "first contacted date", "first contacted", "first contact",
-                            "outreach date", "date of outreach"),
-        # HOW the first contact was made — email / LinkedIn / call / WhatsApp.
-        # Read ONLY by the progress check, which drops its "ask for their email
-        # address" line when the first contact was already by email. Asking a
-        # prospect you emailed for their email address is the kind of line that
-        # gets a bot switched off. See config.EMAIL_CONTACT_TYPES.
-        "first_contact_type": ("first contact type", "contact type", "type of first contact",
-                               "first contact via", "channel", "outreach channel",
-                               "contacted via", "medium"),
-        # WHEN THE DM WENT OUT, which is a different fact from the connection
-        # date. Connected-and-no-DM and DM-sent-and-no-reply are two different
-        # states needing two different next actions, and one date cannot carry
-        # both.
-        "dm_sent_date": ("dm sent date", "dm sent", "date dm sent", "dm date",
-                         "message sent date", "dm sent on", "first dm"),
+        # A-I: THE IDENTITY BLOCK. Restricted from writing (A:I), never from
+        # reading. Mapped so the bot can NAME the column when it refuses to
+        # write one — "I never write to Email id" beats "I have no rule for that".
+        "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
+        "company": ("company uni", "company/uni", "company", "company name",
+                    "university", "uni", "account", "client", "organisation",
+                    "organization", "org"),
+        "industry": ("industry", "sector", "domain"),
+        "name": ("name", "poc name", "contact name", "point of contact",
+                 "contact person", "person", "poc"),
+        "designation": ("designation", "poc designation", "title", "job title", "role"),
+        "email": ("email id", "email", "e mail", "email address", "mail"),
+        # WHERE THEY ARE. Read by nothing proactive; quoted constantly in answers
+        # ("who do we have in Singapore").
+        "based": ("based", "based in", "based at", "location", "city", "country",
+                  "geography", "geo", "region"),
+        # THE RESEARCH LINKS. The research brief fetches ONLY what is here, and
+        # only from RESEARCH_ALLOWED_DOMAINS — it never searches the web and
+        # never guesses a URL from a name.
+        "paper_links": ("research paper link", "research paper links",
+                        "research paper", "paper link", "paper links",
+                        "research link", "research links", "papers", "paper",
+                        "publications", "publication", "arxiv",
+                        "google scholar", "scholar"),
+        "li_url": ("li url", "linkedin url", "linkedin", "linkedin profile",
+                   "li profile", "profile link", "profile"),
+
+        # J-R: THE WRITABLE WINDOW. The only nine columns any write path can
+        # reach, and the reason RESTRICTED_COLUMN_RANGES is A:I,S:X.
+        #
+        # WHETHER first contact happened at all / who made it. Distinct from its
+        # TYPE (K) and its DATE (L): "yes, by Sid, in March" is three facts in
+        # three cells, and collapsing them is how a date column ends up holding
+        # the word "Yes".
+        "first_contact": ("first contact", "first contact by", "first contacted by",
+                          "first touch", "contacted"),
+        # HOW it was made — email / LinkedIn / call / WhatsApp. Read by the
+        # progress check, which drops its "ask for their email address" line
+        # when the first contact was already by email. See EMAIL_CONTACT_TYPES.
+        "first_contact_type": ("first contact type", "contact type",
+                               "type of first contact", "first contact via",
+                               "outreach channel", "contacted via", "channel",
+                               "medium"),
+        # WHEN. An ACTIVATION column.
+        "first_contact_date": ("first contact date", "date of first contact",
+                               "first contacted date", "first contacted",
+                               "outreach date", "date of outreach"),
+        # WHETHER THE CONNECTION REQUEST WENT OUT, and from whose account. A
+        # request sent is not a request accepted, which is why this is a
+        # different cell from the connected DATE beside it.
+        "sid_li_added": ("sid li addition", "sid linkedin addition", "sid li added",
+                         "li addition", "linkedin addition", "li request sent",
+                         "connection request sent"),
+        # WHEN THEY ACCEPTED. The other ACTIVATION column.
+        "li_connected_date": ("li connected date", "linkedin connected date",
+                              "connected date", "connection date", "date connected",
+                              "connected on", "li connected"),
+        # WHETHER THE DM WENT OUT, and WHEN — again two cells, because
+        # connected-and-no-DM and DM-sent-and-no-reply are two different states
+        # needing two different next actions, and one date cannot carry both.
+        "li_dm_sent": ("li dm sent", "linkedin dm sent", "dm sent", "dm sent?",
+                       "message sent"),
+        "li_dm_date": ("li dm date", "linkedin dm date", "dm date", "dm sent date",
+                       "date dm sent", "message sent date"),
+        "meeting_date": ("meeting date", "call date", "demo date", "meeting on",
+                         "meeting"),
+        # A STATE, NOT A DATE — "booked", "completed", "no-show", "rescheduled".
+        # Read it through `normalise_meeting_status` before comparing it.
+        "meeting_status": ("meeting status", "meeting state", "meeting outcome",
+                           "meeting done", "meeting?"),
+
+        # S-X: THE COMMERCIAL BLOCK. Restricted from writing (S:X) because these
+        # are maintained by people and by formulas. Read freely.
+        "next_steps": ("next steps notes", "next steps/notes", "next steps",
+                       "next step", "next action", "notes", "action"),
+        # WHICH PACKAGE went out. Cross-referenced against the Sales Packages
+        # tab, which is what says whether that package is finished enough to send.
+        "package": ("package", "package sent", "package shared", "pack", "packages"),
         # WHERE THE PROSPECT IS. The quote chase fires off the value "Demo".
-        "prospect_stage": ("prospect", "prospect stage", "stage", "pipeline stage",
-                           "prospect status", "funnel stage"),
-        # THE TERMINAL COLUMN. "0%", "Dead", "Unresponsive", "Won", "Lost" stop
-        # a row for good; a percentage puts it in the fast or the slow lane.
-        "closure": ("closure", "closure %", "closure percentage", "closure probability",
-                    "probability", "% closure", "close probability", "likelihood of closure"),
-        # In Progress / On Hold. Separate from `closure` because a deal can be
-        # 70% and parked, and those need opposite treatment.
-        "deal_status": ("deal status", "deal", "deal stage", "deal state",
-                        "opportunity status"),
-        "use_case": ("use case", "usecase", "pitch"),
-        "intro_date": ("membrane intro date", "intro date", "introduction date", "intro"),
-        "last_followed_up": ("last followed up date", "last followed up", "last follow up", "last followup", "last touch"),
-        "followups_count": ("total follow-ups till date", "total follow ups", "total followups", "number of follow-ups", "follow-ups", "followups"),
-        "response": ("response?", "response", "responded", "replied"),
-        "reason": ("reason", "lost reason", "reason for no response", "why"),
-        "meeting_date": ("meeting date", "meeting", "call date", "demo date"),
-        # MEETING STATUS is a different fact from the meeting DATE — "booked",
-        # "done", "no-show", "rescheduled". The reply loop writes this one; a
-        # date and a state cannot share a cell.
-        "meeting_status": ("meeting status", "meeting state", "meeting?",
-                           "meeting done", "meeting outcome"),
-        "assets_shared": ("assets shared", "assets", "collateral shared", "material shared"),
-        # WHETHER THE PACKAGE WENT OUT. Distinct from assets_shared, which in
-        # this sheet means collateral generally; "package sent" is the specific
-        # thing the reply loop asks about.
-        "package_sent": ("package sent", "package", "package shared", "pack sent",
-                         "proposal sent", "packet sent"),
+        "prospect_status": ("prospect status", "prospect", "prospect stage",
+                            "pipeline stage", "funnel stage", "stage"),
+        # THE TERMINAL COLUMN. "0%", "Dead", "Unresponsive", "Won", "Lost" stop a
+        # row for good; a percentage puts it in the fast or the slow lane. Read
+        # it through `closure_percent`, which handles "60%", "0.6" and "60".
+        "closure_prob": ("closure prob", "closure prob%", "closure probability",
+                         "closure %", "closure", "probability",
+                         "close probability", "likelihood of closure"),
         # DEAL SIZE — explicit-command only, never written off a reply. A number
-        # somebody mentioned in passing is not a number somebody committed to
-        # the sheet.
-        "deal_size": ("deal size", "deal value", "estimated value", "value",
-                      "contract value", "ticket size"),
-        "next_steps": ("next steps", "next step", "action", "next action"),
-        "other_updates": ("other updates", "updates", "notes", "comments", "remarks"),
-        "connected": ("connection date", "date connected", "connected on",
-                      "connected date", "connect date", "connected?", "connected",
-                      "connection status"),
-        # NO OWNER COLUMN TODAY. The role is mapped anyway so that the day one
-        # appears (or GTM_COLUMN_MAP names one) the bot starts addressing rows
-        # to the person who owns them. Until then every line resolves to
-        # SALES_DEFAULT_OWNER_ID.
-        "owner": ("owner", "row owner", "assigned to", "assignee", "sdr", "bd",
-                  "account owner", "handled by", "responsible"),
-        "status": ("status", "stage", "deal status", "current status"),
+        # somebody mentioned in passing is not a number somebody committed.
+        "deal_size": ("estd deal size usd", "estd. deal size (usd)",
+                      "estd deal size", "estimated deal size", "deal size",
+                      "deal value", "estimated value", "contract value",
+                      "ticket size"),
+        # In Progress / On Hold. Separate from `closure_prob` because a deal can
+        # be 70% and parked, and those need opposite treatment.
+        "deal_status": ("deal status", "deal stage", "deal state",
+                        "opportunity status", "deal"),
     },
     # THE PIPELINE TAB. Priority Level is populated (High/Medium/Low); Lead
     # Stage and Estimated Value are blank on every row today. Nothing reads the
@@ -449,19 +551,124 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
                           "outreach line"),
         "dates": ("dates", "date"),
     },
-    # THE EVENTS & SUMMITS TAB. Read for its DATES: each event earns one
-    # reminder at T-EVENT_LEAD_DAYS. Everything else on the row is carried into
-    # that reminder so it says something useful rather than "there is an event".
+    # THE AI EVENTS & SUMMITS TAB, found by name (GTM_EVENTS_TAB_TITLES).
+    # Read for its DATES: each event earns ONE reminder at T-EVENT_LEAD_DAYS and
+    # never another. Everything else on the row rides into that reminder so it
+    # says something useful rather than "there is an event".
+    #
+    # ITS DATES ARE FREE TEXT and always have been — "15-10-2026" on one row,
+    # "October 20-21, 2026" on the next, "not available" on a third. They go
+    # through `parse_event_date`, which returns a span and says plainly when it
+    # could not read one. A date it cannot parse is UNKNOWN, never today.
     EVENTS: {
-        "event": ("event", "event name", "summit", "conference", "name"),
-        "event_date": ("date", "event date", "start date", "dates", "when"),
-        "location": ("location", "city", "venue", "where", "geography"),
+        "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
+        "location": ("location", "city", "venue", "where", "geography", "country"),
+        "event": ("event name", "event", "summit", "conference", "name"),
+        "link": ("link", "url", "website", "site", "registration link", "page"),
+        "event_date": ("date", "event date", "dates", "start date", "when"),
+        # "9am-5pm", "Day 1: 10:00". Carried into the reminder verbatim; nothing
+        # parses it, because nothing needs to.
+        "timings": ("timings", "timing", "time", "schedule", "hours"),
+        "key_people": ("key people attending", "key people", "people attending",
+                       "speakers", "attendees", "who is attending"),
+        # A SECOND DEADLINE, and usually the one that actually bites: the event
+        # is in November and registration shut in September. Free text like the
+        # event date, and read the same way.
+        "registration_deadline": ("last day for registration",
+                                  "last date for registration",
+                                  "registration deadline", "register by",
+                                  "registration closes", "rsvp by"),
+        # Booleans as people type them — "TRUE", "Yes", "Y", a tick. Read them
+        # through `parse_flag`, which returns None for anything it cannot read
+        # rather than guessing a No.
+        "registered": ("registered?", "registered", "have we registered",
+                       "registration done"),
+        "attended": ("attended?", "attended", "did we attend", "attendance"),
+        # KEPT FOR TABS THAT STILL CARRY THEM. The live tab has none of these;
+        # they map to nothing there and cost nothing, and an older events tab
+        # that still names them keeps working.
         "event_type": ("type", "event type", "format", "category"),
         "owner": ("owner", "assigned to", "assignee", "responsible", "who"),
         "status": ("status", "attending", "attending?", "decision", "going"),
         "cost": ("cost", "price", "budget", "ticket", "fee"),
         "notes": ("notes", "comments", "remarks", "other updates", "details"),
-        "link": ("link", "url", "website", "site", "registration"),
+    },
+    # THE DELIVERABLES CHECKLIST, found by name (GTM_DELIVERABLES_TAB_TITLES).
+    # What the team owes, to whom it is blocked on, and by when. READ-ONLY.
+    #
+    # ITS DEADLINES CARRY NO YEAR — "25-Sep", "3-Oct". `parse_bare_deadline`
+    # resolves those to the NEXT OCCURRENCE from today, which is the only
+    # reading that is right all year: in September "25-Sep" means this month,
+    # and in December it means next year. Assuming the current year instead puts
+    # every Q1 deadline eleven months in the past and reports the lot as overdue.
+    DELIVERABLES: {
+        "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
+        "action_item": ("action item", "action", "deliverable", "item", "task",
+                        "work item"),
+        # WHAT IT IS BLOCKED ON. The reason a deadline slipping is sometimes
+        # somebody else's deadline slipping, and worth saying in that order.
+        "dependency": ("functional dependency", "dependency", "dependencies",
+                       "depends on", "blocked by", "blocker"),
+        "priority": ("priority", "priority level", "tier", "band"),
+        "deadline": ("tentative deadline", "deadline", "due date", "due",
+                     "target date", "eta"),
+        "timelines": ("timelines", "timeline", "duration", "effort", "estimate"),
+        "link": ("link destination", "link/destination", "destination", "link",
+                 "url", "doc", "document"),
+        "status": ("status", "state", "progress", "current status"),
+        "reminder_freq": ("reminder freq", "reminder frequency", "reminder",
+                          "frequency", "cadence", "remind every"),
+    },
+    # THE SALES PACKAGES TAB, found by name (GTM_PACKAGES_TAB_TITLES).
+    # WHAT CAN ACTUALLY BE SOLD TODAY, and how finished each package is.
+    # READ-ONLY, and the point of reading it is `ready`: offering a prospect a
+    # package that is 40% built is a promise somebody else has to keep.
+    #
+    # `ready` IS BLANK ON MOST ROWS, and blank means NO (`ready_flag`). That is
+    # the safe direction and the only one: a package nobody has marked ready is
+    # a package nobody has said is ready.
+    PACKAGES: {
+        "package": ("package", "package id", "package code", "pkg", "sr no", "#"),
+        "name": ("name", "package name", "title"),
+        "purpose": ("purpose", "why", "objective", "intent"),
+        "use_case": ("use case", "usecase", "case", "application"),
+        "size": ("size", "volume", "scale", "quantity"),
+        "audio_files": ("audio files", "audio file", "audio", "audios"),
+        "image_files": ("image files", "image file", "images", "image"),
+        "jsonl_output": ("jsonl output", "jsonl", "output", "json output"),
+        "product_doc": ("pulse product doc", "pulse_product doc", "pulse doc",
+                        "product doc", "spec doc", "doc"),
+        # "% Completion" normalises to "completion" — the per cent sign is
+        # punctuation and `normalise_header` drops it.
+        "completion": ("completion", "% completion", "completion %",
+                       "percent completion", "progress", "percent complete"),
+        "ready": ("ready?", "ready", "is ready", "ready to sell", "sellable"),
+        "status": ("status", "state", "current status"),
+    },
+    # THE QUARTER'S GOAL-SETTING TAB, found by name (GTM_GOALS_TAB_TITLES).
+    # TWO TABLES STACKED IN ONE SHEET: the strategy motions, then the goals.
+    #
+    # READ-ONLY CONTEXT FOR ANSWERS, AND NOTHING ELSE. No rule evaluates against
+    # it, nothing proactive fires off it, and no write path can reach it. It is
+    # there so that "what is this quarter committed to" has an answer the bot
+    # can cite instead of infer.
+    #
+    # THE MAPPING IS DELIBERATELY LOOSE. One header row cannot describe two
+    # tables, so `_header_row_index` picks the first and everything the roles
+    # below do not claim is carried verbatim in `_extra`, keyed by its own
+    # header. A question about the second table is answerable from `_extra` even
+    # though no role here names its columns.
+    GOALS: {
+        "motion": ("strategy motion", "strategy motions", "motion", "strategy",
+                   "gtm motion", "play", "lever"),
+        "goal": ("goal", "goals", "objective", "outcome", "target outcome"),
+        "metric": ("metric", "measure", "how measured", "measurement"),
+        "target": ("target", "q4 target", "number", "value", "goal value"),
+        "owner": ("owner", "dri", "responsible", "assigned to", "who"),
+        "timeline": ("timeline", "timelines", "by when", "when", "quarter",
+                     "deadline", "due"),
+        "status": ("status", "state", "progress"),
+        "notes": ("notes", "comments", "remarks", "details", "context"),
     },
     PRIORITY: {
         "company": ("company", "company name", "account", "prospect", "organisation", "organization"),
@@ -526,6 +733,33 @@ _KIND_SIGNATURES: list[tuple[str, tuple[str, ...], int, tuple[str, ...]]] = [
      2,
      ("company", "priority")),
 ]
+
+# THE NAME-CLAIMED TABS. Each of these is found by its TITLE, before any
+# signature is scored, and each has an env var holding its candidate titles.
+#
+# WHY NAMES HERE AND SIGNATURES EVERYWHERE ELSE. A signature describes a SHAPE,
+# and this playbook has several tabs of each shape: "Deliverables Checklist" and
+# "Sales Packages" are both a list of things with a status; the events tab and
+# the goal-setting tab are both a name and a date. A signature would have to
+# choose between them on a scoring margin, and the wrong choice is silent — the
+# bot reads the goals tab as the events list and reminds nobody about anything.
+# These tabs were named to us directly, so naming them is the honest mechanism.
+#
+# THE ORDER MATTERS: the first entry whose titles match wins, and the canonical
+# tab is first so that nothing can take the kind the whole bot runs on.
+#
+# Each value is a callable rather than the list itself so that the CURRENT value
+# of the setting is read on every call. A module-level snapshot would freeze
+# whatever the env said at import time, which is exactly the bug the whole
+# "re-point the bot with an env change" design exists to avoid.
+_NAME_CLAIMED_KINDS: tuple = (
+    (POCS, lambda: config.GTM_POCS_TAB_TITLES),
+    (DELIVERABLES, lambda: config.GTM_DELIVERABLES_TAB_TITLES),
+    (RESEARCHER_LINES, lambda: config.GTM_PIPELINE_TAB_TITLES),
+    (PACKAGES, lambda: config.GTM_PACKAGES_TAB_TITLES),
+    (EVENTS, lambda: config.GTM_EVENTS_TAB_TITLES),
+    (GOALS, lambda: config.GTM_GOALS_TAB_TITLES),
+)
 
 # Name hints are a TIE-BREAK ONLY, applied when two kinds score equally. They
 # never override a signature, because the signature is the thing that survives a
@@ -647,6 +881,350 @@ def is_no_or_blank(value) -> bool:
     return v == "" or v in _NO
 
 
+# -- VALUE NORMALISATION ------------------------------------------------------
+# THE SHEET IS TYPED BY PEOPLE, so one fact arrives in half a dozen spellings.
+# "60%", "0.6" and "60" are the same closure probability; "TRUE", "Yes", "Y" and
+# a tick are the same yes; "completed", "Completed" and "done" are the same
+# meeting.
+#
+# EVERY ONE OF THESE RETURNS None — or, where a blank has an agreed meaning, the
+# SAFE value — rather than guessing when it cannot read the cell. That is the
+# whole discipline: a normaliser that guesses turns a typo into a fact, and then
+# the bot repeats that fact back to people as though somebody had typed it.
+
+# Ticks and crosses, matched on the RAW cell. `normalise_header` strips
+# punctuation, which would eat them, so the symbols are checked before it runs.
+_TRUE_MARKS = {"✓", "✔", "☑", "✅"}
+_FALSE_MARKS = {"✗", "✘", "✖", "❌", "☐"}
+
+_TRUE_WORDS = {
+    "true", "yes", "y", "done", "sent", "completed", "complete", "connected",
+    "1", "ok", "okay", "confirmed", "registered", "attended",
+}
+_FALSE_WORDS = {
+    "false", "no", "n", "not yet", "none", "nil", "0", "pending", "na", "n a",
+    "not applicable", "not done", "-",
+}
+
+# What the sheet says when NOBODY KNOWS YET. Distinct from blank, and the
+# distinction earns its keep: "not available" is somebody having looked and
+# found nothing, and a date parser that treated it as a parse failure would keep
+# reporting a filled-in cell as a schema problem.
+_UNKNOWN_WORDS = {
+    "not available", "na", "n a", "tbd", "tba", "unknown", "?",
+    "to be confirmed", "to be announced", "not announced", "not yet announced",
+    "not confirmed",
+}
+
+
+def is_unknown_value(value) -> bool:
+    """True when a cell says, in so many words, that nobody knows yet.
+
+    "the sheet says the date is not available" and "the sheet does not say" are
+    different sentences, and only the second one is a gap somebody should fill.
+    """
+    return normalise_header(clean_cell(value)).strip() in _UNKNOWN_WORDS
+
+
+def parse_flag(value) -> Optional[bool]:
+    """A people-typed boolean. True / False / None when it is neither.
+
+    "TRUE", "Yes", "Y" and a tick are True; "FALSE", "No", "N" and a cross are
+    False; a blank, a sentence, or anything unrecognised is None.
+
+    NONE IS NOT FALSE, and keeping them apart is the point. "Registered? = No"
+    is a decision somebody made; "Registered? = (blank)" is a question nobody
+    has answered, and a bot that reports the second as the first is inventing a
+    decision. A caller that wants blank to mean no says so itself — `ready_flag`
+    is the one place in this file that does.
+    """
+    raw = clean_cell(value).strip()
+    if not raw:
+        return None
+    if raw in _TRUE_MARKS:
+        return True
+    if raw in _FALSE_MARKS:
+        return False
+    word = normalise_header(raw).replace("?", "").strip()
+    if not word:
+        return None
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    return None
+
+
+def ready_flag(value) -> str:
+    """The Sales Packages "Ready?" cell as "Yes" or "No". BLANK IS NO.
+
+    The one place in this module a blank reads as a negative, and deliberately:
+    a package nobody has marked ready is a package nobody has said is ready, and
+    the two mistakes do not cost the same. Calling a finished package unready
+    costs one question. Offering a prospect a half-built one costs a promise
+    somebody else then has to keep.
+    """
+    return "Yes" if parse_flag(value) is True else "No"
+
+
+def closure_percent(value) -> Optional[int]:
+    """A closure-probability cell as a whole percentage. None when it isn't one.
+
+    "60%", "60", "60 %" and "0.6" all read as 60.
+
+    A FRACTION IS RECOGNISED ONLY BELOW 1. In a percentage column "0.6" means
+    six tenths and "60" means six tenths, and reading 0.6 as six tenths of ONE
+    PER CENT would quietly move a live deal into the slow lane. An explicit 0
+    stays 0 — zero is a terminal value here, not a missing one.
+    """
+    raw = clean_cell(value).replace("%", "").replace(",", "").strip()
+    if not raw:
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if 0 < number < 1:
+        number *= 100
+    if number < 0 or number > 100:
+        return None
+    return int(round(number))
+
+
+# The meeting states this bot reasons about, and the words a sheet writes them
+# with. Anything unrecognised comes back normalised but UNCHANGED rather than
+# forced into one of these — an unmapped state is a state nobody told the bot
+# about, and inventing a mapping for it is how "rescheduled" becomes "done".
+_MEETING_STATUS_WORDS = {
+    "completed": ("completed", "complete", "done", "held", "happened",
+                  "met", "finished", "occurred", "meeting done"),
+    "booked": ("booked", "scheduled", "confirmed", "set", "fixed", "planned",
+               "upcoming"),
+    "no_show": ("no show", "noshow", "did not attend", "didnt attend",
+                "no showed"),
+    "rescheduled": ("rescheduled", "reschedule", "moved", "postponed", "pushed"),
+    "cancelled": ("cancelled", "canceled", "called off", "dropped"),
+}
+
+
+def normalise_meeting_status(value) -> str:
+    """A meeting-status cell as one of the states above, or "" when blank.
+
+    "completed", "Completed", "COMPLETED" and "done" all return "completed".
+    """
+    word = normalise_header(clean_cell(value)).replace("?", "").strip()
+    if not word:
+        return ""
+    for state, spellings in _MEETING_STATUS_WORDS.items():
+        if word in spellings:
+            return state
+    return word
+
+
+def is_meeting_completed(value) -> bool:
+    """True only when the cell says the meeting actually HAPPENED.
+
+    A booked meeting is not a completed one, and the gap between those two is
+    the entire follow-up. This is why `meeting_status` is a separate column from
+    `meeting_date`: a date says when, and only this says whether.
+    """
+    return normalise_meeting_status(value) == "completed"
+
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_MONTH_NAMES = "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
+
+# "25-Sep", "3 Oct", "25/09" — a deadline with no year, which is how the
+# Deliverables Checklist is written.
+_BARE_DEADLINE_RE = re.compile(
+    r"^\s*(\d{1,2})\s*[-/ ]\s*(" + _MONTH_NAMES + r")[a-z]*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_bare_deadline(value, *, today=None):
+    """"25-Sep" -> the NEXT 25 September from today. None when it isn't one.
+
+    THE NEXT OCCURRENCE, NOT THIS YEAR'S. A yearless deadline is written by
+    somebody who means "the one coming up", and that is the only reading that is
+    right in every month of the year. Assuming the CURRENT year instead puts
+    every January deadline eleven months in the past the moment February
+    arrives, and reports the whole checklist as overdue.
+
+    TODAY COUNTS AS THE NEXT OCCURRENCE. A deadline of today is due today, not
+    due in a year.
+
+    A cell carrying a FULL date ("25-Sep-2026") returns None here on purpose, so
+    the caller falls through to `sheet_date` — which knows about years — rather
+    than having this function silently re-date it.
+    """
+    match = _BARE_DEADLINE_RE.match(clean_cell(value))
+    if not match:
+        return None
+    day = int(match.group(1))
+    month = _MONTHS.get(match.group(2).lower()[:3])
+    if not month:
+        return None
+    base = today or datetime.now(timezone.utc).date()
+    for year in (base.year, base.year + 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            # 29 February in a non-leap year. Try the next year rather than
+            # giving up: the deadline is real, this calendar just has no such day.
+            continue
+        if candidate >= base:
+            return candidate
+    return None
+
+
+# FREE-TEXT EVENT DATES, IN THE FOUR SHAPES THE LIVE TAB ACTUALLY USES. Every
+# one of these is in the Date column right now, which is why there are four
+# patterns and not one:
+#   "15-10-2026", "15/10/2026"              numeric, day-first
+#   "October 20-21,2026"                    month first, a range, a year
+#   "4-5 November 2026", "13-15 Oct, 2026"  DAY FIRST, a range, a year
+#   "23 September"                          day first, NO YEAR
+#
+# Built with chr() rather than an escape so the class is unambiguous in the
+# source: these are hyphen, EN DASH and EM DASH, and a reader should not have to
+# work out which of the three a font is showing them.
+_DASH_CLASS = "[-" + chr(0x2013) + chr(0x2014) + "]"
+
+_EVENT_DMY_RE = re.compile(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b")
+
+# "October 20-21, 2026" / "Oct 5, 2026". The year is OPTIONAL: "October 20-21"
+# on its own resolves to the next occurrence, like every other yearless date in
+# this module.
+_EVENT_MONTH_RE = re.compile(
+    r"\b(" + _MONTH_NAMES + r")[a-z]*\.?\s+(\d{1,2})"
+    r"(?:\s*" + _DASH_CLASS + r"\s*(\d{1,2}))?\s*,?\s*(\d{4})?\b",
+    re.IGNORECASE,
+)
+
+# "4-5 November 2026" / "25-26 November 2026" / "13-15 Oct, 2026" / "23 September".
+# The mirror image of the pattern above, and the shape the live tab uses most.
+_EVENT_DAY_MONTH_RE = re.compile(
+    r"\b(\d{1,2})(?:\s*" + _DASH_CLASS + r"\s*(\d{1,2}))?\s*(?:st|nd|rd|th)?\s+"
+    r"(?:of\s+)?(" + _MONTH_NAMES + r")[a-z]*\.?\s*,?\s*(\d{4})?\b",
+    re.IGNORECASE,
+)
+
+
+def _next_occurrence(month: int, day: int, today=None):
+    """A month and a day with NO YEAR -> the next date that matches.
+
+    The same rule `parse_bare_deadline` uses, for the same reason: a yearless
+    date is written by somebody who means the one coming up, and "23 September"
+    read as the current year's is in the past for three quarters of the year.
+    """
+    base = today or datetime.now(timezone.utc).date()
+    for year in (base.year, base.year + 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue
+        if candidate >= base:
+            return candidate
+    return None
+
+
+def parse_event_date(value) -> dict:
+    """A free-text event date as {start, end, text, known, year_assumed, reason}.
+
+    THE EVENTS TAB'S DATE COLUMN IS PROSE AND ALWAYS HAS BEEN. The live tab
+    carries all of these at once: "15-10-2026", "October 20-21,2026",
+    "4-5 November 2026", "13-15 Oct, 2026", "23 September" and "not available".
+    All of them are read except the last, which is an ANSWER rather than a
+    failure and is reported as one.
+
+    A RANGE returns its first day as `start` and its last as `end`, because a
+    reminder fires off the day the thing begins.
+
+    A DATE WITH NO YEAR resolves to the NEXT OCCURRENCE and sets `year_assumed`,
+    so a caller can say "23 September, assuming the next one" instead of stating
+    a year nobody wrote.
+
+    `known` is False for anything unreadable, and `reason` says WHICH KIND of
+    unreadable it was. "The sheet says it is not available" and "I cannot read
+    this date" are different sentences, and only the second is worth anyone's
+    time to fix.
+
+    DAY-FIRST, NOT MONTH-FIRST, for the numeric form. "15-10-2026" is 15
+    October: this team writes dates the way most of the world does, and the rest
+    of this module already assumes it (`sheet_date`). A value that cannot BE
+    day-first is reported unreadable rather than silently swapped, because a bot
+    that quietly reinterprets one date will quietly reinterpret a real one.
+    """
+    text = clean_cell(value)
+    out = {"start": None, "end": None, "text": text, "known": False,
+           "year_assumed": False, "reason": ""}
+    if not text:
+        out["reason"] = "the cell is empty"
+        return out
+    if is_unknown_value(text):
+        out["reason"] = "the sheet says the date is not available"
+        return out
+
+    match = _EVENT_DMY_RE.search(text)
+    if match:
+        day, month, year = (int(g) for g in match.groups())
+        try:
+            out["start"] = out["end"] = date(year, month, day)
+            out["known"] = True
+        except ValueError:
+            out["reason"] = "%r is not a real day-first date" % text
+        return out
+
+    # Month-first, then day-first. Both may carry a range and both may omit the
+    # year. Month-first is tried first because "October 20-21, 2026" would
+    # otherwise let the day-first pattern match "21, 2026" as "21 <no month>".
+    for pattern, month_first in ((_EVENT_MONTH_RE, True), (_EVENT_DAY_MONTH_RE, False)):
+        match = pattern.search(text)
+        if not match:
+            continue
+        if month_first:
+            name, first, last, year = match.groups()
+        else:
+            first, last, name, year = match.groups()
+        month = _MONTHS.get(name.lower()[:3])
+        if not month:
+            continue
+        if year:
+            try:
+                start = date(int(year), month, int(first))
+                end = date(int(year), month, int(last)) if last else start
+            except ValueError:
+                out["reason"] = "%r names a day that month does not have" % text
+                return out
+        else:
+            start = _next_occurrence(month, int(first))
+            end = _next_occurrence(month, int(last)) if last else start
+            if start is None:
+                out["reason"] = "%r names a day that month does not have" % text
+                return out
+            out["year_assumed"] = True
+        out["start"] = start
+        # "October 30-2" is a range running backwards — somebody meant it to
+        # cross a month boundary and this column cannot express that. Take the
+        # start day rather than inventing a span nobody wrote.
+        out["end"] = end if (end and end >= start) else start
+        out["known"] = True
+        return out
+
+    parsed = sheet_date(text)
+    if parsed:
+        out["start"] = out["end"] = parsed
+        out["known"] = True
+        return out
+
+    out["reason"] = "I cannot read %r as a date" % text
+    return out
+
+
 def parse_priority(value) -> Optional[int]:
     """"P1" → 1. None when the cell doesn't name a priority band."""
     m = _PRIORITY_RE.search(str(value or ""))
@@ -680,11 +1258,24 @@ class Tab:
 
     def __init__(self, *, title: str, kind: str, headers: list[str],
                  role_to_col: dict[str, int], rows: list[dict], read_at: float,
-                 header_row: int = 1, error_cells: Optional[list] = None):
+                 header_row: int = 1, error_cells: Optional[list] = None,
+                 canonical_role_to_col: Optional[dict] = None):
         self.title = title
         self.kind = kind
         self.headers = headers
         self.role_to_col = role_to_col      # role -> 0-based column index
+        # THE SAME MAP WITHOUT THE COMPATIBILITY ALIASES. `role_to_col` above
+        # carries the renamed-role shims (POCS_COMPAT_ALIASES) so that code not
+        # yet migrated still resolves to the right column; this one carries only
+        # the roles the SHEET actually has.
+        #
+        # Anything that INVERTS the map — the schema log, the writable-window
+        # report, the "which role is this column" lookups — must use this one.
+        # Inverting the aliased map is many-to-one, so the column that is really
+        # `name` would report itself as `poc` about half the time, depending on
+        # dict ordering. A diagnostic that reports a different answer on
+        # different runs is worse than no diagnostic.
+        self.canonical_role_to_col = dict(canonical_role_to_col or role_to_col)
         self.rows = rows
         self.read_at = read_at
         # 1-based sheet row the headers live on. Kept because appending the bot's
@@ -708,7 +1299,7 @@ class Tab:
 
     def schema_line(self) -> str:
         """The one-line schema summary logged once per tab at startup."""
-        mapped = ", ".join(sorted(self.role_to_col)) or "(none)"
+        mapped = ", ".join(sorted(self.canonical_role_to_col)) or "(none)"
         return (
             f"tab {self.title!r} kind={self.kind} rows={len(self.rows)} "
             f"cols={len(self.headers)} mapped=[{mapped}]"
@@ -767,6 +1358,12 @@ class GTMSheets:
         # sheet_key -> {"ok": bool, "error": str, "remedy": str, "title": str}
         self._access: dict[str, dict] = {}
         self._schema_logged: set[tuple[str, str]] = set()
+        # THE LAST FULL DISCOVERY, per spreadsheet: every tab, recognised or
+        # not, with its kind, row count and headers. Kept so "sheet status" can
+        # report what the bot found WITHOUT a second round trip to the API, and
+        # so the answer it gives is the same discovery the startup log printed
+        # rather than a fresh one that might disagree with it.
+        self._last_schema: dict[str, list[dict]] = {}
 
     # -- identity ----------------------------------------------------------
 
@@ -1073,6 +1670,37 @@ class GTMSheets:
         )
 
     @staticmethod
+    def _claimed_by_name(title: str) -> Optional[str]:
+        """The kind this TITLE is named for, or None.
+
+        Compared through `normalise_header`, so "AI Events & Summits",
+        "ai events and summits" and "AI  Events  &  Summits" are one tab.
+
+        First match wins and the canonical tab is checked first, so a title
+        listed in two env vars by mistake resolves deterministically instead of
+        depending on dict ordering. The clash is logged, because two settings
+        naming one tab is a configuration error somebody should fix.
+        """
+        want = normalise_header(title)
+        if not want:
+            return None
+        claimed: list = []
+        for kind, titles_of in _NAME_CLAIMED_KINDS:
+            for candidate in (titles_of() or []):
+                if str(candidate).strip() and want == normalise_header(candidate):
+                    claimed.append(kind)
+                    break
+        if not claimed:
+            return None
+        if len(claimed) > 1:
+            log.warning(
+                "[gtm] tab %r is named by more than one setting (%s). Reading it as %s "
+                "— the first match wins. Remove it from the others so the two settings "
+                "cannot disagree.", title, ", ".join(claimed), claimed[0],
+            )
+        return claimed[0]
+
+    @staticmethod
     def _title_hints(title: str) -> set:
         """The kinds whose NAME hints this title matches. A tie-break, nothing more."""
         low = normalise_header(title)
@@ -1094,31 +1722,23 @@ class GTMSheets:
         `_KIND_SIGNATURES` is in priority order, so a genuine tie (same score,
         no name hint) goes to the earlier entry.
 
-        THE ONE EXCEPTION IS THE CANONICAL TAB. "Outreach PoCs" is claimed by
-        NAME, before any signature is scored, because that is the tab phase 2
-        was pointed at by name and the retired tracker tab's columns are close
-        enough that a signature would take it instead. Its COLUMNS are still
-        discovered dynamically; only its identity is fixed.
+        THE EXCEPTIONS ARE THE NAME-CLAIMED TABS (`_NAME_CLAIMED_KINDS`): the
+        canonical Outreach PoCs tab, the Deliverables Checklist, the Master
+        Pipeline, the Sales Packages tab, the AI Events & Summits tab and the
+        goal-setting tab. Each is claimed by TITLE before any signature is
+        scored, because each shares its shape with another tab in this playbook
+        and a scoring margin is not a safe way to tell them apart. THEIR COLUMNS
+        ARE STILL DISCOVERED DYNAMICALLY; only their identity is fixed.
 
         None when it is none of the kinds, which is the common case in a real
         playbook full of research and strategy tabs.
         """
-        if self._is_canonical_title(title):
-            log.debug("[gtm] tab %r claimed as the canonical Outreach PoCs tab by name", title)
-            return POCS
-
-        # THE EVENTS TAB, BY NAME WHEN IT IS NAMED. Its signature ("a name and a
-        # date") is genuinely weak — half a playbook's tabs match it — so the
-        # title is allowed to settle it here rather than only as a tie-break.
-        # The signature still catches a renamed tab; this catches the far more
-        # common case of a differently-shaped one that is plainly the events list.
-        want = normalise_header(title)
-        if want and any(
-            want == normalise_header(t)
-            for t in (config.GTM_EVENTS_TAB_TITLES or []) if str(t).strip()
-        ):
-            log.debug("[gtm] tab %r claimed as the Events & Summits tab by name", title)
-            return EVENTS
+        named = self._claimed_by_name(title)
+        if named is not None:
+            log.debug(
+                "[gtm] tab %r claimed as %s by name", title, KIND_LABELS.get(named, named),
+            )
+            return named
 
         hints = self._title_hints(title)
         best, best_score, best_rank = None, 0, 99
@@ -1310,7 +1930,7 @@ class GTMSheets:
             )
             return
 
-        col_to_role = {i: r for r, i in tab.role_to_col.items()}
+        col_to_role = {i: r for r, i in tab.canonical_role_to_col.items()}
         named: list[str] = []
         for lo, hi in windows:
             for idx in range(lo, min(hi, len(tab.headers) - 1) + 1):
@@ -1348,7 +1968,7 @@ class GTMSheets:
         window. What `log_writable_window` prints, as data — the "sheet status"
         answer quotes this so the log and the answer can never disagree."""
         out: list[dict] = []
-        col_to_role = {i: r for r, i in tab.role_to_col.items()}
+        col_to_role = {i: r for r, i in tab.canonical_role_to_col.items()}
         for lo, hi in config.writable_windows():
             for idx in range(lo, min(hi, len(tab.headers) - 1) + 1):
                 header = str(tab.headers[idx]).strip()
@@ -1409,8 +2029,19 @@ class GTMSheets:
             log.debug("[gtm] tab %r doesn't match a known kind; skipping", title)
             return None
 
-        role_to_col = self._map_headers(kind, headers)
-        col_to_role = {v: k for k, v in role_to_col.items()}
+        canonical_role_to_col = self._map_headers(kind, headers)
+        col_to_role = {v: k for k, v in canonical_role_to_col.items()}
+
+        # THE COMPATIBILITY SHIM, applied once per tab rather than once per
+        # lookup. An old role name resolves to the column its renamed successor
+        # found, and only when that successor actually mapped — an alias
+        # pointing at a column that does not exist would be a worse lie than the
+        # missing role it replaced.
+        role_to_col = dict(canonical_role_to_col)
+        if kind == POCS:
+            for old_role, new_role in POCS_COMPAT_ALIASES.items():
+                if new_role in canonical_role_to_col and old_role not in role_to_col:
+                    role_to_col[old_role] = canonical_role_to_col[new_role]
 
         rows: list[dict] = []
         error_cells: list = []
@@ -1437,21 +2068,76 @@ class GTMSheets:
                     row[role] = value
                 elif header:
                     row["_extra"][header] = value
-            # A tracker/priority row with no company is a spacer or a total line,
-            # not a deal — carrying it would let it be counted and flagged.
+            # THE COMPATIBILITY ALIASES, on the row as well as on the map.
+            # Code that reads `row["poc"]` gets the Name cell; code that reads
+            # `row["first_contacted"]` gets the First Contact Date cell. Filled
+            # from the canonical value, never the other way round, so there is
+            # still exactly one cell behind each fact.
+            if kind == POCS:
+                for old_role, new_role in POCS_COMPAT_ALIASES.items():
+                    if new_role in row and old_role not in row:
+                        row[old_role] = row[new_role]
+
+            # A SPACER OR A TOTAL LINE IS NOT A ROW. Every kind below has one
+            # column that a real row cannot be missing, and a blank in it means
+            # the line is formatting rather than data. Carrying those let a
+            # "TOTAL" line be counted as a deal and flagged as one.
             if kind in (MASTER, POCS, PRIORITY, PIPELINE, RESEARCHER_LINES) \
                     and not (row.get("company") or "").strip():
                 continue
-            # An events row with no event name is a spacer or a total line.
             if kind == EVENTS and not (row.get("event") or "").strip():
                 continue
+            if kind == DELIVERABLES and not (row.get("action_item") or "").strip():
+                continue
+            if kind == PACKAGES and not (
+                (row.get("name") or "").strip() or (row.get("package") or "").strip()
+            ):
+                continue
+            # THE GOALS TAB IS DELIBERATELY NOT FILTERED. It holds two stacked
+            # tables under one header row, so a row that maps no role at all is
+            # very likely the second table's content — exactly the thing the
+            # answers need. Its columns ride in `_extra`, keyed by their own
+            # headers, and a blank-line drop is already handled above.
             rows.append(row)
+
+        if kind == POCS:
+            self._warn_retired_roles(title, headers)
 
         return Tab(
             title=title, kind=kind, headers=headers,
             role_to_col=role_to_col, rows=rows, read_at=read_at,
             header_row=hidx + 1, error_cells=error_cells,
+            canonical_role_to_col=canonical_role_to_col,
         )
+
+    @staticmethod
+    def _warn_retired_roles(title: str, headers: list[str]) -> None:
+        """Name any header on the canonical tab that a RETIRED role used to own.
+
+        THE RETIREMENT HAS TO BE AUDIBLE. The tracker-era roles were removed
+        from ROLES[POCS], which means a tab still carrying "Total Follow-ups" or
+        "Response?" now files that column under `_extra` and every rule that
+        used to read it sees nothing. That is the intended behaviour — those
+        rules ran on a tab phase 2 retired — but it is indistinguishable from a
+        column rename nobody noticed unless somebody says so out loud.
+
+        Logged once per read of the tab, at INFO: it is not an error, it is the
+        bot telling you which columns it has deliberately stopped reading.
+        """
+        norm = {normalise_header(h) for h in headers if str(h).strip()}
+        still_there = sorted(
+            role for role in RETIRED_POCS_ROLES
+            if any(normalise_header(alias) in norm
+                   for alias in _RETIRED_ROLE_HEADERS.get(role, (role,)))
+        )
+        if still_there:
+            log.info(
+                "[gtm] tab %r still carries column(s) for %d RETIRED role(s): %s. Those "
+                "are tracker-era columns: they are read into `_extra` and quoted in "
+                "answers, but no rule evaluates them any more. Nothing to fix unless you "
+                "expected one of them to drive a reminder.",
+                title, len(still_there), ", ".join(still_there),
+            )
 
     # -- reads -------------------------------------------------------------
 
@@ -1497,7 +2183,7 @@ class GTMSheets:
                 if tab is not None:
                     mapped = {
                         role: (tab.headers[i] if i < len(tab.headers) else f"col{i}")
-                        for role, i in tab.role_to_col.items()
+                        for role, i in tab.canonical_role_to_col.items()
                     }
                     taken = set(tab.role_to_col.values())
                     schema_entries.append({
@@ -1538,8 +2224,14 @@ class GTMSheets:
                     ", ".join("%r (%d rows%s)" % (
                         t.title, len(t.rows),
                         ", HIDDEN" if hidden_by_title.get(t.title) else "",
-                    ) for t in found) or "(no tab matched this signature)",
+                    ) for t in found)
+                    or ("(NO TAB CLAIMED THIS NAME — check the *_TAB_TITLES "
+                        "setting for this kind against the schema below)"
+                        if kind in {k for k, _ in _NAME_CLAIMED_KINDS}
+                        else "(no tab matched this signature)"),
                 )
+
+            self._last_schema[which] = list(schema_entries)
 
             full_key = (which, "_full_schema")
             if config.GTM_LOG_FULL_SCHEMA and full_key not in self._schema_logged:
@@ -1653,6 +2345,392 @@ class GTMSheets:
         self.read(which)  # ensure the cache is populated / fresh
         with self._lock:
             return list(self._cache.get((which, kind)) or [])
+
+    def discovered_tabs(self, which: str = ORIGINAL) -> list[dict]:
+        """EVERY tab in the spreadsheet, recognised or not, as plain dicts.
+
+        [{title, hidden, kind, kind_label, rows, columns, headers, mapped_roles,
+          unmapped_headers}], in sheet order.
+
+        WHAT THE STARTUP LOG PRINTS, AS DATA. The "sheet status" answer is built
+        from this for the same reason `writable_window_columns` exists: a
+        verification answer assembled separately from the log it is verifying
+        can disagree with it, and then neither one can be trusted.
+
+        Includes the UNRECOGNISED tabs deliberately — "I can see this tab and I
+        do not read it" is the most useful line in the whole report when
+        somebody has just renamed something.
+        """
+        self.read(which)   # ensure discovery has run at least once
+        with self._lock:
+            entries = list(self._last_schema.get(which) or [])
+        out: list[dict] = []
+        for e in entries:
+            out.append({
+                "title": e["title"],
+                "hidden": bool(e["hidden"]),
+                "kind": e["kind"] or "",
+                "kind_label": KIND_LABELS.get(e["kind"] or "", "") if e["kind"]
+                else "not read — this tab matches no known kind",
+                "rows": e["rows"],
+                "columns": len(e["headers"]),
+                "headers": list(e["headers"]),
+                "mapped_roles": dict(e["mapped"]),
+                "unmapped_headers": list(e["unmapped"]),
+            })
+        return out
+
+    # -- APPENDING A ROW ---------------------------------------------------
+
+    def find_duplicate(self, tab: "Tab", *, company: str, poc: str = "") -> Optional[dict]:
+        """The existing row this append would duplicate, or None.
+
+        NORMALISED THE SAME WAY THE NEWS-SCREEN MATCHER IS — `normalise_header`,
+        lower-cased with punctuation collapsed. "Wispr Flow", "wispr flow" and
+        "Wispr  Flow." are one company, and an append that did not think so
+        would put a second row for the same account into a sheet people read as
+        one-row-per-account.
+
+        COMPANY ALONE for the pipeline and events tabs; COMPANY PLUS PERSON for
+        Outreach PoCs, where several rows per company is the normal shape and
+        only the same PERSON at the same company is a duplicate.
+        """
+        want_co = normalise_header(company)
+        if not want_co:
+            return None
+        want_poc = normalise_header(poc)
+        for row in (tab.rows or []):
+            have_co = normalise_header(clean_cell(row.get("company")))
+            if have_co != want_co:
+                continue
+            if tab.kind != POCS or not want_poc:
+                return row
+            have_poc = normalise_header(
+                clean_cell(row.get("name") or row.get("poc") or row.get("event"))
+            )
+            if have_poc == want_poc:
+                return row
+        return None
+
+    def first_empty_row(self, tab: "Tab", sh=None) -> int:
+        """The 1-based sheet row an append may write into.
+
+        THE FIRST ROW AFTER THE LAST ONE HOLDING ANYTHING, and it is computed
+        from a FRESH read rather than from `tab.rows`. `tab.rows` has had blank
+        and spacer rows filtered out of it — that is what makes it useful
+        everywhere else and useless here, because the row numbers it kept are
+        not a contiguous range and its last entry is not necessarily the last
+        occupied row.
+
+        NEVER A ROW WITH ANY EXISTING VALUE. The caller checks again before
+        writing (`append_row`), because this is arithmetic and that is the
+        actual guarantee.
+        """
+        try:
+            sh = sh or self._open(ORIGINAL)
+            ws = sh.worksheet(tab.title)
+            values = ws.get_all_values()
+        except Exception:
+            log.exception("[gtm] could not read %r to find its last row", tab.title)
+            return 0
+        last = 0
+        for i, row in enumerate(values, start=1):
+            if any(str(c).strip() for c in (row or [])):
+                last = i
+        return last + 1
+
+    def _next_sr_no(self, tab: "Tab") -> str:
+        """The next serial number, or "" when the tab has no Sr No column.
+
+        MAX PLUS ONE, NOT COUNT PLUS ONE. A tab somebody has deleted rows from
+        has a count lower than its highest serial, and count+1 would hand out a
+        number that is already in the sheet.
+        """
+        if "sr_no" not in (tab.canonical_role_to_col or {}):
+            return ""
+        best = 0
+        for row in (tab.rows or []):
+            raw = clean_cell(row.get("sr_no")).strip()
+            try:
+                best = max(best, int(float(raw)))
+            except (TypeError, ValueError):
+                continue
+        return str(best + 1)
+
+    def append_row(self, tab: "Tab", values: dict, *, reason: str,
+                   expect_company: str = "", dry_run: bool = False) -> dict:
+        """Append ONE row. Returns {ok, sheet_row, written, error, remedy, duplicate}.
+
+        THE ONLY WAY A ROW IS EVER CREATED, and it runs only after an approver
+        has said yes — `approvals` owns that gate and this function is not
+        reachable without it.
+
+        SIX THINGS IN ORDER, and the order is the design:
+
+          1. THE TAB MUST BE APPENDABLE. SHEET_APPENDABLE_TABS decides, because
+             "which tabs may grow" is a decision about the workbook rather than
+             about one row.
+          2. DUPLICATE CHECK. A company (or company + person) already on the tab
+             is reported, not appended. Said out loud — a silent skip reads as
+             a successful append to everybody downstream.
+          3. WHICH COLUMNS. Only MAPPED roles, and on Outreach PoCs only the
+             new-row band A:R. S-X is refused on a new row exactly as it is on
+             an existing one: a bot that has just discovered a company has no
+             business stating its closure probability.
+          4. AN EMPTY ROW, CHECKED IMMEDIATELY BEFORE WRITING. Not "the row
+             arithmetic said it was empty a moment ago" — re-read, because
+             somebody typing into the sheet between the two is exactly the race
+             this would lose.
+          5. WRITE.
+          6. READ BACK AND COMPARE EVERY CELL. On any mismatch the written
+             cells are CLEARED and the failure is reported. A half-written row
+             is worse than no row: it looks like data.
+
+        `dry_run` (SHEET_WRITES_ENABLED=false) stops after step 4 and reports
+        exactly what would have been written.
+        """
+        out: dict = {
+            "ok": False, "sheet_row": 0, "written": [], "error": "", "remedy": "",
+            "duplicate": None, "dry_run": bool(dry_run),
+        }
+
+        # A SIMULATION NEVER WRITES, whatever SHEET_WRITES_ENABLED says. There
+        # is no flag to turn this off and there must not be one: the whole
+        # contract of a simulation is that it leaves no trace, and a sheet row
+        # is the most visible trace there is.
+        try:
+            import simulation as _sim
+            if _sim.in_simulation():
+                dry_run = True
+                out["dry_run"] = True
+                out["dry_run_reason"] = "a simulation never writes to the sheet"
+        except Exception:
+            pass
+
+        if not config.SHEET_WRITES_ENABLED and not dry_run:
+            # Belt and braces: the caller checks too, but this is the
+            # function that opens a socket to the sheet.
+            dry_run = True
+            out["dry_run"] = True
+
+        appendable = {
+            str(t).strip().lower() for t in (config.SHEET_APPENDABLE_TABS or [])
+        }
+        if tab.kind not in appendable:
+            out["error"] = (
+                f"{tab.title!r} ({tab.kind}) is not in SHEET_APPENDABLE_TABS, so no "
+                "row may be added to it"
+            )
+            out["remedy"] = "Add its kind to SHEET_APPENDABLE_TABS if it should grow."
+            return out
+
+        company = str(values.get("company") or expect_company or "").strip()
+        poc = str(values.get("name") or values.get("poc") or values.get("event") or "").strip()
+        dup = self.find_duplicate(tab, company=company, poc=poc)
+        if dup is not None:
+            who = f"{company} · {poc}" if poc else company
+            out["duplicate"] = {
+                "sheet_row": dup.get("_row"),
+                "company": clean_cell(dup.get("company")),
+                "poc": clean_cell(dup.get("name") or dup.get("poc") or dup.get("event")),
+            }
+            out["error"] = (
+                f"{who} is already on {tab.title!r} at row {dup.get('_row')}, so I have "
+                "not added a second one"
+            )
+            log.info("[gtm.append] refused a duplicate: %s (row %s)", who, dup.get("_row"))
+            return out
+
+        # WHICH CELLS. Mapped roles only, and band-checked per row kind.
+        cells: list = []
+        refused: list = []
+        payload = dict(values)
+        sr = self._next_sr_no(tab)
+        if sr and "sr_no" not in payload:
+            payload["sr_no"] = sr
+
+        for role, value in payload.items():
+            text = clean_cell(value)
+            if not text:
+                continue
+            idx = (tab.canonical_role_to_col or {}).get(role)
+            if idx is None:
+                refused.append({"role": role, "why": f"{tab.title!r} has no {role} column"})
+                continue
+            if tab.kind == POCS and not config.may_write_new_row_column(idx):
+                refused.append({
+                    "role": role,
+                    "why": (
+                        f"column {config.column_label(idx)} is outside "
+                        f"NEW_ROW_WRITABLE_RANGES ({config.NEW_ROW_WRITABLE_RANGES}) — "
+                        "the commercial block is never written, even on a new row"
+                    ),
+                })
+                continue
+            cells.append({
+                "role": role, "column": config.column_label(idx), "index": idx,
+                "header": tab.headers[idx] if idx < len(tab.headers) else role,
+                "value": text,
+            })
+
+        out["refused"] = refused
+        if not cells:
+            out["error"] = "nothing in that row maps to a column I may write"
+            return out
+
+        try:
+            sh = self._open(ORIGINAL)
+            ws = sh.worksheet(tab.title)
+        except Exception as e:
+            out["error"] = f"the sheet could not be opened ({type(e).__name__})"
+            return out
+
+        target = self.first_empty_row(tab, sh)
+        if target <= 0:
+            out["error"] = "I could not work out where the tab ends"
+            return out
+        out["sheet_row"] = target
+
+        # THE ROW MUST BE EMPTY, RE-READ NOW. Not "the arithmetic said so a
+        # moment ago" — somebody typing into the sheet between the two is
+        # exactly the race this would otherwise lose.
+        try:
+            existing = ws.row_values(target)
+        except Exception:
+            existing = []
+        occupied = [
+            f"{config.column_label(i)}={str(v).strip()!r}"
+            for i, v in enumerate(existing or []) if str(v).strip()
+        ]
+        if occupied:
+            out["error"] = (
+                f"row {target} is not empty ({', '.join(occupied[:4])}), so I have not "
+                "written anything"
+            )
+            out["remedy"] = "Somebody may have added a row since I last read the tab."
+            log.warning("[gtm.append] refused: row %d on %r is occupied", target, tab.title)
+            return out
+
+        if dry_run:
+            out["ok"] = True
+            out["written"] = [dict(c, old="") for c in cells]
+            log.info(
+                "[gtm.append] DRY RUN — would write %d cell(s) into row %d of %r: %s",
+                len(cells), target, tab.title,
+                ", ".join(f"{c['column']}={c['value']!r}" for c in cells),
+            )
+            return out
+
+        # WRITE, one batch.
+        try:
+            ws.batch_update([
+                {"range": f"{c['column']}{target}", "values": [[c["value"]]]}
+                for c in cells
+            ], value_input_option="USER_ENTERED")
+        except Exception as e:
+            # A 403 HERE IS A SHARING PROBLEM, NOT A BUG, and it is worth saying
+            # so in those words. The service account can READ the playbook — it
+            # just read 517 rows out of it — and "the caller does not have
+            # permission" on a write means it was shared as VIEWER. That is one
+            # click to fix and impossible to guess from the raw error.
+            detail = str(e)
+            if "403" in detail or "permission" in detail.lower():
+                out["error"] = (
+                    "the sheet refused the write: the service account can read this "
+                    "playbook but not write to it"
+                )
+                out["remedy"] = (
+                    f"Share the spreadsheet with {config.service_account_email() or 'the service account'} "
+                    "as an EDITOR (it currently has Viewer). Every write path is "
+                    "affected, not just row additions."
+                )
+                log.error(
+                    "[gtm.append] 403 on %r row %d — the service account has read "
+                    "access but not write access. Share the playbook as Editor.",
+                    tab.title, target,
+                )
+            else:
+                out["error"] = f"the sheet refused the write ({type(e).__name__}: {e})"
+                log.exception("[gtm.append] the write failed on %r row %d",
+                              tab.title, target)
+            return out
+
+        # READ BACK AND COMPARE EVERY CELL. A write that reported success and
+        # landed somewhere else is the failure this exists to catch — and the
+        # only way to catch it is to look.
+        try:
+            back = ws.row_values(target)
+        except Exception as e:
+            out["error"] = (
+                f"the row was written but could not be read back to confirm "
+                f"({type(e).__name__}). I have left it in place rather than clearing "
+                "something I cannot see."
+            )
+            return out
+
+        mismatches = []
+        for c in cells:
+            got = clean_cell(back[c["index"]]) if c["index"] < len(back) else ""
+            if normalise_header(got) != normalise_header(c["value"]):
+                mismatches.append(f"{c['column']}: wrote {c['value']!r}, read {got!r}")
+
+        if mismatches:
+            log.error(
+                "[gtm.append] READ-BACK MISMATCH on %r row %d: %s. Clearing what was "
+                "written.", tab.title, target, "; ".join(mismatches),
+            )
+            try:
+                ws.batch_update([
+                    {"range": f"{c['column']}{target}", "values": [[""]]}
+                    for c in cells
+                ], value_input_option="USER_ENTERED")
+                cleared = "the cells have been cleared"
+            except Exception:
+                log.exception("[gtm.append] could not clear the mismatched row")
+                cleared = (
+                    "I could NOT clear them — row %d of %r needs a human eye"
+                    % (target, tab.title)
+                )
+            out["error"] = (
+                "the row did not read back as written (" + "; ".join(mismatches[:3])
+                + "), so " + cleared
+            )
+            return out
+
+        out["ok"] = True
+        out["written"] = cells
+        log.info(
+            "[gtm.append] wrote and verified %d cell(s) into row %d of %r (%s)",
+            len(cells), target, tab.title, reason,
+        )
+        return out
+
+    def clear_cells(self, tab_title: str, *, row: int, columns: list,
+                    reason: str) -> dict:
+        """Blank specific cells on one row. How an appended row is undone.
+
+        IT NEVER DELETES A ROW. Deleting shifts every row below it, which would
+        renumber cells other people's notes and formulas point at — and the undo
+        for an append is "make it as if nothing was written", not "make the
+        sheet one row shorter". An undone append leaves an empty row, and the
+        next append reuses it.
+        """
+        out = {"ok": False, "cleared": [], "error": ""}
+        try:
+            sh = self._open(ORIGINAL)
+            ws = sh.worksheet(tab_title)
+            ws.batch_update([
+                {"range": f"{col}{int(row)}", "values": [[""]]} for col in columns
+            ], value_input_option="USER_ENTERED")
+        except Exception as e:
+            out["error"] = f"the cells could not be cleared ({type(e).__name__}: {e})"
+            log.exception("[gtm.append] undo failed on %r row %s", tab_title, row)
+            return out
+        out["ok"] = True
+        out["cleared"] = list(columns)
+        log.info("[gtm.append] undo: cleared %s on %r row %s (%s)",
+                 ", ".join(columns), tab_title, row, reason)
+        return out
 
     def pocs_tab(self, which: str = ORIGINAL) -> Optional[Tab]:
         """THE CANONICAL TAB — "Outreach PoCs" — or None when it isn't there.
@@ -1870,6 +2948,23 @@ class GTMSheets:
         state that drove it is untouched. The sheet is what the team reads;
         SQLite is what the bot knows.
         """
+
+        # A SIMULATION NEVER WRITES A CELL EITHER. Same contract as
+        # `append_row`: the caller is supposed to have arranged this, and
+        # this is the function that opens the socket to the sheet.
+        try:
+            import simulation as _sim
+            if _sim.in_simulation():
+                log.info(
+                    "[gtm] simulation: refusing to write %d cell(s) to row %s",
+                    len(values or {}), row,
+                )
+                return {
+                    "ok": False, "written": [], "error": "", "simulated": True,
+                    "remedy": "a simulation never writes to the sheet",
+                }
+        except Exception:
+            pass
         out = {"ok": False, "written": [], "refused": [], "error": ""}
 
         if not config.SHEET_WRITES_ENABLED:

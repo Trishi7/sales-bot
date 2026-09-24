@@ -186,8 +186,8 @@ def funnel_action(counts: dict, *, today: Optional[date] = None) -> Optional[dic
         "due_iso": dl.iso(today),
         # LAST IN THE QUEUE, ALWAYS. It is a number, not a task, and it must
         # never take a slot from a reply somebody is waiting on.
-        "priority": nextaction.P_SLOW,
-        "priority_label": nextaction.BAND_LABELS[nextaction.P_SLOW],
+        "priority": nextaction.P_CONTEXT,
+        "priority_label": nextaction.BAND_LABELS[nextaction.P_CONTEXT],
         "overdue_days": 0,
         "company": "the week",
         "poc": "",
@@ -277,7 +277,7 @@ def _self_test() -> int:
     line = funnel_action(counts, today=date(2026, 9, 11))     # a Friday
     check("on its Friday", bool(line), True)
     check("counts only, zeros included", "0 paid" in line["text"], True)
-    check("last in the queue", line["priority"], nextaction.P_SLOW)
+    check("last in the queue", line["priority"], nextaction.P_CONTEXT)
     check("no bullets", any(c in line["text"] for c in ("**", "- ")), False)
     config.WEEKLY_FUNNEL_ENABLED = False
 

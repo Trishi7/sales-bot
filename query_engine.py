@@ -226,7 +226,17 @@ class QueryEngine:
 
     async def _call_model(self, *, system, tools, messages):
         """One model turn, on a thread so the sync SDK never blocks the Discord
-        gateway heartbeat."""
+        gateway heartbeat.
+
+        THE STRATEGY DOC IS GUARANTEED HERE, at this engine's only model call,
+        for the same reason it is guaranteed in `llm._create`: so that no future
+        call site can reach a model without the plan in front of it. The marker
+        check means a prompt that already carries the block — everything built
+        on `persona.system_preamble()`, which is every prompt this engine uses
+        today — is not given a second copy.
+        """
+        if persona.STRATEGY_MARKER not in (system or ""):
+            system = persona.strategy_preamble() + (system or "")
         return await asyncio.to_thread(
             self._client.messages.create,
             model=self._model,

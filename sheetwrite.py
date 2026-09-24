@@ -86,28 +86,37 @@ TIER_NEVER = "never"
 
 # THE REPLY LOOP. What a person answering the bot can put into the sheet without
 # having to phrase it as an instruction — the facts a nudge asks about.
+# EVERY ROLE HERE LIVES IN THE WRITABLE WINDOW (J:R) EXCEPT THE LAST TWO, and
+# that is not an accident — it is the tier list and the band list agreeing. The
+# bands are still what enforce it: `plan_writes` checks the column index before
+# it checks the tier, so a role listed here by mistake is refused by the band
+# rather than written.
 REPLY_ROLES: tuple = (
+    "first_contact",
     "first_contact_type",
-    "first_contacted",
-    "connected",
-    "dm_sent_date",
-    "response",
-    "meeting_status",
+    "first_contact_date",
+    "sid_li_added",
+    "li_connected_date",
+    "li_dm_sent",
+    "li_dm_date",
     "meeting_date",
+    "meeting_status",
+    # S and U, inside the restricted right-hand band. Kept in the tier list so
+    # that the refusal names the COLUMN ("I never write to Next Steps/Notes")
+    # instead of falling through to "I have no rule for that" — the second is
+    # true and useless, and it reads as the bot not having listened.
     "next_steps",
-    "other_updates",
-    "package_sent",
-    "assets_shared",
-    "prospect_stage",
+    "prospect_status",
 )
 
 # EXPLICIT COMMAND ONLY. Commercial judgements. A number somebody mentions in a
 # sentence is not a number they have decided to put in the sheet, and the
 # difference between those two things is a forecast nobody agreed to.
 COMMAND_ROLES: tuple = (
-    "closure",
+    "closure_prob",
     "deal_size",
     "deal_status",
+    "package",
 )
 
 TRIGGER_REPLY = "reply"
@@ -122,10 +131,11 @@ TRIGGER_COMMAND = "command"
 # Listed by role as well as caught by the band check, because the band check
 # needs the column to be MAPPED to fire, and a sheet that has not named its
 # email column yet would fall through to the generic path.
-CONTACT_ROLES: tuple = ("email", "linkedin", "phone")
+CONTACT_ROLES: tuple = ("email", "li_url", "linkedin", "phone")
 
 CONTACT_LABELS = {
     "email": "email address",
+    "li_url": "LinkedIn link",
     "linkedin": "LinkedIn link",
     "phone": "phone number",
 }
@@ -133,20 +143,20 @@ CONTACT_LABELS = {
 # How each role reads in an echo line. The bot names the COLUMN as the sheet
 # names it wherever it can (the header text), and falls back to these.
 ROLE_LABELS = {
+    "first_contact": "first contact",
     "first_contact_type": "first contact type",
-    "first_contacted": "first contact date",
-    "connected": "connection date",
-    "dm_sent_date": "DM sent date",
-    "response": "responded",
-    "meeting_status": "meeting status",
+    "first_contact_date": "first contact date",
+    "sid_li_added": "LinkedIn connection request",
+    "li_connected_date": "LinkedIn connected date",
+    "li_dm_sent": "LinkedIn DM sent",
+    "li_dm_date": "LinkedIn DM date",
     "meeting_date": "meeting date",
-    "next_steps": "next steps",
-    "other_updates": "notes",
-    "package_sent": "package sent",
-    "assets_shared": "assets shared",
-    "prospect_stage": "prospect status",
-    "closure": "closure probability",
-    "deal_size": "deal size",
+    "meeting_status": "meeting status",
+    "next_steps": "next steps / notes",
+    "package": "package",
+    "prospect_status": "prospect status",
+    "closure_prob": "closure probability",
+    "deal_size": "estimated deal size",
     "deal_status": "deal status",
 }
 
@@ -268,6 +278,27 @@ def plan_writes(
             })
             continue
 
+        # (1b) NO SUCH COLUMN ON THIS TAB -> say THAT, before the tier speaks.
+        #      A role with no column is almost always a RETIRED one
+        #      (gtm_sheet.RETIRED_POCS_ROLES — response, assets_shared,
+        #      followups_count and the rest of the tracker era). Letting the
+        #      tier check answer first would refuse it with "I have no rule for
+        #      that", which is true and useless: it tells somebody who just
+        #      reported a real fact nothing about why it went nowhere. "There
+        #      is no Assets Shared column on this tab any more" is actionable.
+        if idx is None:
+            retired = role in getattr(gtm_sheet, "RETIRED_POCS_ROLES", ())
+            label = ROLE_LABELS.get(role, role)
+            out["skipped"].append({
+                "role": role,
+                "why": (
+                    f"there is no column for {label} on this tab"
+                    + (" any more — it is a retired tracker-era column, and "
+                       "nothing records it now" if retired else "")
+                ),
+            })
+            continue
+
         # (2) TIER.
         if not allowed_for(role, trigger):
             t = tier(role)
@@ -294,7 +325,7 @@ def plan_writes(
             continue
 
         # (4) TERMINAL STATUS needs the words.
-        if role in ("prospect_stage", "deal_status") and is_terminal_status(value):
+        if role in ("prospect_status", "deal_status") and is_terminal_status(value):
             said = said_terminal_words(reply_text)
             if not said:
                 out["skipped"].append({
@@ -573,12 +604,15 @@ def _self_test() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: got {got!r}, want {want!r}")
 
     print("tiers")
-    check("dm_sent_date is reply-loop", tier("dm_sent_date"), TIER_REPLY)
-    check("closure is command-only", tier("closure"), TIER_COMMAND)
+    check("li_dm_date is reply-loop", tier("li_dm_date"), TIER_REPLY)
+    check("closure_prob is command-only", tier("closure_prob"), TIER_COMMAND)
     check("an unknown role is NEVER", tier("wat"), TIER_NEVER)
     check("a reply may write next_steps", allowed_for("next_steps", TRIGGER_REPLY), True)
-    check("a reply may NOT write closure", allowed_for("closure", TRIGGER_REPLY), False)
-    check("a command may write closure", allowed_for("closure", TRIGGER_COMMAND), True)
+    check("a reply may NOT write closure_prob",
+          allowed_for("closure_prob", TRIGGER_REPLY), False)
+    check("a command may write closure_prob",
+          allowed_for("closure_prob", TRIGGER_COMMAND), True)
+    check("a retired role is NEVER", tier("response"), TIER_NEVER)
 
     print("\nterminal words")
     check("'dead' in the text unlocks it", bool(said_terminal_words("they're dead")), True)
@@ -603,20 +637,25 @@ def _self_test() -> int:
     print("\nplan_writes - the fill rule and the gates")
     import time as _time
 
-    # A:I identity (restricted) · J:R the writable window · S:X formulas
-    # (restricted). The command-only columns sit INSIDE the window here, which
-    # is the arrangement a sheet needs for the bot to be able to maintain them
-    # at all — see "THE BANDS OUTRANK THE TIERS" in the module header.
-    headers = ["Sr. No.", "Company", "Industry", "PoC", "Designation", "Email",
-               "LinkedIn", "Geography", "Source",
-               "First Contact Type", "First Contact Date", "Connection Date",
-               "DM Sent Date", "Prospect", "Response?", "Next Steps",
-               "Closure", "Deal Status",
-               "F1", "F2", "F3", "F4", "F5", "F6"]
+    # THE REAL SCHEMA, A-X. A:I identity (restricted) · J:R the writable
+    # window · S:X the commercial block (restricted).
+    #
+    # NOTE WHAT THIS ARRANGEMENT COSTS: every command-only role
+    # (closure_prob, deal_size, deal_status, package) sits in the RESTRICTED
+    # S:X band on the live tab, so no instruction can write one — the bands
+    # outrank the tiers, and the test below asserts exactly that rather than
+    # pretending otherwise with a friendlier fixture.
+    headers = ["Sr No", "Company/Uni", "Industry", "Name", "Designation",
+               "Email id", "Based", "Research Paper Link", "LI Url",
+               "First Contact", "First Contact Type", "First Contact Date",
+               "Sid - LI Addition", "LI Connected Date", "LI DM Sent",
+               "LI DM Date", "Meeting Date", "Meeting Status",
+               "Next Steps/Notes", "Package", "Prospect Status",
+               "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status"]
     values = [headers,
-              ["1", "Acme", "Fin", "Ann", "CTO", "", "", "IN", "ref",
-               "LinkedIn", "01-09-2026", "05-09-2026", "", "Lead", "", "",
-               "", "",
+              ["1", "Acme", "Fin", "Ann", "CTO", "", "IN", "", "",
+               "TRUE", "LinkedIn", "01-09-2026", "TRUE", "05-09-2026", "", "",
+               "", "Booked",
                "", "", "", "", "", ""]]
     tab = gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=_time.time())
     trow = tab.rows[0]
@@ -625,44 +664,59 @@ def _self_test() -> int:
         return plan_writes(tab=tab, row=trow, fields=fields, trigger=trigger,
                            reply_text=text)
 
-    p1 = plan([{"role": "dm_sent_date", "value": "09-09-2026", "supersedes": False}])
-    check("an EMPTY cell is filled", p1["writes"], {"dm_sent_date": "09-09-2026"})
+    check("the fixture maps all 24 columns", len(tab.canonical_role_to_col), 24)
+    check("...and no retired role among them",
+          sorted(set(gtm_sheet.RETIRED_POCS_ROLES) & set(tab.canonical_role_to_col)),
+          [])
 
-    p2 = plan([{"role": "prospect_stage", "value": "Demo", "supersedes": False}])
+    p1 = plan([{"role": "li_dm_date", "value": "09-09-2026", "supersedes": False}])
+    check("an EMPTY cell in the window is filled",
+          p1["writes"], {"li_dm_date": "09-09-2026"})
+
+    p2 = plan([{"role": "meeting_status", "value": "Completed", "supersedes": False}])
     check("a NON-empty cell is left alone without supersedes", p2["writes"], {})
     check("...and the reason is reported", bool(p2["skipped"]), True)
 
-    p3 = plan([{"role": "prospect_stage", "value": "Demo", "supersedes": True}])
-    check("...but supersedes replaces it", p3["writes"], {"prospect_stage": "Demo"})
+    p3 = plan([{"role": "meeting_status", "value": "Completed", "supersedes": True}])
+    check("...but supersedes replaces it",
+          p3["writes"], {"meeting_status": "Completed"})
 
-    p4 = plan([{"role": "closure", "value": "60%", "supersedes": False}])
-    check("a reply cannot set closure", p4["writes"], {})
-    p5 = plan([{"role": "closure", "value": "60%", "supersedes": False}],
+    p4 = plan([{"role": "closure_prob", "value": "60%", "supersedes": False}])
+    check("a reply cannot set closure_prob", p4["writes"], {})
+    p5 = plan([{"role": "closure_prob", "value": "60%", "supersedes": False}],
               trigger=TRIGGER_COMMAND)
-    check("...but a command can", p5["writes"], {"closure": "60%"})
+    check("...and NEITHER CAN A COMMAND: V is inside the restricted S:X band",
+          p5["writes"], {})
+    check("...and the refusal names the column",
+          any("Closure Prob" in str(sk.get("why", "")) or
+              "Closure Prob" in str(sk.get("label", "")) for sk in p5["skipped"]),
+          True)
 
     p6 = plan([{"role": "email", "value": "ann@acme.com", "supersedes": False}])
     check("an email is never written", p6["writes"], {})
     check("...it becomes an ASK", [a["role"] for a in p6["asks"]], ["email"])
-    check("...naming the sheet own column", p6["asks"][0]["label"], "Email")
+    check("...naming the sheet own column", p6["asks"][0]["label"], "Email id")
 
-    p7 = plan([{"role": "poc", "value": "Someone Else", "supersedes": True}])
+    p7 = plan([{"role": "name", "value": "Someone Else", "supersedes": True}])
     check("a restricted identity column is never written", p7["writes"], {})
 
-    p8 = plan([{"role": "prospect_stage", "value": "Dead", "supersedes": True}],
+    p7b = plan([{"role": "poc", "value": "Someone Else", "supersedes": True}])
+    check("...and the retired spelling of it is refused too", p7b["writes"], {})
+
+    p8 = plan([{"role": "prospect_status", "value": "Dead", "supersedes": True}],
               text="no reply for weeks")
     check("Dead without the word is refused", p8["writes"], {})
-    p9 = plan([{"role": "prospect_stage", "value": "Dead", "supersedes": True}],
+    p9 = plan([{"role": "prospect_status", "value": "Dead", "supersedes": True}],
               text="call it, they are dead")
-    check("...and allowed when they said it", p9["writes"], {"prospect_stage": "Dead"})
+    check("...and STILL refused, because U is restricted too", p9["writes"], {})
 
-    p11 = plan([{"role": "meeting_status", "value": "Done", "supersedes": True}])
-    check("a role with no column on this tab is refused, and named",
+    p11 = plan([{"role": "assets_shared", "value": "Yes", "supersedes": True}])
+    check("a RETIRED role has no column and is refused, and named",
           (p11["writes"], "no column" in str(p11["skipped"])), ({}, True))
 
     many = [{"role": r, "value": "x", "supersedes": True}
-            for r in ("dm_sent_date", "next_steps", "response",
-                      "closure", "deal_status")]
+            for r in ("first_contact", "first_contact_type", "sid_li_added",
+                      "li_dm_sent", "meeting_date")]
     p10 = plan(many, trigger=TRIGGER_COMMAND)
     check("over the cell ceiling -> nothing at all", p10["writes"], {})
     check("...refused whole, and said so",
@@ -671,7 +725,7 @@ def _self_test() -> int:
     print("\necho line")
     line = echo_line(company="Acme", poc="Ann", applied=p1["applied"], asks=[],
                      skipped=[], undo_hours=24)
-    check("names the column and the value", "dm sent date" in line.lower(), True)
+    check("names the column and the value", "li dm date" in line.lower(), True)
     check("offers the undo", "undo" in line.lower(), True)
     check("no bullets or headers",
           any(c in line for c in ("**", "- ", '•')), False)

@@ -22,10 +22,11 @@ WHERE EVERY LINE COMES FROM, and nowhere else:
                               or industry wording.
     meeting notes             anything on file about this company.
 
-    ONLINE RESEARCH IS NOT ONE OF THEM. This bot has no web access. Rather than
-    leave that as a silent gap that reads like "there was nothing to find", every
-    brief carries a section saying so in as many words and marked "pending web
-    access decision". Nothing external is inferred, guessed or filled in from
+    ONLINE RESEARCH IS NOT ONE OF THEM — and that is now a choice, not a
+    limitation. The bot HAS web search (`websearch.py`, wired into the drip's
+    rules); this brief does not use it. Rather than leave that as a silent gap
+    that reads like "there was nothing to find", every brief carries a section
+    saying which it is. Nothing external is inferred, guessed or filled in from
     the model's own knowledge — see `_no_web_section`.
 
 WHAT IT WILL NOT DO. It will not assert anything the sources did not say. A
@@ -286,16 +287,20 @@ def _notes_section(company: str, *, notes_module, today: date) -> list[str]:
 
 
 def _no_web_section() -> list[str]:
-    """The honest gap. Phase 1 has no web access, and a brief that quietly
-    omitted external research would read as "there was nothing to find"."""
+    """The honest gap, and it is a gap in THE BRIEF rather than in the bot.
+
+    The bot has web search now (`websearch.py`); the drip's rules use it. This
+    brief does not, and a brief that quietly omitted external research would
+    read as "there was nothing to find" — so it says which it is.
+    """
     if not config.CADENCE_PREP_NOTE_NO_WEB:
         return []
     return [
-        "**External / online research — pending web access decision**",
-        "  · Not included. This bot has no web access, so nothing here comes from "
-        "outside the sheets and the meeting notes above. Recent news, funding, "
-        "headcount and product launches have NOT been checked — look them up "
-        "yourself before the call.",
+        "**External / online research — not in this brief**",
+        "  · Not included. Everything above comes from the sheets and the meeting "
+        "notes. Recent news, funding, headcount and product launches have NOT "
+        "been checked for this brief — look them up, or ask me and I will "
+        "search.",
     ]
 
 

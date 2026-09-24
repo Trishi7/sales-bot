@@ -18,7 +18,9 @@ which runs a tool-use loop. What lives here are the four short calls around it:
 Two rules run through all of them:
 
   EVERY REPLY-PATH CALL CARRIES THE POLICY. The system prompt is built from
-  `persona.system_preamble()`, which re-reads sales_policy.md and appends the
+  `persona.system_preamble()`, which re-reads sales_strategy.md (THE CORE BRAIN,
+  injected into every call by `_create` whether the prompt asked for it or not)
+  and sales_policy.md, and appends the
   current source statuses. A path that spoke without them would be a path
   operating under a different policy than the rest of the bot.
 
@@ -80,9 +82,14 @@ def _text_of(resp) -> str:
 
 
 # The shapes a proactive message must never have. Checked rather than trusted:
-# the voice rules say "no headers, no bullets, no emojis, one thought", and a
-# model that ignores them produces exactly the message the drip was built to
-# stop sending.
+# the voice rules say "no headers, no bullets, one thought", and a model that
+# ignores them produces exactly the message the drip was built to stop sending.
+#
+# EMOJI AND LENGTH ARE NO LONGER HERE. They moved to `tone.check`, because both
+# are now SETTINGS rather than constants: SALEY_EMOJI decides how many emoji are
+# allowed and SALEY_LENGTH decides how many sentences. The old rules could not
+# express either — one banned every emoji outright, and the other capped bytes,
+# which is not what "one to three sentences" means.
 _PROACTIVE_BANNED = (
     "\n- ", "\n* ", "\n1. ",
     "**", "##", "•",
@@ -90,18 +97,33 @@ _PROACTIVE_BANNED = (
 
 
 def _proactive_problem(text: str) -> str:
-    """Why this composed message cannot be sent, or "" when it is fine."""
+    """Why this composed message cannot be sent, or "" when it is fine.
+
+    THREE KINDS OF CHECK, and the middle one is new:
+
+      SHAPE     headers, bullets, more than two paragraphs. Constants — no tone
+                setting makes a bulleted nudge acceptable.
+      TONE      emoji count and sentence count, from `tone.check`. These are
+                SETTINGS, and they are the two of the five that are enforced
+                rather than merely asked for.
+      SANITY    a hard byte ceiling, kept as a backstop well above any tone
+                setting — a model that returns two thousand characters has
+                malfunctioned rather than been slightly verbose.
+    """
+    import tone as _tone
+
     if not text:
         return "empty"
-    if len(text) > 600:
-        return f"too long ({len(text)} chars)"
     for token in _PROACTIVE_BANNED:
         if token in text:
             return f"contains {token!r} — headers and bullets are not the voice"
-    if any(ord(ch) > 0x2100 for ch in text):
-        return "contains an emoji or symbol"
     if text.count(chr(10) * 2) >= 2:
         return "more than two paragraphs — one thought per message"
+    problem = _tone.check(text)
+    if problem:
+        return problem
+    if len(text) > 1200:
+        return f"far too long ({len(text)} chars) — the model has malfunctioned"
     return ""
 
 
@@ -123,22 +145,29 @@ You output JSON only. No prose, no fences.
   "confidence": 0.0-1.0
 }
 
-THE ROLES YOU MAY USE, and what each holds:
-  first_contact_type  how first contact was made: Email / LinkedIn / Call / WhatsApp
-  first_contacted     the date first contact went out
-  connected           the date the connection was accepted
-  dm_sent_date        the date the DM went out
-  response            whether they replied: Y / N / P / Awaited
-  meeting_status      Booked / Done / No-show / Rescheduled / Cancelled
+THE ROLES YOU MAY USE, and what each holds. These are the sheet's OWN columns —
+use these names exactly, and never invent one:
+  first_contact       whether first contact happened, or who made it
+  first_contact_type  how it was made: Email / LinkedIn / Call / WhatsApp
+  first_contact_date  the date first contact went out
+  sid_li_added        whether the LinkedIn connection request was sent
+  li_connected_date   the date the LinkedIn connection was accepted
+  li_dm_sent          whether the LinkedIn DM went out: Yes / No
+  li_dm_date          the date that DM went out
   meeting_date        the date of the meeting
+  meeting_status      Booked / Completed / No-show / Rescheduled / Cancelled
   next_steps          the next action, in their words, short
-  other_updates       a note worth keeping that fits nowhere else
-  package_sent        Yes / No, or the date it went
-  assets_shared       Yes / No
-  prospect_stage      Lead / Demo / Quote / Dead / Unresponsive
-  closure             a closure probability, as a percentage
-  deal_size           the deal value
+  package             which package went to them
+  prospect_status     Lead / Demo / Quote / Dead / Unresponsive
+  closure_prob        a closure probability, as a percentage
+  deal_size           the estimated deal size, in USD
   deal_status         In Progress / On Hold / Won / Lost
+
+THREE COLUMNS, NOT ONE, FOR FIRST CONTACT — and the same for the LinkedIn DM.
+"I emailed her on Tuesday" is three facts: that it happened (first_contact),
+that it was email (first_contact_type), and that it was Tuesday
+(first_contact_date). Put each in its own field. Never put a date in a
+whether-it-happened column or the word "Yes" in a date column.
 
 DATES: today's date is given below. Resolve "this morning", "yesterday",
 "Tuesday", "the 3rd" against it and output DD-MM-YYYY. Never output a relative
@@ -181,6 +210,25 @@ class LLM:
         self._model = model
 
     async def _create(self, *, system: str, prompt: str, max_tokens: int):
+        """One model call, with the STRATEGY DOC in front of the system prompt.
+
+        THE INJECTION LIVES HERE, AT THE CHOKEPOINT, AND NOT AT THE CALL SITES.
+        Every call this class makes goes through this method, so putting it here
+        is what makes "every LLM call reads the strategy" a property of the code
+        rather than a convention somebody has to remember. Four of the prompts
+        in this file are bare constants — the query parser, the sheet-update
+        extractor, the commitment detector — and each of them was one forgotten
+        line away from reasoning about this team's deals without the plan.
+
+        `strategy_preamble()` re-reads the file (mtime+size cached), so an edit
+        to sales_strategy.md is in force on the very next call.
+
+        THE MARKER CHECK IS WHAT STOPS A SECOND COPY. Prompts built on
+        `persona.system_preamble()` already carry the block; prepending blindly
+        would send it twice and pay for it twice.
+        """
+        if persona.STRATEGY_MARKER not in system:
+            system = persona.strategy_preamble() + system
         return await asyncio.to_thread(
             self._client.messages.create,
             model=self._model,
@@ -292,7 +340,8 @@ class LLM:
             return fallback_social_reply(kind, requester or "")
         return reply
 
-    async def proactive_message(self, *, prompt: str, fallback: str) -> tuple[str, bool]:
+    async def proactive_message(self, *, prompt: str, fallback: str,
+                                recent_openers=None) -> tuple[str, bool]:
         """Compose ONE proactive message in the warm-sales-head voice.
 
         Returns (text, used_model). `fallback` is a complete, sendable sentence
@@ -306,17 +355,25 @@ class LLM:
         proactive voice is a markdown edit, not a deploy.
 
         The reply is sanity-checked before it is trusted. A model that returns a
-        bulleted list, a header, or four paragraphs has not followed the voice
-        rules, and shipping it would teach the team that the rules are
-        decorative. In that case the deterministic fallback goes out instead.
+        bulleted list, a header, four paragraphs, or more emoji than SALEY_EMOJI
+        allows has not followed the voice rules, and shipping it would teach the
+        team that the rules are decorative. In that case the deterministic
+        fallback goes out instead.
+
+        `recent_openers` is the last few openings, so the composer can be told
+        what not to start with. Passed in rather than read here, because reading
+        it is a database hit and this class does no I/O beyond the model call.
         """
         if not config.DRIP_LLM_COMPOSE:
             return fallback, False
         try:
             resp = await self._create(
-                system=persona.proactive_voice_prompt(),
+                # TONE IS READ HERE, AT COMPOSE TIME, not at import. A change to
+                # SALEY_WARMTH is in force on the very next message with no
+                # restart — which is the point of the setting existing.
+                system=persona.proactive_voice_prompt(recent_openers=recent_openers),
                 prompt=prompt,
-                max_tokens=220,
+                max_tokens=320,
             )
         except Exception:
             log.exception("[llm.proactive] call raised; sending the template instead")
@@ -332,6 +389,35 @@ class LLM:
             return fallback, False
         log.info("[llm.proactive] composed %d chars", len(text))
         return text, True
+
+    async def classify_leave(self, *, prompt: str) -> str:
+        """WHO IS AWAY TODAY, from the leave channel's recent posts.
+
+        Returns the model's raw reply; `leave.py` parses it. Returns "" on any
+        failure, which that module treats as "nobody is on leave" — the
+        recoverable direction, because the cost of failing open is one nudge to
+        somebody who is away, and the cost of failing closed would be silently
+        redirecting everybody's work to Vaishnavi whenever the API blinked.
+
+        THE STRATEGY DOC IS NOT IN THIS PROMPT and should not be. `_create`
+        prepends it to everything by default; this one call is about reading
+        prose for dates and names, and the plan has no bearing on whether
+        somebody said they were off on Thursday. It is passed the marker already
+        present so the injection skips it.
+        """
+        import leave as _leave
+
+        system = (
+            persona.STRATEGY_MARKER
+            + " — not needed for this call ===\n"
+            + _leave.LEAVE_PROMPT
+        )
+        try:
+            resp = await self._create(system=system, prompt=prompt, max_tokens=800)
+        except Exception:
+            log.exception("[llm.leave] call raised; treating everyone as IN")
+            return ""
+        return (_text_of(resp) or "").strip()
 
     async def extract_sheet_update(
         self, *, text: str, today: str, company_hint: str = "",
@@ -407,6 +493,91 @@ class LLM:
             intent, out["company"], [f["role"] for f in fields], confidence,
         )
         return out
+
+    async def web_research(self, *, rule: str, prompt: str,
+                           max_uses: int = 0) -> dict:
+        """Run ONE web-search call for a rule. Returns what websearch parsed.
+
+        {"ok", "text", "sources", "searches", "errors", "note"} — and `ok` is
+        False for every failure, including the ones the API reports inside a 200
+        response. The caller never has to distinguish an exception from an
+        error block.
+
+        THE TOOL IS DECLARED HERE, NOT IN `_create`. Every other call this class
+        makes has no business searching the web: a leave classifier that could
+        search is a leave classifier that can be steered by a web page. The tool
+        rides on this one method and nothing else.
+
+        THE SAFETY PREAMBLE IS PREPENDED, ALWAYS, AND NOT OPTIONALLY. Web
+        content is data, never instructions — `websearch.SAFETY_PREAMBLE` says
+        so, and it goes in front of the rule's own prompt so nothing a page
+        contains can appear earlier in the system prompt than the rule that
+        governs how to read it.
+
+        NO BUDGET CHECK HERE. The caller owns the ledger (it is a database
+        write, and this class is not the place for one); this method reports
+        what was billed and the caller banks it.
+        """
+        import websearch
+
+        if not websearch.enabled():
+            return {
+                "ok": False, "text": "", "sources": [], "searches": 0,
+                "errors": [], "note": websearch.unavailable_note(
+                    "WEB_SEARCH_ENABLED is off"
+                ),
+            }
+
+        tool = websearch.tool_definition(max_uses=max_uses or None)
+        system = (
+            websearch.SAFETY_PREAMBLE
+            + "\n\n"
+            + persona.system_preamble(include_sources=False)
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=4000,
+                system=system,
+                tools=[tool],
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            log.exception("[websearch] the %s search call raised", rule)
+            return {
+                "ok": False, "text": "", "sources": [], "searches": 0,
+                "errors": [{"code": type(e).__name__, "why": str(e)[:200]}],
+                "note": websearch.unavailable_note(
+                    f"the search call failed ({type(e).__name__})"
+                ),
+            }
+
+        parsed = websearch.parse_results(resp)
+
+        # A PAUSED TURN IS NOT A RESULT. The API can pause a long search turn
+        # and expects the assistant message back unchanged to continue. This
+        # method is deliberately single-shot — a rule that needs more than one
+        # round trip is a rule doing too much in one post — so a pause is
+        # reported as "incomplete" rather than silently treated as an answer
+        # that happens to stop mid-sentence.
+        if getattr(resp, "stop_reason", "") == "pause_turn":
+            parsed["errors"].append({
+                "code": "pause_turn",
+                "why": "the search turn paused before finishing",
+            })
+
+        parsed["ok"] = bool(parsed["text"]) and not parsed["errors"]
+        parsed["note"] = ""
+        if parsed["errors"]:
+            parsed["note"] = websearch.unavailable_note(
+                "; ".join(e["why"] for e in parsed["errors"][:2])
+            )
+        log.info(
+            "[websearch] %s: %d search(es) billed, %d source(s), %d error(s)",
+            rule, parsed["searches"], len(parsed["sources"]), len(parsed["errors"]),
+        )
+        return parsed
 
     async def research_brief(self, *, material: str) -> str:
         """Write ONE research brief from the gathered material. Copy material.

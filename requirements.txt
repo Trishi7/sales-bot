@@ -19,3 +19,11 @@ google-auth>=2.28.0
 #   openpyxl — nothing reads .xlsx. The sheet is read over the API, so there is
 #              no workbook file to parse. Don't add it back without a reader
 #              that actually needs it.
+
+# --- the twelve rules --------------------------------------------------------
+# bot_rules.yaml is the machine copy of the "Bot Rules" tab: which rules exist,
+# which weekday each runs, how many items a post may carry, where it goes. It is
+# read once at startup by rules.py, so a schedule change is an edit and a
+# restart rather than a code change. Without PyYAML that file cannot be read and
+# the bot runs NO rules at all — loudly, at ERROR, rather than quietly.
+PyYAML>=6.0

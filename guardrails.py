@@ -6,17 +6,42 @@ in a prompt, they are a chokepoint the code cannot route around. A prompt can be
 argued with; `send()` cannot.
 
 THE RULES
-    1. NEVER DM ANYONE. Not a fallback, not "just this once", not for a nudge
-       that failed to post in channel. `send()` refuses any destination that
-       isn't a guild text channel, and there is no DM path anywhere in the code.
+    1. DM ONLY THROUGH THE NARROW EXCEPTION, and never otherwise. The default is
+       still a flat refusal: `send()` rejects any destination that is not a
+       guild text channel unless the caller passes an explicit `dm_reason` that
+       `may_dm()` recognises. There are exactly two recognised reasons, both
+       from the strategy doc:
+
+         (a) an item at least DM_OVERDUE_DAYS overdue, to the person who owns
+             it — past its deadline, or past its first reminder;
+         (b) R9's second and third meeting follow-ups (DM_MEETING_FOLLOWUP_RUNGS).
+
+       And four conditions on both, every one of them checked in code:
+         - SALES_DMS_ENABLED must be on. It is OFF by default.
+         - the recipient must be in TEAM_ROSTER_IDS. A DM is the one path where
+           "outside the team" would be invisible to everyone but the recipient.
+         - the same item must not have gone to the channel the same day.
+         - the DM is written to state/audit.jsonl with its reason, like
+           everything else — more so, because nobody else can see it.
+
+       ANY OTHER DM IS STILL REFUSED, loudly, exactly as before. A caller with
+       no `dm_reason`, an unrecognised one, or a reason that fails its own check
+       gets None and an audit record.
+
     2. NEVER MESSAGE ANYONE OFF THE TEAM ROSTER. The bot may only @-mention users
        in TEAM_ROSTER_IDS. Everyone else is named in plain text, never pinged —
        `mention_for()` is the only way a mention token is ever produced, and
        `sanitize()` strips any stray <@id> the model invented.
-    3. POST ONLY IN SALES_CHANNEL_IDS. Enforced at BOTH ends: `may_read()` gates
-       every history scan and every incoming message, `send()` gates every post.
-       A channel that isn't in the list is invisible in one direction and
-       unreachable in the other.
+    3. POST ONLY IN SALES_CHANNEL_IDS. Enforced at BOTH ends, and the two ends
+       are deliberately separate functions: `may_read()` gates every history
+       scan and every incoming message, `send()` gates every post.
+
+       THE READ SIDE ADMITS ONE MORE CHANNEL: HOLIDAY_CHANNEL_ID, the leave
+       channel. The bot reads it to find out whether the person it is about to
+       address is off today. THE SEND SIDE DOES NOT ADMIT IT — `send()` still
+       checks SALES_CHANNEL_IDS alone, so there is no code path that posts
+       there. That asymmetry is the whole reason reading and writing were ever
+       two functions instead of one `may_use()`.
     4. EVERY ACTION IS LOGGED. `send()` writes an audit record (state/audit.jsonl)
        for every message that goes out, with a timestamp and a reason. A refusal
        is logged too — a blocked send is exactly the event an operator wants to
@@ -57,14 +82,47 @@ class GuardrailViolation(Exception):
 
 def may_read(channel_id) -> bool:
     """May the bot read this channel at all? The gate for every incoming message
-    and every history scan (query.py). Anything outside SALES_CHANNEL_IDS is
-    treated as if it does not exist."""
-    return config.is_sales_channel(channel_id)
+    and every history scan (query.py).
+
+    SALES_CHANNEL_IDS, PLUS THE LEAVE CHANNEL AND NOTHING ELSE. Anything outside
+    those is treated as if it does not exist.
+
+    The leave channel is readable so the bot can find out whether the person it
+    is about to address is off today. It is NOT postable: `send()` checks
+    `config.is_sales_channel` directly and does not consult this function. If
+    you are adding a channel here, check whether you also meant to make it
+    sendable — you almost certainly did not.
+    """
+    if config.is_sales_channel(channel_id):
+        return True
+    return is_leave_channel(channel_id)
+
+
+def is_leave_channel(channel_id) -> bool:
+    """True for HOLIDAY_CHANNEL_ID, the one read-only non-sales channel.
+
+    Separate from `may_read` so a caller can ask which KIND of readable channel
+    it has. The leave reader uses it to refuse to read anything else, which
+    means a mis-set HOLIDAY_CHANNEL_ID reads the wrong channel rather than
+    every channel.
+    """
+    holiday = int(getattr(config, "HOLIDAY_CHANNEL_ID", 0) or 0)
+    if not holiday:
+        return False
+    try:
+        return int(channel_id) == holiday
+    except (TypeError, ValueError):
+        return False
 
 
 def readable_channel_ids() -> list[int]:
-    """The channel ids any scan may walk. Scans iterate THIS, never a caller-
-    supplied list, so a new scan can't accidentally widen the scope."""
+    """The channel ids a SALES scan may walk. Scans iterate THIS, never a
+    caller-supplied list, so a new scan can't accidentally widen the scope.
+
+    THE LEAVE CHANNEL IS NOT IN HERE. It is readable (`may_read`) but it is not
+    a sales channel, and a scan looking for what the team said about a deal has
+    no business walking it. The leave reader addresses it by id, on purpose.
+    """
     return list(config.SALES_CHANNEL_IDS)
 
 
@@ -167,6 +225,65 @@ def _is_dm(destination) -> bool:
     return getattr(destination, "guild", "missing") is None
 
 
+# THE TWO RECOGNISED DM REASONS. A caller passes one of these as `dm_reason`;
+# anything else — including None — is refused. Strings rather than booleans so
+# the audit record says WHY, and so a third reason cannot be added by accident.
+DM_REASON_OVERDUE = "overdue_escalation"
+DM_REASON_MEETING_FOLLOWUP = "meeting_followup_rung"
+DM_REASONS = (DM_REASON_OVERDUE, DM_REASON_MEETING_FOLLOWUP)
+
+
+def may_dm(user_id, *, dm_reason: str = "", overdue_days: int = 0,
+           rung: int = 0, item_in_channel_today: bool = False) -> tuple:
+    """(allowed, why) for one DM. The whole exception, in one place.
+
+    EVERY CONDITION IS CHECKED HERE AND THE REASON IS RETURNED EITHER WAY, so a
+    refusal can be logged with the thing that caused it rather than as a bare
+    False. A DM nobody can explain afterwards is exactly the action this bot
+    must not take, and that applies to the ones it declines as much as the ones
+    it sends.
+    """
+    if not config.SALES_DMS_ENABLED:
+        return False, "SALES_DMS_ENABLED is off — the DM ban is fully in force"
+
+    reason = str(dm_reason or "").strip()
+    if reason not in DM_REASONS:
+        return False, (
+            f"{reason or '(none)'} is not a recognised DM reason; the only two are "
+            + " and ".join(DM_REASONS)
+        )
+
+    if not config.may_dm(user_id):
+        return False, (
+            f"user {user_id} is not in TEAM_ROSTER_IDS — this bot never contacts "
+            "anyone outside the team, and a DM is the one path where that would be "
+            "invisible to everybody but the recipient"
+        )
+
+    if item_in_channel_today and not config.DM_SAME_DAY_AS_CHANNEL:
+        return False, (
+            "this item already went to the channel today; the same thing in a DM as "
+            "well reads as the bot asking twice"
+        )
+
+    if reason == DM_REASON_OVERDUE:
+        need = max(0, int(config.DM_OVERDUE_DAYS))
+        if int(overdue_days or 0) < need:
+            return False, (
+                f"{int(overdue_days or 0)} day(s) overdue is below DM_OVERDUE_DAYS "
+                f"({need})"
+            )
+        return True, f"{int(overdue_days)} day(s) overdue, at or past DM_OVERDUE_DAYS ({need})"
+
+    rungs = list(config.DM_MEETING_FOLLOWUP_RUNGS or ())
+    if int(rung or 0) not in rungs:
+        return False, (
+            f"meeting-follow-up rung {int(rung or 0)} is not one of the DM rungs "
+            f"({', '.join(str(r) for r in rungs) or 'none'})"
+        )
+    return True, f"R9 follow-up rung {int(rung)}, which is a DM rung"
+
+
 async def send(
     destination,
     text: str,
@@ -175,6 +292,11 @@ async def send(
     kind: str = "message",
     reply_to: Optional[discord.Message] = None,
     extra: Optional[dict] = None,
+    dm_reason: str = "",
+    overdue_days: int = 0,
+    rung: int = 0,
+    item_in_channel_today: bool = False,
+    item_key: str = "",
 ) -> Optional[discord.Message]:
     """The ONLY way this bot puts text into Discord.
 
@@ -182,26 +304,79 @@ async def send(
     explain afterwards is not an action this bot is allowed to take.
 
     Refuses, loudly and without falling back to any other destination:
-      - a DM or any non-guild channel (rule 1),
-      - any channel outside SALES_CHANNEL_IDS (rule 3).
+      - a DM, UNLESS `dm_reason` names one of the two recognised exceptions and
+        every condition on it holds (rule 1, `may_dm`),
+      - any channel outside SALES_CHANNEL_IDS (rule 3). The leave channel is
+        readable but NOT sendable, and that is checked here by asking
+        `config.is_sales_channel` directly rather than `may_read`.
+
+    THE DM ARGUMENTS ARE ALL EXPLICIT AND ALL DEFAULT TO REFUSAL. A caller that
+    does not know about the exception cannot trip it: no `dm_reason` means no
+    DM, exactly as before this existed.
 
     Returns the sent message, or None when the send was refused or Discord
     rejected it. Never raises on a Discord failure — a failed post is logged and
     audited, not propagated into the sweeper.
     """
     if _is_dm(destination):
-        log.error(
-            "[guardrails] REFUSED: attempt to DM %r (kind=%s reason=%s). This bot never DMs.",
-            getattr(destination, "id", destination), kind, reason,
+        recipient = getattr(destination, "id", destination)
+        allowed, why = may_dm(
+            recipient, dm_reason=dm_reason, overdue_days=overdue_days,
+            rung=rung, item_in_channel_today=item_in_channel_today,
+        )
+        if not allowed:
+            log.error(
+                "[guardrails] REFUSED: attempt to DM %r (kind=%s reason=%s). %s",
+                recipient, kind, reason, why,
+            )
+            state.audit(
+                "send_refused",
+                reason="hard guardrail: " + why,
+                kind=kind,
+                attempted_reason=reason,
+                dm_reason=dm_reason or "(none)",
+                destination=str(recipient),
+                item_key=item_key,
+            )
+            return None
+
+        # ALLOWED — AND AUDITED BEFORE IT IS SENT, not after. A DM that fails
+        # mid-send still happened as far as intent goes, and nobody but the
+        # recipient can see one. The record of WHY it was permitted is the only
+        # thing standing between this exception and an unreviewable channel.
+        log.warning(
+            "[guardrails] DM PERMITTED to %r (kind=%s reason=%s): %s",
+            recipient, kind, reason, why,
         )
         state.audit(
-            "send_refused",
-            reason="hard guardrail: this bot never sends DMs",
+            "dm_permitted",
+            reason=reason,
             kind=kind,
-            attempted_reason=reason,
-            destination=str(getattr(destination, "id", destination)),
+            dm_reason=dm_reason,
+            why_allowed=why,
+            destination=str(recipient),
+            overdue_days=int(overdue_days or 0),
+            rung=int(rung or 0),
+            item_key=item_key,
         )
-        return None
+        body = sanitize(text or "").strip()
+        if not body:
+            log.info("[guardrails] nothing to DM (empty body) for kind=%s", kind)
+            return None
+        try:
+            sent = await destination.send(body)
+        except discord.DiscordException:
+            log.exception("[guardrails] Discord rejected the DM to %r (kind=%s)",
+                          recipient, kind)
+            state.audit("dm_failed", reason=reason, kind=kind,
+                        destination=str(recipient), item_key=item_key)
+            return None
+        state.audit(
+            "dm_sent", reason=reason, kind=kind, dm_reason=dm_reason,
+            destination=str(recipient), message_id=str(getattr(sent, "id", "")),
+            item_key=item_key,
+        )
+        return sent
 
     channel_id = _channel_id_of(destination)
     if channel_id is None or not config.is_sales_channel(channel_id):

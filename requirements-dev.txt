@@ -1,0 +1,9 @@
+# Development and test dependencies. NOT needed to run the bot.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pytest
+
+# The regression suite in tests/ — one test class per bug that shipped and was
+# caught by running something real. Every test runs OFFLINE: no sheet, no
+# network, no Discord, and the two that touch a database use a temporary file.
+pytest>=8.0

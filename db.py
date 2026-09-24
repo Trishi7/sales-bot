@@ -78,6 +78,30 @@ def _days_between(earlier: str, later: str) -> int:
     return (b - a).days
 
 
+def _norm_key(text: str) -> str:
+    """A company name as a comparable key: lower-cased, punctuation collapsed.
+
+    "Acme Corp", "acme corp" and "Acme  Corp." are one company. Without this a
+    case change in the sheet would read as a brand-new company and R11 would
+    announce one that has been there for months.
+    """
+    v = re.sub(r"[^a-z0-9]+", " ", str(text or "").strip().lower())
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def _iso_days_ago(today_iso: str, days: int) -> str:
+    """`days` before an ISO date, as an ISO date. Falls back to the input when
+    it cannot be parsed, which widens the window rather than narrowing it — a
+    rule that looks too far back is noisy, one that looks too far forward is
+    silent, and noisy is the recoverable direction."""
+    from datetime import date as _date, timedelta as _td
+    try:
+        y, m, d = (int(p) for p in str(today_iso)[:10].split("-"))
+        return (_date(y, m, d) - _td(days=max(0, int(days)))).isoformat()
+    except Exception:
+        return str(today_iso)[:10]
+
+
 SCHEMA = """
 -- One row per commitment the bot is waiting on. `due_at` is when we may FIRST
 -- nudge, derived from what the person said ("tomorrow" → +1 day).
@@ -453,6 +477,211 @@ CREATE INDEX IF NOT EXISTS ix_conversions_date ON nudge_conversions(on_date);
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
     value       TEXT,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- R11: WHEN EACH MASTER PIPELINE COMPANY WAS FIRST SEEN.
+--
+-- THE TAB HAS NO CREATED-DATE COLUMN, so "this company is new" can only be
+-- answered by remembering what was there yesterday. One row per company, with
+-- the date it first showed up; `pipeline_snapshot` inserts the ones it has not
+-- seen and leaves the rest alone, so `first_seen` is genuinely the first time
+-- and not the last time the bot looked.
+--
+-- KEYED ON THE NORMALISED NAME, not the raw cell: "Acme Corp" and "acme corp"
+-- are one company, and a case change in the sheet must not read as a new one.
+CREATE TABLE IF NOT EXISTS pipeline_companies (
+    company_key TEXT PRIMARY KEY,
+    company     TEXT NOT NULL,
+    first_seen  TEXT NOT NULL,
+    -- 1 for the rows written by the FIRST EVER snapshot. Those companies were
+    -- already on the tab before the bot could see it, so their `first_seen` is
+    -- the day the bot started looking, not the day they arrived. They are
+    -- remembered so the next run can tell what is genuinely new, and excluded
+    -- from every R11 result forever — announcing 273 companies that have been
+    -- there for months would be a memorable first impression.
+    seeded      INTEGER NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- R5: HOW MANY TIMES A CONTACT HAS BEEN LISTED WITH NOTHING CHANGED.
+--
+-- The rule asks whether to skip a contact after PROSPECT_REPEAT_ASK_AT posts
+-- carrying them unchanged. "Unchanged" is the point: `signature` holds what the
+-- row looked like when it was last posted, and a differing signature RESETS the
+-- count. Somebody who updated the row deserves a fresh start, not a bot still
+-- counting from before they acted.
+CREATE TABLE IF NOT EXISTS prospect_mentions (
+    row_key     TEXT PRIMARY KEY,
+    count       INTEGER NOT NULL DEFAULT 0,
+    signature   TEXT NOT NULL DEFAULT '',
+    last_date   TEXT NOT NULL DEFAULT '',
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- R5: WHICH COMPANIES THIS WEEK'S PROSPECTING IS ALREADY WORKING THROUGH.
+--
+-- Two companies a week, and the bot stays with one until every contact on it
+-- has a first contact recorded. That promise spans days, so the companies in
+-- flight are remembered against the ISO week rather than recomputed each run —
+-- otherwise Thursday would start two fresh companies and Tuesday's would be
+-- abandoned half-contacted.
+CREATE TABLE IF NOT EXISTS prospect_week (
+    iso_week    TEXT NOT NULL,
+    company     TEXT NOT NULL,
+    started_on  TEXT NOT NULL,
+    PRIMARY KEY (iso_week, company)
+);
+
+-- R9: WHICH RUNG OF THE FOLLOW-UP LADDER EACH MEETING IS ON.
+--
+-- One channel post, then two DMs, then one escalation, then STOP. `sent` is the
+-- number of rungs already used and is what decides both the next destination
+-- and when to stop for good. `last_date` paces the every-3-days interval.
+--
+-- ADVANCED BY THE SENDER, NEVER BY THE ENGINE. `nextaction` only reads this —
+-- if computing the queue advanced the ladder, every `cadence preview` would
+-- burn a rung and a preview would change the thing it was previewing.
+-- PERMISSION BEFORE EVERY WRITE: the open proposals.
+--
+-- A proposal is a write the bot has DESCRIBED and not made. It holds everything
+-- needed to apply it later — the row, the cells, and the ORIGINAL reply text —
+-- because the approval arrives in a different message from the one that
+-- justified it.
+--
+-- THE ORIGINAL TEXT IS THE POINT OF STORING IT. `said_terminal_words` is
+-- matched against what the HUMAN WROTE, not against the extractor's reading of
+-- it. Once the write is deferred behind a yes, "yes" is the message in hand and
+-- it contains no terminal word at all — so re-deriving consent from the
+-- approval would silently disarm the one gate that stops a row being killed by
+-- inference.
+--
+-- `status`: open | applied | declined | expired. Rows are kept after they close
+-- so "what did the bot ask and what did we say" has an answer.
+CREATE TABLE IF NOT EXISTS write_proposals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_key  TEXT NOT NULL UNIQUE,
+    kind          TEXT NOT NULL DEFAULT 'cell_update',
+    tab           TEXT NOT NULL DEFAULT '',
+    sheet_row     INTEGER,
+    row_key       TEXT NOT NULL DEFAULT '',
+    company       TEXT NOT NULL DEFAULT '',
+    poc           TEXT NOT NULL DEFAULT '',
+    payload       TEXT NOT NULL DEFAULT '{}',
+    reply_text    TEXT NOT NULL DEFAULT '',
+    trigger       TEXT NOT NULL DEFAULT '',
+    proposed_text TEXT NOT NULL DEFAULT '',
+    requested_by  TEXT NOT NULL DEFAULT '',
+    channel_id    INTEGER,
+    message_id    TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'open',
+    decided_by    TEXT NOT NULL DEFAULT '',
+    decided_at    TEXT NOT NULL DEFAULT '',
+    decision      TEXT NOT NULL DEFAULT '',
+    nudged_on     TEXT NOT NULL DEFAULT ''
+);
+
+-- EVERY ANSWER TO A PROPOSAL, not just the deciding one.
+--
+-- Two approvers can disagree, and SALES_FINAL_SAY_ID breaks the tie — which
+-- means the bot has to remember that Vaishnavi said yes before Sid said no,
+-- rather than acting on whichever arrived first and forgetting the other. The
+-- decision is computed from ALL the votes, every time one lands.
+CREATE TABLE IF NOT EXISTS proposal_votes (
+    proposal_key  TEXT NOT NULL,
+    voter_id      INTEGER NOT NULL,
+    voter_label   TEXT NOT NULL DEFAULT '',
+    vote          TEXT NOT NULL,
+    voted_at      TEXT NOT NULL DEFAULT '',
+    message_id    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (proposal_key, voter_id)
+);
+
+-- FOCUS COMMANDS: one row per focus ever set, with an expiry.
+--
+-- Kept rather than deleted on expiry so "what were we focused on in October"
+-- has an answer, and so the one expiry announcement can be made exactly once
+-- (`announced_expiry`).
+CREATE TABLE IF NOT EXISTS focus (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    field         TEXT NOT NULL DEFAULT '',
+    value         TEXT NOT NULL,
+    raw           TEXT NOT NULL DEFAULT '',
+    set_by        TEXT NOT NULL DEFAULT '',
+    set_by_id     INTEGER,
+    set_on        TEXT NOT NULL DEFAULT '',
+    expires_on    TEXT NOT NULL DEFAULT '',
+    cleared_on    TEXT NOT NULL DEFAULT '',
+    cleared_by    TEXT NOT NULL DEFAULT '',
+    announced_expiry INTEGER NOT NULL DEFAULT 0
+);
+
+-- RULE 9's ANSWERS, which the bot may NOT put in the sheet.
+--
+-- Next steps, package and deal size live in S-X, the restricted commercial
+-- block. R9 asks for them; when somebody answers, the answer is recorded HERE
+-- and in the audit log, and the bot says plainly that a human has to put it in
+-- the sheet. Recording it is not a substitute for the sheet and is not
+-- presented as one — it is so the answer is not lost between being given and
+-- being typed in.
+CREATE TABLE IF NOT EXISTS meeting_outcomes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_key       TEXT NOT NULL,
+    company       TEXT NOT NULL DEFAULT '',
+    poc           TEXT NOT NULL DEFAULT '',
+    next_steps    TEXT NOT NULL DEFAULT '',
+    package       TEXT NOT NULL DEFAULT '',
+    deal_size     TEXT NOT NULL DEFAULT '',
+    told_by       TEXT NOT NULL DEFAULT '',
+    told_at       TEXT NOT NULL DEFAULT '',
+    message_id    TEXT NOT NULL DEFAULT '',
+    in_sheet      INTEGER NOT NULL DEFAULT 0
+);
+
+-- THE DAILY WEB-SEARCH LEDGER. One row per day, per rule.
+--
+-- Web search is billed per search on top of tokens, and seven rules can each
+-- want several — a runaway day is a real bill. `searches` counts what the API
+-- ACTUALLY BILLED (usage.server_tool_use.web_search_requests), not what the bot
+-- intended: an errored search is not billed and must not spend the budget.
+--
+-- PER RULE AS WELL AS PER DAY, so "what spent the budget" has an answer. A
+-- day that ran out at 11am because R2 screened forty companies is a different
+-- problem from one that ran out because the cap is too low.
+CREATE TABLE IF NOT EXISTS web_search_usage (
+    on_date     TEXT NOT NULL,
+    rule_id     TEXT NOT NULL DEFAULT '',
+    searches    INTEGER NOT NULL DEFAULT 0,
+    calls       INTEGER NOT NULL DEFAULT 0,
+    errors      INTEGER NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (on_date, rule_id)
+);
+
+-- THE LAST FEW OPENINGS, so the bot does not start five messages the same way.
+--
+-- Repeating an opening is the single clearest tell that a human is not writing
+-- these: three "Worth a look at..." messages in a row and the team stops
+-- reading the fourth. The composer is handed the recent openers and told not to
+-- reuse them.
+--
+-- THE KEY IS THE OPENING WITH THE NAME STRIPPED (tone.opener_of). "Vaishnavi —
+-- worth a look at Acme" and "Kushal — worth a look at Borealis" are the SAME
+-- opening wearing two names, and storing them as different ones would let the
+-- bot use one shape every day forever.
+CREATE TABLE IF NOT EXISTS message_openers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    opener      TEXT NOT NULL,
+    rule_id     TEXT NOT NULL DEFAULT '',
+    sent_at     TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS meeting_followups (
+    row_key     TEXT PRIMARY KEY,
+    sent        INTEGER NOT NULL DEFAULT 0,
+    last_date   TEXT NOT NULL DEFAULT '',
+    meeting_date TEXT NOT NULL DEFAULT '',
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -1622,6 +1851,646 @@ class DB:
         row tomorrow does not."""
         name = re.sub(r"[^a-z0-9]+", " ", str(event or "").lower()).strip()
         return f"{name}|{str(event_date or '')}"
+
+    # -- R11: the Master Pipeline snapshot ---------------------------------
+
+    def pipeline_snapshot(self, companies: list, *, today: str) -> list:
+        """Record today's company names; return the ones NEVER SEEN BEFORE.
+
+        [{"company": name, "first_seen": iso}] for every company that was not
+        already in the table, PLUS every company recorded within the last
+        `NEW_COMPANY_WINDOW_DAYS` — R11 needs the recent ones too, because a
+        company first seen on Friday is due on Monday and the caller must still
+        be able to see it then.
+
+        THIS IS THE WRITE THAT KEEPS THE ENGINE PURE. `nextaction` cannot take
+        this snapshot itself: computing the queue would advance the state the
+        queue is derived from, and every `cadence preview` would consume the
+        newness it was supposed to be showing. So the caller takes it, once a
+        tick, and passes the result in.
+
+        THE FIRST RUN RECORDS EVERYTHING AND REPORTS NOTHING NEW. On an empty
+        table every company looks new, and announcing 273 of them would be a
+        spectacular first impression. The table is seeded silently and the rule
+        starts finding genuinely new ones from the next run.
+        """
+        import config as _config
+
+        seen_before = self._pipeline_known()
+        first_run = not seen_before
+        window = max(1, int(getattr(_config, "NEW_COMPANY_WINDOW_DAYS", 7)))
+
+        fresh: list = []
+        with self.conn() as c:
+            for name in companies or []:
+                label = str(name or "").strip()
+                if not label:
+                    continue
+                key = _norm_key(label)
+                if not key or key in seen_before:
+                    continue
+                c.execute(
+                    "INSERT OR IGNORE INTO pipeline_companies "
+                    "(company_key, company, first_seen, seeded) VALUES (?, ?, ?, ?)",
+                    (key, label, today, 1 if first_run else 0),
+                )
+                seen_before.add(key)
+                fresh.append(label)
+
+        if first_run:
+            log.info(
+                "[db] pipeline snapshot seeded with %d company(ies) on the first run. "
+                "None is reported as new — on an empty table every company looks new, "
+                "and announcing the whole tab would be a poor first impression. R11 "
+                "starts finding genuinely new ones from the next run.", len(fresh),
+            )
+            return []
+
+        if fresh:
+            log.info("[db] pipeline snapshot: %d new company(ies): %s",
+                     len(fresh), ", ".join(fresh[:8]))
+
+        # Everything recorded inside the window, so a Friday arrival is still
+        # visible on Monday when its working-day delay comes due.
+        cutoff = _iso_days_ago(today, window)
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT company, first_seen FROM pipeline_companies "
+                "WHERE seeded = 0 AND first_seen >= ? ORDER BY first_seen, company",
+                (cutoff,),
+            ).fetchall()
+        return [{"company": r["company"], "first_seen": r["first_seen"]} for r in rows]
+
+    def _pipeline_known(self) -> set:
+        try:
+            with self.conn() as c:
+                rows = c.execute("SELECT company_key FROM pipeline_companies").fetchall()
+            return {r["company_key"] for r in rows}
+        except Exception:
+            log.exception("[db] the pipeline snapshot could not be read")
+            return set()
+
+    # -- R5: repeat counts and the week's companies ------------------------
+
+    def prospect_repeats(self) -> dict:
+        """{row_key: count} — how many posts have carried each contact unchanged.
+
+        FAILS OPEN, at 0. An unreadable table means the bot asks "shall I skip
+        them?" later than it should, which is a mild annoyance; failing closed
+        would mean it asked on the first mention, which reads as a bot giving up
+        before it started.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT row_key, count FROM prospect_mentions"
+                ).fetchall()
+            return {r["row_key"]: int(r["count"] or 0) for r in rows}
+        except Exception:
+            log.exception("[db] prospect repeat counts could not be read; treating as 0")
+            return {}
+
+    def record_prospect_mention(self, row_key: str, *, signature: str, on_date: str) -> int:
+        """Count one post that carried this contact. Returns the new count.
+
+        A CHANGED SIGNATURE RESETS THE COUNT TO 1. The rule is "three times with
+        nothing changed", not "three times" — somebody who updated the row has
+        acted, and a counter that kept climbing through their update would ask
+        to skip a contact who is actually moving.
+        """
+        key = str(row_key or "").strip()
+        if not key:
+            return 0
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT count, signature FROM prospect_mentions WHERE row_key = ?",
+                (key,),
+            ).fetchone()
+            if row and str(row["signature"] or "") == str(signature or ""):
+                count = int(row["count"] or 0) + 1
+            else:
+                count = 1
+            c.execute(
+                "INSERT INTO prospect_mentions (row_key, count, signature, last_date) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(row_key) DO UPDATE SET "
+                "count = excluded.count, signature = excluded.signature, "
+                "last_date = excluded.last_date, updated_at = CURRENT_TIMESTAMP",
+                (key, count, str(signature or ""), str(on_date or "")),
+            )
+        return count
+
+    def prospect_week_companies(self, iso_week: str) -> list:
+        """The companies this week's prospecting is already working through."""
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT company FROM prospect_week WHERE iso_week = ? "
+                    "ORDER BY started_on, company",
+                    (str(iso_week),),
+                ).fetchall()
+            return [r["company"] for r in rows]
+        except Exception:
+            log.exception("[db] the week's prospect companies could not be read")
+            return []
+
+    def start_prospect_company(self, company: str, *, iso_week: str, on_date: str) -> None:
+        """Remember that this week's prospecting has opened this company."""
+        label = str(company or "").strip()
+        if not label:
+            return
+        with self.conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO prospect_week (iso_week, company, started_on) "
+                "VALUES (?, ?, ?)",
+                (str(iso_week), label, str(on_date or "")),
+            )
+
+    # -- R9: the meeting follow-up ladder ----------------------------------
+
+    def meeting_followups(self) -> dict:
+        """{row_key: {"sent": n, "last_iso": iso, "meeting": iso}} for R9.
+
+        FAILS CLOSED, at "already finished". An unreadable ladder table returns
+        {} and every row then reads as rung 0 — which would restart a chase
+        somebody has already escalated. The empty dict is the honest answer and
+        the caller treats a missing entry as rung 0 only because a row that has
+        never been chased genuinely is at rung 0; the failure is logged loudly
+        so a broken table is not mistaken for a fresh one.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT row_key, sent, last_date, meeting_date FROM meeting_followups"
+                ).fetchall()
+            return {
+                r["row_key"]: {
+                    "sent": int(r["sent"] or 0),
+                    "last_iso": str(r["last_date"] or ""),
+                    "meeting": str(r["meeting_date"] or ""),
+                }
+                for r in rows
+            }
+        except Exception:
+            log.exception(
+                "[db] the meeting follow-up ladder could not be read. Every row will "
+                "read as rung 0, which can restart a chase that was already escalated."
+            )
+            return {}
+
+    def advance_meeting_followup(self, row_key: str, *, on_date: str,
+                                 meeting_date: str = "") -> int:
+        """Move one meeting up a rung. Returns the new rung count.
+
+        CALLED BY THE SENDER, NEVER BY THE ENGINE. If computing the queue
+        advanced the ladder, every `cadence preview` would burn a rung and the
+        preview would change what it was previewing.
+        """
+        key = str(row_key or "").strip()
+        if not key:
+            return 0
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT sent FROM meeting_followups WHERE row_key = ?", (key,)
+            ).fetchone()
+            sent = int((row["sent"] if row else 0) or 0) + 1
+            c.execute(
+                "INSERT INTO meeting_followups (row_key, sent, last_date, meeting_date) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(row_key) DO UPDATE SET "
+                "sent = excluded.sent, last_date = excluded.last_date, "
+                "meeting_date = excluded.meeting_date, updated_at = CURRENT_TIMESTAMP",
+                (key, sent, str(on_date or ""), str(meeting_date or "")),
+            )
+        return sent
+
+    def reset_meeting_followup(self, row_key: str) -> None:
+        """Next steps arrived — the chase is over and the ladder is cleared.
+
+        Without this a row that got its next steps after two DMs would stay at
+        rung 2 forever, and the next stalled meeting on the same contact would
+        start at the escalation.
+        """
+        key = str(row_key or "").strip()
+        if not key:
+            return
+        with self.conn() as c:
+            c.execute("DELETE FROM meeting_followups WHERE row_key = ?", (key,))
+
+    # -- permission before every write: proposals ---------------------------
+
+    def open_proposal(self, *, proposal_key: str, kind: str, tab: str,
+                      sheet_row, row_key: str, company: str, poc: str,
+                      payload: dict, reply_text: str, trigger: str,
+                      proposed_text: str, requested_by: str, channel_id,
+                      message_id: str, created_at: str) -> bool:
+        """Record a write the bot has DESCRIBED and not made. False if it exists.
+
+        `payload` is the whole plan, as JSON — the cells, the labels, the old
+        values. `reply_text` is the ORIGINAL message, kept because the terminal-
+        word gate is matched against what the human wrote and "yes" contains no
+        terminal word at all.
+        """
+        import json as _json
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO write_proposals (proposal_key, kind, tab, sheet_row, "
+                    "row_key, company, poc, payload, reply_text, trigger, "
+                    "proposed_text, requested_by, channel_id, message_id, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (proposal_key, kind, tab, sheet_row, row_key, company, poc,
+                     _json.dumps(payload or {}), reply_text or "", trigger or "",
+                     proposed_text or "", requested_by or "", channel_id,
+                     str(message_id or ""), created_at or ""),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def proposal(self, proposal_key: str) -> Optional[dict]:
+        """One proposal, with its votes. None when there is no such key."""
+        import json as _json
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM write_proposals WHERE proposal_key = ?",
+                (str(proposal_key),),
+            ).fetchone()
+            if row is None:
+                return None
+            votes = c.execute(
+                "SELECT voter_id, voter_label, vote, voted_at FROM proposal_votes "
+                "WHERE proposal_key = ? ORDER BY voted_at",
+                (str(proposal_key),),
+            ).fetchall()
+        out = dict(row)
+        try:
+            out["payload"] = _json.loads(out.get("payload") or "{}")
+        except (ValueError, TypeError):
+            out["payload"] = {}
+        out["votes"] = [dict(v) for v in votes]
+        return out
+
+    def open_proposal_for_message(self, message_id: str) -> Optional[dict]:
+        """The open proposal whose own message is `message_id`.
+
+        How a reply finds what it is answering: somebody replies "yes" to the
+        bot's proposal, and this is the lookup that turns that reply into the
+        write it approves.
+        """
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT proposal_key FROM write_proposals "
+                "WHERE message_id = ? AND status = 'open'",
+                (str(message_id or ""),),
+            ).fetchone()
+        return self.proposal(row["proposal_key"]) if row else None
+
+    def latest_open_proposal(self, *, company: str = "") -> Optional[dict]:
+        """The newest open proposal, optionally for one company.
+
+        For a bare "yes" that is not a reply to anything. The NEWEST, because
+        that is the one the person is almost certainly answering — and the echo
+        names what was applied, so a wrong guess is visible immediately rather
+        than silent.
+        """
+        sql = "SELECT proposal_key FROM write_proposals WHERE status = 'open'"
+        args: list = []
+        if company:
+            sql += " AND LOWER(company) = LOWER(?)"
+            args.append(company)
+        sql += " ORDER BY id DESC LIMIT 1"
+        with self.conn() as c:
+            row = c.execute(sql, args).fetchone()
+        return self.proposal(row["proposal_key"]) if row else None
+
+    def record_vote(self, *, proposal_key: str, voter_id: int, voter_label: str,
+                    vote: str, voted_at: str, message_id: str = "") -> None:
+        """One approver's answer. A later answer from the same person REPLACES
+        their earlier one — somebody who says "no, wait" after a yes has changed
+        their mind, and the bot should act on what they think now."""
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO proposal_votes (proposal_key, voter_id, voter_label, "
+                "vote, voted_at, message_id) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(proposal_key, voter_id) DO UPDATE SET "
+                "vote = excluded.vote, voted_at = excluded.voted_at, "
+                "message_id = excluded.message_id",
+                (str(proposal_key), int(voter_id), voter_label or "", str(vote),
+                 voted_at or "", str(message_id or "")),
+            )
+
+    def close_proposal(self, *, proposal_key: str, status: str, decision: str,
+                       decided_by: str, decided_at: str) -> None:
+        with self.conn() as c:
+            c.execute(
+                "UPDATE write_proposals SET status = ?, decision = ?, decided_by = ?, "
+                "decided_at = ? WHERE proposal_key = ?",
+                (status, decision, decided_by or "", decided_at or "",
+                 str(proposal_key)),
+            )
+
+    def stale_proposals(self, *, before_iso: str, nudged: bool) -> list:
+        """Open proposals created on or before `before_iso` (an IST date),
+        split by whether they have already had their one nudge.
+
+        `nudged=False` -> due a nudge. `nudged=True` -> due to be dropped.
+
+        THE DATE COMPARISON HAPPENS IN PYTHON, NOT IN SQL, and that is
+        deliberate. Two bugs live at this boundary and only one of them is
+        obvious:
+
+          1. `created_at` is a full ISO TIMESTAMP and `before_iso` is a bare
+             DATE. Compared as strings the timestamp is the LONGER value, so
+             "2026-09-18T14:00:00" <= "2026-09-18" is FALSE — a proposal created
+             on the cutoff day never qualified and the sweep silently found
+             nothing, for ever.
+
+          2. `substr(created_at, 1, 10)` fixes (1) by reading the first ten
+             characters and calling them the date. That is right only while
+             every writer happens to store IST — today's convention
+             (`dl.now_ist()`), but enforced nowhere. A single caller using
+             `datetime.now(timezone.utc)` would shift the comparison by 5.5
+             hours: a proposal made at 00:30 IST is 19:00 UTC THE PREVIOUS DAY,
+             and SQL would read it as yesterday's.
+
+        `dl.ist_date_of` parses whatever offset the row carries and converts to
+        IST before taking the date, so both shapes are right. The cost is
+        fetching the open rows and filtering here — which is nothing, because
+        open proposals are nudged and dropped within days by construction and
+        there are never many.
+        """
+        import deadlines as _dl
+
+        cutoff = _dl.ist_date_of(before_iso)
+        if cutoff is None:
+            log.warning(
+                "[approvals] stale_proposals was given an unreadable cutoff (%r); "
+                "returning nothing rather than sweeping an unknown range.",
+                before_iso,
+            )
+            return []
+
+        sql = (
+            "SELECT proposal_key, created_at FROM write_proposals "
+            "WHERE status = 'open' AND nudged_on "
+            + ("!= ''" if nudged else "= ''")
+            + " ORDER BY id"
+        )
+        with self.conn() as c:
+            rows = c.execute(sql).fetchall()
+
+        out = []
+        for row in rows:
+            made = _dl.ist_date_of(row["created_at"])
+            if made is None:
+                log.warning(
+                    "[approvals] proposal %s has an unreadable created_at (%r); it is "
+                    "skipped by the sweep rather than dropped on a guess.",
+                    row["proposal_key"], row["created_at"],
+                )
+                continue
+            if made <= cutoff:
+                out.append(self.proposal(row["proposal_key"]))
+        return out
+
+    def mark_proposal_nudged(self, proposal_key: str, *, on_date: str) -> None:
+        with self.conn() as c:
+            c.execute(
+                "UPDATE write_proposals SET nudged_on = ? WHERE proposal_key = ?",
+                (on_date or "", str(proposal_key)),
+            )
+
+    # -- focus ---------------------------------------------------------------
+
+    def set_focus(self, *, field: str, value: str, raw: str, set_by: str,
+                  set_by_id, set_on: str, expires_on: str) -> int:
+        """Start a focus, clearing any that is still live.
+
+        ONE FOCUS AT A TIME, deliberately. Two overlapping focuses is a filter
+        nobody can predict the effect of, and "prioritise X" said twice means
+        the second one — not both at once.
+        """
+        with self.conn() as c:
+            c.execute(
+                "UPDATE focus SET cleared_on = ?, cleared_by = ? "
+                "WHERE cleared_on = '' AND expires_on > ?",
+                (set_on, "superseded by a new focus", set_on),
+            )
+            cur = c.execute(
+                "INSERT INTO focus (field, value, raw, set_by, set_by_id, set_on, "
+                "expires_on) VALUES (?,?,?,?,?,?,?)",
+                (field or "", value, raw or "", set_by or "", set_by_id, set_on,
+                 expires_on),
+            )
+            return int(cur.lastrowid or 0)
+
+    def active_focus(self, *, today: str) -> Optional[dict]:
+        """The focus in force today, or None. Expiry is exclusive of the day it
+        names: "for two weeks" ends at the end of the fourteenth day."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM focus WHERE cleared_on = '' AND expires_on >= ? "
+                "ORDER BY id DESC LIMIT 1",
+                (str(today),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def clear_focus(self, *, on_date: str, by: str) -> Optional[dict]:
+        """End the live focus. Returns what was cleared, or None."""
+        live = self.active_focus(today=on_date)
+        if not live:
+            return None
+        with self.conn() as c:
+            c.execute(
+                "UPDATE focus SET cleared_on = ?, cleared_by = ? WHERE id = ?",
+                (on_date, by or "", int(live["id"])),
+            )
+        return live
+
+    def focus_due_expiry_announcement(self, *, today: str) -> Optional[dict]:
+        """A focus that has just run out and has not been announced. Once only.
+
+        The announcement is a courtesy — the team should know the filter came
+        off — and it is exactly once, because a bot that mentions a lapsed focus
+        every morning is a bot with a stuck record.
+        """
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM focus WHERE announced_expiry = 0 AND cleared_on = '' "
+                "AND expires_on < ? ORDER BY id DESC LIMIT 1",
+                (str(today),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_focus_announced(self, focus_id: int) -> None:
+        with self.conn() as c:
+            c.execute(
+                "UPDATE focus SET announced_expiry = 1 WHERE id = ?", (int(focus_id),)
+            )
+
+    # -- rule 9's answers, which the bot may not put in the sheet -----------
+
+    def record_meeting_outcome(self, *, row_key: str, company: str, poc: str,
+                               next_steps: str = "", package: str = "",
+                               deal_size: str = "", told_by: str = "",
+                               told_at: str = "", message_id: str = "") -> int:
+        """Record what somebody said came out of a meeting.
+
+        THIS IS NOT THE SHEET AND IS NEVER PRESENTED AS IT. Next steps, package
+        and deal size live in S-X, the restricted commercial block, and the bot
+        does not write there — on any row, with any approval. What this table is
+        for is that the answer is not LOST between being given in a channel and
+        being typed into the sheet by a person. `in_sheet` stays 0 until
+        somebody says it is in.
+        """
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT INTO meeting_outcomes (row_key, company, poc, next_steps, "
+                "package, deal_size, told_by, told_at, message_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (row_key or "", company or "", poc or "", next_steps or "",
+                 package or "", deal_size or "", told_by or "", told_at or "",
+                 str(message_id or "")),
+            )
+            return int(cur.lastrowid or 0)
+
+    def meeting_outcomes_not_in_sheet(self, limit: int = 20) -> list:
+        """What people have told the bot that nobody has typed in yet."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM meeting_outcomes WHERE in_sheet = 0 "
+                "ORDER BY id DESC LIMIT ?", (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- the daily web-search budget ---------------------------------------
+
+    def web_searches_today(self, on_date: str) -> int:
+        """How many searches have been BILLED today, across every rule.
+
+        FAILS CLOSED, at the budget. An unreadable ledger returns a number that
+        stops further searching rather than one that permits it: the failure
+        mode of over-reporting is a quiet day the bot explains, and the failure
+        mode of under-reporting is an unbounded bill nobody sees until it
+        arrives.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT COALESCE(SUM(searches), 0) AS n FROM web_search_usage "
+                    "WHERE on_date = ?", (str(on_date),),
+                ).fetchone()
+            return int((row["n"] if row else 0) or 0)
+        except Exception:
+            log.exception(
+                "[websearch] the daily ledger could not be read; treating the budget "
+                "as SPENT. Rules will say web research is unavailable today rather "
+                "than searching an unknown number of times."
+            )
+            import config as _config
+            return max(0, int(_config.WEB_SEARCH_DAILY_BUDGET))
+
+    def web_search_budget_left(self, on_date: str) -> int:
+        import config as _config
+        budget = max(0, int(_config.WEB_SEARCH_DAILY_BUDGET))
+        return max(0, budget - self.web_searches_today(on_date))
+
+    def record_web_search(self, *, on_date: str, rule_id: str, searches: int,
+                          errors: int = 0) -> int:
+        """Bank one call's billed searches. Returns the new day total.
+
+        Called AFTER the response comes back, with the count the API reported —
+        which is why a call that errored adds 0 to `searches` and 1 to `errors`.
+        Reserving before the call would spend a budget on searches that never
+        happened.
+        """
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO web_search_usage (on_date, rule_id, searches, calls, "
+                    "errors) VALUES (?,?,?,1,?) "
+                    "ON CONFLICT(on_date, rule_id) DO UPDATE SET "
+                    "searches = searches + excluded.searches, "
+                    "calls = calls + 1, errors = errors + excluded.errors, "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    (str(on_date), str(rule_id or ""), max(0, int(searches or 0)),
+                     max(0, int(errors or 0))),
+                )
+        except Exception:
+            log.exception("[websearch] could not record %d search(es) for %s",
+                          searches, rule_id)
+        return self.web_searches_today(on_date)
+
+    def web_search_breakdown(self, on_date: str) -> list:
+        """[{rule_id, searches, calls, errors}] for one day — what spent it."""
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT rule_id, searches, calls, errors FROM web_search_usage "
+                    "WHERE on_date = ? ORDER BY searches DESC", (str(on_date),),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            log.exception("[websearch] the ledger breakdown could not be read")
+            return []
+
+    # -- the opening-variety ledger ----------------------------------------
+
+    def recent_openers(self, limit: int = 5) -> list:
+        """The last `limit` openings, newest first.
+
+        FAILS OPEN, at []. An unreadable ledger means the composer is not told
+        what to avoid and may repeat an opening — mildly annoying. Failing the
+        other way would mean refusing to compose at all, which costs the whole
+        message to save a turn of phrase.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT opener FROM message_openers ORDER BY id DESC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
+            return [r["opener"] for r in rows if r["opener"]]
+        except Exception:
+            log.exception(
+                "[tone] the opener ledger could not be read; the composer will not "
+                "be told what to avoid this time"
+            )
+            return []
+
+    def record_opener(self, opener: str, *, rule_id: str = "",
+                      sent_at: str = "", keep: int = 50) -> None:
+        """Remember one opening, and trim the table.
+
+        TRIMMED RATHER THAN ALLOWED TO GROW. Only the last few are ever read, so
+        a table with ten thousand rows in it is ten thousand rows of nothing.
+        """
+        key = str(opener or "").strip()
+        if not key:
+            return
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO message_openers (opener, rule_id, sent_at) "
+                    "VALUES (?,?,?)", (key, str(rule_id or ""), str(sent_at or "")),
+                )
+                c.execute(
+                    "DELETE FROM message_openers WHERE id NOT IN ("
+                    "SELECT id FROM message_openers ORDER BY id DESC LIMIT ?)",
+                    (max(10, int(keep)),),
+                )
+        except Exception:
+            log.exception("[tone] could not record the opener %r", key[:40])
+
+    def opener_used_recently(self, opener: str, *, within: int = 5) -> bool:
+        """Has this opening been used in the last `within` messages?
+
+        The check the composer's output is held to after the fact — the prompt
+        asks it not to repeat, and this is what notices when it did anyway.
+        """
+        key = str(opener or "").strip()
+        if not key:
+            return False
+        return key in set(self.recent_openers(within))
 
     def event_reminder_sent(self, event_key: str) -> bool:
         """Has this event already had its one reminder?

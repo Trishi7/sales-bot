@@ -106,18 +106,19 @@ _EVIDENCE: tuple = (
 
 # WHAT STAGE A NUDGE IS ASKING ABOUT. Evidence at or above this converts it.
 #
-# A type absent from this map CANNOT BE CONVERTED and its nudge always goes out
-# as a task — which is the right default. `mark_unresponsive` and `pulse_check`
-# are deliberately absent: "they are unresponsive" is a judgement nobody records
-# in passing, and a parked deal has nothing that would count as already done.
+# KEYED ON THE RULE'S TRIGGER, now that a rule is the type.
+#
+# A rule absent from this map CANNOT BE CONVERTED and its nudge always goes out
+# as a task — which is the right default, and why most of the twelve are absent.
+# R1, R2, R3, R11 and R12 are not about a contact at all, so there is no
+# "already done" for evidence to find; R9 asks for next steps, which is a
+# sentence somebody has to write rather than a fact the sheet can already show.
 _ACTION_STAGE: dict = {
-    nextaction.DM_SENT_CHECK: STAGE_TOUCHED,
-    nextaction.DM_CHECK: STAGE_TOUCHED,
-    nextaction.FOLLOWUP: STAGE_TOUCHED,
-    nextaction.CHANNEL_SWITCH: STAGE_TOUCHED,
-    nextaction.PROGRESS_CHECK: STAGE_REPLIED,
-    nextaction.MEETING_PROPOSAL: STAGE_MEETING,
-    nextaction.QUOTE_CHASE: STAGE_QUOTED,
+    nextaction.R_LI_NO_DM: STAGE_TOUCHED,
+    nextaction.R_PROSPECTS: STAGE_TOUCHED,
+    nextaction.R_DM_NO_MEETING: STAGE_REPLIED,
+    nextaction.R_MEETING_PREP: STAGE_MEETING,
+    nextaction.R_CLOSURE_SUPPORT: STAGE_QUOTED,
 }
 
 # What the offer proposes to WRITE when the evidence carries no explicit value.
@@ -370,36 +371,40 @@ def _self_test() -> int:
 
     print("the ladder")
     check("a booked meeting converts a DM check",
-          stage("meeting booked with Sahaj Friday", nextaction.DM_CHECK, "Sahaj Labs", "Sahaj"),
+          stage("meeting booked with Sahaj Friday", nextaction.R_LI_NO_DM, "Sahaj Labs", "Sahaj"),
           STAGE_MEETING)
     check("...and a follow-up",
-          stage("meeting booked with Sahaj", nextaction.FOLLOWUP, "Sahaj Labs", "Sahaj"),
+          stage("meeting booked with Sahaj", nextaction.R_PROSPECTS, "Sahaj Labs", "Sahaj"),
           STAGE_MEETING)
     check("a DM sent converts a DM check",
-          stage("dm sent to Sahaj this morning", nextaction.DM_CHECK, "Sahaj Labs", "Sahaj"),
+          stage("dm sent to Sahaj this morning", nextaction.R_LI_NO_DM, "Sahaj Labs", "Sahaj"),
           STAGE_TOUCHED)
     check("but a DM sent does NOT convert a meeting proposal",
-          stage("dm sent to Sahaj", nextaction.MEETING_PROPOSAL, "Sahaj Labs", "Sahaj"),
+          stage("dm sent to Sahaj", nextaction.R_MEETING_PREP, "Sahaj Labs", "Sahaj"),
           None)
     check("a quote sent converts a quote chase",
-          stage("quote sent to Acme yesterday", nextaction.QUOTE_CHASE, "Acme"),
+          stage("quote sent to Acme yesterday", nextaction.R_CLOSURE_SUPPORT, "Acme"),
           STAGE_QUOTED)
     check("the HIGHEST stage present wins",
-          stage("dm sent, then meeting booked with Acme", nextaction.DM_CHECK, "Acme"),
+          stage("dm sent, then meeting booked with Acme", nextaction.R_LI_NO_DM, "Acme"),
           STAGE_MEETING)
 
     print(chr(10) + "what is NOT evidence")
     check("future tense", stage("will send the DM to Sahaj tomorrow",
-                                nextaction.DM_CHECK, "Sahaj Labs", "Sahaj"), None)
+                                nextaction.R_LI_NO_DM, "Sahaj Labs", "Sahaj"), None)
     check("a different account", stage("meeting booked with Globex",
-                                       nextaction.DM_CHECK, "Sahaj Labs", "Sahaj"), None)
+                                       nextaction.R_LI_NO_DM, "Sahaj Labs", "Sahaj"), None)
     check("the right words, no account named",
-          stage("meeting booked, finally", nextaction.DM_CHECK, "Sahaj Labs", "Sahaj"), None)
-    check("mark-unresponsive can never be converted",
-          stage("they are unresponsive", nextaction.MARK_UNRESPONSIVE, "Acme"), None)
-    check("a parked deal's pulse can never be converted",
-          stage("meeting booked with Acme", nextaction.PULSE_CHECK, "Acme"), None)
-    check("empty text", stage("", nextaction.DM_CHECK, "Acme"), None)
+          stage("meeting booked, finally", nextaction.R_LI_NO_DM, "Sahaj Labs", "Sahaj"), None)
+    # A RULE ABSENT FROM _ACTION_STAGE CAN NEVER BE CONVERTED, and most of the
+    # twelve are absent on purpose. These two stand in for the whole class.
+    check("the news sweep can never be converted",
+          stage("meeting booked with Acme", nextaction.R_AI_NEWS, "Acme"), None)
+    check("a package chase can never be converted",
+          stage("meeting booked with Acme", nextaction.R_PACKAGES, "Acme"), None)
+    check("R9's ask for next steps can never be converted",
+          stage("meeting booked with Acme", nextaction.R_MEETING_FOLLOWUP, "Acme"), None)
+    check("empty text", stage("", nextaction.R_LI_NO_DM, "Acme"), None)
 
     print(chr(10) + "identifiers — how people actually name an account")
     check("the sheet's full name and the short one",
@@ -409,12 +414,12 @@ def _self_test() -> int:
     check("a PoC's first name counts",
           "ann" in identifiers("Acme Technologies", "Ann Patel"), True)
     check("'Sahaj' alone matches the row for 'Sahaj Labs'",
-          bool(find_in_text("meeting booked with Sahaj", action_type=nextaction.DM_CHECK,
+          bool(find_in_text("meeting booked with Sahaj", action_type=nextaction.R_LI_NO_DM,
                             company="Sahaj Labs", poc="Sahaj")), True)
 
     print(chr(10) + "the offer")
     hit = find_in_text("meeting booked with Sahaj Friday 3pm",
-                       action_type=nextaction.DM_CHECK, company="Sahaj Labs", poc="Sahaj")
+                       action_type=nextaction.R_LI_NO_DM, company="Sahaj Labs", poc="Sahaj")
     fields = proposed_fields(hit)
     check("it proposes the evidence's own column",
           [f["role"] for f in fields], ["meeting_status"])
