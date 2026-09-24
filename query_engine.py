@@ -40,6 +40,7 @@ from typing import Optional
 from anthropic import Anthropic
 
 import config
+import deadlines
 import persona
 
 log = logging.getLogger(__name__)
@@ -213,6 +214,58 @@ name in it is right.
 - When a tool errors, say briefly what failed. Don't retry endlessly."""
 
 
+def _searches_billed(response) -> int:
+    """How many web searches the API BILLED for this response.
+
+    Read from `usage.server_tool_use.web_search_requests` — the same number
+    `websearch.searches_used` reads, and the same reason: an errored search is
+    not billed and so must not be spent out of the day's budget.
+    """
+    try:
+        import websearch
+
+        return websearch.searches_used(response)
+    except Exception:
+        return 0
+
+
+def _sources_in(response) -> list:
+    """Every source this response cited, via the SAME reader the rules use.
+
+    WHY THE STRUCTURE AND NOT THE PROSE. The preamble tells the model to put a
+    link beside every fact, and on a live call it frequently does not — the
+    search runs inside code execution, `citations` comes back empty, and the
+    answer is a page of confident claims with nothing to check them against.
+    `websearch.parse_results` already knows all three places a URL can hide
+    (citations, links the model wrote, the raw result pool) because the drip hit
+    exactly this and was fixed there. Reusing it means the answer path cannot
+    drift from the rule path on the one question that matters: where did this
+    come from.
+    """
+    try:
+        import websearch
+
+        return list(websearch.parse_results(response).get("sources") or [])
+    except Exception:
+        log.debug("[engine] could not read the sources off a response", exc_info=True)
+        return []
+
+
+def _server_tools_used(response) -> list:
+    """The names of any SERVER-side tools the API ran inside this response.
+
+    They never come back as `tool_use` blocks, so the ordinary loop below never
+    sees them and the caller would have no way to know a search happened.
+    """
+    out = []
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) == "server_tool_use":
+            name = str(getattr(block, "name", "") or "")
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
 class QueryEngine:
     """A bounded tool-use loop over caller-supplied read-only tools.
 
@@ -253,6 +306,8 @@ class QueryEngine:
         requester_name: str = "",
         tools: Optional[list[dict]] = None,
         history: Optional[list[dict]] = None,
+        extra_system: str = "",
+        outcome: Optional[dict] = None,
     ) -> Optional[str]:
         """Answer `question` by looping model ⇄ tools. Returns the reply text, or
         None on total failure (the caller then falls back to a persona-voiced
@@ -264,23 +319,53 @@ class QueryEngine:
         answer from the conversation alone, which is the correct behaviour when
         every source is unavailable.
 
+        SERVER-SIDE TOOLS HAVE NO HANDLER, and web search is one. The API runs
+        them itself and hands back the result inside the assistant turn, so the
+        entry carries a `schema` and nothing else; anything without a handler is
+        simply never dispatched here. A caller adding one MUST also put its
+        rules in `extra_system` — for web search that is
+        `websearch.SAFETY_PREAMBLE`, and it is not optional. See bot.py.
+
         `history` is the last few turns in this channel as [{"question",
         "answer"}] (oldest first), replayed as user/assistant messages before the
         current question so a follow-up that omits its subject ("what about
         Globex?") resolves against what was just asked. Short-term working
         context only — never persisted.
+
+        `outcome`, when given, is FILLED IN with what actually happened:
+        {"model_error", "searches", "tools_used"}. It exists because "I found
+        nothing" and "I never got an answer out of the model" are completely
+        different things to tell somebody, and a bare `None` return cannot tell
+        them apart — see `persona.model_failure_reply`. The searches count is
+        what the API billed, which the caller banks against the shared daily
+        budget.
         """
         tools = tools or []
-        handlers = {t["schema"]["name"]: t["handler"] for t in tools}
+        handlers = {
+            t["schema"]["name"]: t["handler"]
+            for t in tools if t.get("handler") is not None
+        }
         schemas = [t["schema"] for t in tools]
         tool_names = [t["schema"]["name"] for t in tools]
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        report = outcome if outcome is not None else {}
+        report.setdefault("model_error", "")
+        report.setdefault("searches", 0)
+        report.setdefault("tools_used", [])
+        report.setdefault("sources", [])
+
+        today = deadlines.today_ist().isoformat()
         system = _system_prompt(
             requester_name=requester_name or "(unknown)",
             today=today,
             tool_names=tool_names,
         )
+        if extra_system:
+            # IN FRONT, not behind. Rules about how to read retrieved content
+            # must appear earlier in the system prompt than anything that could
+            # carry retrieved content — the same ordering `llm.web_research`
+            # uses, for the same reason.
+            system = extra_system.rstrip() + "\n\n" + system
 
         messages: list[dict] = []
         for turn in history or []:
@@ -292,8 +377,9 @@ class QueryEngine:
         messages.append({"role": "user", "content": question})
 
         log.info(
-            "[engine] start q=%r requester=%r tools=%d history_turns=%d",
+            "[engine] start q=%r requester=%r tools=%d (%d server-side) history_turns=%d",
             question[:160], requester_name, len(schemas),
+            len(schemas) - len(handlers),
             len([t for t in (history or []) if (t or {}).get("question")]),
         )
 
@@ -302,9 +388,24 @@ class QueryEngine:
             log.info("[engine] iteration %d/%d: calling model", i + 1, MAX_TOOL_ITERATIONS)
             try:
                 resp = await self._call_model(system=system, tools=schemas, messages=messages)
-            except Exception:
-                log.exception("[engine] model call raised")
+            except Exception as e:
+                log.error(
+                    "[engine] the model call raised %s: %s",
+                    type(e).__name__, str(e)[:300], exc_info=True,
+                )
+                report["model_error"] = type(e).__name__
                 return last_text or None
+
+            report["searches"] += _searches_billed(resp)
+            for name in _server_tools_used(resp):
+                if name not in report["tools_used"]:
+                    report["tools_used"].append(name)
+            if report["searches"]:
+                known = {s["url"] for s in report["sources"]}
+                for src in _sources_in(resp):
+                    if src.get("url") and src["url"] not in known:
+                        known.add(src["url"])
+                        report["sources"].append(src)
 
             text_now = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
@@ -313,6 +414,17 @@ class QueryEngine:
                 last_text = text_now
 
             stop = resp.stop_reason
+
+            # A PAUSED TURN IS NOT AN ANSWER. The API pauses a long server-tool
+            # turn and expects the assistant message handed straight back to
+            # continue it. Treating a pause as the end — which this did before
+            # web search reached this engine — truncates a searching answer
+            # mid-sentence and reports it as finished.
+            if stop == "pause_turn":
+                log.info("[engine] iteration %d: the turn paused; resuming it", i + 1)
+                messages.append({"role": "assistant", "content": resp.content})
+                continue
+
             if stop != "tool_use":
                 log.info("[engine] iteration %d: final (stop=%s) len=%d", i + 1, stop, len(last_text))
                 return last_text or None
@@ -323,6 +435,8 @@ class QueryEngine:
                 if getattr(block, "type", None) != "tool_use":
                     continue
                 log.info("[engine] tool_use %s input=%s", block.name, block.input)
+                if block.name not in report["tools_used"]:
+                    report["tools_used"].append(block.name)
                 result = await self._dispatch(block.name, block.input or {}, handlers)
                 tool_results.append(
                     {
@@ -363,8 +477,13 @@ class QueryEngine:
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()
             return final or last_text or None
-        except Exception:
-            log.exception("[engine] final no-tools call raised")
+        except Exception as e:
+            log.error(
+                "[engine] the final no-tools call raised %s: %s",
+                type(e).__name__, str(e)[:300], exc_info=True,
+            )
+            if not last_text:
+                report["model_error"] = type(e).__name__
             return last_text or None
 
     async def _dispatch(self, name: str, tool_input: dict, handlers: dict):

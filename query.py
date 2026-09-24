@@ -51,7 +51,11 @@ def _display(user) -> str:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """Now, in UTC, through the bot's clock. Every use of this is a "last N
+    days" cutoff over channel history, and "N days ago" has to be counted from
+    the day the bot thinks it is."""
+    import clock
+    return clock.now_ist().astimezone(timezone.utc)
 
 
 # -- Discord activity scan ---------------------------------------------------

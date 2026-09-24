@@ -41,6 +41,7 @@ REAL output to the test channel with NORMAL STATE and REAL TIMING — for testin
 replies, approvals, undo and appends end to end against a test sheet. It is not
 isolated and does not pretend to be.
 """
+import difflib
 import logging
 import os
 import re
@@ -80,6 +81,199 @@ _ADVANCE_RE = re.compile(
 )
 _RESET_CLOCK_RE = re.compile(r"\breset\s+clock\b", re.IGNORECASE)
 _RESET_STATE_RE = re.compile(r"\breset\s+test\s+state\b", re.IGNORECASE)
+
+
+# -- THE PLAIN-LANGUAGE TEST COMMANDS -----------------------------------------
+#
+# WHO THESE ARE FOR. The commands above all contain the word "simulate" and all
+# run against a throwaway database. Both were right for the person who wrote
+# them and wrong for the person who has to use them: a non-technical tester
+# cannot guess the word "simulate", and when they do find it, the results are
+# discarded — so nothing they click on, approve or undo has any effect, and the
+# bot appears not to work at all.
+#
+# So there is a second set, in the words somebody would actually use, under a
+# clock that stays where they put it, against the REAL database and the REAL
+# sheet. The simulations are unchanged and still there for a quick preview.
+#
+# MATCHED AS PLAIN TEXT, BEFORE ANY MODEL CALL, deliberately. The first thing a
+# tester does when the bot is misbehaving is ask it for help — and an
+# unreachable or misconfigured API is one of the things they are testing. A
+# help command that needs the model to work is a help command that is missing
+# exactly when it is wanted.
+CMD_HELP = "help"
+CMD_MAKE_IT = "make_it"
+CMD_NEXT_DAY = "next_day"
+CMD_BACK_TO_TODAY = "back_to_today"
+CMD_START_OVER = "start_over"
+
+_TEST_HELP_RE = re.compile(
+    r"^(?:test\s+help|help\s+test|test\s+commands|what\s+can\s+i\s+test)[\s?.!]*$",
+    re.IGNORECASE,
+)
+_MAKE_IT_RE = re.compile(r"^make\s+it\s+(?P<when>.{1,40}?)[\s?.!]*$", re.IGNORECASE)
+_NEXT_DAY_RE = re.compile(
+    r"^(?:next\s+day|the\s+next\s+day|tomorrow)[\s?.!]*$", re.IGNORECASE
+)
+_BACK_TO_TODAY_RE = re.compile(
+    r"^(?:back\s+to\s+today|back\s+to\s+the\s+real\s+day|real\s+clock|"
+    r"stop\s+testing)[\s?.!]*$",
+    re.IGNORECASE,
+)
+_START_OVER_RE = re.compile(r"^start\s+over[\s?.!]*$", re.IGNORECASE)
+
+# The confirmation for "start over", and nothing else. Deliberately a short
+# closed list: "start over" deletes the test database, and a tester who typed
+# something ambiguous should be asked again rather than have it guessed at.
+_YES_RE = re.compile(
+    r"^(?:yes|yep|yeah|y|confirm|confirmed|do\s+it|go\s+ahead)[\s?.!]*$", re.IGNORECASE
+)
+_NO_RE = re.compile(
+    r"^(?:no|nope|n|cancel|stop|never\s+mind|nevermind)[\s?.!]*$", re.IGNORECASE
+)
+
+
+def parse_test_command(text: str) -> Optional[dict]:
+    """One of the plain-language test commands, or None.
+
+    {"cmd", "date", "raw"}. `date` is set only for "make it X", and only when X
+    could be read as a day — an unreadable one comes back as None so the caller
+    can say what it tried rather than silently picking today.
+    """
+    body = " ".join(str(text or "").split()).strip()
+    if not body:
+        return None
+
+    if _TEST_HELP_RE.match(body):
+        return {"cmd": CMD_HELP, "date": None, "raw": body}
+    if _NEXT_DAY_RE.match(body):
+        return {"cmd": CMD_NEXT_DAY, "date": None, "raw": body}
+    if _BACK_TO_TODAY_RE.match(body):
+        return {"cmd": CMD_BACK_TO_TODAY, "date": None, "raw": body}
+    if _START_OVER_RE.match(body):
+        return {"cmd": CMD_START_OVER, "date": None, "raw": body}
+
+    m = _MAKE_IT_RE.match(body)
+    if m:
+        asked = m.group("when").strip()
+        when = read_day(asked)
+        # "MAKE IT HAPPEN" IS NOT A DATE COMMAND. An unreadable day is only
+        # claimed as one when it was plainly an ATTEMPT at a day — a mistyped
+        # weekday, or anything with a number in it. Otherwise the phrase is
+        # ordinary English and belongs to whoever handles it next; claiming it
+        # would have the bot answer "I couldn't read 'happen' as a day" to
+        # somebody who was simply talking.
+        if when is None and not _looks_like_an_attempt_at_a_day(asked):
+            return None
+        return {"cmd": CMD_MAKE_IT, "date": when, "raw": body, "asked_for": asked}
+    return None
+
+
+def _looks_like_an_attempt_at_a_day(phrase: str) -> bool:
+    """Was this MEANT to be a day, even though it does not parse?
+
+    A near-miss on a weekday ("mondya") or anything carrying a number ("32
+    Sep", "2026-13-01") was an attempt, and deserves "I couldn't read that as a
+    day" rather than silence. Plain words are not.
+    """
+    want = " ".join(str(phrase or "").split()).strip().lower().strip(".,!?")
+    if not want:
+        return False
+    if any(ch.isdigit() for ch in want):
+        return True
+    names = list(WEEKDAYS) + [n[:3] for n in WEEKDAYS] + [
+        "today", "tomorrow", "yesterday",
+    ] + [m.lower() for m in (
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec",
+    )]
+    return bool(difflib.get_close_matches(want, names, n=1, cutoff=0.7))
+
+
+def is_yes(text: str) -> bool:
+    return bool(_YES_RE.match(" ".join(str(text or "").split())))
+
+
+def is_no(text: str) -> bool:
+    return bool(_NO_RE.match(" ".join(str(text or "").split())))
+
+
+def read_day(phrase: str) -> Optional[date]:
+    """"monday", "28 Sep", "2026-09-28", "tomorrow" -> a date. None otherwise.
+
+    A WEEKDAY MEANS THE NEXT ONE, TODAY INCLUDED — the same rule `next_weekday`
+    uses for the simulations, because a tester who says "make it Monday" on a
+    Monday means the Monday they are standing in.
+    """
+    want = " ".join(str(phrase or "").split()).strip().lower().strip(".,!?")
+    if not want:
+        return None
+    if want in ("today", "now"):
+        return today()
+    if want == "tomorrow":
+        return today() + timedelta(days=1)
+    if want == "yesterday":
+        return today() - timedelta(days=1)
+
+    parts = want.split()
+    if len(parts) == 1 and parts[0] in _WEEKDAY_INDEX:
+        return next_weekday(_WEEKDAY_INDEX[parts[0]])
+
+    # Anything else is a date, read by the one parser the sheet already uses,
+    # so a tester may type a date in any form the spreadsheet accepts.
+    parsed = dl.parse_date(want)
+    if parsed is not None:
+        return parsed
+    # A bare day-and-month ("28 Sep") is the commonest form and that parser
+    # wants a year. Try this year, then next, and prefer one not in the past —
+    # somebody testing a date almost always means the one coming up.
+    base = today()
+    for year in (base.year, base.year + 1):
+        got = dl.parse_date(f"{want} {year}")
+        if got is not None and got >= base:
+            return got
+    return dl.parse_date(f"{want} {base.year}")
+
+
+def help_text() -> str:
+    """Every test command, in words, with no jargon and no rule codes.
+
+    IT NAMES WHAT IS REAL AND WHAT IS NOT, because that is the one question a
+    tester cannot answer from the outside, and the one that decides whether
+    they trust what they just watched happen.
+    """
+    import clock
+
+    lines = [
+        "Here is everything you can say to me in this channel.",
+        "",
+        "  make it Monday      I will act as if today is Monday, and post that",
+        "                      day's messages. Any day works: a weekday name,",
+        "                      'tomorrow', or a date like 28 Sep.",
+        "  next day            Move on to the following day and post that.",
+        "  back to today       Stop pretending. The real date comes back.",
+        "  start over          Wipe everything I have recorded while testing",
+        "                      and begin again. I will ask you to confirm.",
+        "  test help           This list.",
+        "",
+        "While a pretend day is set, everything is REAL: what I write goes to",
+        "the spreadsheet, approving and undoing work, and chasing somebody over",
+        "several days works because the days really do move. That is the point.",
+        "",
+        "  simulate monday     A quick preview instead. I show you what Monday",
+        "  simulate week       would look like and record none of it: nothing is",
+        "  simulate rule R8    written, and I forget it the moment it finishes.",
+        "",
+        "  pretend Sid is on leave   See what happens when somebody is away.",
+        "  clear leave               Undo that.",
+    ]
+    st = clock.status()
+    lines.append("")
+    lines.append(
+        f"Right now I think it is {clock.describe()}." if st["pretending"]
+        else f"Right now I am on the real clock: {clock.describe()}."
+    )
+    return "\n".join(lines)
 
 
 # -- the injected clock -------------------------------------------------------

@@ -40,7 +40,11 @@ MAX_DUE_MINUTES = 14 * 24 * 60
 
 
 def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    """Now, in UTC — but through the bot's clock, so a pretend day moves the
+    due times with it. A commitment made "by Thursday" on a pretend Monday has
+    to be overdue on the pretend Thursday, not the real one."""
+    import clock
+    return clock.now_ist().astimezone(timezone.utc)
 
 
 def to_ts(dt: datetime) -> str:

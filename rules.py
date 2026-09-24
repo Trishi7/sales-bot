@@ -23,6 +23,7 @@ dropped half its schedule would look exactly like a quiet week.
 """
 import logging
 import os
+import re
 import threading
 from typing import Optional
 
@@ -68,10 +69,68 @@ WEB_DEPENDENT = frozenset({
     "meeting_prep", "closure_support", "new_pipeline_company",
 })
 
-# The placeholder a web-dependent item carries until that layer exists. One
-# string, used everywhere, so it can be grepped out in one pass when R5 of the
-# series lands.
+# The placeholder a web-dependent item carries UNTIL ITS SEARCH HAS RUN.
+#
+# IT MEANS "NOT SEARCHED YET", NOT "NEEDS SEARCHING". The distinction became
+# real the moment the rules started actually searching: an item whose search ran
+# and came back empty is a fact about a quiet day, and leaving the marker on it
+# would say the opposite — that the bot never looked. So the research layer
+# clears it on BOTH outcomes (see `bot._mark_unresearched`), and the marker
+# survives only where search genuinely did not happen: it is off, the budget is
+# spent, or the call failed. In every one of those cases the item also carries a
+# `research_note` saying which, because "web research pending" on its own is a
+# status and not a reason.
 WEB_PENDING = "web research pending"
+
+
+# WHAT EACH RULE IS, IN WORDS SOMEBODY OUTSIDE THE TEAM WOULD FOLLOW.
+#
+# WHY THIS IS NOT `name`. The names are the Bot Rules tab's own headings and
+# they are written for people who already know the schedule — "LinkedIn
+# connected, no DM" is a column heading, not a sentence. These are the sentence.
+#
+# WHY IT EXISTS AT ALL. "R6" means nothing to anyone who has not read
+# bot_rules.yaml, and the model repeats whatever the tools hand it — so the
+# team was reading answers about "R6" and "R1" in a sales channel. An id is an
+# internal key: it belongs in the log and in `cadence preview`, where somebody
+# is deliberately looking at the machinery, and nowhere else. See
+# `render_for_user`.
+#
+# KEYED ON THE TRIGGER, NOT THE ID, because the trigger is what the rule DOES —
+# an id can be retired and replaced, and the replacement means the same thing.
+# A rule may override its own wording with a `plain:` line in bot_rules.yaml.
+PLAIN_BY_TRIGGER = {
+    "ai_news": "today's AI news worth reading",
+    "news_company_screen": "companies in the news that aren't in the pipeline yet",
+    "events": "AI events and summits coming up",
+    "deliverables": "deliverables due or overdue",
+    "prospects": "people we haven't made first contact with",
+    "li_no_dm": "people connected on LinkedIn with no DM yet",
+    "dm_no_meeting": "people we DM'd who haven't booked a meeting",
+    "meeting_prep": "meetings coming up that need prep",
+    "meeting_followup": "meetings that happened with no next steps recorded",
+    "closure_support": "deals close enough to push over the line",
+    "new_pipeline_company": "companies that just appeared in the pipeline",
+    "sales_packages": "sales packages that aren't ready yet",
+}
+
+# A rule id as it appears in text: R1 to R99. Two digits, because the schedule
+# is twelve rules today and a hard limit of nine would be an odd thing to build
+# in.
+_RULE_ID_RE = re.compile(r"\bR(\d{1,2})\b")
+
+# The pieces `render_for_user` assembles per rule. Separate constants because
+# they are built into patterns at runtime and a literal backslash buried in an
+# f-string is how a working regex quietly stops matching.
+RULE_ID_BOUNDARY = r"\b"
+SEPARATOR_THEN = r"[ \t]*[-:–—]?[ \t]*"
+
+# Tidy-up after a removal: doubled spaces, a separator left with nothing in
+# front of it, a space pushed up against punctuation, and blank edges.
+_DOUBLE_SPACE_RE = re.compile(r"[ \t]{2,}")
+_ORPHAN_SEP_RE = re.compile(r"(^|\n)[ \t]*[-:–—][ \t]*")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"[ \t]+([,.;:!?)])")
+_BLANK_LINE_EDGE_RE = re.compile(r"^[ \t]+|[ \t]+$", re.M)
 
 
 class RulesError(Exception):
@@ -90,14 +149,19 @@ class Rule:
     rule cannot mean one thing to the preview and another to the queue.
     """
 
-    __slots__ = ("id", "name", "weekdays", "trigger", "max_items_per_post",
-                 "destination", "counts_toward_cap", "enabled", "_order")
+    __slots__ = ("id", "name", "plain", "weekdays", "trigger",
+                 "max_items_per_post", "destination", "counts_toward_cap",
+                 "enabled", "_order")
 
     def __init__(self, *, id: str, name: str, weekdays: tuple, trigger: str,
                  max_items_per_post: int, destination: str,
-                 counts_toward_cap: bool, enabled: bool, order: int = 0):
+                 counts_toward_cap: bool, enabled: bool, order: int = 0,
+                 plain: str = ""):
         self.id = id
         self.name = name
+        # What this rule is, in words somebody outside the team would follow.
+        # See PLAIN_BY_TRIGGER for why it exists and why it is not `name`.
+        self.plain = plain or PLAIN_BY_TRIGGER.get(trigger, "") or name
         self.weekdays = weekdays            # tuple of 0..6, Monday = 0
         self.trigger = trigger
         self.max_items_per_post = max_items_per_post
@@ -145,7 +209,8 @@ class Rule:
 
     def as_dict(self) -> dict:
         return {
-            "id": self.id, "name": self.name, "trigger": self.trigger,
+            "id": self.id, "name": self.name, "plain": self.plain,
+            "trigger": self.trigger,
             "weekdays": self.weekday_label(),
             "max_items_per_post": self.max_items_per_post,
             "destination": self.destination,
@@ -219,6 +284,7 @@ def _parse_rule(raw: dict, *, order: int) -> Rule:
     return Rule(
         id=rule_id,
         name=name,
+        plain=" ".join(str(raw.get("plain") or "").split()).strip(),
         weekdays=_parse_weekdays(raw.get("weekdays"), rule_id),
         trigger=trigger,
         max_items_per_post=max_items,
@@ -342,6 +408,78 @@ def status() -> dict:
     }
 
 
+def plain_description(rule_id: str) -> str:
+    """"R6" -> "people connected on LinkedIn with no DM yet". "" when unknown.
+
+    The unknown case is deliberately empty rather than the id itself: an id we
+    cannot explain is an id the reader definitely cannot, and echoing it back
+    is the behaviour this whole function exists to stop.
+    """
+    rule = by_id(str(rule_id or "").strip().upper())
+    return rule.plain if rule is not None else ""
+
+
+def render_for_user(text: str) -> str:
+    """The USER-FACING rendering of any text that might carry rule ids.
+
+    "R6 LinkedIn connected, no DM: 4" becomes "people connected on LinkedIn
+    with no DM yet: 4". An id with no rule behind it is REMOVED rather than
+    passed through — see `plain_description`.
+
+    WHY A RENDERING MODE AND NOT A FIX AT THE SOURCE. The ids are real and they
+    are load-bearing: they key the dedup ledger, the SQLite state, `cadence
+    preview` and every log line, and a team member reading the boot log needs
+    them. It is only the OUTWARD face of the bot that must not use them, so the
+    translation belongs at the boundary — one function, called once on the way
+    out, rather than a dozen call sites each remembering.
+
+    TWO PASSES, AND THE ORDER MATTERS. The id usually arrives with its own name
+    behind it ("R6 LinkedIn connected, no DM"), so the pair is replaced first
+    and as a unit; replacing the id alone would leave the heading behind and
+    read as two things where there is one. Whatever id survives that is a bare
+    one, and is replaced on its own.
+    """
+    body = str(text or "")
+    if not body or "R" not in body:
+        return body
+
+    try:
+        loaded = safe_load()
+    except Exception:                      # never break a send over a rules file
+        log.debug("[rules] could not load rules to render user-facing text",
+                  exc_info=True)
+        loaded = []
+
+    for rule in loaded:
+        if not rule.name:
+            continue
+        pair = re.compile(
+            RULE_ID_BOUNDARY + re.escape(rule.id) + RULE_ID_BOUNDARY
+            + SEPARATOR_THEN + re.escape(rule.name)
+            + RULE_ID_BOUNDARY,
+            re.IGNORECASE,
+        )
+        body = pair.sub(lambda _m, r=rule: r.plain, body)
+
+    known = {r.id.upper(): r for r in loaded}
+    body = _RULE_ID_RE.sub(
+        lambda m: getattr(known.get("R" + m.group(1)), "plain", ""), body
+    )
+    return _tidy(body)
+
+
+def _tidy(text: str) -> str:
+    """Close the gaps a removed id leaves behind.
+
+    A stripped id leaves "  " or a dangling "— " that reads as a typo, and a
+    message that looks mangled gets less trust than one that says nothing.
+    """
+    out = _DOUBLE_SPACE_RE.sub(" ", text)
+    out = _ORPHAN_SEP_RE.sub(lambda m: m.group(1), out)
+    out = _SPACE_BEFORE_PUNCT_RE.sub(lambda m: m.group(1), out)
+    return _BLANK_LINE_EDGE_RE.sub("", out).strip()
+
+
 def by_id(rule_id: str) -> Optional[Rule]:
     for rule in safe_load():
         if rule.id == str(rule_id):
@@ -364,12 +502,35 @@ def log_startup() -> None:
 
     This is the line somebody reads to answer "why did nothing go out on
     Tuesday" without opening the YAML or the code.
+
+    IT LOADS BEFORE IT REPORTS. `status()` reads the cache and does not fill
+    it, so asking it first — which this used to do — described the cache at the
+    instant before anything had loaded: an empty rule list and an empty error
+    string, reported as "could not be loaded (unknown error). NOTHING proactive
+    will run", moments before the rules loaded fine and ran all day. The report
+    was the only thing broken, which is the worst kind of broken: the boot log
+    is where somebody goes to find out whether the schedule is alive, and it
+    was lying to them.
+
+    AND IT NEVER SAYS "unknown error". A failure with no reason attached is not
+    a diagnosis, it is a shrug. `safe_load()` records a reason for every genuine
+    failure, so if the rule list is empty and no reason came with it, the file
+    parsed and simply held nothing — which is a different fault with a different
+    fix, and this says so.
     """
+    rules_now = safe_load()
     st = status()
     if not st["loaded"]:
         log.error(
-            "[rules] %s could not be loaded (%s). NOTHING proactive will run.",
-            st["path"] or "bot_rules.yaml", st["error"] or "unknown error",
+            "[rules] %s could not be loaded: %s%s NOTHING proactive will run.",
+            st["path"] or "bot_rules.yaml",
+            st["error"] or (
+                "the file was read but produced no rules — the cache is empty "
+                "and no error was recorded, which means the 'rules:' list "
+                "parsed as empty rather than failing"
+            ),
+            (" " + st["remedy"]) if st["remedy"] else
+            " Check that 'rules:' in the file lists at least one rule.",
         )
         return
     src = st["source"] or {}
@@ -379,7 +540,7 @@ def log_startup() -> None:
         src.get("sheet") or "?", src.get("tab") or "?",
         src.get("amended") or "unamended",
     )
-    for rule in safe_load():
+    for rule in rules_now:
         log.info("[rules]   %s%s", rule.describe(),
                  "   [needs web research]" if rule.needs_web else "")
     disabled = st["count"] - st["enabled"]

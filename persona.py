@@ -623,17 +623,70 @@ When torn between "question" and "other", choose "question" — answering honest
 costs little, brushing off a real question costs a lot."""
 
 
+def model_failure_reply(reason: str = "") -> str:
+    """What to say when a MODEL CALL RAISED. Never "I'm not sure what you mean".
+
+    THE TWO FAILURES ARE NOT THE SAME AND MUST NOT READ THE SAME. "I'm not sure
+    what you're after" is a statement about the person's message: it says they
+    were unclear, and it invites them to rephrase something that was already
+    fine. When the Anthropic call has thrown, none of that is true — the bot
+    never read their message at all. Sending them away to rewrite a perfectly
+    good question, repeatedly, while an API key is wrong or a service is down,
+    is how somebody concludes the bot does not work and stops using it.
+
+    So this says the three things they need: the failure is mine, here is the
+    shape of it, and your message was not the problem.
+
+    THE REASON IS A CLASS NAME, NOT A STACK TRACE. "APIConnectionError" is
+    something an operator can act on and a reader can ignore; the full message
+    can carry an API key fragment or a request id and belongs in the log.
+    """
+    detail = " ".join(str(reason or "").split())[:60].strip() or "no reason given"
+    return (
+        f"I can't think right now — the AI service behind me isn't responding "
+        f"({detail}). Your message was fine; try again shortly."
+    )
+
+
+def sources_checked_line() -> str:
+    """"I checked the sales channels, the GTM sheet and the meeting notes" —
+    the live list, not a remembered one.
+
+    Only sources that are actually USABLE are named. A "not sure" reply that
+    listed a source the bot cannot currently read would be claiming a search it
+    never performed.
+    """
+    usable = [s["label"] for s in sources.status_report() if s["status"] in sources.USABLE]
+    if not usable:
+        return "I couldn't reach any of my sources just now"
+    if len(usable) == 1:
+        return f"I checked {usable[0]}"
+    return "I checked " + ", ".join(usable[:-1]) + " and " + usable[-1]
+
+
 def fallback_social_reply(kind: str, requester: str = "") -> str:
-    """Deterministic reply used ONLY when the model call on the social path
-    fails. Still first person, still direct, still no emojis — a failure path must
-    not reintroduce a chirpy "here are my commands" template."""
+    """Deterministic reply for a SUCCESSFUL call that came back with nothing.
+
+    Still first person, still direct, still no emojis — a failure path must not
+    reintroduce a chirpy "here are my commands" template.
+
+    NOT FOR A CALL THAT RAISED. "I'm not sure what you're after" blames the
+    asker's wording, and when the model never answered, their wording was never
+    the problem — use `model_failure_reply` for that. This line is only honest
+    after a look that actually happened and found nothing.
+
+    AND IT SAYS WHERE IT LOOKED. "I didn't find anything" is unfalsifiable and
+    tells nobody whether to rephrase, to check a different source, or to go and
+    write the thing down; naming the sources turns it into something the reader
+    can act on or correct.
+    """
     who = (requester or "").strip().split()[0] if (requester or "").strip() else ""
     hi = f"Hi {who}" if who else "Hi"
     if kind == "greeting":
         return f"{hi} — what do you need? I can look through the sales channels and the meeting notes."
     return (
-        f"{hi} — I'm not sure what you're after there, and I didn't find anything to go on. "
-        "Say a bit more and I'll dig into it."
+        f"{hi} — {sources_checked_line()} and couldn't find anything that answers "
+        "that. Say a bit more — a company, a person or a date — and I'll go again."
     )
 
 

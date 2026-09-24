@@ -173,6 +173,36 @@ def mention_for(user_id, display_name: str = "") -> str:
     return name or "there"
 
 
+def _for_people(text: str, *, keep_rule_ids: bool = False) -> str:
+    """Outbound text as a PERSON should read it: no internal rule codes.
+
+    THE LEAK THIS CLOSES. The rules engine hands the model tool output full of
+    "R1", "R6", "R11" — they are the keys everything is stored against — and
+    the model, reasonably, repeated them straight back into a sales channel.
+    Nobody outside this repository knows what R6 is, and a message that opens
+    with a code the reader cannot decode teaches them to skim the rest.
+
+    HERE, RATHER THAN AT EACH COMPOSER, because this function is on the only
+    path text can take into Discord. A rule id cannot reach a person without
+    passing through it, which is a guarantee that "remember to strip it in the
+    composer" could never be.
+
+    NEVER FAILS A SEND. A rules file that will not load is a serious problem
+    and it is not this function's problem: the original text goes out.
+    """
+    body = str(text or "")
+    if keep_rule_ids or not body:
+        return body
+    try:
+        import rules
+
+        return rules.render_for_user(body)
+    except Exception:
+        log.debug("[guardrails] could not translate rule ids; sending as written",
+                  exc_info=True)
+        return body
+
+
 def sanitize(text: str) -> str:
     """Strip every mention token the bot did not itself authorise.
 
@@ -297,6 +327,7 @@ async def send(
     rung: int = 0,
     item_in_channel_today: bool = False,
     item_key: str = "",
+    keep_rule_ids: bool = False,
 ) -> Optional[discord.Message]:
     """The ONLY way this bot puts text into Discord.
 
@@ -313,6 +344,12 @@ async def send(
     THE DM ARGUMENTS ARE ALL EXPLICIT AND ALL DEFAULT TO REFUSAL. A caller that
     does not know about the exception cannot trip it: no `dm_reason` means no
     DM, exactly as before this existed.
+
+    RULE IDS ARE TRANSLATED ON THE WAY OUT. "R6" is an internal key and means
+    nothing to the person reading the channel, so every outbound body goes
+    through `rules.render_for_user` first — see `_for_people`. `keep_rule_ids`
+    opts out, and is for the cadence preview alone, where the ids ARE the
+    answer somebody asked for.
 
     Returns the sent message, or None when the send was refused or Discord
     rejected it. Never raises on a Discord failure — a failed post is logged and
@@ -359,7 +396,7 @@ async def send(
             rung=int(rung or 0),
             item_key=item_key,
         )
-        body = sanitize(text or "").strip()
+        body = sanitize(_for_people(text, keep_rule_ids=keep_rule_ids)).strip()
         if not body:
             log.info("[guardrails] nothing to DM (empty body) for kind=%s", kind)
             return None
@@ -394,7 +431,7 @@ async def send(
         )
         return None
 
-    body = sanitize(text or "").strip()
+    body = sanitize(_for_people(text, keep_rule_ids=keep_rule_ids)).strip()
     if not body:
         log.info("[guardrails] nothing to send (empty body) for kind=%s reason=%s", kind, reason)
         return None

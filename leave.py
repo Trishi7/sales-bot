@@ -92,7 +92,10 @@ _cache: dict = {}
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    """Now, in UTC, through the bot's clock — the leave lookback is an "N days
+    ago" window over the leave channel, so it moves with a pretend day."""
+    import clock
+    return clock.now_ist().astimezone(timezone.utc)
 
 
 def _norm(name: str) -> str:

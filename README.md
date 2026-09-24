@@ -277,6 +277,50 @@ it. What did **not** change: the daily digest, the ask-time deadline
 announcement, and the reply-based deadline chasing — a reply to the bot's digest or to the
 original promise still closes that chase, whether or not it also gets an answer.
 
+### When the model is down, the bot says so
+
+**"I'm not sure what you're after" must never mean "the API threw".** Those two
+failures had the same wording, and only one of them is about the person's
+message. The "not sure" line says *they* were unclear and invites them to
+rephrase something that was already fine; when the Anthropic call has raised,
+the bot never read their message at all. Sending somebody away to rewrite a good
+question, repeatedly, while a key is wrong or a service is down, is how a team
+concludes the bot does not work and stops using it.
+
+So a raised call gets its own sentence (`persona.model_failure_reply`):
+
+> I can't think right now — the AI service behind me isn't responding
+> (`APIConnectionError`). Your message was fine; try again shortly.
+
+Three things, deliberately: **the failure is mine**, **here is its shape**, and
+**your message was not the problem**. The reason is the exception **class**, not
+its text — a class name is something an operator can act on and a reader can
+ignore, while the full message can carry a key fragment or a request id and
+belongs in the log. The class is logged at **ERROR** on every such path.
+
+| Situation | What the person gets |
+|---|---|
+| The model call **raised** | the sentence above, naming the class |
+| The call **succeeded** and returned nothing | the "not sure" line — now naming **which sources were checked** |
+| The call succeeded and found nothing | the answer, with its empty result stated |
+| A **capability** question, model down | the real answer, built from the live source statuses without a model |
+
+The second row changed too. "I didn't find anything" is unfalsifiable and tells
+nobody whether to rephrase, look elsewhere, or go and write the thing down, so
+it now names the sources it actually checked — from
+`sources.status_report()`, filtered to the ones that are genuinely **usable**,
+because listing a source the bot cannot currently read would be claiming a
+search it never performed:
+
+> Hi Vaishnavi — I checked the GTM Playbook spreadsheet, the researcher/buyer
+> mapping sheet, the strategy doc and the sales meeting notes and couldn't find
+> anything that answers that. Say a bit more — a company, a person or a date —
+> and I'll go again.
+
+The engine reports which it was through `outcome["model_error"]`, because a bare
+`None` return cannot tell the two apart, and `_answer_with_engine` answers the
+failure itself rather than letting it fall through to the "no progress" path.
+
 ---
 
 ## The two documents the bot thinks with
@@ -1704,6 +1748,93 @@ the same thing and neither should get an empty list.
 | Deadlines the bot announced | `deadlines` | unchanged |
 | Sheet-health dedup | `quality_flags` | unchanged |
 
+### The boot report loads before it reports
+
+`rules.log_startup()` prints the whole schedule at boot — the line somebody
+reads to answer *"why did nothing go out on Tuesday"* without opening the YAML.
+
+**It used to lie.** It called `status()`, which reads the cache and does not
+fill it, so at boot it described the cache at the instant before anything had
+loaded: an empty rule list and an empty error string, printed as
+
+```
+[rules] bot_rules.yaml could not be loaded (unknown error). NOTHING proactive will run.
+```
+
+— moments before the rules loaded fine and ran all day. Only the report was
+broken, which is the worst kind of broken: the boot log is where somebody goes
+to find out whether the schedule is alive, and it was telling them it was dead.
+
+Two changes. It **loads first** (`safe_load()`, then `status()`), so it
+describes what the bot is actually running on. And it **never prints "unknown
+error"** — a failure with no reason attached is a shrug, not a diagnosis.
+`safe_load()` records a reason for every genuine failure, so an empty rule list
+with no reason means something different and specific: the file parsed and held
+nothing, the `rules:` list came back empty, and that is what it now says, with
+the fix.
+
+### Rule ids never reach a person
+
+**"R6" is an internal key, and it is load-bearing** — it keys the dedup ledger,
+the SQLite state, `cadence preview` and every log line, so it cannot simply be
+renamed away. But `cadence_preview` hands the model its output keyed by id, and
+the model — reasonably — repeated them straight back into a sales channel.
+Nobody outside this repository knows what R6 is, and a message that opens with a
+code the reader cannot decode teaches them to skim the rest.
+
+So each rule carries a **plain description**, in words somebody outside the team
+would follow, and outbound text is translated on the way out:
+
+| Rule | `name` (the tab's heading) | `plain` (what a person reads) |
+|---|---|---|
+| R1 | AI news | today's AI news worth reading |
+| R4 | Deliverables checklist | deliverables due or overdue |
+| R6 | LinkedIn connected, no DM | people connected on LinkedIn with no DM yet |
+| R9 | Meeting done, no next steps | meetings that happened with no next steps recorded |
+| R10 | Closure support | deals close enough to push over the line |
+
+The wording lives in **`bot_rules.yaml`** as an optional `plain:` line per rule —
+it is a product decision, so it is an edit and a restart like every other field —
+falling back to `rules.PLAIN_BY_TRIGGER`, which is keyed on the **trigger**
+rather than the id, because the trigger is what the rule *does* and an id can be
+retired and replaced by one that means the same thing.
+
+**`rules.render_for_user(text)`** is the translation, in two passes and the order
+matters:
+
+1. the id **with its own name behind it** — "R6 LinkedIn connected, no DM" is one
+   heading, not two, and replacing only the id would leave the name stranded;
+2. whatever bare ids survive that;
+3. a backstop strip of anything still matching `\bR\d{1,2}\b`, with the spacing
+   and punctuation closed up behind it — a stripped id leaves a dangling "— "
+   that reads as a typo, and a mangled message gets less trust than a plain one.
+
+An id with no rule behind it is **removed, not echoed**: an id the bot cannot
+explain is one the reader definitely cannot.
+
+**It is applied in `guardrails.send`**, via `_for_people`, because that is the
+only path text can take into Discord — a rule id cannot reach a person without
+passing through it, which is a guarantee that "remember to strip it in the
+composer" could never be. It **never fails a send**: an unloadable rules file is
+a serious problem and not this function's problem, so the original text goes out.
+
+**Two things keep the ids**, both passing `keep_rule_ids=True`:
+
+- **`cadence preview`** — somebody deliberately asked to see the machinery, so
+  the ids *are* the answer. `_answer_with_engine` detects it from the engine's
+  `outcome["tools_used"]` rather than by guessing at the question's wording.
+- **`simulate …`** — the developer preview, which is the same kind of request.
+
+**Logs keep them everywhere**, untouched. The boot report, the queue preview and
+every `[rules]` line still name R1 to R12, because that is where somebody is
+looking at the machinery on purpose.
+
+The tool also hands the model the plain wording (`plain` per group, plus a
+`rule_words` map and a `how_to_name_the_rules` note), so an ordinary answer can
+be written without codes in the first place rather than relying on the outbound
+strip to tidy up after it. Both halves are tested —
+`tests/test_regressions.py::TestRuleIdsNeverReachAPerson`.
+
 ### Checking it offline
 
 ```bash
@@ -2568,9 +2699,9 @@ header.
 
 | Rule | What it searches for |
 |---|---|
-| **R1** | AI news, **last 24 hours only**, in the categories from `sales_strategy.md` §7. Prioritises items about companies and people **already on the sheet** |
-| **R2** | Companies in the news **not** in the Master Pipeline, judged against the use-case table in `sales_strategy.md` §2 (A–J and who buys each) |
-| **R3** | Events not already on the AI Events & Summits tab |
+| **R1** | **our own contacts by name**, on rotation — see below. Falls back to the wider AI field when nothing about them turns up, and says which mode it is in |
+| **R2** | Companies in the news **not** in the Master Pipeline, judged against the use-case table in `sales_strategy.md` §2 (A–J and who buys each). **Re-reads R1's results** rather than searching again |
+| **R3** | Events not already on the tab, in the current and next month — plus the **registration-deadline backfill** for rows that lack one |
 | **R6** | A published public email — **only when column F is empty** (see below) |
 | **R8** | Recent news about the person and company, for meeting prep |
 | **R10** | Recent news relevant to a deal in progress |
@@ -2579,6 +2710,336 @@ header.
 The queries live in `websearch.RULE_QUERIES`, not in `nextaction.py` — the rules
 stay pure and compute *which* items are due; this decides what a search for one
 of them should ask.
+
+### …and in answers, not just in the rules
+
+**"What's new in AI today?" used to get "I can't search the web"** — while the
+drip, three feet away, was searching it every morning. The capability existed;
+only the answering path could not reach it. `_websearch_tools()` now adds the
+**same tool definition** to the question engine's tool list, shaped by the same
+config and carrying the same preamble, so there is one definition of "how this
+bot searches the web" rather than two that drift.
+
+| | The rule path (`llm.web_research`) | The answer path (`QueryEngine.answer`) |
+|---|---|---|
+| Tool | `websearch.tool_definition()` | **the same** |
+| Preamble | `websearch.SAFETY_PREAMBLE`, prepended | **the same**, prepended ahead of everything |
+| Budget | `WEB_SEARCH_DAILY_BUDGET`, checked before and banked after | **the same ledger**, shared |
+| Links | rendered by `websearch.format_sources` | **the same**, when the model leaves them out |
+
+**The budget is shared, and it is one number.** An answer that searches spends
+the same `web_search_usage` rows the morning's research does — recorded under
+`rule_id="question"` so a breakdown still shows where the day went. It is
+checked before the call (a call with nothing left bills anyway) and banked after
+from what the API **billed**, not from what the model attempted, so an errored
+search costs nothing. It is banked **even when the turn failed**: the invoice
+does not care whether the answer reached the channel.
+
+**When it cannot search, it says so — it does not answer from memory.** Off,
+spent, or unreadable, the tool is withheld *and* a line goes into the system
+prompt telling the model to say which, in one sentence, and to answer whatever
+part it can from its other tools. A bot that quietly answers from memory when
+its search is switched off is worse than one that cannot search, because the
+answer looks identical either way.
+
+**A paused turn is not an answer.** The API pauses a long server-tool turn and
+expects the assistant message handed straight back to continue it. The engine's
+loop treated `pause_turn` as the end — which truncated a searching answer
+mid-sentence and reported it as finished — and now resumes it.
+
+**Server-side tools have no handler.** The engine's tool entries are
+`{"schema", "handler"}`; a server tool carries a schema alone, is never
+dispatched locally, and the API's `server_tool_use` blocks are reported through
+`outcome["tools_used"]` so the caller knows a search happened at all.
+
+> **Links are rendered from the structure, not trusted to the prose.** The
+> preamble asks for a URL beside every fact and on a live call the model
+> frequently gives none — with dynamic filtering the search runs inside code
+> execution and there is nothing for it to cite from. The drip hit exactly this
+> and fixed it by rendering the links itself; `_with_sources` is the same fix in
+> the same words, appending a `Sources:` list under any searched answer that
+> carries no links of its own. A claim from the web with no link is
+> indistinguishable from one the model made up.
+
+### R1 searches for our people first
+
+**R1 is not a general AI news feed**, and reading it as one was the bug. The Bot
+Rules tab asks for news about *our* contacts — a funding round at a company we
+are talking to, a paper by a PoC, somebody we have been chasing changing jobs.
+Those are things the team can act on this week. A bigger story about a stranger
+is reading material, and a post full of reading material is one people stop
+opening.
+
+**Who gets searched for, in this order** (`news.collect_targets`):
+
+| Tier | Where from | Which |
+|---|---|---|
+| 1 | Outreach PoCs | the PoCs on **active** rows — a stopped row is one we are not pursuing |
+| 2 | researcher/buyer mapping | **T1 and T2** only. T3 is "possible fit, thin evidence" and searching those spends the rotation on people we are not yet chasing |
+| 3 | Master Pipeline | the companies |
+
+**Nobody on the departures list is ever searched**, and they are *removed* from
+the rotation rather than merely skipped — skipping is not enough once somebody
+is already in it, or they come up every few weeks forever and spend a search on
+a dead contact. `do_not_recommend` on a mapping row does the same.
+
+### The rotation, and why there has to be one
+
+There are several hundred of those and one day's budget carries
+`NEWS_PEOPLE_PER_RUN` (8). Taking the first eight off the sheet each day would
+mean **the ninth person is never searched once, ever** — so whose turn it is is a
+fact in SQLite rather than an accident of sheet order.
+
+`news_targets` keeps a `last_searched` date per person and company, and the
+**least-recently-searched come up first**. `last_searched` is `''` for a target
+nobody has searched yet and the empty string sorts before any ISO date, so a PoC
+added this morning is picked up on the **next** run rather than after everybody
+else has had a turn.
+
+**Tier order first, rotation within it.** Filling the quota from PoCs before
+researchers before companies is the rules sheet's own priority; oldest-first then
+decides *which* PoCs. Pure oldest-first across everything would let four hundred
+pipeline companies crowd out the people we are actually talking to.
+
+**A search that found nothing still counts as a turn.** If only hits moved the
+clock, somebody nobody writes about would be searched every single run forever,
+which is the opposite of a rotation. `hits` is tracked separately and is
+diagnostic only — it is how you notice that a third of the rotation never
+produces anything.
+
+### The three passes, and the fallback that is not a failure
+
+```
+1. OUR PEOPLE, restricted to NEWS_PREFERRED_DOMAINS      (skipped if unset)
+2. OUR PEOPLE again, open across the web                 (if 1 was thin)
+3. THE WIDER FIELD, open                                 (if 1 and 2 found nothing)
+```
+
+> **Some sites block Anthropic's crawler, and naming one is a 400 on the whole
+> request** — not a thinner result, *no* result. Five of the shipped
+> `NEWS_PREFERRED_DOMAINS` turned out to be in that category (Reuters, the WSJ,
+> The Verge, Ars Technica, the Indian Express), so R1's preferred pass failed
+> every single time and the rule limped along on its fallback. The error names
+> them, so `websearch.inaccessible_domains` reads them back out and
+> `llm.web_research` retries once without them, logging which at WARNING so the
+> `.env` can be pruned. A static block-list would have been wrong within a
+> quarter — sites change their robots.txt and nobody is tracking it — so the
+> list self-heals and a newly blocking site costs one retry, not a broken rule.
+
+**Preferred sites are a preference, not a restriction.** The first pass is
+limited to `NEWS_PREFERRED_DOMAINS`; if it comes back with fewer than
+`NEWS_MIN_ITEMS` (3) the open pass runs and the results are **merged**, because a
+story the preferred sites had is not made worse by the fact that they only had
+one. Getting the domain list wrong must cost relevance and never the day's news.
+Which pass produced each story is logged, so the list can be tuned in the `.env`
+rather than guessed at. A caller's preference can never reach outside
+`WEB_SEARCH_ALLOWED_DOMAINS` when that is set — a preference is about taste and
+the allow-list is about policy.
+
+**Pass 3 is the fallback and the post says so, in plain words:**
+
+> Nothing on our contacts today, so here is what moved in AI:
+
+Most days nothing at all is written about eight particular mid-market AI people,
+and a rule that went silent on those days would look broken. A reader cannot
+otherwise tell "quiet week for our contacts" from "the bot has stopped looking",
+so the mode is never left to be inferred.
+
+### The message carries links, and that is enforced rather than requested
+
+Each story is **one short line**: what happened, who it concerns, and its link.
+`NEWS_MAX_ITEMS` (5) per post. A story about somebody on our sheets names the row
+it came from:
+
+```
+• Sahaj Garg — raised a $30m Series B for Wispr Flow <https://techcrunch.com/wispr>
+  (Sahaj Garg — Wispr Flow, on our Outreach PoCs)
+• Alan Turing — published a paper on model evaluations <https://arxiv.org/abs/1234>
+  (Alan Turing — Globex, on our researcher mapping (T1))
+```
+
+**A line that arrives without a URL is dropped**, silently and on purpose
+(`news.parse_stories`) — the prompt says every line needs one, and a line without
+one is a claim nobody can check. And because the *composer* can also lose a link
+while tidying a sentence, `drip.with_sources` re-attaches any that went missing
+immediately before the send. "Never post a story with no source link" cannot be
+a request the model is free to decline.
+
+### No repeats
+
+Every posted story's normalised URL and title go into `news_stories`, and
+anything posted within `NEWS_REPEAT_DAYS` (30) is skipped.
+
+**Keyed on the URL, not the headline.** The same funding round is reported by
+four outlets with four headlines, and one outlet re-runs its own piece with
+`utm_` parameters bolted on. `news.url_key` strips the scheme, `www.`, the query
+string, the fragment and any trailing slash so those collapse to one row — and
+the title is kept only for the log, because it is not stable enough to match on.
+The check **fails closed**: an unreadable table reports "seen" and the story is
+skipped, since the alternative failure is the same story posted every day until
+somebody notices.
+
+### R2 re-reads R1's results rather than searching again
+
+The news-company screen wants companies that turned up in today's news and are
+**not** in the Master Pipeline. That is the result set R1 already paid for, so R2
+costs one cheap call to judge it rather than a second search of the web. Each one
+gets a line on whether it fits membrane and **why**, judged against the use-case
+table (A–J) in `sales_strategy.md`, with its link:
+
+```
+In the news today and not in the Master Pipeline:
+• Nebius — fits use case C, inference infrastructure, buys eval data <https://nebius.com/news>
+Say the word and I'll add any of these — I won't add anything without a yes.
+```
+
+**It asks. It never writes.** Adding a row is `approvals` plus
+`gtm_sheet.append_row`, and neither is reachable from here.
+
+### Keywords come from the sheet, and they are seeds
+
+`NEWS_KEYWORDS` and `EVENT_KEYWORDS` are the "Sample Keywords" column of the Bot
+Rules tab, in the `.env` rather than in code so Vaishnavi can tune them where she
+owns them. Both prompts say so explicitly: the sheet says *"not limited to
+these"*, so they are a starting point and adjacent terms are fair game. Which
+keywords produced results is logged, so there is something to tune **against**.
+Every story still needs a source link whatever matched it.
+
+### Failures degrade honestly
+
+| What happened | What the post says |
+|---|---|
+| `WEB_SEARCH_ENABLED=false` | "web research unavailable today — WEB_SEARCH_ENABLED is off", and the item keeps its place in the queue |
+| The budget is spent | "the daily search budget is spent (20/20 searches used)" |
+| The call failed | the reason, and **no invented stories** |
+| It searched and found nothing | "I searched and found nothing today", and the pending marker is **cleared** |
+
+That last row is the one worth reading twice. `web research pending` means *not
+searched yet*, not *needs searching*: an item whose search ran and came back
+empty is a fact about a quiet day, and leaving the marker on it would claim the
+bot never looked. So the marker is cleared on **both** outcomes and survives only
+where search genuinely did not happen — and in every one of those cases the item
+also carries a `research_note` saying which, because a status is not a reason.
+
+### R3 fills the sheet from the web, and backfills the deadlines
+
+R3 used to read the AI Events & Summits tab and nothing else, which made it half
+a rule: **an event nobody had typed in did not exist**, and a row whose "Last day
+for registration" cell was empty could not warn about the thing that actually
+bites — the conference is in November and registration shut in September.
+
+Two jobs now, both in `events_discovery.py`, and **neither writes anything by
+itself**.
+
+#### Discovery
+
+On each R3 run, search for AI events, summits and conferences whose date falls in
+the **current or next calendar month** — months rather than a rolling window,
+because that is how conference calendars are published and how somebody thinks
+about them. Relevant to AI research, evals, agents, speech and safety, seeded
+from `EVENT_KEYWORDS`.
+
+**Skipping what we already have is the hard part**, and it errs towards "we have
+it": a missed discovery costs one event, a duplicated row costs somebody's
+afternoon and makes the sheet untrustworthy. `already_on_tab` tries three tests,
+loosest last — an exact normalised match, then a same-month match with a shared
+distinctive word, then a strong name-token overlap when neither side has a usable
+date. Years and filler words (`the`, `AI`, `summit`, `conference`, `annual`…) are
+dropped from the comparison, so "NeurIPS 2026" and "NeurIPS" are one conference
+while "AI Summit London" in October and in April are two.
+
+**The limits exist because proposals cost attention**:
+`EVENTS_DISCOVERY_MAX_PER_RUN` (3) and `EVENTS_DISCOVERY_MAX_PER_MONTH` (8),
+counted in `event_discoveries`. A discovery feature with no ceiling produces a
+weekly listings page, and a listings page is not read — at which point the one
+event that mattered is missed by exactly the same margin as if the feature did
+not exist.
+
+**A no is an answer.** An event somebody declined is recorded as declined and is
+never proposed again. Re-asking a fortnight later is not a reminder, it is
+nagging, and it teaches people to skim the message.
+
+```
+An AI event coming up that isn't on the Events tab:
+• Voice AI Forum — Bengaluru, India — Wed 14 Oct 2026
+  registration closes Thu 01 Oct 2026
+  <https://voiceaiforum.in>
+
+Want these on the sheet? Say yes and I'll add them — I won't add anything without one.
+```
+
+**A yes is what writes it.** The proposal is opened against the message that
+carried it (`_open_event_proposals`), so replying "yes" resolves it through
+`open_proposal_for_message` exactly as it does for a cell update — there is one
+approval mechanism in this bot and R3 does not get its own. The discovery and
+the deadlines are **separate proposals**, because they are separate decisions:
+somebody may well want the missing deadlines filled in and not want three new
+rows, and one proposal carrying both would make the smaller, safer change
+hostage to the larger one.
+
+On a yes, `gtm_sheet.append_row` writes it with every column the
+tab has — and **unknown cells are left empty rather than guessed**. The tab has
+columns for timings, key people, registered and attended, and a search result
+knows none of them: an empty cell is a question somebody can answer, an invented
+one is a wrong answer nobody knows to check. The append reads back and compares
+every cell as any append does, clearing the row on a mismatch.
+
+#### The registration-deadline backfill
+
+For rows where the deadline is empty or reads as unknown — the live tab has
+`""`, `not available` and `n/a`, and `UNKNOWN_DEADLINE` holds all of them **in
+their normalised form**, which is not a detail: `_norm` strips punctuation, so
+`"n/a"` arrives as `"n a"`, and writing the set with the punctuation intact
+fails silently by reading the cell as a real deadline.
+
+Look it up — the row's own link first, then a search — and propose writing **just
+that cell**. One approval message can carry several rows; each cell still needs
+its yes.
+
+```
+I found registration deadlines for these — shall I put them in the sheet?
+• Evals Day London — closes Mon 05 Oct 2026  <https://evalsday.io/register>  (row 3)
+
+Say yes and I'll write just those cells. Nothing else on the rows changes.
+```
+
+Writing that one cell needs a **tab-aware** writer, because `write_cells` is
+bound to the Outreach PoCs tab and carries its restricted-band refusal and its
+company-name interlock — neither of which means anything on the Events tab.
+`write_cells_on` is deliberately narrower instead: tabs on `SHEET_APPENDABLE_TABS`
+only, one named cell at a time, mapped columns only, and **it refuses to
+overwrite a cell that already has something in it**. That last rule is what makes
+it safe without the interlock — it can fill a gap the sheet has and can never
+replace something a human typed.
+
+**A date with no source is treated as not found.** The prompt forbids a deadline
+the page does not state, and `parse_deadlines` is where that is enforced rather
+than hoped for — an unsourced date is exactly the guess the prompt forbids, and
+somebody will plan around whatever the bot says.
+
+**Not found is said once.** A miss goes into `event_deadline_checks` and is not
+re-asked for `EVENTS_DEADLINE_RECHECK_DAYS` (14). Saying "I couldn't find it"
+once is useful; saying it every other Wednesday about the same six events is how
+a report stops being read, and the answer rarely changes inside a fortnight. A
+deadline that later turns up clears the miss.
+
+### One search call per rule run, and the budget is banked by the caller
+
+Everything above goes through **`llm.web_research`** — the safety preamble
+always, web content is data and never instructions, `only_domains` narrowing one
+call for R1's preferred pass and never widening past the operator's allow-list.
+
+`bot._one_search` is the single banked-search helper both R1 and R3 go through,
+so the budget cannot be spent by a path that forgot to record it:
+
+- **checked before** the call, because a call made with nothing left bills anyway;
+- **banked after** it from `usage.server_tool_use.web_search_requests` — what the
+  API actually billed, not what the model attempted, so an errored search costs
+  nothing;
+- **logged both ways**: `[websearch] R1: 2 search(es) billed, 17 left of 20 today`.
+
+Recorded under the rule's own id (`R1`, `R2`, `R3`, `R3-deadlines`), so
+`web_search_breakdown` still shows where a day went.
 
 ### R6's order: column F first, web second
 
@@ -3122,9 +3583,9 @@ Same gates — test channel, approvers.
 |---|---|
 | `pretend Kushal is on leave today` | overrides the leave check for one name, so you can watch reassignment happen without waiting for a real holiday |
 | `clear leave` | drops the override |
-| `advance clock 3 days` | shifts `simulation.today()`. **Refused unless `SALES_TEST_MODE` is on** — a live bot with a shifted clock would send Thursday's messages on Monday |
+| `advance clock 3 days` | shifts `simulation.today()` for the throwaway simulations. **Refused unless `SALES_TEST_MODE` is on** — a live bot with a shifted clock would send Thursday's messages on Monday. For a clock that STAYS put and runs against real state, use `make it Monday` below |
 | `reset clock` | back to real time |
-| `reset test state` | wipes the test database and starts a fresh one |
+| `reset test state` | wipes the test database and starts a fresh one. `start over` is the plain-language form, and it asks you to confirm first |
 
 > **`reset test state` refuses unless `DB_PATH` ends in `_test.db`.** The name
 > check is the whole safety: typed against a live bot it would delete every
@@ -3134,13 +3595,148 @@ Same gates — test channel, approvers.
 > Both the leave override and the reset are written to `audit.jsonl` with who
 > typed them.
 
+### The plain-language commands — for somebody who is not a developer
+
+Everything above needs the word **"simulate"** and runs against a **throwaway
+copy**. Both were right for the person who wrote them and wrong for the person
+who has to use them: a non-technical tester cannot guess the word, and when
+they do find it, nothing they approve or undo has any effect — so the bot
+appears not to work.
+
+So there is a second set, in the words somebody would actually use, under a
+clock that **stays where they put it** against the **real** database and the
+**real** sheet. Same gates — test channel, approver, silent anywhere else.
+
+| Typed | What happens |
+|---|---|
+| `test help` | every command below, in friendly words. **Matched as plain text before any model call**, so it still answers when the API key is wrong |
+| `make it Monday` | it *is* Monday from now on, and the bot posts that day. Any day works: a weekday name, `tomorrow`, `28 Sep`, `2026-09-28` |
+| `next day` | move on to the following day and post that |
+| `back to today` | stop pretending; the real date comes back |
+| `start over` | wipe everything recorded while testing. **Asks you to confirm first** |
+
+Every `simulate …` phrasing keeps working unchanged.
+
+> **Why plain text and not the router.** The first thing a tester does when the
+> bot is misbehaving is ask it for help — and an unreachable or misconfigured
+> API is one of the things they are testing. A help command that needs the model
+> to work is a help command that is missing exactly when it is wanted. The
+> patterns are matched in `simulation.parse_test_command`, before `_handle_query`
+> reaches `llm.parse_query`.
+
+> **"make it happen" is not a date command.** An unreadable day is only claimed
+> as one when it was plainly an *attempt* at a day — a mistyped weekday, or
+> anything with a number in it. Otherwise the phrase is ordinary English and
+> falls through, rather than having the bot answer "I couldn't read 'happen' as
+> a day" to somebody who was simply talking.
+
+### The pretend clock (`clock.py`)
+
+`make it Monday` sets a **persistent** pretend clock, stored in SQLite:
+
+```
+pretend now = pretend start + (real now − real start)
+```
+
+so **time still moves** — an hour of testing is an hour on the pretend clock,
+which is what makes the gap between two posts mean anything. What it will not do
+is roll into the next day on its own: the date is **held** at the pretend day,
+because "make it Monday" is an instruction about the day, and a day that changed
+itself mid-test would invalidate the test without saying so.
+
+**It is stored, not held in memory.** A tester who restarts the bot has not
+changed their mind about what day it is, and a clock that evaporated on a
+restart would leave the bot behaving as if it were still yesterday's tester.
+
+**Everything reads it.** `deadlines.today_ist()` and `deadlines.now_ist()` are
+the only functions in the codebase that answer "what time is it", and both now
+go through `clock`. So the pretend day reaches the rules' weekday, the drip
+window, deadline arithmetic, the undo window, the leave lookback, every "N days
+ago" cutoff and the date the answering engine is told it is — without any of
+them knowing the clock can be moved. `deadlines.real_today_ist()` is there for
+the few things that are about the machine rather than the work.
+
+**It refuses outside `SALES_TEST_MODE`**, for the same reason `advance clock`
+does: on a live bot it would move every deadline the team is working to.
+
+### What a test day looks like
+
+Two stops, because the real day has two — the meeting-prep day-of touch is
+pinned to `MEETING_DAYOF_TIME` and lands outside the posting window, and
+everything else waits for `SALES_DRIP_START`. Standing at a single time would
+show a day that does not happen.
+
+```
+Vaishnavi   @bot make it Monday
+
+Saley       Right — it's now Monday 28 Sep, 9:00 AM (test time).
+            [TEST] It's now Monday 28 Sep, 10:00 AM (test time).
+            @Vaishnavi Your 11:00 with Sahaj Labs — here's where we left it …
+            [TEST] It's now Monday 28 Sep, 2:00 PM (test time).
+            @Vaishnavi Four people connected on LinkedIn with no DM yet …
+            @Sid The Mindtrail deck is four working days past its date …
+            [TEST] That's Monday 28 Sep done.
+                     2 posts went out
+                     sales packages that aren't ready yet — that only runs on a Thursday
+                     nothing on deliverables due or overdue — I looked and there was nothing due
+
+                   All of that was real: it's in my records and any sheet changes
+                   are waiting for your yes. Say "next day" to carry on, or
+                   "back to today" to stop.
+```
+
+Posts are spaced `TEST_POST_GAP_SECONDS` apart (default 20) rather than the real
+90 minutes — a test day is watched by somebody sitting there — but not zero: the
+posts have to arrive one at a time, in an order a person can follow.
+
+The footer names **the skips as well as the sends**, in plain words with no rule
+codes. "Two posts" tells a tester what they watched; "two posts, one held over
+because the day was full, nothing on packages because that only runs on a
+Thursday" tells them whether what they watched was *right*. A tester who cannot
+tell a quiet day from a broken one will report neither.
+
+### The state is real — that is the point
+
+| | `simulate monday` | `make it Monday` |
+|---|---|---|
+| Database | throwaway copy, deleted | **the real one** (point `DB_PATH` at a `*_test.db`) |
+| Sheet | never written | **written**, to whatever `GTM_SHEET_ORIGINAL_ID` points at |
+| Approvals / undo | die with the copy | **work** — approve what it proposes, undo it after |
+| Nudge-and-drop | a single day | **climbs a rung per pretend day** |
+| The clock | one run, then gone | **persists** until you say otherwise |
+| Good for | "what will Monday look like?" | "does this actually work over three days?" |
+
+Sending goes through `_send_drip_message` — the same method the real drip uses —
+so slots are claimed, the leave check runs, and suppress-or-convert fires. A
+tester who cannot approve the thing they were just shown has not tested
+anything.
+
+> **`start over` asks first, and only the person who asked can confirm**, in the
+> channel they asked in, within `TEST_CONFIRM_SECONDS` (120). It still refuses
+> outright unless `DB_PATH` ends in `_test.db`. A stray "yes" in a conversation
+> that has moved on must never be the thing that deletes a database.
+
 ### Checking it
 
 ```bash
 python verify_simulation.py               # the model composes, as a real simulation does
 python verify_simulation.py --templates   # skip the API calls; schedule only
-python simulation.py                      # the parser, the sandbox, the gates
+python simulation.py                      # the parsers, the sandbox, the gates
+python verify_testday.py                  # "make it Monday" end to end, nothing sent
+python clock.py                           # the pretend clock's arithmetic
+python verify_news_events.py              # R1/R2/R3's web half, stubbed search
+python verify_news_events.py --live       # ...against the real API, spends budget
+python news.py                            # selection, prompts, parsing, rendering
+python events_discovery.py                # matching, windows, limits, parsing
 ```
+
+`verify_testday.py` drives `make it Monday` -> the two stops -> the footer
+against a fake channel that collects instead of sending, on a throwaway
+`*_test.db`, and asserts what a tester depends on: the run opens at 10:00 and
+again at 14:00 with the agreed wording, the footer counts the posts and names
+what rolled and what was skipped **with reasons**, **no rule code appears
+anywhere**, `start over` asks before it wipes, and every command is silent
+outside the test channel.
 
 `verify_simulation.py` drives the **real** simulation path — the real rules, the
 real sheet, the real planner — with a fake Discord channel that collects instead
@@ -3513,7 +4109,7 @@ guardrails forbid.
 | `research.py` | **research briefs**: link extraction, the domain allow-list, the bounded fetch, the LinkedIn status, and the brief prompt. Copy material only — never sent, never written |
 | `approvals.py` | **permission before every write**: reading a yes/no from a message, the Sid-wins tie-break computed from *all* the votes, and the proposal text. Pure |
 | `focus.py` | **focus commands**: parsing the command and its duration, matching a row against the focus, and the ordering R5 applies. Pure |
-| `simulation.py` | **simulation and test mode**: the command parser, the throwaway database copy, the injected clock, the leave override, the [TEST]/DM rendering, and the silent channel gate. Nearly pure — the only I/O is copying a file |
+| `simulation.py` | **simulation and test mode**: the `simulate …` parser, the throwaway database copy, the injected clock, the leave override, the [TEST]/DM rendering, and the silent channel gate — plus the **plain-language test commands** (`test help`, `make it Monday`, `next day`, `back to today`, `start over`), matched as text before any model call. Nearly pure — the only I/O is copying a file |
 | `tests/` | **the regression suite** — one class per bug that shipped and was caught by running something real, plus `test_env_example.py`, which pins the `.env.example` contract by reading every module's AST for the variables it uses. `pytest`, all offline |
 | `tone.py` | **the five tone dials**, read from the environment on every compose: the prompt block, the human touches, the enforced emoji/sentence counters, and the name-stripped opener key. Pure |
 | `websearch.py` | **the web-search tool**: its definition built from config, the per-rule queries, the safety preamble, and the three-way source recovery. Pure — responses in, parsed dicts out |
@@ -3537,7 +4133,11 @@ guardrails forbid.
 | `gtm_sheet.py` | the Sheets API layer: auth, schema discovery, cached reads, the narrow write path |
 | `mapping_sheet.py` | the researcher/buyer mapping — **read-only**: no write method, read-only scope, and the legend loaded as enforced rules |
 | `tracker.py` | the canonical tab read as a pipeline: last touch, open/engaged, the twice-weekly reminder, the playbook's six-stage funnel definition, and the week's leading/lagging metrics. **The three flags are removed** — see `nextaction.py` |
-| `deadlines.py` | IST working-day maths, cadence resolution, the announcement |
+| `clock.py` | **what time the bot thinks it is**, and the only place that decides. Real IST, or the persistent pretend clock a tester set with "make it Monday" (stored in SQLite, so it survives a restart). No dependencies but `config` |
+| `news.py` | **R1 and R2**: who to search for and in what order, the rotation's selection rule, the three prompts, story parsing and the no-repeat URL key, and how a story line is rendered. No I/O — the search is `llm.web_research`, made by bot.py |
+| `events_discovery.py` | **R3's web half**: event discovery in the current and next month, tolerant matching against what the tab already has, the per-run and per-month limits, and the registration-deadline backfill. Proposes; never writes. No I/O |
+| `gtm_sheet.write_cells_on` | a **tab-aware** single-cell write for the Events tab: allow-listed tabs, mapped columns, one cell at a time, and it **never overwrites a non-empty cell** |
+| `deadlines.py` | IST working-day maths, cadence resolution, the announcement. `today_ist()`/`now_ist()` go through `clock`, and they are the ONLY functions in the codebase that answer "what time is it" |
 | `notes.py` | syncs the Drive meeting notes into `NOTES_DIR`, filters them to the sales ones, reads those |
 | `query.py` | Discord read primitives, scoped to the sales channels |
 | `query_engine.py` | the bounded tool-use loop; holds no tools of its own |

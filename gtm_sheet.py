@@ -290,6 +290,19 @@ def is_error_value(value) -> bool:
     return str(value or "").strip().lower() in SHEET_ERROR_VALUES
 
 
+def _clock_today():
+    """Today, through the bot's clock.
+
+    A yearless date ("23 September") resolves against TODAY, so on a pretend
+    day it has to resolve against the pretend today — otherwise a tester on a
+    pretend December reads a sheet whose dates were resolved in September.
+    Imported lazily: `deadlines` imports this module's siblings and a top-level
+    import here would close the loop.
+    """
+    import clock
+    return clock.today_ist()
+
+
 def clean_cell(value) -> str:
     """A raw cell as the rest of the bot should see it: stripped, and EMPTY when
     it is a spreadsheet error. This is the single normalisation point — every
@@ -1068,7 +1081,7 @@ def parse_bare_deadline(value, *, today=None):
     month = _MONTHS.get(match.group(2).lower()[:3])
     if not month:
         return None
-    base = today or datetime.now(timezone.utc).date()
+    base = today or _clock_today()
     for year in (base.year, base.year + 1):
         try:
             candidate = date(year, month, day)
@@ -1121,7 +1134,7 @@ def _next_occurrence(month: int, day: int, today=None):
     date is written by somebody who means the one coming up, and "23 September"
     read as the current year's is in the past for three quarters of the year.
     """
-    base = today or datetime.now(timezone.utc).date()
+    base = today or _clock_today()
     for year in (base.year, base.year + 1):
         try:
             candidate = date(year, month, day)
@@ -3058,6 +3071,135 @@ class GTMSheets:
             log.error("[gtm] write failed after %d cell(s): %s", len(out["written"]), err)
             if err.remedy:
                 log.error("[gtm] ACTION REQUIRED: %s", err.remedy)
+            return out
+
+        out["ok"] = bool(out["written"])
+        return out
+
+    def write_cells_on(self, tab: "Tab", *, row: int, values: dict,
+                       reason: str = "") -> dict:
+        """Write cells on a row of a NON-canonical tab. Returns the same shape
+        as `write_cells`.
+
+        WHY A SECOND METHOD RATHER THAN A `tab=` ARGUMENT ON THE FIRST.
+        `write_cells` carries the Outreach PoCs tab's own safety furniture — the
+        restricted-band refusal (S:X is the humans' territory) and the
+        company-name interlock that proves the row is still the row somebody
+        approved. Neither has any meaning on the Events tab, and threading a tab
+        through the original would have meant `if tab is pocs` around both, with
+        the failure mode that a future caller passing another tab silently loses
+        the band check on the one tab that needs it.
+
+        SO THIS IS DELIBERATELY NARROWER: it writes to tabs on the allow-list
+        below, one named cell at a time, only into MAPPED columns, and it
+        refuses to overwrite a cell that already has something in it. That last
+        rule is what makes it safe without the interlock — this method can add a
+        fact the sheet was missing and can never replace one a human typed.
+
+        It is reachable only from an approved proposal, like every other write.
+        """
+        out: dict = {"ok": False, "written": [], "refused": [], "error": "",
+                     "dry_run": False}
+
+        # A SIMULATION NEVER WRITES, whatever else is true. Same rule and same
+        # reason as `append_row`.
+        try:
+            import simulation as _sim
+            if _sim.in_simulation():
+                out["dry_run"] = True
+        except Exception:
+            pass
+        if not config.SHEET_WRITES_ENABLED:
+            out["dry_run"] = True
+
+        if tab is None:
+            out["error"] = "there is no such tab to write to"
+            return out
+        # THE SAME ALLOW-LIST THE APPEND USES. A tab nobody said could grow is
+        # also a tab nobody said could be edited by the bot.
+        appendable = {str(t).strip().lower()
+                      for t in (config.SHEET_APPENDABLE_TABS or [])}
+        if tab.kind not in appendable:
+            out["error"] = (
+                f"{tab.title!r} ({tab.kind}) is not in SHEET_APPENDABLE_TABS, so I "
+                "will not write to it"
+            )
+            return out
+
+        current = next((r for r in tab.rows if r.get("_row") == int(row)), None)
+        if current is None:
+            out["error"] = f"row {int(row)} is not on {tab.title!r} any more"
+            return out
+
+        planned: list = []
+        for role, new_value in (values or {}).items():
+            idx = tab.role_to_col.get(role)
+            if idx is None:
+                out["refused"].append({
+                    "role": role, "column": "",
+                    "why": f"{tab.title!r} has no column mapped to {role!r}",
+                })
+                continue
+            old = clean_cell(current.get(role))
+            if old:
+                # NEVER OVERWRITE. This method exists to fill a gap the sheet
+                # has; a cell with something already in it is somebody's answer,
+                # and replacing it is a different and much riskier operation
+                # than the one that was approved.
+                out["refused"].append({
+                    "role": role, "column": _col_letter(idx),
+                    "why": (f"{_col_letter(idx)}{int(row)} already reads {old!r} — I "
+                            "only fill blanks on this tab, I never overwrite"),
+                })
+                continue
+            planned.append({
+                "role": role,
+                "column": _col_letter(idx),
+                "cell": f"{_col_letter(idx)}{int(row)}",
+                "header": tab.headers[idx] if idx < len(tab.headers) else role,
+                "old": "",
+                "new": str(new_value or "").strip(),
+            })
+
+        if not planned:
+            out["error"] = out["error"] or (
+                "; ".join(r["why"] for r in out["refused"])
+                or "nothing writable in that update"
+            )
+            return out
+
+        if out["dry_run"]:
+            out["written"] = planned
+            out["ok"] = True
+            log.info("[gtm] DRY RUN: would write %s on %s",
+                     ", ".join(p["cell"] for p in planned), tab.title)
+            return out
+
+        try:
+            sh = self._open()
+            ws = sh.worksheet(tab.title)
+            for entry in planned:
+                # One cell per call, by construction, exactly as `write_cells`
+                # does it: a bug in a range string cannot reach a neighbour.
+                ws.update(
+                    values=[[entry["new"]]],
+                    range_name=entry["cell"],
+                    value_input_option="USER_ENTERED",
+                )
+                out["written"].append(entry)
+                log.info(
+                    "[gtm] WROTE %s on %s (%s) -> %r%s",
+                    entry["cell"], tab.title, entry["header"], entry["new"],
+                    f" — {reason}" if reason else "",
+                )
+        except SheetAccessError as e:
+            out["error"] = f"{e}. {e.remedy}".strip()
+            log.error("[gtm] write failed after %d cell(s): %s", len(out["written"]), e)
+            return out
+        except Exception as e:
+            err = self._translate(e, ORIGINAL, self.sheet_id(), writing=True)
+            out["error"] = f"{err}. {err.remedy}".strip()
+            log.error("[gtm] write failed after %d cell(s): %s", len(out["written"]), err)
             return out
 
         out["ok"] = bool(out["written"])

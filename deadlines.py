@@ -34,12 +34,16 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+import clock
 import config
 
 log = logging.getLogger(__name__)
 
 # The team works in IST. Every deadline date is a CALENDAR DATE in this zone.
-IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+# DEFINED IN `clock.py` AND RE-EXPORTED HERE, so `dl.IST` still means what it
+# always did while the module that answers "what time is it" keeps no
+# dependencies of its own.
+IST = clock.IST
 
 # The kinds of deadline the bot can set, with the env knob and the human-readable
 # rule text that goes into the announcement (people accept a date far more
@@ -93,12 +97,33 @@ _ORDINAL_RE = re.compile(r"(\d{1,2})(st|nd|rd|th)\b", re.IGNORECASE)
 
 
 def today_ist() -> date:
-    """Today's calendar date in IST — the reference point for every deadline."""
-    return datetime.now(IST).date()
+    """Today's calendar date in IST — the reference point for every deadline.
+
+    THROUGH `clock`, which is what makes a pretend day real. A tester who says
+    "make it Monday" needs Monday to reach every rule, every sweep, every
+    deadline and every "three days ago" — and the only way to be sure it does
+    is for there to be ONE function that answers this question. This is it;
+    `datetime.now(IST)` appears nowhere else. On a live bot the pretend clock
+    is never set and this is `datetime.now(IST)` with one dict lookup in front.
+    """
+    return clock.today_ist()
 
 
 def now_ist() -> datetime:
-    return datetime.now(IST)
+    return clock.now_ist()
+
+
+def real_today_ist() -> date:
+    """The ACTUAL date, ignoring any pretend clock.
+
+    For the few things that are about the machine rather than about the work:
+    how long the process has been up, when a log line was written.
+    """
+    return clock.real_today_ist()
+
+
+def real_now_ist() -> datetime:
+    return clock.real_now_ist()
 
 
 def is_working_day(d: date) -> bool:

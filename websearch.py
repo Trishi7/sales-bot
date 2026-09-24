@@ -202,12 +202,24 @@ def enabled() -> bool:
     return bool(config.WEB_SEARCH_ENABLED)
 
 
-def tool_definition(*, max_uses: Optional[int] = None) -> dict:
+def tool_definition(*, max_uses: Optional[int] = None,
+                    only_domains: Optional[list] = None) -> dict:
     """The `tools` entry for one call. Shaped by config, never hard-coded.
 
     `allowed_domains` and `blocked_domains` are MUTUALLY EXCLUSIVE — the API
     returns a 400 when both are present — so only one is ever attached and the
     allow-list wins when somebody has set both. Bare domains, no scheme.
+
+    `only_domains` NARROWS ONE CALL and never widens it. R1's first pass asks
+    for its preferred sites (NEWS_PREFERRED_DOMAINS) and falls back to an open
+    search when that comes back thin, so this has to be a per-call argument
+    rather than a config read — the same process makes both calls, seconds
+    apart.
+
+    IT INTERSECTS WITH THE CONFIGURED ALLOW-LIST RATHER THAN REPLACING IT. If an
+    operator has restricted the whole bot to a set of domains, a caller's
+    preference cannot reach outside it: a preference is about taste, and
+    WEB_SEARCH_ALLOWED_DOMAINS is about policy.
     """
     tool: dict = {
         "type": str(config.WEB_SEARCH_TOOL_TYPE).strip(),
@@ -216,6 +228,20 @@ def tool_definition(*, max_uses: Optional[int] = None) -> dict:
     }
 
     allowed = [d for d in (config.WEB_SEARCH_ALLOWED_DOMAINS or []) if str(d).strip()]
+    narrow = [str(d).strip() for d in (only_domains or []) if str(d).strip()]
+    if narrow:
+        if allowed:
+            keep = [d for d in narrow if d in set(allowed)]
+            if not keep:
+                log.warning(
+                    "[websearch] the caller asked for %d domain(s), none of which are "
+                    "in WEB_SEARCH_ALLOWED_DOMAINS. Using the configured allow-list — "
+                    "a caller's preference cannot reach outside the operator's policy.",
+                    len(narrow),
+                )
+            allowed = keep or allowed
+        else:
+            allowed = narrow
     blocked = [d for d in (config.WEB_SEARCH_BLOCKED_DOMAINS or []) if str(d).strip()]
     if allowed and blocked:
         log.warning(
@@ -252,6 +278,36 @@ def tool_definition(*, max_uses: Optional[int] = None) -> dict:
     if config.WEB_SEARCH_ALLOWED_CALLERS:
         tool["allowed_callers"] = list(config.WEB_SEARCH_ALLOWED_CALLERS)
     return tool
+
+
+# Sites that block Anthropic's crawler. Naming one in `allowed_domains` is a
+# 400 on the WHOLE request, not a thinner result — so the error has to be read
+# rather than the failure absorbed. The API spells them out; this pulls them
+# back out of the message.
+_INACCESSIBLE_RE = re.compile(
+    r"following domains are not accessible[^\[]*\[([^\]]*)\]", re.IGNORECASE
+)
+_QUOTED_RE = re.compile(r"['\"]([^'\"]+)['\"]")
+
+
+def inaccessible_domains(error) -> set:
+    """The domains an API error says block the crawler. Empty when it says none.
+
+    WHY PARSE AN ERROR MESSAGE. The alternative is a hard-coded block-list, and
+    that is wrong within a quarter: sites change their robots.txt, and no
+    operator is tracking which ones let Anthropic's crawler in. Reading the
+    error means the preferred-domain list self-heals — a newly blocking site
+    costs one retry and a warning, not a broken rule.
+
+    DELIBERATELY FORGIVING. Anything it cannot parse comes back as an empty set
+    and the caller treats the error as an ordinary failure, which is what it was
+    before this existed.
+    """
+    text = str(error or "")
+    m = _INACCESSIBLE_RE.search(text)
+    if not m:
+        return set()
+    return {d.strip().lower() for d in _QUOTED_RE.findall(m.group(1)) if d.strip()}
 
 
 def searches_used(response) -> int:

@@ -26,6 +26,15 @@
 #                       reusing it.
 #   name                what a human calls it. Shown in `cadence preview` and
 #                       in the "why" line of every item the rule produces.
+#   plain               OPTIONAL. The rule in words somebody outside the team
+#                       would follow, used wherever the bot speaks to a person.
+#                       IDS NEVER GO TO USERS: "R6" means nothing to anybody who
+#                       has not read this file, so every outbound message has its
+#                       ids swapped for this line (rules.render_for_user). The id
+#                       still appears in the log and in `cadence preview`, which
+#                       is where somebody is deliberately looking at the
+#                       machinery. Omitted, it falls back to the wording in
+#                       rules.PLAIN_BY_TRIGGER for that trigger.
 #   weekdays            which days it may run, as three-letter names
 #                       (mon tue wed thu fri sat sun). An EMPTY list means the
 #                       rule never runs on a schedule — R8 and R9 are anchored
@@ -68,6 +77,7 @@ rules:
   # AI regulation and compliance updates.
   - id: R1
     name: AI news
+    plain: today's AI news worth reading
     weekdays: [mon, tue, wed, thu, fri]
     trigger: ai_news
     max_items_per_post: 5
@@ -81,6 +91,7 @@ rules:
   # added to the sheet — the bot never adds a row on its own.
   - id: R2
     name: News-company screen
+    plain: companies in the news that aren't in the pipeline yet
     weekdays: [tue, fri]
     trigger: news_company_screen
     max_items_per_post: 5
@@ -95,6 +106,7 @@ rules:
   # passed are skipped.
   - id: R3
     name: AI events and summits
+    plain: AI events and summits coming up
     weekdays: [wed]
     trigger: events
     max_items_per_post: 5
@@ -108,6 +120,7 @@ rules:
   # Dependency cell; blank means Vaishnavi.
   - id: R4
     name: Deliverables checklist
+    plain: deliverables due or overdue
     weekdays: [mon]
     trigger: deliverables
     max_items_per_post: 5
@@ -123,6 +136,7 @@ rules:
   # comes up three times with no update, ask whether to skip it.
   - id: R5
     name: Prospects to contact
+    plain: people we haven't made first contact with
     weekdays: [tue, thu]
     trigger: prospects
     max_items_per_post: 5
@@ -136,6 +150,7 @@ rules:
   # where it was found, or that none was.
   - id: R6
     name: LinkedIn connected, no DM
+    plain: people connected on LinkedIn with no DM yet
     weekdays: [tue, fri]
     trigger: li_no_dm
     max_items_per_post: 5
@@ -148,6 +163,7 @@ rules:
   # logged against that contact.
   - id: R7
     name: DM sent, no meeting
+    plain: people we DM'd who haven't booked a meeting
     weekdays: [mon]
     trigger: dm_no_meeting
     max_items_per_post: 5
@@ -166,6 +182,7 @@ rules:
   # crowded out by a Monday chase.
   - id: R8
     name: Meeting preparation
+    plain: meetings coming up that need prep
     weekdays: []
     trigger: meeting_prep
     max_items_per_post: 3
@@ -184,6 +201,7 @@ rules:
   # at. See the DM note at the bottom of this file.
   - id: R9
     name: Meeting done, no next steps
+    plain: meetings that happened with no next steps recorded
     weekdays: []
     trigger: meeting_followup
     max_items_per_post: 3
@@ -198,6 +216,7 @@ rules:
   # agreed to. Asks what is needed for the next stage and shares relevant news.
   - id: R10
     name: Closure support
+    plain: deals close enough to push over the line
     weekdays: [mon]
     trigger: closure_support
     max_items_per_post: 5
@@ -217,6 +236,7 @@ rules:
   # before anything is added to Outreach PoCs.
   - id: R11
     name: New company in Master Pipeline
+    plain: companies that just appeared in the pipeline
     weekdays: [mon, tue, wed, thu, fri]
     trigger: new_pipeline_company
     max_items_per_post: 3
@@ -230,6 +250,7 @@ rules:
   # gtm_sheet.ready_flag for why that direction and not the other.
   - id: R12
     name: Sales packages
+    plain: sales packages that aren't ready yet
     weekdays: [thu]
     trigger: sales_packages
     max_items_per_post: 5

@@ -684,6 +684,104 @@ CREATE TABLE IF NOT EXISTS meeting_followups (
     meeting_date TEXT NOT NULL DEFAULT '',
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- R1: WHO HAS BEEN SEARCHED FOR, AND WHEN.
+--
+-- THE ROTATION LEDGER. R1 searches for our own people first, and there are far
+-- more of them than one day's search budget can carry — several hundred PoCs,
+-- the researcher mapping, every company in the Master Pipeline. Taking the
+-- first eight off the sheet each day would mean the ninth is never searched at
+-- all, so the least-recently-searched come up first and everybody comes round.
+--
+-- ONE ROW PER TARGET, keyed on a normalised name so a spelling change in the
+-- sheet does not reset somebody's turn. `last_searched` is the ordering key and
+-- is empty for a target that has never been searched — which sorts first, so a
+-- newly added PoC is picked up on the next run rather than last.
+--
+-- `kind` is poc | researcher | company, which is also the priority order the
+-- selector uses before falling back to least-recently-searched.
+CREATE TABLE IF NOT EXISTS news_targets (
+    target_key    TEXT PRIMARY KEY,   -- normalised name + kind
+    kind          TEXT NOT NULL,      -- poc | researcher | company
+    name          TEXT NOT NULL,      -- as the sheet spells it
+    company       TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT '',   -- which tab the row came from
+    sheet_row     INTEGER,
+    last_searched TEXT NOT NULL DEFAULT '',   -- ISO date, '' = never
+    searches      INTEGER NOT NULL DEFAULT 0,
+    hits          INTEGER NOT NULL DEFAULT 0, -- runs that found something
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_news_targets_turn
+    ON news_targets(last_searched ASC, kind ASC);
+
+-- R1: WHAT HAS ALREADY BEEN POSTED.
+--
+-- KEYED ON A NORMALISED URL, not on the title. The same funding round is
+-- reported by four outlets with four headlines and often the same canonical
+-- link; and the same outlet re-runs its own piece with utm parameters attached.
+-- `url_key` strips the scheme, "www.", the query string and any trailing slash,
+-- so those collapse to one row. The title is kept for the log and for the
+-- report, never for matching.
+--
+-- WHY A TABLE AND NOT A WINDOW OVER `drip_sends`: a story's identity is its
+-- URL, and the sent message is prose. There is nothing in a sent message to
+-- match a tomorrow's search result against.
+CREATE TABLE IF NOT EXISTS news_stories (
+    url_key    TEXT PRIMARY KEY,
+    url        TEXT NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    about      TEXT NOT NULL DEFAULT '',   -- the person/company it concerned
+    rule_id    TEXT NOT NULL DEFAULT '',
+    mode       TEXT NOT NULL DEFAULT '',   -- people | field
+    posted_on  TEXT NOT NULL,              -- ISO date
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_news_stories_date ON news_stories(posted_on);
+
+-- R3: EVENTS THE BOT HAS PROPOSED ADDING.
+--
+-- COUNTED SO THE PROPOSALS STAY RARE — EVENTS_DISCOVERY_MAX_PER_RUN and
+-- EVENTS_DISCOVERY_MAX_PER_MONTH both read this table. It also doubles as the
+-- "already proposed" check: an event somebody declined must not come back next
+-- fortnight as a fresh discovery, because a proposal nobody accepted is an
+-- answer and re-asking it is nagging.
+--
+-- KEYED ON NAME + DATE, normalised, which is the same key the "is it already on
+-- the tab" check uses. Two events with the same name in different months are
+-- two events; the same event spelled two ways in the same month is one.
+CREATE TABLE IF NOT EXISTS event_discoveries (
+    event_key   TEXT PRIMARY KEY,   -- normalised name + ISO date
+    name        TEXT NOT NULL,
+    event_date  TEXT NOT NULL DEFAULT '',
+    location    TEXT NOT NULL DEFAULT '',
+    link        TEXT NOT NULL DEFAULT '',
+    proposed_on TEXT NOT NULL,      -- ISO date
+    month       TEXT NOT NULL,      -- YYYY-MM, for the monthly cap
+    status      TEXT NOT NULL DEFAULT 'proposed',  -- proposed | added | declined
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_event_discoveries_month ON event_discoveries(month);
+
+-- R3: REGISTRATION DEADLINES THE BOT LOOKED FOR AND DID NOT FIND.
+--
+-- "I couldn't find the registration deadline for X" is worth saying ONCE.
+-- Saying it every other Wednesday about the same six events is how a useful
+-- report becomes one people stop reading, and the answer rarely changes inside
+-- a fortnight — so a miss is recorded here and not re-asked for
+-- EVENTS_DEADLINE_RECHECK_DAYS.
+--
+-- ONLY MISSES ARE RECORDED. A deadline that was found is written to the sheet,
+-- and the sheet is then the answer; a row here for a found deadline would be a
+-- second copy of a fact that can change.
+CREATE TABLE IF NOT EXISTS event_deadline_checks (
+    event_key    TEXT PRIMARY KEY,   -- normalised name + ISO date
+    name         TEXT NOT NULL,
+    last_checked TEXT NOT NULL,      -- ISO date
+    attempts     INTEGER NOT NULL DEFAULT 1,
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -2587,6 +2685,270 @@ class DB:
                 (str(offer or ""), str(on_date), int(slot)),
             )
         return bool(cur.rowcount)
+
+    # -- R1: the news rotation ---------------------------------------------
+    #
+    # WHY A ROTATION AT ALL. R1 is supposed to search for OUR people, and there
+    # are several hundred of them across the three sheets. One day's search
+    # budget carries eight. Taking the first eight off the sheet every day would
+    # mean the ninth person is never searched once, ever — so whose turn it is
+    # has to be a fact in the database rather than an accident of sheet order.
+
+    def sync_news_targets(self, targets: list) -> int:
+        """Add any target we have not seen. Returns how many were new.
+
+        UPSERT THAT LEAVES `last_searched` ALONE. A person's turn in the
+        rotation survives their row being edited, re-sorted or re-typed in the
+        sheet: only the display fields are refreshed. Resetting the clock on an
+        edit would let a frequently-edited row monopolise the rotation.
+
+        Targets that have LEFT are not removed here — see `drop_news_targets`.
+        """
+        rows = [
+            (str(t["target_key"]), str(t.get("kind") or "company"),
+             str(t.get("name") or ""), str(t.get("company") or ""),
+             str(t.get("source") or ""), t.get("sheet_row"))
+            for t in (targets or []) if str(t.get("target_key") or "").strip()
+        ]
+        if not rows:
+            return 0
+        with self.conn() as c:
+            before = c.execute("SELECT COUNT(*) AS n FROM news_targets").fetchone()["n"]
+            c.executemany(
+                "INSERT INTO news_targets "
+                "(target_key, kind, name, company, source, sheet_row) "
+                "VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(target_key) DO UPDATE SET "
+                "  name = excluded.name, company = excluded.company, "
+                "  source = excluded.source, sheet_row = excluded.sheet_row",
+                rows,
+            )
+            after = c.execute("SELECT COUNT(*) AS n FROM news_targets").fetchone()["n"]
+        new = max(0, after - before)
+        if new:
+            log.info("[news] %d new search target(s); %d tracked in total", new, after)
+        return new
+
+    def drop_news_targets(self, keys: list) -> int:
+        """Remove targets that should never be searched again.
+
+        The departures list is the reason this exists: somebody who has left is
+        not news we want, and leaving them in the rotation would spend a search
+        on them every few weeks forever.
+        """
+        keys = [str(k) for k in (keys or []) if str(k or "").strip()]
+        if not keys:
+            return 0
+        with self.conn() as c:
+            cur = c.executemany(
+                "DELETE FROM news_targets WHERE target_key = ?", [(k,) for k in keys]
+            )
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(keys)
+
+    def news_targets_due(self, *, limit: int, kinds: tuple = ()) -> list[dict]:
+        """The least-recently-searched targets, oldest first.
+
+        NEVER-SEARCHED FIRST, because `last_searched` is '' for those and the
+        empty string sorts before any ISO date. A PoC added to the sheet this
+        morning is therefore picked up on the next run rather than after
+        everybody else has had a turn.
+
+        `kinds` restricts to poc / researcher / company. The caller asks for the
+        priority tiers in order rather than this method knowing the policy.
+        """
+        sql = "SELECT * FROM news_targets"
+        params: list = []
+        if kinds:
+            sql += " WHERE kind IN (" + ",".join("?" * len(kinds)) + ")"
+            params.extend([str(k) for k in kinds])
+        sql += " ORDER BY last_searched ASC, searches ASC, name ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self.conn() as c:
+            return [dict(r) for r in c.execute(sql, params).fetchall()]
+
+    def mark_news_targets_searched(self, keys: list, *, on_date: str,
+                                   hit_keys: tuple = ()) -> None:
+        """Stamp a run against these targets, whether or not it found anything.
+
+        A SEARCH THAT FOUND NOTHING STILL COUNTS AS A TURN. If only hits moved
+        the clock, somebody nobody writes about would be searched every single
+        run forever — and the whole point of the rotation is that the budget
+        goes round.
+
+        `hit_keys` additionally bumps `hits`, which is diagnostic only: it is
+        how you notice that a third of the rotation never produces anything.
+        """
+        marker = str(on_date)
+        hits = {str(k) for k in (hit_keys or ())}
+        with self.conn() as c:
+            c.executemany(
+                "UPDATE news_targets SET last_searched = ?, searches = searches + 1, "
+                "hits = hits + ? WHERE target_key = ?",
+                [(marker, 1 if str(k) in hits else 0, str(k)) for k in (keys or [])],
+            )
+
+    def news_rotation_status(self) -> dict:
+        """{tracked, never_searched, oldest} — for the log and `cadence preview`."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS tracked, "
+                "  SUM(CASE WHEN last_searched = '' THEN 1 ELSE 0 END) AS never, "
+                "  MIN(NULLIF(last_searched, '')) AS oldest FROM news_targets"
+            ).fetchone()
+        return {
+            "tracked": int(row["tracked"] or 0),
+            "never_searched": int(row["never"] or 0),
+            "oldest": str(row["oldest"] or ""),
+        }
+
+    # -- R1: stories already posted ----------------------------------------
+
+    def news_story_seen(self, url_key: str, *, since_iso: str) -> bool:
+        """Has this story been posted since `since_iso`? FAILS CLOSED.
+
+        An unreadable table reports "yes, seen" and the story is skipped. The
+        cost of failing this way is one story missed; the cost of the other way
+        is the same story posted every day until somebody notices, which is the
+        failure this table exists to prevent.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT 1 FROM news_stories WHERE url_key = ? AND posted_on >= ? "
+                    "LIMIT 1", (str(url_key), str(since_iso)),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            log.exception("[news] could not check whether a story was already posted; "
+                          "treating it as seen")
+            return True
+
+    def record_news_stories(self, stories: list, *, on_date: str,
+                            rule_id: str = "", mode: str = "") -> int:
+        """Remember what went out. Returns how many were newly recorded."""
+        rows = [
+            (str(s["url_key"]), str(s.get("url") or ""), str(s.get("title") or "")[:300],
+             str(s.get("about") or "")[:200], str(rule_id), str(mode), str(on_date))
+            for s in (stories or []) if str(s.get("url_key") or "").strip()
+        ]
+        if not rows:
+            return 0
+        with self.conn() as c:
+            cur = c.executemany(
+                "INSERT OR IGNORE INTO news_stories "
+                "(url_key, url, title, about, rule_id, mode, posted_on) "
+                "VALUES (?,?,?,?,?,?,?)", rows,
+            )
+            return max(0, cur.rowcount or 0)
+
+    def news_stories_posted(self, *, since_iso: str) -> int:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM news_stories WHERE posted_on >= ?",
+                (str(since_iso),),
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    # -- R3: discovered events ---------------------------------------------
+
+    def event_discovery_seen(self, event_key: str) -> Optional[dict]:
+        """Has this event already been proposed? The row, or None.
+
+        A DECLINED PROPOSAL IS AN ANSWER. An event somebody said no to must not
+        come back a fortnight later as a fresh discovery — that is not a
+        reminder, it is nagging, and it teaches people to ignore the message.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT * FROM event_discoveries WHERE event_key = ?",
+                    (str(event_key),),
+                ).fetchone()
+            return dict(row) if row else None
+        except Exception:
+            log.exception("[events] could not read the discovery ledger")
+            return {"status": "unknown"}          # fails closed: do not re-propose
+
+    def record_event_discoveries(self, events: list, *, on_date: str,
+                                 month: str) -> int:
+        rows = [
+            (str(e["event_key"]), str(e.get("name") or ""),
+             str(e.get("event_date") or ""), str(e.get("location") or ""),
+             str(e.get("link") or ""), str(on_date), str(month))
+            for e in (events or []) if str(e.get("event_key") or "").strip()
+        ]
+        if not rows:
+            return 0
+        with self.conn() as c:
+            cur = c.executemany(
+                "INSERT OR IGNORE INTO event_discoveries "
+                "(event_key, name, event_date, location, link, proposed_on, month) "
+                "VALUES (?,?,?,?,?,?,?)", rows,
+            )
+            return max(0, cur.rowcount or 0)
+
+    def set_event_discovery_status(self, event_key: str, status: str) -> None:
+        with self.conn() as c:
+            c.execute(
+                "UPDATE event_discoveries SET status = ? WHERE event_key = ?",
+                (str(status), str(event_key)),
+            )
+
+    def event_discoveries_this_month(self, month: str) -> int:
+        """How many have been proposed in `month` (YYYY-MM). FAILS CLOSED HIGH.
+
+        An unreadable table returns the cap, so discovery stays quiet rather
+        than proposing without a limit.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM event_discoveries WHERE month = ?",
+                    (str(month),),
+                ).fetchone()
+            return int(row["n"] or 0)
+        except Exception:
+            log.exception("[events] could not count this month's discoveries")
+            return 10 ** 6
+
+    # -- R3: registration deadlines we could not find ----------------------
+
+    def deadline_recently_checked(self, event_key: str, *, since_iso: str) -> bool:
+        """Did we already look for this deadline and fail, recently?
+
+        FAILS CLOSED — an unreadable table means "yes, recently", so the bot
+        stays quiet rather than asking about the same six events fortnightly.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT 1 FROM event_deadline_checks WHERE event_key = ? "
+                    "AND last_checked >= ? LIMIT 1",
+                    (str(event_key), str(since_iso)),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            log.exception("[events] could not read the deadline-check ledger")
+            return True
+
+    def record_deadline_miss(self, *, event_key: str, name: str, on_date: str,
+                             note: str = "") -> None:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO event_deadline_checks "
+                "(event_key, name, last_checked, note) VALUES (?,?,?,?) "
+                "ON CONFLICT(event_key) DO UPDATE SET "
+                "  last_checked = excluded.last_checked, "
+                "  attempts = event_deadline_checks.attempts + 1, "
+                "  note = excluded.note",
+                (str(event_key), str(name), str(on_date), str(note)[:300]),
+            )
+
+    def clear_deadline_miss(self, event_key: str) -> None:
+        """The deadline turned up — stop remembering that it did not."""
+        with self.conn() as c:
+            c.execute("DELETE FROM event_deadline_checks WHERE event_key = ?",
+                      (str(event_key),))
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.conn() as c:

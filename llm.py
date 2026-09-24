@@ -52,6 +52,7 @@ from persona import (
     SOCIAL_REPLY_PROMPT,
     fallback_capability_reply,
     fallback_social_reply,
+    model_failure_reply,
 )
 
 log = logging.getLogger(__name__)
@@ -330,12 +331,21 @@ class LLM:
                 prompt=prompt,
                 max_tokens=250,
             )
-        except Exception:
-            log.exception("[llm.social] call raised; using deterministic fallback")
-            return fallback_social_reply(kind, requester or "")
+        except Exception as e:
+            # A RAISED CALL IS NEVER "I'm not sure what you're after". That line
+            # tells the person their message was unclear; the truth is that the
+            # bot never read it. See `persona.model_failure_reply`.
+            log.error(
+                "[llm.social] the model call raised %s: %s. Replying that the "
+                "service is down rather than blaming the question.",
+                type(e).__name__, str(e)[:300], exc_info=True,
+            )
+            return model_failure_reply(type(e).__name__)
 
         reply = _text_of(resp)
         if not reply:
+            # The call SUCCEEDED and produced nothing, which is the one case
+            # the "not sure" line is honest for.
             log.warning("[llm.social] empty reply; using deterministic fallback")
             return fallback_social_reply(kind, requester or "")
         return reply
@@ -495,7 +505,8 @@ class LLM:
         return out
 
     async def web_research(self, *, rule: str, prompt: str,
-                           max_uses: int = 0) -> dict:
+                           max_uses: int = 0,
+                           only_domains: Optional[list] = None) -> dict:
         """Run ONE web-search call for a rule. Returns what websearch parsed.
 
         {"ok", "text", "sources", "searches", "errors", "note"} — and `ok` is
@@ -517,6 +528,10 @@ class LLM:
         NO BUDGET CHECK HERE. The caller owns the ledger (it is a database
         write, and this class is not the place for one); this method reports
         what was billed and the caller banks it.
+
+        `only_domains` NARROWS THIS ONE CALL — R1's preferred-sites pass. It
+        can never widen past WEB_SEARCH_ALLOWED_DOMAINS; see
+        `websearch.tool_definition`.
         """
         import websearch
 
@@ -528,30 +543,70 @@ class LLM:
                 ),
             }
 
-        tool = websearch.tool_definition(max_uses=max_uses or None)
+        tool = websearch.tool_definition(max_uses=max_uses or None,
+                                         only_domains=only_domains)
         system = (
             websearch.SAFETY_PREAMBLE
             + "\n\n"
             + persona.system_preamble(include_sources=False)
         )
-        try:
-            resp = await asyncio.to_thread(
+        async def _call(t):
+            return await asyncio.to_thread(
                 self._client.messages.create,
                 model=self._model,
                 max_tokens=4000,
                 system=system,
-                tools=[tool],
+                tools=[t],
                 messages=[{"role": "user", "content": prompt}],
             )
+
+        try:
+            resp = await _call(tool)
         except Exception as e:
-            log.exception("[websearch] the %s search call raised", rule)
-            return {
-                "ok": False, "text": "", "sources": [], "searches": 0,
-                "errors": [{"code": type(e).__name__, "why": str(e)[:200]}],
-                "note": websearch.unavailable_note(
-                    f"the search call failed ({type(e).__name__})"
-                ),
-            }
+            # SOME SITES BLOCK ANTHROPIC'S CRAWLER, and naming one in
+            # `allowed_domains` is a 400 that kills the WHOLE call — not a
+            # thinner result, no result. Reuters, the WSJ, The Verge and Ars
+            # Technica were all in the shipped NEWS_PREFERRED_DOMAINS, so R1's
+            # preferred pass failed every single time and the feature limped
+            # along on its fallback.
+            #
+            # THE ERROR NAMES THEM, so drop exactly those and go again. A static
+            # block-list would be wrong within a quarter — sites change their
+            # robots.txt, and an operator cannot be expected to track it. The
+            # dropped domains are logged at WARNING so the .env can be pruned,
+            # but nothing breaks until somebody gets round to it.
+            blocked = websearch.inaccessible_domains(e)
+            retried = False
+            if blocked and tool.get("allowed_domains"):
+                keep = [d for d in tool["allowed_domains"]
+                        if d.lower() not in blocked]
+                log.warning(
+                    "[websearch] %s: %d preferred domain(s) block the search "
+                    "crawler and were refused by the API (%s). Retrying without "
+                    "them%s. Remove them from NEWS_PREFERRED_DOMAINS to save the "
+                    "round trip.",
+                    rule, len(blocked), ", ".join(sorted(blocked)),
+                    f" ({len(keep)} left)" if keep else " (searching openly)",
+                )
+                retry = dict(tool)
+                if keep:
+                    retry["allowed_domains"] = keep
+                else:
+                    retry.pop("allowed_domains", None)
+                try:
+                    resp = await _call(retry)
+                    retried = True
+                except Exception as again:
+                    e = again
+            if not retried:
+                log.exception("[websearch] the %s search call raised", rule)
+                return {
+                    "ok": False, "text": "", "sources": [], "searches": 0,
+                    "errors": [{"code": type(e).__name__, "why": str(e)[:200]}],
+                    "note": websearch.unavailable_note(
+                        f"the search call failed ({type(e).__name__})"
+                    ),
+                }
 
         parsed = websearch.parse_results(resp)
 
@@ -639,8 +694,16 @@ class LLM:
                 prompt=prompt,
                 max_tokens=600,
             )
-        except Exception:
-            log.exception("[llm.capability] call raised; using deterministic fallback")
+        except Exception as e:
+            # The fallback here IS a real answer — it is built from the same live
+            # source statuses without a model — so it stands. The class is
+            # logged at ERROR either way, because a capability answer that
+            # quietly stopped using the model is still a service failure.
+            log.error(
+                "[llm.capability] the model call raised %s: %s. Answering from the "
+                "live source statuses instead.",
+                type(e).__name__, str(e)[:300], exc_info=True,
+            )
             return fallback_capability_reply()
 
         reply = _text_of(resp)

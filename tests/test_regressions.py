@@ -562,3 +562,93 @@ class TestProposalSweep:
         import deadlines as dl
         monday = date(2026, 9, 21)
         assert dl.subtract_working_days(monday, 1) == date(2026, 9, 18)
+
+
+# --------------------------------------------------------------------------
+# 8. Rule ids never reach a person
+# --------------------------------------------------------------------------
+
+class TestRuleIdsNeverReachAPerson:
+    """THE BUG: the `cadence_preview` tool hands the model its output keyed by
+    rule id — "R1", "R6", "R11" — and the model, reasonably, repeated them
+    straight back into the sales channel. "R6: 4 items" means nothing to
+    anybody who has not read bot_rules.yaml, and an answer that opens with a
+    code the reader cannot decode teaches them to skim the rest.
+
+    THE RULE: ids are an internal key. They belong in the log and in `cadence
+    preview`, where somebody deliberately asked to see the machinery, and
+    nowhere else. `rules.render_for_user` is the translation and
+    `guardrails._for_people` is the one place every outbound body passes
+    through, so a composer cannot forget to call it.
+    """
+
+    def test_a_bare_id_becomes_words(self):
+        import rules
+        assert rules.render_for_user("R6") == (
+            "people connected on LinkedIn with no DM yet"
+        )
+
+    def test_an_id_with_its_own_name_is_replaced_as_one_thing(self):
+        """"R6 LinkedIn connected, no DM" is ONE heading, not two.
+
+        Replacing only the id would leave the name behind and read as two
+        different things where there is one.
+        """
+        import rules
+        got = rules.render_for_user("R6 LinkedIn connected, no DM: 4 items")
+        assert got == "people connected on LinkedIn with no DM yet: 4 items"
+
+    def test_several_ids_in_a_sentence(self):
+        import rules
+        got = rules.render_for_user("Today R1 has 3 and R6 has 4.")
+        assert "R1" not in got and "R6" not in got
+        assert "today's AI news worth reading" in got
+        assert "people connected on LinkedIn with no DM yet" in got
+
+    def test_an_unknown_id_is_removed_not_echoed(self):
+        """An id we cannot explain is one the reader definitely cannot."""
+        import rules
+        got = rules.render_for_user("R99 is not a rule")
+        assert "R99" not in got
+
+    def test_nothing_matching_the_pattern_survives(self):
+        """The backstop: whatever the two passes leave, the pattern catches."""
+        import re
+        import rules
+        for text in (
+            "R1 AI news and R12 Sales packages",
+            "see R8, then R9, then R10",
+            "R7",
+        ):
+            assert not re.search(r"\bR\d{1,2}\b", rules.render_for_user(text)), text
+
+    def test_ordinary_text_is_left_alone(self):
+        import rules
+        for text in ("no codes here at all", "", "Rico at Realm raised a round"):
+            assert rules.render_for_user(text) == text
+
+    def test_every_loaded_rule_has_words_of_its_own(self):
+        """A rule with no plain description would render as nothing at all."""
+        import rules
+        for rule in rules.safe_load():
+            assert rule.plain.strip(), f"{rule.id} has no plain description"
+            assert rules.plain_description(rule.id) == rule.plain
+
+    def test_the_outbound_hook_strips_by_default(self):
+        """`guardrails._for_people` is on the only path into Discord."""
+        import guardrails
+        assert "R6" not in guardrails._for_people("R6 has 4 waiting")
+
+    def test_the_outbound_hook_keeps_ids_when_asked(self):
+        """`cadence preview` asked for the machinery; it gets the machinery."""
+        import guardrails
+        assert "R6" in guardrails._for_people("R6 has 4 waiting", keep_rule_ids=True)
+
+    def test_the_cadence_preview_tool_hands_over_the_words(self):
+        """The model is GIVEN the plain wording, so an ordinary answer can be
+        written without codes rather than relying on the outbound strip to
+        tidy up after it."""
+        import rules
+        words = {r.id: r.plain for r in rules.safe_load()}
+        assert words.get("R6") == "people connected on LinkedIn with no DM yet"
+        assert len(words) == 12

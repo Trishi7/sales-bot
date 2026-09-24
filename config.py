@@ -407,6 +407,48 @@ SIMULATION_PREFIX = (
     os.getenv("SIMULATION_PREFIX", "") or ""
 ).strip() or "[TEST]"
 
+# -- THE PLAIN-LANGUAGE TEST RUN ----------------------------------------------
+#
+# These govern the "make it Monday" path, which is a different thing from the
+# simulations above: the clock is PERSISTENT, the database is the REAL one and
+# the writes are REAL. See clock.py and simulation.parse_test_command.
+
+# The gap between two posts in a test run, in seconds. A test day is watched by
+# somebody sitting there, so the real 90-minute spacing is compressed — but not
+# to nothing: the posts have to arrive one at a time and in an order a person
+# can follow, and a burst of six is the thing this number exists to prevent.
+TEST_POST_GAP_SECONDS = _int("TEST_POST_GAP_SECONDS", 20)
+
+# How long a "start over" confirmation stays open, in seconds. Short, because a
+# stray "yes" in a conversation that has moved on must never be the thing that
+# deletes a database.
+TEST_CONFIRM_SECONDS = _int("TEST_CONFIRM_SECONDS", 120)
+
+# WHERE THE CLOCK STANDS FOR EACH HALF OF A TEST DAY, "HH:MM" IST.
+#
+# TWO STOPS, NOT ONE, because the real day has two. The meeting-prep day-of
+# touch is fixed at MEETING_DAYOF_TIME and lands outside the posting window;
+# everything else waits for SALES_DRIP_START. Standing at one time would mean
+# either the morning items never came due or the afternoon ones all did at
+# once, and in both cases the tester would be watching a day that does not
+# happen.
+TEST_MORNING_TIME = (os.getenv("TEST_MORNING_TIME", "") or "").strip() or "10:00"
+TEST_AFTERNOON_TIME = (os.getenv("TEST_AFTERNOON_TIME", "") or "").strip() or "14:00"
+
+
+def test_morning_ist() -> tuple[int, int]:
+    """TEST_MORNING_TIME as (hour, minute) IST. Unreadable falls back to 10:00."""
+    import digest as _digest
+
+    return _digest.parse_time(TEST_MORNING_TIME, default="10:00")
+
+
+def test_afternoon_ist() -> tuple[int, int]:
+    """TEST_AFTERNOON_TIME as (hour, minute) IST. Unreadable falls back to 14:00."""
+    import digest as _digest
+
+    return _digest.parse_time(TEST_AFTERNOON_TIME, default="14:00")
+
 # Now that the id exists, put it in scope.
 _attach_test_channel()
 
@@ -1565,6 +1607,78 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 # than "odd ISO weeks" because the team picked a date, and an ISO-week parity
 # rule silently flips its meaning in any year with 53 weeks.
 EVENTS_ANCHOR_DATE = (os.getenv("EVENTS_ANCHOR_DATE", "2026-09-23") or "").strip()
+
+# -- R1 NEWS: WHO TO SEARCH FOR, AND WHAT COUNTS ------------------------------
+#
+# R1 searches for OUR PEOPLE FIRST and the wider field only as a fallback. News
+# about somebody already on our sheets is something the team can act on this
+# week; a bigger story about a stranger is reading material.
+#
+# ROTATION, because the budget cannot carry everyone. Searching every PoC,
+# researcher and pipeline company daily is impossible inside
+# WEB_SEARCH_DAILY_BUDGET, and searching the same eight every day would mean the
+# ninth person is never searched at all. So a last-searched date is kept per
+# person and company in SQLite and the LEAST RECENTLY SEARCHED come up first —
+# everybody comes round, and the order is a fact in the database rather than an
+# accident of sheet order.
+
+# How many people/companies one R1 run searches for. Eight fits a single search
+# call's query comfortably; raising it makes each query longer and vaguer rather
+# than making the run find more.
+NEWS_PEOPLE_PER_RUN = _int("NEWS_PEOPLE_PER_RUN", 8)
+
+# The most stories one post may carry. The rule's own max_items_per_post in
+# bot_rules.yaml caps the ITEMS; this caps the STORIES inside the news item.
+NEWS_MAX_ITEMS = _int("NEWS_MAX_ITEMS", 5)
+
+# PREFERRED SITES, comma-separated bare domains, and it is a PREFERENCE rather
+# than a restriction. The first search is limited to these; if it comes back
+# with fewer than NEWS_MIN_ITEMS stories, a SECOND open search runs across the
+# whole web. Empty (the default) means one open search and no first pass.
+#
+# Why not just use WEB_SEARCH_ALLOWED_DOMAINS: that one is a hard allow-list for
+# every search the bot makes. This is R1's opinion about where the good AI
+# coverage is, and being wrong about it must not cost the day's news.
+NEWS_PREFERRED_DOMAINS = _str_list("NEWS_PREFERRED_DOMAINS")
+
+# How thin the preferred-domain pass has to be before the open pass runs.
+NEWS_MIN_ITEMS = _int("NEWS_MIN_ITEMS", 3)
+
+# How long a posted story stays remembered, so it is not posted twice. A month:
+# a funding round re-reported three weeks later is the same funding round.
+NEWS_REPEAT_DAYS = _int("NEWS_REPEAT_DAYS", 30)
+
+# SEED KEYWORDS FOR R1, from the "Sample Keywords" column of the Bot Rules tab.
+#
+# SEEDS, NOT LIMITS. The sheet says "not limited to these", so the search is
+# told they are a starting point and adjacent terms are fair game. They are here
+# rather than hardcoded so Vaishnavi can tune them in the sheet; which keyword
+# produced which story is logged, so there is something to tune against.
+NEWS_KEYWORDS = _str_list("NEWS_KEYWORDS")
+
+
+# -- R3 EVENTS: DISCOVERY AND DEADLINE BACKFILL -------------------------------
+#
+# R3 used to read the AI Events & Summits tab and nothing else, so an event
+# nobody had typed in did not exist. Discovery searches for events in the
+# current and next month and PROPOSES them; an approver says yes and only then
+# is a row appended.
+
+# The most events proposed in one run, and in one calendar month. Two limits
+# because they stop different things: the per-run limit stops one message
+# becoming a listings page, and the per-month limit stops a slow drip of
+# proposals nobody has time to read.
+EVENTS_DISCOVERY_MAX_PER_RUN = _int("EVENTS_DISCOVERY_MAX_PER_RUN", 3)
+EVENTS_DISCOVERY_MAX_PER_MONTH = _int("EVENTS_DISCOVERY_MAX_PER_MONTH", 8)
+
+# How long before the bot asks again about a registration deadline it could not
+# find. Saying "I couldn't find it" once is useful; saying it every other
+# Wednesday is noise, and the answer rarely changes inside a fortnight.
+EVENTS_DEADLINE_RECHECK_DAYS = _int("EVENTS_DEADLINE_RECHECK_DAYS", 14)
+
+# SEED KEYWORDS FOR R3's discovery, from the same "Sample Keywords" column.
+# Seeds, not limits — see NEWS_KEYWORDS.
+EVENT_KEYWORDS = _str_list("EVENT_KEYWORDS")
 
 # R4 — DELIVERABLES. An item is chased when its tentative deadline is within
 # this many days OR has already passed. 3 is the plan's number: close enough to
