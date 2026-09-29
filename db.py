@@ -3091,6 +3091,21 @@ class DB:
                 (int(searches), int(found), int(posted), str(on_date), str(slot)),
             )
 
+    def clear_test_day(self, on_date: str) -> dict:
+        """Forget ONE date's drip sends and news checks. {"drip_sends": n, "news_checks": n}.
+
+        THE TEST DAY'S STALE-SEND CLEAR. A pretend date re-run a second time
+        found its slots already taken by the first run and posted nothing.
+        Strictly `WHERE on_date = ?` — no other date is ever touched; "reset
+        test state" is the tool that wipes everything.
+        """
+        with self.conn() as c:
+            sends = c.execute("DELETE FROM drip_sends WHERE on_date = ?",
+                              (str(on_date),)).rowcount
+            checks = c.execute("DELETE FROM news_checks WHERE on_date = ?",
+                               (str(on_date),)).rowcount
+        return {"drip_sends": int(sends or 0), "news_checks": int(checks or 0)}
+
     def news_breaking_messages_today(self, on_date: str) -> int:
         """Breaking MESSAGES sent on `on_date`: checks whose message went out."""
         with self.conn() as c:

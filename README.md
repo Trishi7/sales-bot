@@ -3046,12 +3046,21 @@ Naming a site that blocks the search crawler used to be a 400 on the whole
 call; as a preference it cannot fail anything, and the blocked-domain retry in
 `llm.web_research` is gone because nothing passes a domain restriction any more.
 
+**No digest links.** The prompt asks for the *primary* report — the company's
+own announcement or a named outlet's article, never a roundup, digest,
+newsletter or "everything that happened today" page — and `news.parse_stories`
+enforces it: a story whose url host or path contains `digest`, `roundup`,
+`newsletter`, `everything-that-happened`, `news-brief` or `daily-brief`, or
+whose host (or a subdomain of it) is on `NEWS_BLOCKED_DOMAINS` (default
+`theneuron.ai,aiagentsdirectory.com`), is dropped, and each drop is logged:
+`[news] dropped a story with a digest link — theneuron.ai is on NEWS_BLOCKED_DOMAINS: …`.
+
 ### Choosing what goes out — `news.choose`
 
 Most important first, so the cap trims filler rather than the big one. The
 gates, in order, and **every skip is logged with a sentence**:
 
-1. *(checks only)* importance below `NEWS_BREAKING_MIN_IMPORTANCE` (4) — a check
+1. *(checks only)* importance below `NEWS_BREAKING_MIN_IMPORTANCE` (5) — a check
    posts only the major;
 2. **already posted within `NEWS_REPEAT_DAYS` (30), by url_key OR headline_key.**
    Four outlets give one funding round four URLs, so the headline — its first
@@ -3097,7 +3106,7 @@ through `_one_search` like every other search.
 
 | What the check found | What happens |
 |---|---|
-| NOTHING FOUND, or nothing at importance ≥ 4 that is new | **one INFO line**, no post, no rows stored |
+| NOTHING FOUND, or nothing at importance ≥ 5 that is new | **one INFO line**, no post, no rows stored |
 | important stories, valve open | **ONE grouped message** — `Worth knowing now:` then one line per story — to the sales channel (the test channel under `SALES_TEST_MODE`) via `guardrails.send`. **Not** through `drip_sends`, **not** counted toward `DAILY_MESSAGE_CAP`, **no @-mentions** (web text is stripped of mention tokens). Recorded as `kind=breaking` |
 | important stories, valve full (`NEWS_BREAKING_MAX_PER_DAY`, default 2) | nothing posted, **nothing stored**, and a log line saying it is *held for the next main post* — tomorrow's main sweep finds it again. `99` disables the valve |
 
@@ -3146,9 +3155,18 @@ against — because "not in the pipeline" is its whole question.
 `make it Monday` / `next day` (the live test day) runs the main sweep exactly as
 live, in R1's pinned slot, against the test DB — and then runs **one hourly
 check immediately**, so the tester can see a breaking post without waiting for
-a slot. The check is recorded in `news_checks` as `test HH:MM` under the pretend
-date. `simulate …` does the same inside its throwaway sandbox, at the main
-post's time on the simulated day.
+a slot. The check is recorded in `news_checks` under **the same slot key the live
+check would claim** at that moment (e.g. `13:00` at the 14:00 stop; `test HH:MM`
+only before the day's first slot, or when that slot is already taken), so the
+live loop sees that hour as done. `simulate …` does the same inside its
+throwaway sandbox, at the main post's time on the simulated day.
+
+**Exactly one news check per test day.** The live sweep reads `dl.now_ist()`,
+which follows the pretend clock — so while a tester stood at "Monday 14:00" the
+live loop used to run Monday's hourly checks alongside the forced one. While a
+test day or a simulation runs, and for `NEWS_HOLD_AFTER_TEST_SECONDS` (300)
+after, the live `_maybe_breaking_news` stands down; the forced check ignores
+the hold.
 
 ### Failures degrade honestly
 
@@ -3956,30 +3974,53 @@ show a day that does not happen.
 Vaishnavi   @bot make it Monday
 
 Saley       Right — it's now Monday 28 Sep, 9:00 AM (test time).
+            [TEST] It's now Monday 28 Sep, 9:00 AM (test time).
+                   Working through the day — sheet, rules, then the news check. About a minute or two.
+            [TEST] 2 posts were already recorded for Monday 28 Sep from an earlier run — clearing them so today starts clean.
+            [TEST] Rules read — 3 of 12 checks have something today.
+            [TEST] Plan made: 3 posts.
             [TEST] It's now Monday 28 Sep, 10:00 AM (test time).
             @Vaishnavi Your 11:00 with Sahaj Labs — here's where we left it …
             [TEST] It's now Monday 28 Sep, 2:00 PM (test time).
             @Vaishnavi Four people connected on LinkedIn with no DM yet …
             @Sid The Mindtrail deck is four working days past its date …
-            [TEST] That's Monday 28 Sep done.
-                     2 posts went out
-                     sales packages that aren't ready yet — that only runs on a Thursday
-                     nothing on deliverables due or overdue — I looked and there was nothing due
-
-                   All of that was real: it's in my records and any sheet changes
-                   are waiting for your yes. Say "next day" to carry on, or
-                   "back to today" to stop.
+            [TEST] News check done — nothing important enough to interrupt anybody.
+            [TEST] Monday 28 Sep — done
+                   • Sent: 3
+                   • Rolled to tomorrow: companies that just appeared in the pipeline (2)
+                   • Looked, nothing due: deliverables due or overdue
+                   • Not a Monday rule: sales packages that aren't ready yet
+                   Say "next day" to carry on or "back to today" to stop.
 ```
+
+**It talks while it works.** The sheet read, the rules and the news check take
+a minute or two, so the whole run sits inside Discord's typing indicator, and
+after "It's now …" come at most four short, fixed-text progress lines (working;
+rules read; plan made: N posts; news check done) — no model call. Each stage's
+duration is logged: `[test-day] 2026-09-28: rules read took 11.4s`.
+
+**It plans once.** The queue the footer reports on is the queue the plan is
+made from — `_plan_drip(queue=…)` — so the sheet is read once per test day, not
+twice.
+
+**A re-run date starts clean.** Running the same pretend date twice used to find
+every slot from the first run still in `drip_sends` and post nothing. Now the
+test day says how many were recorded, deletes **that date's rows only** from
+`drip_sends` and `news_checks`, and logs it. No other date is touched; "reset
+test state" still wipes everything. (It refuses when the pretend date is the
+*real* today on a database not named `*_test.db` — those rows are real sends.)
 
 Posts are spaced `TEST_POST_GAP_SECONDS` apart (default 20) rather than the real
 90 minutes — a test day is watched by somebody sitting there — but not zero: the
 posts have to arrive one at a time, in an order a person can follow.
 
-The footer names **the skips as well as the sends**, in plain words with no rule
-codes. "Two posts" tells a tester what they watched; "two posts, one held over
-because the day was full, nothing on packages because that only runs on a
-Thursday" tells them whether what they watched was *right*. A tester who cannot
-tell a quiet day from a broken one will report neither.
+**The footer is points, at most six lines**, each bullet at most 15 words, plain
+rule names (`rules.plain_description`) and no rule codes. Rolled work is counted
+in items per rule; a bullet with nothing in it is left out; a held group ("asked
+recently") counts as looked-and-nothing-due; a disabled rule is not mentioned.
+The grouping is `simulation.day_points`, and the simulation footer uses the same
+one, so the two cannot disagree. A tester who cannot tell a quiet day from a
+broken one will report neither — the skips are still there, just shorter.
 
 ### The state is real — that is the point
 
@@ -4009,6 +4050,7 @@ python verify_simulation.py               # the model composes, as a real simula
 python verify_simulation.py --templates   # skip the API calls; schedule only
 python simulation.py                      # the parsers, the sandbox, the gates
 python verify_testday.py                  # "make it Monday" end to end, nothing sent
+python verify_testday_talk.py             # progress lines, stale-send clear, one news check, digest drops
 python clock.py                           # the pretend clock's arithmetic
 python verify_news_feed.py                # R1's main sweep + hourly checks, valve, ledgers
 python verify_interim.py                  # typing indicator, interim line, latency log (real timings)

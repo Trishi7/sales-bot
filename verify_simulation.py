@@ -146,7 +146,7 @@ async def main() -> int:
           "Simulating the week" in bodies[0], True)
     check("seven day headers",
           sum(1 for b in bodies if "Simulating " in b and " · " not in b), 7)
-    check("seven footers", sum(1 for b in bodies if "done" in b and "posts sent" in b), 7)
+    check("seven footers", sum(1 for b in bodies if "— done" in b and "• Sent:" in b), 7)
 
     digest_after = hashlib.sha256(
         open(db_before, "rb").read()

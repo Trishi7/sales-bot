@@ -1713,7 +1713,7 @@ NEWS_TOPICS_PER_WEEK = _int("NEWS_TOPICS_PER_WEEK", 6)
 # THE IMPORTANCE SCALE, 1-5, is defined in the prompt: 5 = the whole industry is
 # talking about it today; 4 = a sales team must know this week; 3 = useful;
 # 2-1 = filler. At or above this, a check posts and the spread gates yield.
-NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 4)
+NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 5)
 
 # Breaking MESSAGES per day (one message may carry several stories). 99
 # disables the valve.
@@ -1727,6 +1727,19 @@ NEWS_CHECK_MAX_USES = _int("NEWS_CHECK_MAX_USES", 2)
 # domain restriction, so a site that blocks the search crawler cannot fail the
 # call and a wrong list costs relevance, never the day's news.
 NEWS_PREFERRED_DOMAINS = _str_list("NEWS_PREFERRED_DOMAINS")
+
+# BLOCKED SITES, comma-separated bare domains (subdomains count). A story whose
+# link is on one of these is DROPPED by `news.parse_stories`, and logged —
+# unlike the preference line above, this is enforced, not asked for. For
+# digest and roundup sites that link to the news rather than report it; a url
+# whose host or path says digest/roundup/newsletter is dropped anyway.
+NEWS_BLOCKED_DOMAINS = _str_list(
+    "NEWS_BLOCKED_DOMAINS", "theneuron.ai,aiagentsdirectory.com")
+
+# While a test day or a simulation runs, the LIVE hourly news check stands down
+# (the live sweep follows the pretend clock, so it would otherwise run the
+# pretend day's checks too). It stays down this many seconds afterwards.
+NEWS_HOLD_AFTER_TEST_SECONDS = _int("NEWS_HOLD_AFTER_TEST_SECONDS", 300)
 
 # How long a posted story stays remembered, so it is not posted twice — main
 # or breaking. Matched on the normalised URL OR the headline key.

@@ -9,8 +9,8 @@ temp directory. It asserts the contract a tester depends on:
   - "make it Monday" moves the persistent clock and posts that day;
   - the run stops at 10:00 for the morning item and 14:00 for the rest;
   - each stop opens with "It's now Monday 28 Sep, 2:00 PM (test time)";
-  - the footer counts the posts and names what rolled and what was skipped,
-    WITH REASONS and in plain words;
+  - the footer is points (at most six lines): Sent, what rolled, what looked
+    and found nothing, what is not today's rule — in plain words;
   - NO rule code (R1, R6, ...) appears anywhere the tester can read;
   - "next day" and "back to today" move and clear the clock;
   - "start over" asks before it wipes, and "no" cancels;
@@ -111,7 +111,7 @@ async def main():
             {"id": "R4", "name": "Deliverables checklist", "ran": True, "items": 0},
         ]}
 
-    async def fake_plan(*, today, already):
+    async def fake_plan(*, today, already, queue=None):
         return {
             "messages": [
                 _msg(1, 10, 0, "R8", "Meeting preparation", "Vaishnavi"),
@@ -156,17 +156,18 @@ async def main():
     check("the opening line is the agreed wording",
           any(l.strip().startswith("[TEST] It's now Monday")
               and "(test time)" in l for l in text.splitlines()))
-    check("the footer counts the posts", "3 posts went out" in text)
-    check("the footer says what rolled over and why",
-          "companies that just appeared in the pipeline" in text
-          and "over the cap" in text)
-    check("the footer says what was skipped and why",
-          "sales packages that aren't ready yet" in text
-          and "does not run on a Monday" in text)
+    check("the footer counts the posts", "• Sent: 3" in text)
+    check("the footer says what rolled over",
+          "• Rolled to tomorrow: companies that just appeared in the pipeline (1)"
+          in text)
+    check("the footer says what is not today's rule",
+          "• Not a Monday rule: sales packages that aren't ready yet" in text)
     check("...including a rule that ran and found nothing",
-          "deliverables due or overdue" in text
-          and "there was nothing due" in text)
-    check("the footer says the state is real", "real" in text.lower())
+          "• Looked, nothing due: deliverables due or overdue" in text)
+    footer = next((p for p in POSTED if "— done" in str(p)), "")
+    check("the footer is at most six lines", 0 < len(footer.splitlines()) <= 6)
+    check("the footer ends with what to say next",
+          footer.rstrip().endswith('Say "next day" to carry on or "back to today" to stop.'))
 
     import re
     codes = re.findall(r"\bR\d{1,2}\b", text)

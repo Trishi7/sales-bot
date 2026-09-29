@@ -548,34 +548,111 @@ def header(day: date, *, mode: str = MODE_DAY, rule: str = "") -> str:
     )
 
 
-def footer(result: dict) -> str:
-    """What happened, and why. The half of a simulation people actually read.
+# THE DAY IN POINTS — one grouping, used by the test day's footer AND by the
+# simulation footer, so the two can never disagree about what a day was.
+BULLET_MAX_WORDS = 15
 
-    IT REPORTS THE SKIPS AS WELL AS THE SENDS. "Three posts" tells you what
-    happened; "three posts, two rolled because the window filled, R4 skipped
-    because it does not run on a Tuesday" tells you whether that was right.
+
+def _plain_rule(rule_id: str, fallback: str) -> str:
+    import rules as rules_mod
+    return rules_mod.plain_description(rule_id or "") or str(fallback or "something")
+
+
+def day_points(*, planned: Optional[dict], rules_run: Optional[list]) -> dict:
+    """{"rolled": [(name, items)], "looked": [names], "not_today": [names],
+    "failed": [names]} — plain rule names, no rule codes, no owners.
+
+    ROLLED IS COUNTED IN ITEMS PER RULE: two owner groups of the same rule are
+    one line to a tester ("deliverables due or overdue (5)"), which is what the
+    old per-group list with its owner-and-company parentheticals got wrong.
+
+    A HELD GROUP ("asked recently") counts as LOOKED, NOTHING DUE: the rule
+    ran and found the item, but the nudge ladder says it is not due today.
+    A DISABLED rule is off every day, so it is not news about this one.
     """
-    lines = [f"{config.SIMULATION_PREFIX} — {result.get('day_label', 'day')} done"]
-    sent = int(result.get("sent") or 0)
-    cap = result.get("cap")
-    counted = int(result.get("counted") or 0)
-    lines.append(
-        f"  posts sent: {sent}"
-        + (f" ({counted} against the cap of {cap}"
-           + (", cap HIT" if cap is not None and counted >= cap else "")
-           + ")" if cap is not None else "")
+    rolled: dict = {}
+    for g in ((planned or {}).get("rolled") or []):
+        name = _plain_rule(g.get("rule_id"), g.get("rule_name") or g.get("type"))
+        rolled[name] = rolled.get(name, 0) + max(1, len(g.get("actions") or []))
+
+    looked: list = []
+    not_today: list = []
+    failed: list = []
+
+    def _add(bucket, name):
+        if name and name not in bucket:
+            bucket.append(name)
+
+    for g in ((planned or {}).get("held") or []):
+        _add(looked, _plain_rule(g.get("rule_id"), g.get("rule_name") or g.get("type")))
+    for entry in (rules_run or []):
+        rid = str(entry.get("id") or "")
+        if rid in ("", "—"):
+            continue
+        name = _plain_rule(rid, entry.get("name"))
+        why = str(entry.get("why") or "")
+        if entry.get("ran"):
+            if "raised" in why:
+                _add(failed, name)
+            elif not entry.get("items"):
+                _add(looked, name)
+        elif why.startswith("does not run on"):
+            _add(not_today, name)
+    return {"rolled": [(n, c) for n, c in rolled.items()], "looked": looked,
+            "not_today": not_today, "failed": failed}
+
+
+def fit_bullet(label: str, items: list, *, limit: int = BULLET_MAX_WORDS) -> str:
+    """"• <label> a, b and 3 more", never more than `limit` words.
+
+    The first item is always shown, even alone over the limit — a bullet that
+    names nothing is worse than a long one.
+    """
+    words = len(label.split())
+    shown: list = []
+    for i, item in enumerate(items):
+        more = len(items) - i - 1
+        cost = len(str(item).split()) + (3 if more else 0)
+        if shown and words + cost > limit:
+            break
+        shown.append(str(item))
+        words += len(str(item).split())
+    hidden = len(items) - len(shown)
+    text = ", ".join(shown) + (f" and {hidden} more" if hidden else "")
+    return f"• {label} {text}"
+
+
+def point_lines(*, sent: int, points: dict, weekday: str) -> list:
+    """The bullets. A bullet with nothing in it is left out entirely."""
+    lines = [f"• Sent: {int(sent)}"]
+    if points.get("rolled"):
+        lines.append(fit_bullet("Rolled to tomorrow:",
+                                [f"{n} ({c})" for n, c in points["rolled"]]))
+    if points.get("looked"):
+        lines.append(fit_bullet("Looked, nothing due:", points["looked"]))
+    if points.get("not_today"):
+        lines.append(fit_bullet(f"Not a {weekday} rule:", points["not_today"]))
+    return lines
+
+
+def footer(result: dict) -> str:
+    """What happened, in points. The half of a simulation people actually read.
+
+    THE SAME GROUPING AS THE TEST DAY (`day_points`): sent, rolled, looked and
+    found nothing, not today's rule. At most six lines. `note` is one extra
+    line for a day with no plan at all (a weekend, the engine off).
+    """
+    points = result.get("points") or {}
+    head = f"{config.SIMULATION_PREFIX} {result.get('day_label', 'day')} — done"
+    if points.get("failed"):
+        head += " · couldn't check " + ", ".join(points["failed"][:2])
+    lines = [head] + point_lines(
+        sent=int(result.get("sent") or 0), points=points,
+        weekday=str(result.get("weekday") or "today's"),
     )
-    times = result.get("times") or []
-    if times:
-        lines.append("  planned times: " + ", ".join(times))
-    for entry in (result.get("rolled") or []):
-        lines.append(f"  rolled: {entry}")
-    for entry in (result.get("skipped") or []):
-        lines.append(f"  skipped: {entry}")
-    if result.get("notes"):
-        for note in result["notes"]:
-            lines.append(f"  note: {note}")
-    return "\n".join(lines)
+    if result.get("note"):
+        lines.append(str(result["note"]))
+    return "\n".join(lines[:6])
 
 
 def pace_seconds(*, fast: bool, count: int) -> float:
@@ -677,17 +754,33 @@ def _self_test() -> int:
           "R8 only" in header(date(2026, 9, 28), rule="R8"), True)
 
     print("\nthe footer")
-    text = footer({
-        "day_label": "Mon 28 Sep", "sent": 3, "counted": 3, "cap": 3,
-        "times": ["14:00", "15:30", "17:00"],
-        "rolled": ["R1 AI news — the window filled"],
-        "skipped": ["R4 — does not run on a Tuesday"],
-    })
-    check("reports the count", "posts sent: 3" in text, True)
-    check("reports the cap being hit", "cap HIT" in text, True)
-    check("reports the times", "14:00, 15:30, 17:00" in text, True)
-    check("reports what rolled", "rolled: R1" in text, True)
-    check("reports what was skipped", "skipped: R4" in text, True)
+    pts = day_points(
+        planned={"rolled": [
+            {"rule_id": "R4", "rule_name": "Deliverables checklist", "actions": [1, 2]},
+            {"rule_id": "R4", "rule_name": "Deliverables checklist", "actions": [3]},
+        ], "held": []},
+        rules_run=[{"id": "R12", "name": "Sales packages", "ran": False,
+                    "why": "does not run on Monday (runs Thursday)"},
+                   {"id": "R6", "name": "LinkedIn", "ran": True, "items": 0},
+                   {"id": "R9", "name": "Meeting done", "ran": False,
+                    "why": "disabled in bot_rules.yaml"}])
+    text = footer({"day_label": "Mon 28 Sep", "sent": 3, "points": pts,
+                   "weekday": "Monday"})
+    print("   " + text.replace("\n", "\n   "))
+    check("reports the count", "• Sent: 3" in text, True)
+    check("rolled is counted per rule", "deliverables due or overdue (3)" in text, True)
+    check("reports what looked and found nothing",
+          "Looked, nothing due: people connected on LinkedIn" in text, True)
+    check("reports what is not today's", "Not a Monday rule: sales packages" in text, True)
+    check("a disabled rule is not mentioned", "no next steps" in text, False)
+    check("no rule codes", re.findall(r"\bR\d{1,2}\b", text), [])
+    check("at most six lines", len(text.splitlines()) <= 6, True)
+    check("every bullet within 15 words",
+          all(len(l.split()) - 1 <= BULLET_MAX_WORDS
+              for l in text.splitlines() if l.startswith("•")), True)
+    check("a long list is cut with 'and N more'",
+          fit_bullet("Not a Monday rule:", ["a b c d e", "f g h i j", "k l m n o"]),
+          "• Not a Monday rule: a b c d e and 2 more")
 
     print("\npacing")
     check("fast uses the configured gap",

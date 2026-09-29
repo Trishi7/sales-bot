@@ -48,6 +48,7 @@ import logging
 import re
 from datetime import date, datetime, timedelta
 from typing import Optional
+from urllib.parse import urlsplit
 
 import config
 import deadlines as dl
@@ -193,6 +194,9 @@ def sweep_prompt(topics: list, *, today: date, since_hours: int, mode: str,
         "<what happened, one clause> | <url> | <importance 1-5>",
         "",
         "EVERY LINE NEEDS A REAL URL you actually found. No url, no line.",
+        "The url must be the PRIMARY report — the company's own announcement or "
+        "a named outlet's article. Never a roundup, digest, newsletter or "
+        "'everything that happened today' page.",
         "One line per story — the same story from two outlets is ONE line.",
     ]
     if mode != MODE_CHECK:
@@ -269,6 +273,35 @@ _SCREEN_RE = re.compile(r"^\s*SCREEN\s*\|", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://[^\s<>)\]|]+")
 _IMPORTANCE_RE = re.compile(r"^\D*([1-5])\b")
 
+# A DIGEST IS NOT A SOURCE. A roundup page links to the story; it is not the
+# story, and a sales team clicking through lands on twenty other things.
+_DIGEST_RE = re.compile(
+    r"digest|roundup|newsletter|everything-that-happened|news-brief|daily-brief",
+    re.IGNORECASE,
+)
+
+
+def digest_link_reason(url: str, *, blocked: Optional[list] = None) -> str:
+    """Why this url is not a primary report, or "" when it may be one.
+
+    The HOST or PATH naming a digest/roundup/newsletter, or a host on
+    NEWS_BLOCKED_DOMAINS (a subdomain of a blocked domain counts).
+    """
+    parts = urlsplit(str(url or "").strip())
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for d in (blocked if blocked is not None else (config.NEWS_BLOCKED_DOMAINS or [])):
+        d = str(d or "").strip().lower().lstrip(".")
+        if d.startswith("www."):
+            d = d[4:]
+        if d and (host == d or host.endswith("." + d)):
+            return f"{host} is on NEWS_BLOCKED_DOMAINS"
+    m = _DIGEST_RE.search(host) or _DIGEST_RE.search(parts.path or "")
+    if m:
+        return f"the link looks like a {m.group(0).lower()} page, not the primary report"
+    return ""
+
 
 def _canonical_topic(raw: str, topics: Optional[list]) -> str:
     """The topic as the list spells it, or OTHER."""
@@ -313,6 +346,11 @@ def parse_stories(text: str, *, topics: Optional[list] = None) -> list:
             log.info("[news] dropped a story with no source link: %r", line[:120])
             continue
         url = found.group(0).rstrip(".,;)")
+        why = digest_link_reason(url)
+        if why:
+            log.info("[news] dropped a story with a digest link — %s: %s | %r",
+                     why, url, line[:120])
+            continue
         before = fields[:url_at]
         after = fields[url_at + 1:]
         topic = _canonical_topic(before[0] if len(before) >= 3 else "", topics)
