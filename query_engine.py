@@ -33,6 +33,7 @@ as every other path that speaks.
 """
 import asyncio
 import json
+import time
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -42,6 +43,8 @@ from anthropic import Anthropic
 import config
 import deadlines
 import persona
+import usage
+import tone
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +59,32 @@ MAX_TOKENS = max(256, int(config.QUERY_ENGINE_MAX_TOKENS))
 
 
 def _system_prompt(*, requester_name: str, today: str, tool_names: list[str]) -> str:
+    """The whole system prompt as ONE string — what `_system_blocks` sends,
+    joined. Kept for the verify scripts and for anything that reads it."""
+    return persona.system_preamble() + _engine_text(
+        requester_name=requester_name, today=today, tool_names=tool_names)
+
+
+def _system_blocks(*, requester_name: str, today: str, tool_names: list[str],
+                   front: str = "", tail: str = "") -> list:
+    """The system prompt as CACHEABLE BLOCKS (persona.system_blocks):
+
+        [front: web-search safety rules][persona]   static
+        [strategy]                                  cache_control
+        [policy]                                    cache_control
+        [sources, citation rule, the engine's own instructions, `tail`]
+
+    `front` is the STATIC web-search rules — still in front of everything, as
+    they must be; `tail` is anything that changes per call (the searches left
+    today), after the last system breakpoint so it cannot break the cache.
+    """
+    return persona.system_blocks(
+        include_sources=True, front=front,
+        tail=_engine_text(requester_name=requester_name, today=today,
+                          tool_names=tool_names) + (("\n\n" + tail) if tail else ""))
+
+
+def _engine_text(*, requester_name: str, today: str, tool_names: list[str]) -> str:
     """The full system prompt: persona + policy + live source statuses (all from
     `persona.system_preamble()`), then how to answer.
 
@@ -64,11 +93,12 @@ def _system_prompt(*, requester_name: str, today: str, tool_names: list[str]) ->
     the tool set is caller-supplied and can legitimately differ between calls."""
     tools_line = ", ".join(tool_names) if tool_names else "(none — you have no tools this turn)"
 
-    return persona.system_preamble() + f"""You are answering a question asked in one of
+    return f"""You are answering a question asked in one of
 the team's SALES channels. Today's date is {today} (UTC). The person asking is
 **{requester_name}**; when they say "me", "my" or "I" they mean themselves.
 
 THE TOOLS YOU HAVE RIGHT NOW: {tools_line}
+When somebody asks to be reminded of something, use schedule_reminder even if no company is mentioned.
 
 === WHAT YOU CAN SEE (read the SOURCE STATUS block above before choosing a tool) ===
 You are READ-ONLY everywhere. You cannot send, edit, file, or change anything —
@@ -207,6 +237,7 @@ name in it is right.
 - NO markdown headers (no #, ##, ###). A short **bold label** introduces a
   section if you need one.
 - NO EMOJIS.
+- {tone.STRUCTURE_RULE}
 - No blank lines between items — a single line break is enough.
 - Use jump links when you cite a specific message.
 - If the answer would run very long, lead with the most relevant items and close
@@ -266,6 +297,54 @@ def _server_tools_used(response) -> list:
     return out
 
 
+# -- keeping the history small, and cached -------------------------------------
+
+TRUNCATION_MARKER = "(truncated — already read)"
+MAX_RESULT_CHARS = max(200, int(config.QUERY_TOOL_RESULT_MAX_CHARS))
+KEEP_RESULT_CHARS = max(100, int(config.QUERY_TOOL_RESULT_KEEP_CHARS))
+
+
+def _capped(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + " " + TRUNCATION_MARKER
+
+
+def _trim_old_results(results: list, *, iteration: int) -> None:
+    """Shrink every tool_result older than the two most recent iterations.
+
+    "The two most recent" COUNTS THE CURRENT ONE: at iteration 3 the results
+    from iteration 2 are kept whole (the model is about to reason from them) and
+    iteration 1's shrink to their first KEEP_RESULT_CHARS. Once shrunk a result
+    stays exactly the same, so later requests share it as a cached prefix.
+    """
+    for made_in, entry in results:
+        if made_in >= iteration - 1:
+            continue
+        content = str(entry.get("content") or "")
+        if content.endswith(TRUNCATION_MARKER) and len(content) <= KEEP_RESULT_CHARS + 40:
+            continue
+        entry["content"] = content[:KEEP_RESULT_CHARS] + " " + TRUNCATION_MARKER
+
+
+def _move_history_breakpoint(messages: list) -> None:
+    """ONE history breakpoint, on the last block of the most recent tool_result
+    turn — removed from wherever it was, so a request never carries more than
+    the four the API allows (strategy, policy, last tool, this one)."""
+    last = None
+    for m in messages:
+        if m.get("role") != "user" or not isinstance(m.get("content"), list):
+            continue
+        for block in m["content"]:
+            if isinstance(block, dict):
+                block.pop("cache_control", None)
+                if block.get("type") == "tool_result":
+                    last = m
+    if last is not None:
+        last["content"][-1]["cache_control"] = {"type": "ephemeral"}
+
+
 class QueryEngine:
     """A bounded tool-use loop over caller-supplied read-only tools.
 
@@ -277,7 +356,7 @@ class QueryEngine:
         self._client = Anthropic(api_key=api_key)
         self._model = model
 
-    async def _call_model(self, *, system, tools, messages):
+    async def _call_model(self, *, system, tools, messages, site: str = "engine"):
         """One model turn, on a thread so the sync SDK never blocks the Discord
         gateway heartbeat.
 
@@ -288,16 +367,24 @@ class QueryEngine:
         on `persona.system_preamble()`, which is every prompt this engine uses
         today — is not given a second copy.
         """
-        if persona.STRATEGY_MARKER not in (system or ""):
-            system = persona.strategy_preamble() + (system or "")
-        return await asyncio.to_thread(
-            self._client.messages.create,
-            model=self._model,
-            max_tokens=MAX_TOKENS,
-            system=system,
-            tools=tools,
-            messages=messages,
-        )
+        if persona.STRATEGY_MARKER not in persona.blocks_text(system):
+            system = (persona.strategy_blocks(system or "") if not isinstance(system, list)
+                      else persona.strategy_blocks() + list(system))
+        kwargs = {"model": self._model, "max_tokens": MAX_TOKENS, "system": system,
+                  "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+        t0 = time.monotonic()
+        try:
+            resp = await asyncio.to_thread(self._client.messages.create, **kwargs)
+        except Exception:
+            await asyncio.to_thread(lambda: usage.record(
+                site=site, model=self._model, seconds=time.monotonic() - t0, ok=False))
+            raise
+        await asyncio.to_thread(lambda: usage.record(
+            site=site, model=self._model, response=resp,
+            seconds=time.monotonic() - t0))
+        return resp
 
     async def answer(
         self,
@@ -307,6 +394,7 @@ class QueryEngine:
         tools: Optional[list[dict]] = None,
         history: Optional[list[dict]] = None,
         extra_system: str = "",
+        extra_tail: str = "",
         outcome: Optional[dict] = None,
     ) -> Optional[str]:
         """Answer `question` by looping model ⇄ tools. Returns the reply text, or
@@ -333,39 +421,68 @@ class QueryEngine:
         context only — never persisted.
 
         `outcome`, when given, is FILLED IN with what actually happened:
-        {"model_error", "searches", "tools_used"}. It exists because "I found
+        {"model_error", "searches", "tools_used", "tool_calls"}. It exists
+        because "I found
         nothing" and "I never got an answer out of the model" are completely
         different things to tell somebody, and a bare `None` return cannot tell
         them apart — see `persona.model_failure_reply`. The searches count is
         what the API billed, which the caller banks against the shared daily
         budget.
+
+        PROMPT CACHING, FOUR BREAKPOINTS AND NO MORE: the strategy and the
+        policy blocks of the system prompt, the LAST tool definition, and the
+        last block of the most recent tool_result turn (moved forward every
+        iteration, so each request reuses the one before as a prefix).
+        `extra_system` is static and goes in front; `extra_tail` is per-call and
+        goes after the last system breakpoint.
+
+        TOOL RESULTS ARE TRIMMED. A new result is capped at
+        QUERY_TOOL_RESULT_MAX_CHARS; one older than the two most recent
+        iterations (the current one counts) shrinks to its first
+        QUERY_TOOL_RESULT_KEEP_CHARS. Both are marked "(truncated — already
+        read)". The forced final call keeps the trimmed history.
         """
         tools = tools or []
         handlers = {
             t["schema"]["name"]: t["handler"]
             for t in tools if t.get("handler") is not None
         }
-        schemas = [t["schema"] for t in tools]
+        schemas = [dict(t["schema"]) for t in tools]
         tool_names = [t["schema"]["name"] for t in tools]
+        # THE TOOLS BREAKPOINT: tools render first, so a marker on the last one
+        # caches the whole tool list, which is identical on every question.
+        if schemas:
+            schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
 
         report = outcome if outcome is not None else {}
         report.setdefault("model_error", "")
         report.setdefault("searches", 0)
         report.setdefault("tools_used", [])
+        # Every tool call this turn: each client tool dispatched, plus each
+        # server-side search the API billed. For the reply_latency log.
+        report.setdefault("tool_calls", 0)
         report.setdefault("sources", [])
 
         today = deadlines.today_ist().isoformat()
-        system = _system_prompt(
-            requester_name=requester_name or "(unknown)",
-            today=today,
-            tool_names=tool_names,
+        # ON A THREAD. The preamble probes every source's status live — the
+        # Google Sheets reads among them — and doing that on the event loop
+        # froze everything else for its duration: the Discord heartbeat, the
+        # typing indicator, and the interim-line timer, which fired at 37 s
+        # instead of 10 because the loop could not run it.
+        #
+        # `extra_system` goes IN FRONT: rules about how to read retrieved
+        # content must appear earlier in the system prompt than anything that
+        # could carry retrieved content — the same ordering `llm.web_research`
+        # uses, for the same reason.
+        system = await asyncio.to_thread(
+            lambda: _system_blocks(
+                requester_name=requester_name or "(unknown)",
+                today=today,
+                tool_names=tool_names,
+                front=extra_system or "",
+                tail=extra_tail or "",
+            )
         )
-        if extra_system:
-            # IN FRONT, not behind. Rules about how to read retrieved content
-            # must appear earlier in the system prompt than anything that could
-            # carry retrieved content — the same ordering `llm.web_research`
-            # uses, for the same reason.
-            system = extra_system.rstrip() + "\n\n" + system
 
         messages: list[dict] = []
         for turn in history or []:
@@ -384,8 +501,11 @@ class QueryEngine:
         )
 
         last_text = ""
+        results: list = []              # (iteration it came from, tool_result block)
         for i in range(MAX_TOOL_ITERATIONS):
             log.info("[engine] iteration %d/%d: calling model", i + 1, MAX_TOOL_ITERATIONS)
+            _trim_old_results(results, iteration=i + 1)
+            _move_history_breakpoint(messages)
             try:
                 resp = await self._call_model(system=system, tools=schemas, messages=messages)
             except Exception as e:
@@ -396,7 +516,9 @@ class QueryEngine:
                 report["model_error"] = type(e).__name__
                 return last_text or None
 
-            report["searches"] += _searches_billed(resp)
+            billed = _searches_billed(resp)
+            report["searches"] += billed
+            report["tool_calls"] += billed
             for name in _server_tools_used(resp):
                 if name not in report["tools_used"]:
                     report["tools_used"].append(name)
@@ -437,14 +559,16 @@ class QueryEngine:
                 log.info("[engine] tool_use %s input=%s", block.name, block.input)
                 if block.name not in report["tools_used"]:
                     report["tools_used"].append(block.name)
+                report["tool_calls"] += 1
                 result = await self._dispatch(block.name, block.input or {}, handlers)
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(result, default=str, ensure_ascii=False),
-                    }
-                )
+                entry = {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": _capped(json.dumps(result, default=str, ensure_ascii=False),
+                                       MAX_RESULT_CHARS),
+                }
+                tool_results.append(entry)
+                results.append((i + 1, entry))
             if not tool_results:
                 # stop was tool_use but no dispatchable block came through — the
                 # model isn't waiting on us, so answer with what we have.
@@ -466,13 +590,12 @@ class QueryEngine:
             }
         )
         try:
-            resp = await asyncio.to_thread(
-                self._client.messages.create,
-                model=self._model,
-                max_tokens=MAX_TOKENS,
-                system=system,
-                messages=messages,
-            )
+            # THE TRIMMED HISTORY, with no tools: the breakpoint stays on the
+            # last tool_result so the history reads from the cache.
+            _trim_old_results(results, iteration=MAX_TOOL_ITERATIONS + 1)
+            _move_history_breakpoint(messages)
+            resp = await self._call_model(system=system, tools=None,
+                                          messages=messages, site="engine:final")
             final = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()

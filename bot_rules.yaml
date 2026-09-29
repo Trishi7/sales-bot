@@ -75,6 +75,13 @@ rules:
   # speaking at events, PoCs changing companies, job posts for evals /
   # annotation / model-training roles, competitor news, major global AI news,
   # AI regulation and compliance updates.
+  #
+  # SUPERSEDED BY THE 24/29 SEP DECISION: R1 is a daily AI industry feed on the
+  # NEWS_TOPICS list — ONE main post at NEWS_MAIN_TIME (14:00) covering the last
+  # 24 hours, plus hourly silent checks (NEWS_CHECK_TIMES) that post only when
+  # something is genuinely important. Nothing is searched for from the PoCs, the
+  # mapping, the pipeline or the departures list. The .env settings take
+  # precedence over this row.
   - id: R1
     name: AI news
     plain: today's AI news worth reading
@@ -123,7 +130,10 @@ rules:
     plain: deliverables due or overdue
     weekdays: [mon]
     trigger: deliverables
-    max_items_per_post: 5
+    # The week's whole checklist in ONE Monday post, grouped by rule (not by
+    # team), in numbered points; a list past 2000 characters is split between
+    # lines into consecutive messages that count as one slot.
+    max_items_per_post: 20
     destination: channel
     counts_toward_cap: true
     enabled: true

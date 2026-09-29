@@ -1,101 +1,76 @@
-"""R1 AND R2 — our people first, then the wider field.
+"""R1 AND R2 — a daily AI industry feed on a fixed topic list.
 
-WHAT CHANGED AND WHY. R1 used to be a single placeholder item that said "AI
-news: funding, hires, papers by our PoCs…" and waited for a research layer to
-expand it. The research layer arrived and searched for "AI industry news from
-the last 24 hours", which is a reading list. The rule on the Bot Rules tab is
-not about AI news in general — it is about *our* people: a funding round at a
-company we are talking to, a paper by a PoC, somebody we have been chasing
-changing jobs. Those are things the team can act on this week. A bigger story
-about a stranger is not.
+THE DECISION FROM THE 24 AND 29 SEP CALLS. R1 is no longer about our people.
+It searched the Outreach PoCs, the researcher mapping and the Master Pipeline
+by name, and most days nothing is written about eight particular mid-market AI
+people — so the post was either empty or a fallback that announced itself. The
+team asked for the other thing: what moved in AI, on the topics they care
+about, once a day, and a tap on the shoulder when something big happens.
 
-So R1 searches for OUR PEOPLE FIRST:
+So R1 is now two shapes of ONE search:
 
-    1. the PoCs on ACTIVE Outreach PoCs rows
-    2. the T1 and T2 people in the researcher/buyer mapping
-    3. the companies in the Master Pipeline
+    MAIN   at NEWS_MAIN_TIME (14:00), the last 24 hours, up to NEWS_MAX_ITEMS
+           stories. It is R1's drip slot, so it counts toward the day's cap.
 
-THE ROTATION IS THE WHOLE TRICK. There are several hundred of those and one
-day's search budget carries eight, so whose turn it is has to be remembered.
-`news_targets` in SQLite keeps a last-searched date per person and company and
-the least-recently-searched come up first — everybody comes round, and a PoC
-added this morning (last_searched = '', which sorts first) is picked up on the
-next run rather than after everyone else has had a turn.
+    CHECK  hourly at NEWS_CHECK_TIMES, silent unless something is MAJOR
+           (importance >= NEWS_BREAKING_MIN_IMPORTANCE). A check that finds
+           something posts ONE grouped "Worth knowing now:" message straight to
+           the channel — never through drip_sends, never against the cap — and
+           at most NEWS_BREAKING_MAX_PER_DAY of them a day.
 
-NOBODY ON THE DEPARTURES LIST IS EVER SEARCHED. The mapping sheet flags people
-who have left, and news about where somebody used to work is worse than no news:
-it reads as a live contact.
+NOTHING IS SEARCHED FOR FROM OUR SHEETS. No PoCs, no mapping, no pipeline, no
+departures list. The topics come from config (NEWS_TOPICS), and they are SEEDS,
+NOT LIMITS: important news off the list is welcome, tagged OTHER.
 
-THE FALLBACK IS NOT A FAILURE. Most days nothing at all is written about eight
-particular mid-market AI people, and a rule that went silent on those days would
-look broken. When the people pass finds nothing, R1 searches the wider field for
-the day and SAYS SO in plain words — "nothing on our contacts today, so here is
-what moved in AI". Which mode a post is in is never left for the reader to infer.
+ONE STORY IS POSTED ONCE. `news_stories` remembers every story that went out,
+main or breaking, by normalised URL AND by headline key — four outlets give one
+funding round four URLs, and the headline key is what catches the second one.
+It is also what keeps a story that broke at 16:00 out of the next day's 14:00
+post: `choose` skips it and says so.
 
-PREFERRED SITES ARE A PREFERENCE. `NEWS_PREFERRED_DOMAINS` restricts the FIRST
-search; if that comes back thin (< NEWS_MIN_ITEMS) a SECOND open search runs
-across the web. Getting the domain list wrong must cost relevance, never the
-day's news — so it can never be the reason nothing was found.
+THE SPREAD RULES YIELD TO IMPORTANCE. At most NEWS_PER_TOPIC_PER_DAY stories on
+one topic a day and NEWS_TOPICS_PER_WEEK distinct topics a week, so a feed does
+not become "evals, evals, evals" — but a story at or above the breaking bar
+walks past both, because a spread rule that hid the day's biggest story would
+be the wrong rule.
 
-R2 IS THE SAME SEARCH, READ DIFFERENTLY. The news-company screen wants companies
-that turned up in today's news and are NOT in the Master Pipeline. That is the
-result set R1 already paid for, filtered — so R2 costs no extra searches on a
-day R1 has run, and asks before anything is added to a sheet. It never writes.
+R2 READS WHAT R1 POSTED. The news-company screen wants companies in today's
+news that are NOT in the Master Pipeline. It reads today's rows from
+`news_stories` rather than searching again, and asks before anything is added
+to a sheet. It never writes.
 
-NOTHING HERE OPENS A SOCKET. This module selects, builds prompts and parses; the
-one search call is `llm.web_research`, made by the caller in bot.py, which also
-banks the budget. Keeping the I/O out means the selection and the parsing can be
+NOTHING HERE OPENS A SOCKET. This module builds prompts, parses and chooses; the
+one search call is `llm.web_research(lean=True)`, made by the caller in bot.py,
+which also banks the budget. Keeping the I/O out means everything here can be
 tested without a network or an API key — see `_self_test`.
 """
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import config
 import deadlines as dl
-import gtm_sheet
 
 log = logging.getLogger(__name__)
 
-# The three tiers, in the order the rules sheet puts them. The selector fills
-# its quota from the first tier that still has somebody due before moving on,
-# so a day never spends all eight searches on pipeline companies while a PoC
-# waits.
-KIND_POC = "poc"
-KIND_RESEARCHER = "researcher"
-KIND_COMPANY = "company"
-KIND_ORDER = (KIND_POC, KIND_RESEARCHER, KIND_COMPANY)
+# The modes. MAIN and CHECK are the two prompts; BREAKING is how a check's post
+# renders and what it is recorded as.
+MODE_MAIN = "main"
+MODE_CHECK = "check"
+MODE_BREAKING = "breaking"
 
-# Which mapping tiers are worth a search. T3 is "possible fit, thin evidence" —
-# searching those would spend the rotation on people we are not yet pursuing.
-MAPPING_TIERS = ("T1", "T2")
+# The tag for a story that is not on the topic list. Welcome — the list is
+# seeds, not limits — but named as such.
+TOPIC_OTHER = "OTHER"
 
-# The two modes a post can be in, named so the message can say which.
-MODE_PEOPLE = "people"
-MODE_FIELD = "field"
+# The most headlines the prompt is told not to return. The day's main post plus
+# a couple of breaking messages never gets near it; it is a ceiling on prompt
+# size, not a working number.
+ALREADY_MAX = 25
 
-# What counts as news about one of our people. Straight off the Bot Rules tab —
-# and it is a list of SEVEN THINGS rather than "news", because "any mention"
-# returns a directory listing and a conference programme from 2019.
-NEWS_CATEGORIES = (
-    "a funding round (raised, Series A/B/C, seed, valuation)",
-    "an AI/ML hire or a leadership hire (joined, appointed, named as, promoted to)",
-    "a paper they published or co-authored",
-    "them speaking at, keynoting or appearing at an event",
-    "them changing company (joined, left, departed, moving to)",
-    "a job post for evaluations, annotation, data labelling or model training",
-    "competitor news — another company doing what we do, for anyone",
-)
-
-
-def _norm(text: str) -> str:
-    """The matching form of a name. Case, punctuation and spacing collapsed."""
-    return " ".join(re.sub(r"[^\w\s]", " ", str(text or "")).split()).strip().lower()
-
-
-def target_key(kind: str, name: str) -> str:
-    return f"{kind}|{_norm(name)}"
+# How many significant tokens make a headline key.
+HEADLINE_KEY_TOKENS = 8
 
 
 # -- normalising a story's URL ------------------------------------------------
@@ -105,7 +80,7 @@ _TRACKING = re.compile(r"[?&](utm_[^=]+|ref|ref_src|fbclid|gclid|mc_cid|mc_eid)=
 
 
 def url_key(url: str) -> str:
-    """The identity of a story, for the no-repeats check.
+    """The identity of a story's link, for the no-repeats check.
 
     THE SAME STORY ARRIVES WEARING DIFFERENT CLOTHES: with and without "www.",
     http and https, with a tracking query bolted on by whoever linked it, with
@@ -113,9 +88,7 @@ def url_key(url: str) -> str:
     key, or the dedup silently does nothing and the same funding round is posted
     on Monday, Tuesday and Wednesday.
 
-    The TITLE is deliberately not part of the key — four outlets give the same
-    round four headlines, and an outlet re-running its own piece changes its
-    own. The URL is the only stable identity a story has.
+    Two outlets are still two URLs — that is what `headline_key` is for.
     """
     raw = str(url or "").strip()
     if not raw:
@@ -127,214 +100,123 @@ def url_key(url: str) -> str:
     return raw.lower()
 
 
-# -- who to search for --------------------------------------------------------
+# -- normalising a story's headline -------------------------------------------
+
+# Words that carry no identity. Two outlets writing "OpenAI raises $40bn in a
+# new round" and "OpenAI Raises $40 Billion In New Funding Round" should land on
+# the same key, and it is the nouns and verbs that make that happen.
+_STOPWORDS = frozenset("""
+a an the and or but nor of in on at to for from by with as into onto over under
+about after before than then that this these those is are was were be been being
+has have had do does did will would can could may might should shall its it
+their his her our your my we you they he she them us new says said report reports
+reportedly just now today amid via vs versus up out off per
+""".split())
 
 
-def collect_targets(*, poc_rows: list, mapping_rows: list,
-                    pipeline_companies: list, departed: set) -> list:
-    """Everybody R1 could search for, as rows for `db.sync_news_targets`.
+def headline_key(headline: str) -> str:
+    """The first 8 significant lowercase tokens of a headline.
 
-    THE CALLER HAS ALREADY SPLIT ACTIVE FROM INACTIVE. Only active Outreach PoCs
-    rows arrive here: a row somebody stopped is a row we are not pursuing, and
-    news about them is not something anybody is going to act on.
-
-    DEPARTURES ARE DROPPED HERE AND RETURNED SEPARATELY, so the caller can also
-    delete anyone already in the rotation who has since left. Both halves
-    matter: not adding them is not enough once they are in.
+    Stopwords, digits and punctuation are dropped: "$40bn" and "$40 billion"
+    differ only in the parts that go, and the key is about WHO did WHAT.
     """
-    out: list = []
-    seen: set = set()
-    dropped: list = []
-
-    def _add(kind: str, name: str, company: str = "", source: str = "",
-             sheet_row=None) -> None:
-        clean = gtm_sheet.clean_cell(name)
-        if not clean or len(clean) < 3:
-            return
-        key = target_key(kind, clean)
-        if key in seen:
-            return
-        seen.add(key)
-        if _norm(clean) in departed:
-            dropped.append(key)
-            return
-        out.append({
-            "target_key": key, "kind": kind, "name": clean,
-            "company": gtm_sheet.clean_cell(company), "source": source,
-            "sheet_row": sheet_row,
-        })
-
-    for row in poc_rows or ():
-        _add(KIND_POC, row.get("name") or row.get("poc"),
-             company=row.get("company"), source="Outreach PoCs",
-             sheet_row=row.get("_row"))
-
-    for row in mapping_rows or ():
-        tier = str(row.get("tier") or "").strip().upper()
-        if tier not in MAPPING_TIERS:
+    tokens: list = []
+    for raw in re.findall(r"[A-Za-z0-9']+", str(headline or "").lower()):
+        tok = re.sub(r"[\d']", "", raw)
+        if len(tok) < 2 or tok in _STOPWORDS:
             continue
-        if row.get("do_not_recommend"):
-            dropped.append(target_key(KIND_RESEARCHER,
-                                      gtm_sheet.clean_cell(row.get("researcher")
-                                                           or row.get("name"))))
-            continue
-        _add(KIND_RESEARCHER, row.get("researcher") or row.get("name"),
-             company=row.get("org") or row.get("company"),
-             source=f"researcher mapping ({tier})", sheet_row=row.get("_row"))
-
-    for name in pipeline_companies or ():
-        _add(KIND_COMPANY, name, company=name, source="Master Pipeline")
-
-    return out, [k for k in dropped if k]
-
-
-def select_for_run(db, *, limit: int) -> list:
-    """The targets this run searches for, in tier order then oldest-first.
-
-    TIER ORDER FIRST, ROTATION WITHIN IT. Filling the quota from PoCs before
-    researchers before companies is the rules sheet's own priority; the
-    least-recently-searched rule then decides which PoCs. Doing it the other way
-    round — pure oldest-first across everything — would let four hundred
-    pipeline companies crowd out the people we are actually talking to.
-    """
-    want = max(1, int(limit))
-    picked: list = []
-    for kind in KIND_ORDER:
-        if len(picked) >= want:
+        tokens.append(tok)
+        if len(tokens) >= HEADLINE_KEY_TOKENS:
             break
-        try:
-            rows = db.news_targets_due(limit=want - len(picked), kinds=(kind,))
-        except Exception:
-            log.exception("[news] could not read the rotation for %s", kind)
-            rows = []
-        picked.extend(rows)
-    return picked[:want]
+    return " ".join(tokens)
 
 
 # -- building the search ------------------------------------------------------
 
 
-def _keyword_seeds() -> list:
-    return [k for k in (config.NEWS_KEYWORDS or []) if str(k).strip()]
+def sweep_prompt(topics: list, *, today: date, since_hours: int, mode: str,
+                 already: Optional[list] = None,
+                 preferred: Optional[list] = None) -> str:
+    """ONE prompt for both the main sweep and the hourly check.
 
+    THE TOPICS ARE SEEDS, NOT LIMITS, and the prompt says so in the sheet's own
+    words. A regulation that lands off the list is exactly what the team wants
+    to hear about; it is tagged OTHER rather than left out.
 
-def people_prompt(targets: list, *, today: date, keywords: Optional[list] = None,
-                  domains: Optional[list] = None) -> str:
-    """The search for OUR people. One call, every target named.
+    `already` is every headline posted today, main AND breaking. The model is
+    told not to return them — and `choose` enforces it anyway, because a prompt
+    is a request and the database is a fact.
 
-    NAMED INDIVIDUALLY rather than as "our contacts", because a search engine
-    cannot resolve "our contacts" and a model asked to search for them will
-    invent a plausible set. The names are the query.
+    `preferred` is a PREFERENCE LINE, never a tool domain restriction: a site on
+    it that blocks the crawler must not be able to fail the call.
     """
-    seeds = keywords if keywords is not None else _keyword_seeds()
-    who = []
-    for t in targets:
-        label = str(t.get("name") or "").strip()
-        org = str(t.get("company") or "").strip()
-        if org and org.lower() != label.lower():
-            label += f" ({org})"
-        who.append(label)
-
-    lines = [
-        "Search the news for ANY of these specific people and companies. They are "
-        "contacts and prospects of the team you work for, listed from their own "
-        "sheets — search for each one BY NAME:",
-        "",
-    ]
-    lines += [f"  - {w}" for w in who]
-    lines += [
-        "",
-        "WHAT COUNTS AS A STORY, and nothing else does:",
-    ]
-    lines += [f"  - {c}" for c in NEWS_CATEGORIES]
-    lines += [
-        "",
-        f"RECENCY: prefer the last 7 days. Nothing older than 30 days "
-        f"(today is {dl.iso(today)}).",
-    ]
+    hours = max(1, int(since_hours))
+    seeds = [str(t).strip() for t in (topics or []) if str(t).strip()]
+    if mode == MODE_CHECK:
+        lines = [
+            f"Search for ONLY things in AI that are MAJOR in the last {hours} hours "
+            f"(today is {dl.iso(today)}) — a big launch, a large round, a regulation, "
+            "a leadership move the whole industry is discussing. If nothing is "
+            "major, reply with exactly: NOTHING FOUND",
+        ]
+    else:
+        lines = [
+            f"Search for the most significant AI news of the last {hours} hours "
+            f"(today is {dl.iso(today)}) for a sales team at an AI-data company.",
+        ]
     if seeds:
         lines += [
             "",
-            "These terms are what the team's own rules sheet lists as relevant. They "
-            "are SEEDS AND NOT LIMITS — the sheet says 'not limited to these', so "
-            "closely adjacent terms are fair game:",
+            "TOPICS — these are SEEDS, NOT LIMITS. The team's sheet says 'not limited "
+            "to these', so important news off this list is welcome; tag it OTHER:",
             "  " + ", ".join(seeds),
         ]
+    prior = [str(h).strip() for h in (already or []) if str(h).strip()][:ALREADY_MAX]
+    if prior:
+        lines += ["", "ALREADY POSTED TODAY — do not return these, or the same story "
+                      "from another outlet:"]
+        lines += [f"  - {h}" for h in prior]
+    domains = [str(d).strip() for d in (preferred or []) if str(d).strip()]
     if domains:
-        lines += [
-            "",
-            "Restrict this search to these sites: " + ", ".join(domains),
-        ]
+        lines += ["", "Prefer these sources when they have the story: "
+                      + ", ".join(domains)]
     lines += [
         "",
-        "FOR EACH STORY, one line in exactly this shape and nothing else:",
-        "  STORY | <who or which company it is about> | <what happened, one clause> | <url>",
+        "IMPORTANCE, 1-5:",
+        "  5 = the whole industry is talking about it today",
+        "  4 = a sales team must know this week",
+        "  3 = useful",
+        "  2-1 = filler",
         "",
-        "The first field MUST be the name from the list above that the story is "
-        "about, spelled as it is above. If a story is not about one of them, leave "
-        "it out — a story about the wider industry is a different search.",
+        "FOR EACH STORY, one line in exactly this shape and nothing else:",
+        "  STORY | <topic from the list, or OTHER> | <headline> | "
+        "<what happened, one clause> | <url> | <importance 1-5>",
+        "",
         "EVERY LINE NEEDS A REAL URL you actually found. No url, no line.",
-        "If you found nothing about any of them, reply with exactly: NOTHING FOUND",
+        "One line per story — the same story from two outlets is ONE line.",
     ]
+    if mode != MODE_CHECK:
+        lines.append("If you genuinely found nothing, reply with exactly: NOTHING FOUND")
     return "\n".join(lines)
 
 
-def field_prompt(*, today: date, keywords: Optional[list] = None,
-                 domains: Optional[list] = None) -> str:
-    """The fallback: the wider AI field for the day.
-
-    ONLY REACHED WHEN THE PEOPLE PASS FOUND NOTHING, and the message says so.
-    This is a sales team's brief, not a research digest — what moved, who has
-    money, and what a regulator did.
-    """
-    seeds = keywords if keywords is not None else _keyword_seeds()
-    lines = [
-        "Search for the most significant AI news of the last 48 hours "
-        f"(today is {dl.iso(today)}). This is a briefing for a SALES team at an "
-        "AI-data company, so rank by what would change a sales conversation:",
-        "",
-        "  - major model or product releases",
-        "  - funding rounds and acquisitions",
-        "  - AI regulation, compliance and safety rulings",
-        "  - anything about evaluations, annotation, human data or model training",
-        "  - notable leadership moves at AI companies",
-    ]
-    if seeds:
-        lines += [
-            "",
-            "Relevant terms from the team's own rules sheet — SEEDS, NOT LIMITS "
-            "('not limited to these'), so adjacent terms are fair game:",
-            "  " + ", ".join(seeds),
-        ]
-    if domains:
-        lines += ["", "Restrict this search to these sites: " + ", ".join(domains)]
-    lines += [
-        "",
-        "FOR EACH STORY, one line in exactly this shape and nothing else:",
-        "  STORY | <the company or person it is about> | <what happened, one clause> | <url>",
-        "",
-        "EVERY LINE NEEDS A REAL URL you actually found. No url, no line.",
-        "If you genuinely found nothing, reply with exactly: NOTHING FOUND",
-    ]
-    return "\n".join(lines)
-
-
-def screen_prompt(stories: list, known_companies: list) -> str:
+def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "") -> str:
     """R2 — which of today's news companies are NOT in the pipeline.
 
-    READS THE STORIES R1 ALREADY PAID FOR. No second search: the question is
-    about the companies in a result set we are holding, and searching again to
-    answer it would spend the budget twice for the same information.
+    READS THE STORIES R1 ALREADY POSTED. The question is about a result set we
+    are holding, and searching again to answer it would spend the budget twice.
+
+    THE USE-CASE TABLE RIDES IN HERE, in the user prompt, because the lean
+    system prompt no longer carries the strategy doc. Only that section, capped.
     """
     lines = [
-        "Below are news stories found today, and the list of companies the team "
+        "Below are news stories posted today, and the list of companies the team "
         "already tracks in its Master Pipeline.",
         "",
         "Name the companies that appear in the STORIES but are NOT in the TRACKED "
         "list. For each one, ONE line saying whether it is relevant to membrane and "
-        "why, judged against the use-case table (A-J and who buys each) in the "
-        "sales strategy above. Name the use case you matched, or say plainly that it "
-        "matches none.",
+        "why, judged against the use-case table (A-J and who buys each) below. "
+        "Name the use case you matched, or say plainly that it matches none.",
         "",
         "FORMAT, one per line and nothing else:",
         "  SCREEN | <company> | <fit or no fit, and which use case> | <url>",
@@ -342,58 +224,115 @@ def screen_prompt(stories: list, known_companies: list) -> str:
         "DO NOT propose adding anything to any sheet. A human is asked before any "
         "row is added and that is a separate step you are not part of.",
         "If every company in the news is already tracked, reply: NOTHING NEW",
-        "",
-        "TODAY'S STORIES:",
     ]
+    if use_cases.strip():
+        lines += ["", "MEMBRANE'S USE CASES (from the sales strategy):", use_cases.strip()]
+    lines += ["", "TODAY'S STORIES:"]
     for s in stories[:20]:
-        lines.append(f"  - {s.get('about', '?')}: {s.get('what', '')} <{s.get('url', '')}>")
+        head = s.get("headline") or s.get("title") or s.get("about") or "?"
+        what = s.get("what") or ""
+        lines.append(f"  - {head}: {what} <{s.get('url', '')}>")
     lines += ["", "ALREADY TRACKED:", "  " + ", ".join(known_companies[:200])]
     return "\n".join(lines)
 
 
+def extract_section(text: str, heading: str, *, cap: int = 4000) -> str:
+    """One `#`-headed section of a markdown document, by its heading's words.
+
+    Everything from the heading line to the next heading of the same or a
+    higher level. Matched case-insensitively on the words, so "## 2. What we
+    sell" is found by "What we sell". "" when there is no such heading.
+    """
+    want = " ".join(str(heading or "").lower().split())
+    if not want:
+        return ""
+    out: list = []
+    level = 0
+    for line in str(text or "").splitlines():
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            this = len(m.group(1))
+            if level and this <= level:
+                break
+            if not level and want in " ".join(m.group(2).lower().split()):
+                level = this
+        if level:
+            out.append(line)
+    body = "\n".join(out).strip()
+    return body[:max(0, int(cap))]
+
+
 # -- reading what came back ---------------------------------------------------
 
-_STORY_RE = re.compile(r"^\s*STORY\s*\|", re.IGNORECASE)
+_STORY_RE = re.compile(r"^\s*[-*•]?\s*STORY\s*\|", re.IGNORECASE)
 _SCREEN_RE = re.compile(r"^\s*SCREEN\s*\|", re.IGNORECASE)
-_URL_RE = re.compile(r"https?://[^\s<>)\]]+")
+_URL_RE = re.compile(r"https?://[^\s<>)\]|]+")
+_IMPORTANCE_RE = re.compile(r"^\D*([1-5])\b")
 
 
-def parse_stories(text: str, *, sources: Optional[list] = None) -> list:
-    """The STORY lines, as [{about, what, url, url_key}].
+def _canonical_topic(raw: str, topics: Optional[list]) -> str:
+    """The topic as the list spells it, or OTHER."""
+    text = " ".join(str(raw or "").split()).strip(" []")
+    if not text:
+        return TOPIC_OTHER
+    if text.upper() == TOPIC_OTHER:
+        return TOPIC_OTHER
+    for t in (topics if topics is not None else (config.NEWS_TOPICS or [])):
+        if str(t).strip().lower() == text.lower():
+            return str(t).strip()
+    return TOPIC_OTHER
 
-    A LINE WITHOUT A URL IS DROPPED, silently and on purpose. The prompt says
-    every line needs one; a line that arrives without one is a claim nobody can
-    check, and "never post a story with no source link" is the rule this
-    enforces rather than hopes for.
 
-    `sources` is the structured citation list from `websearch.parse_results`,
-    used to rescue a line whose URL the model put somewhere else — matched by
-    position, which is the best available and is why it is a fallback.
+def parse_stories(text: str, *, topics: Optional[list] = None) -> list:
+    """The STORY lines, as [{topic, headline, what, url, url_key, headline_key,
+    importance}].
+
+    A LINE WITHOUT A URL IS DROPPED, and logged. "No url, no line" is a rule
+    this enforces rather than hopes for: a claim nobody can check does not go
+    into a sales channel.
+
+    FORGIVING ABOUT EVERYTHING ELSE. An unreadable importance is 3 ("useful"),
+    which can never break through on its own; a topic not on the list, or
+    missing, is OTHER.
     """
     out: list = []
-    spare = [s.get("url") for s in (sources or []) if s.get("url")]
     for line in str(text or "").splitlines():
         if not _STORY_RE.match(line):
             continue
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 3:
-            continue
-        about = parts[1] if len(parts) > 1 else ""
-        what = parts[2] if len(parts) > 2 else ""
-        tail = " ".join(parts[3:]) if len(parts) > 3 else ""
-        found = _URL_RE.search(tail) or _URL_RE.search(line)
-        url = found.group(0).rstrip(".,;)") if found else ""
-        if not url and spare:
-            url = spare.pop(0)
-        if not url:
+        # parts[0] is "STORY"
+        fields = parts[1:]
+        found = None
+        url_at = -1
+        for i, f in enumerate(fields):
+            m = _URL_RE.search(f)
+            if m:
+                found, url_at = m, i
+                break
+        if found is None:
             log.info("[news] dropped a story with no source link: %r", line[:120])
             continue
-        # A url that crept into the "what" field would be repeated in the line.
-        what = _URL_RE.sub("", what).strip(" -–—|")
-        if not about or not what:
+        url = found.group(0).rstrip(".,;)")
+        before = fields[:url_at]
+        after = fields[url_at + 1:]
+        topic = _canonical_topic(before[0] if len(before) >= 3 else "", topics)
+        head_fields = before[1:] if len(before) >= 3 else before
+        headline = head_fields[0] if head_fields else ""
+        what = " — ".join(head_fields[1:]) if len(head_fields) > 1 else ""
+        headline = _URL_RE.sub("", headline).strip(" -–—")
+        what = _URL_RE.sub("", what).strip(" -–—")
+        if not headline:
             continue
-        out.append({"about": about, "what": what, "url": url,
-                    "url_key": url_key(url)})
+        importance = 3
+        if after:
+            m = _IMPORTANCE_RE.match(after[0])
+            if m:
+                importance = int(m.group(1))
+        out.append({
+            "topic": topic, "headline": headline, "what": what, "url": url,
+            "url_key": url_key(url), "headline_key": headline_key(headline),
+            "importance": importance,
+        })
     return out
 
 
@@ -422,55 +361,140 @@ def found_nothing(text: str) -> bool:
     return "NOTHING FOUND" in body or "NOTHING NEW" in body
 
 
+# -- choosing what goes out ---------------------------------------------------
+
+
+def iso_week(day: date) -> str:
+    y, w, _ = day.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def cutoff_iso(today: date) -> str:
+    """The date before which a posted story is allowed to be posted again."""
+    return dl.iso(today - timedelta(days=max(1, int(config.NEWS_REPEAT_DAYS))))
+
+
+def choose(stories: list, *, today: date, db, cap: int, per_topic: int,
+           topics_per_week: int, min_importance: int,
+           breaking: bool = False) -> tuple:
+    """(keep, skipped). Every skip is a sentence saying why.
+
+    THE GATES, IN ORDER:
+      0. (breaking only) importance below the bar — a check posts only MAJOR;
+      1. posted within NEWS_REPEAT_DAYS, by url_key OR headline_key — this is
+         what keeps a story that broke at 16:00 out of tomorrow's main post;
+      2. per-topic-per-day room;       } a story at or above min_importance
+      3. topics-per-week room;         } walks past both
+      4. the cap.
+
+    Most important first, so the cap trims filler rather than the big one. Two
+    lines in one batch that are the same story (same link or same headline
+    key) count once.
+    """
+    since = cutoff_iso(today)
+    marker = dl.iso(today)
+    bar = int(min_importance)
+    ranked = sorted(enumerate(stories or []),
+                    key=lambda p: (-int(p[1].get("importance") or 3), p[0]))
+
+    try:
+        week_topics = set(db.news_topics_this_week(iso_week(today)))
+    except Exception:
+        log.exception("[news] could not read this week's topics; treating the week "
+                      "as full so only the important breaks through")
+        week_topics = None
+    topic_counts: dict = {}
+
+    keep: list = []
+    skipped: list = []
+    batch_urls: set = set()
+    batch_heads: set = set()
+
+    def _skip(s, why):
+        skipped.append(f"{s.get('headline', '?')!r} — {why}")
+
+    for _i, s in ranked:
+        imp = int(s.get("importance") or 3)
+        big = imp >= bar
+        topic = s.get("topic") or TOPIC_OTHER
+        if breaking and not big:
+            _skip(s, f"importance {imp} is below the breaking bar of {bar}")
+            continue
+        ukey, hkey = s.get("url_key") or "", s.get("headline_key") or ""
+        if (ukey and ukey in batch_urls) or (hkey and hkey in batch_heads):
+            _skip(s, "the same story is already in this batch")
+            continue
+        seen = db.news_story_seen(ukey, hkey, since_iso=since)
+        if seen:
+            how = "the same link" if seen.get("url_key") == ukey and ukey else \
+                "the same headline"
+            _skip(s, f"already posted on {seen.get('posted_on', '?')} "
+                     f"({seen.get('kind') or 'main'} post) — {how}, within "
+                     f"{config.NEWS_REPEAT_DAYS} days")
+            continue
+        if topic not in topic_counts:
+            try:
+                topic_counts[topic] = int(db.news_topic_count_today(topic, marker))
+            except Exception:
+                topic_counts[topic] = int(per_topic)
+        if topic_counts[topic] >= int(per_topic) and not big:
+            _skip(s, f"{topic} already has {topic_counts[topic]} story/stories today "
+                     f"(NEWS_PER_TOPIC_PER_DAY={per_topic})")
+            continue
+        if not big:
+            full = week_topics is None or (
+                topic not in week_topics and len(week_topics) >= int(topics_per_week))
+            if full:
+                _skip(s, f"{topic} would be topic number "
+                         f"{len(week_topics or ()) + 1} this week "
+                         f"(NEWS_TOPICS_PER_WEEK={topics_per_week})")
+                continue
+        if len(keep) >= int(cap):
+            _skip(s, f"the post is full (cap {cap})")
+            continue
+        keep.append(s)
+        batch_urls.add(ukey)
+        if hkey:
+            batch_heads.add(hkey)
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        if week_topics is not None:
+            week_topics.add(topic)
+    return keep, skipped
+
+
 # -- what the message says ----------------------------------------------------
 
+_PING_RE = re.compile(r"<@[!&]?\d+>|@(everyone|here)\b", re.IGNORECASE)
 
-def attribute(story: dict, targets: list) -> str:
-    """"Sahaj Garg — Wispr Flow, on our Outreach PoCs", or "".
 
-    NAMING THE ROW IS THE POINT. A story about somebody on our sheet is worth
-    more than the same story about a stranger, and the reader can only tell the
-    difference if the message says which row it came from. Without it the news
-    post is a newsletter.
+def _no_pings(text: str) -> str:
+    """Web text never pings anybody: mention tokens are removed outright."""
+    return _PING_RE.sub(lambda m: ("@​" + m.group(1)) if m.group(1) else "",
+                        str(text or ""))
+
+
+def _topic_label(topic: str) -> str:
+    return "Other" if (topic or TOPIC_OTHER) == TOPIC_OTHER else topic
+
+
+def render(stories: list, *, mode: str = MODE_MAIN) -> str:
+    """One line per story: `• [Topic] Headline — what happened <url>`.
+
+    `mode="breaking"` opens with "Worth knowing now:" and carries every story
+    it is given, in ONE message. No attribution block, no fallback
+    announcement: the feed is the feed.
     """
-    about = _norm(story.get("about"))
-    if not about:
-        return ""
-    for t in targets:
-        name = _norm(t.get("name"))
-        if not name:
-            continue
-        if name == about or name in about or about in name:
-            org = str(t.get("company") or "").strip()
-            src = str(t.get("source") or "").strip()
-            bits = str(t.get("name") or "").strip()
-            if org and org.lower() != bits.lower():
-                bits += f" — {org}"
-            return f"{bits}, on our {src}" if src else bits
-    return ""
-
-
-def render(stories: list, *, mode: str, targets: list, limit: int = 0) -> str:
-    """The news item's text: one short line per story, each with its link.
-
-    ONE LINE PER STORY, and the link is on the line rather than in a footnote
-    block — a reader scanning six lines should be able to click the one that
-    matters without matching numbers to a list at the bottom.
-    """
-    cap = max(1, int(limit or config.NEWS_MAX_ITEMS))
-    picked = stories[:cap]
+    picked = [s for s in (stories or []) if s.get("url")]
     if not picked:
         return ""
     lines: list = []
-    if mode == MODE_FIELD:
-        lines.append("Nothing on our contacts today, so here is what moved in AI:")
+    if mode == MODE_BREAKING:
+        lines.append("Worth knowing now:")
     for s in picked:
-        who = attribute(s, targets)
-        head = f"{s['about']} — {s['what']}" if s.get("about") else s.get("what", "")
-        line = f"• {head} <{s['url']}>"
-        if who:
-            line += f"\n  ({who})"
-        lines.append(line)
+        head = _no_pings(s.get("headline") or "")
+        what = _no_pings(s.get("what") or "")
+        body = f"{head} — {what}" if what else head
+        lines.append(f"• [{_topic_label(s.get('topic'))}] {body} <{s['url']}>")
     return "\n".join(lines)
 
 
@@ -482,19 +506,71 @@ def render_screen(rows: list, *, limit: int = 5) -> str:
     lines = ["In the news today and not in the Master Pipeline:"]
     for r in picked:
         link = f" <{r['url']}>" if r.get("url") else ""
-        lines.append(f"• {r['company']} — {r['verdict']}{link}")
+        lines.append(f"• {_no_pings(r['company'])} — {_no_pings(r['verdict'])}{link}")
     lines.append("Say the word and I'll add any of these — I won't add anything "
                  "without a yes.")
     return "\n".join(lines)
 
 
-def cutoff_iso(today: date) -> str:
-    """The date before which a posted story is allowed to be posted again."""
-    return dl.iso(today - timedelta(days=max(1, int(config.NEWS_REPEAT_DAYS))))
+# -- the hourly check's clock -------------------------------------------------
+
+
+def _minutes(hhmm: str) -> Optional[int]:
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(hhmm or ""))
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h > 23 or mi > 59:
+        return None
+    return h * 60 + mi
+
+
+def check_slots(times: Optional[list] = None) -> list:
+    """NEWS_CHECK_TIMES as sorted, de-duplicated "HH:MM" strings."""
+    out = {}
+    for t in (times if times is not None else config.NEWS_CHECK_TIMES) or []:
+        m = _minutes(t)
+        if m is None:
+            log.warning("[news-check] NEWS_CHECK_TIMES entry %r is not HH:MM; ignored", t)
+            continue
+        out[m] = f"{m // 60:02d}:{m % 60:02d}"
+    return [out[k] for k in sorted(out)]
+
+
+def latest_slot(now: datetime, times: Optional[list] = None) -> Optional[str]:
+    """The latest check slot at or before `now`, or None before the first."""
+    at = now.hour * 60 + now.minute
+    best = None
+    for s in check_slots(times):
+        if _minutes(s) <= at:
+            best = s
+    return best
+
+
+def hours_since_previous(slot: str, *, times: Optional[list] = None,
+                         main_time: Optional[str] = None) -> int:
+    """Hours between `slot` and the slot before it — a check slot or the main
+    sweep — wrapping to yesterday for the first one. Never below 1."""
+    at = _minutes(slot)
+    if at is None:
+        return 1
+    marks = {_minutes(s) for s in check_slots(times)}
+    main = _minutes(main_time if main_time is not None else config.NEWS_MAIN_TIME)
+    if main is not None:
+        marks.add(main)
+    marks.discard(None)
+    earlier = [m for m in marks if m < at]
+    if earlier:
+        gap = at - max(earlier)
+    elif marks:
+        gap = at + 24 * 60 - max(marks)
+    else:
+        gap = 60
+    return max(1, round(gap / 60))
 
 
 def _self_test() -> int:
-    """`python -m news` — selection, prompts, parsing, rendering. No I/O."""
+    """`python -m news` — prompts, parsing, choosing, rendering. No I/O."""
     logging.basicConfig(level=logging.ERROR, format="%(levelname)-7s %(message)s")
     failures = 0
 
@@ -504,7 +580,8 @@ def _self_test() -> int:
         failures += 0 if ok else 1
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: got {got!r}, want {want!r}")
 
-    today = date(2026, 9, 28)
+    today = date(2026, 9, 29)
+    topics = ["evals", "RLHF", "AI regulation", "voice agent"]
 
     print("url identity")
     check("tracking parameters are stripped",
@@ -514,112 +591,191 @@ def _self_test() -> int:
     check("fragments go", url_key("https://x.com/a#top"), "x.com/a")
     check("case is ignored", url_key("https://X.com/A"), "x.com/a")
     check("empty stays empty", url_key(""), "")
-    check("two outlets are two stories",
+    check("two outlets are two links",
           url_key("https://a.com/x") == url_key("https://b.com/x"), False)
 
-    print("\ncollecting targets")
-    targets, dropped = collect_targets(
-        poc_rows=[{"name": "Ada Lovelace", "company": "Acme", "_row": 4},
-                  {"name": "Gone Person", "company": "Old Co", "_row": 5},
-                  {"name": "", "company": "No Name"}],
-        mapping_rows=[{"researcher": "Alan Turing", "org": "Globex", "tier": "T1"},
-                      {"researcher": "Grace Hopper", "org": "Initech", "tier": "T3"},
-                      {"researcher": "Departed One", "org": "X", "tier": "T1",
-                       "do_not_recommend": "left for Microsoft"}],
-        pipeline_companies=["Initech", "Acme"],
-        departed={_norm("Gone Person")},
-    )
-    names = [t["name"] for t in targets]
-    check("active PoCs are in", "Ada Lovelace" in names, True)
-    check("a departed PoC is not", "Gone Person" in names, False)
-    check("...and is reported for removal",
-          target_key(KIND_POC, "Gone Person") in dropped, True)
-    check("T1 researchers are in", "Alan Turing" in names, True)
-    check("T3 researchers are not", "Grace Hopper" in names, False)
-    check("a flagged departure is not", "Departed One" in names, False)
-    check("pipeline companies are in", "Initech" in names, True)
-    check("a nameless row is skipped", "" in names, False)
-    check("tiers are tagged",
-          [t["kind"] for t in targets if t["name"] == "Alan Turing"], [KIND_RESEARCHER])
+    print("\nheadline identity")
+    check("stopwords, digits and case go",
+          headline_key("OpenAI raises $40bn in a new round"),
+          headline_key("OPENAI RAISES $40 BN IN NEW ROUND"))
+    check("capped at 8 tokens",
+          len(headline_key("one two three four five six seven eight nine ten").split()),
+          8)
+    check("different stories differ",
+          headline_key("Anthropic ships Claude") == headline_key("Google ships Gemini"),
+          False)
 
-    print("\nthe people prompt")
-    p = people_prompt(targets[:2], today=today, keywords=["evals", "RLHF"])
-    check("it names people individually", "Ada Lovelace" in p, True)
-    check("it carries the company", "(Acme)" in p, True)
-    check("it lists what counts", "funding round" in p, True)
-    check("keywords are seeds, not limits", "not limited to these" in p, True)
-    check("it demands the format", "STORY |" in p, True)
-    check("it demands a url", "No url, no line." in p, True)
-    check("it offers an honest empty", "NOTHING FOUND" in p, True)
-    check("no domain line without domains", "Restrict this search" in p, False)
-    check("...and one with them",
-          "Restrict this search" in people_prompt(
-              targets[:1], today=today, domains=["reuters.com"]), True)
+    print("\nthe main prompt")
+    p = sweep_prompt(topics, today=today, since_hours=24, mode=MODE_MAIN,
+                     already=["Old headline"], preferred=["reuters.com"])
+    check("it says 24 hours", "last 24 hours" in p, True)
+    check("it is for a sales team", "sales team at an AI-data company" in p, True)
+    check("topics are seeds, not limits", "SEEDS, NOT LIMITS" in p, True)
+    check("in the sheet's words", "not limited to these" in p, True)
+    check("it lists the topics", "voice agent" in p, True)
+    check("it forbids today's headlines", "Old headline" in p, True)
+    check("preferred sites are a preference line",
+          "Prefer these sources when they have the story: reuters.com" in p, True)
+    check("it defines the scale", "5 = the whole industry is talking about it today" in p,
+          True)
+    check("it demands the shape",
+          "STORY | <topic from the list, or OTHER> | <headline> | "
+          "<what happened, one clause> | <url> | <importance 1-5>" in p, True)
+    check("no url, no line", "No url, no line." in p, True)
+    already = [f"h{i}" for i in range(40)]
+    check("already is capped at 25",
+          sweep_prompt(topics, today=today, since_hours=24, mode=MODE_MAIN,
+                       already=already).count("\n  - h"), 25)
 
-    print("\nthe field prompt")
-    f = field_prompt(today=today, keywords=["AI safety"])
-    check("it is about the field", "SALES team" in f, True)
-    check("it still demands links", "No url, no line." in f, True)
+    print("\nthe check prompt")
+    c = sweep_prompt(topics, today=today, since_hours=1, mode=MODE_CHECK)
+    check("ONLY MAJOR", "ONLY things in AI that are MAJOR in the last 1 hours" in c, True)
+    check("the honest empty", "if nothing is major, reply with exactly: NOTHING FOUND"
+          in c.replace("If", "if"), True)
+    check("no preference line without domains", "Prefer these sources" in c, False)
 
     print("\nparsing stories")
     text = (
         "Here is what I found.\n"
-        "STORY | Ada Lovelace | raised a $12m Series A | https://x.com/a?utm_source=q\n"
-        "STORY | Globex | hired a head of AI | https://y.com/b\n"
-        "STORY | Nobody | something with no link\n"
+        "STORY | evals | Lab ships an eval suite | a new benchmark for agents | "
+        "https://x.com/a?utm_source=q | 4\n"
+        "STORY | Quantum pastry | Bakery raises seed | irrelevant | https://y.com/b | two\n"
+        "STORY | RLHF | No link here | nothing to check | | 5\n"
+        "STORY | | Untagged | but linked | https://z.com/c | 3\n"
         "not a story line\n"
     )
-    got = parse_stories(text)
-    check("two stories survive", len(got), 2)
+    got = parse_stories(text, topics=topics)
+    check("three stories survive", len(got), 3)
     check("the linkless one is dropped",
-          any(s["about"] == "Nobody" for s in got), False)
-    check("the url is normalised for the key", got[0]["url_key"], "x.com/a")
-    check("the url itself is kept whole",
-          got[0]["url"], "https://x.com/a?utm_source=q")
-    check("what happened is read", got[0]["what"], "raised a $12m Series A")
-    check("a missing url can be rescued from citations",
-          len(parse_stories("STORY | A | did a thing",
-                            sources=[{"url": "https://z.com/1"}])), 1)
+          any(s["headline"] == "No link here" for s in got), False)
+    check("the topic is the list's spelling", got[0]["topic"], "evals")
+    check("an unknown topic is OTHER", got[1]["topic"], TOPIC_OTHER)
+    check("a blank topic is OTHER", got[2]["topic"], TOPIC_OTHER)
+    check("importance is read", got[0]["importance"], 4)
+    check("unreadable importance is 3", got[1]["importance"], 3)
+    check("the url key is normalised", got[0]["url_key"], "x.com/a")
+    check("the url itself is kept whole", got[0]["url"], "https://x.com/a?utm_source=q")
+    check("what happened is read", got[0]["what"], "a new benchmark for agents")
+    check("the headline key is set", got[0]["headline_key"], "lab ships eval suite")
 
-    print("\nparsing the screen")
+    print("\nchoosing")
+
+    class FakeDB:
+        def __init__(self, posted=(), topic_today=None, week=()):
+            self.posted = list(posted)
+            self.topic_today = dict(topic_today or {})
+            self.week = list(week)
+
+        def news_story_seen(self, ukey, hkey, *, since_iso):
+            for r in self.posted:
+                if (ukey and r["url_key"] == ukey) or (hkey and r["headline_key"] == hkey):
+                    return r
+            return None
+
+        def news_topic_count_today(self, topic, on_date):
+            return self.topic_today.get(topic, 0)
+
+        def news_topics_this_week(self, week):
+            return self.week
+
+    def S(topic, head, imp=3, url=None):
+        u = url or f"https://n.com/{headline_key(head).replace(' ', '-')}"
+        return {"topic": topic, "headline": head, "what": "w", "url": u,
+                "url_key": url_key(u), "headline_key": headline_key(head),
+                "importance": imp}
+
+    kw = dict(today=today, cap=5, per_topic=2, topics_per_week=6, min_importance=4)
+    posted = [{"url_key": "other.com/x", "headline_key": headline_key("Big lab raises"),
+               "posted_on": "2026-09-28", "kind": "breaking"}]
+    keep, skipped = choose([S("evals", "Big lab raises", 5, "https://fresh.com/1"),
+                            S("evals", "Eval tooling update")],
+                           db=FakeDB(posted=posted), **kw)
+    check("a story posted as breaking yesterday is skipped by its headline",
+          [s["headline"] for s in keep], ["Eval tooling update"])
+    check("...with a sentence that says so",
+          "already posted on 2026-09-28 (breaking post) — the same headline" in skipped[0],
+          True)
+
+    keep, skipped = choose([S("evals", f"Eval story {w}") for w in
+                            ("alpha", "beta", "gamma")], db=FakeDB(), **kw)
+    check("per-topic room is two", len(keep), 2)
+    check("the third says why", "NEWS_PER_TOPIC_PER_DAY=2" in skipped[0], True)
+    keep, _ = choose([S("evals", f"Eval story {w}", 4) for w in
+                      ("alpha", "beta", "gamma")], db=FakeDB(), **kw)
+    check("importance at the bar bypasses per-topic", len(keep), 3)
+
+    wk = ["t1", "t2", "t3", "t4", "t5", "t6"]
+    keep, skipped = choose([S("evals", "Eval story alpha"), S("t1", "T one story")],
+                           db=FakeDB(week=wk), **kw)
+    check("a seventh topic in a week is refused", [s["topic"] for s in keep], ["t1"])
+    check("...and says so", "NEWS_TOPICS_PER_WEEK=6" in skipped[0], True)
+    keep, _ = choose([S("evals", "Eval story alpha", 5)], db=FakeDB(week=wk), **kw)
+    check("...unless it is important", len(keep), 1)
+
+    keep, skipped = choose([S("OTHER", f"Story {w}") for w in
+                            ("alpha", "beta", "gamma", "delta")],
+                           db=FakeDB(), **{**kw, "cap": 1, "per_topic": 9})
+    check("the cap holds", len(keep), 1)
+    check("...and says so", sum("the post is full" in x for x in skipped), 3)
+
+    keep, skipped = choose([S("evals", "Minor thing", 3), S("RLHF", "Major thing", 4),
+                            S("AI regulation", "Huge thing", 5)],
+                           db=FakeDB(), **{**kw, "cap": 99}, breaking=True)
+    check("breaking considers only the important",
+          sorted(s["headline"] for s in keep), ["Huge thing", "Major thing"])
+    check("...and says why the rest stayed quiet",
+          "below the breaking bar of 4" in skipped[0], True)
+    keep, _ = choose([S("evals", "Same story", 4, "https://a.com/1"),
+                      S("evals", "Same story", 4, "https://b.com/2")],
+                     db=FakeDB(), **kw)
+    check("two outlets, one story", len(keep), 1)
+
+    print("\nrendering")
+    body = render([S("evals", "Lab ships", 4), S(TOPIC_OTHER, "Thing <@123> @everyone")])
+    check("topic tag and link on every line", body.count("• ["), 2)
+    check("the tag is the topic", body.startswith("• [evals] Lab ships — w <https://"), True)
+    check("OTHER reads as Other", "[Other]" in body, True)
+    check("no pings survive", "<@123>" in body or "@everyone" in body, False)
+    b = render([S("evals", "A", 5), S("RLHF", "B", 4)], mode=MODE_BREAKING)
+    check("breaking opens with the line", b.splitlines()[0], "Worth knowing now:")
+    check("...and carries every story", b.count("• ["), 2)
+    check("no stories, no text", render([]), "")
+
+    print("\nthe check clock")
+    slots = ["11:00", "12:00", "13:00", "15:00", "16:00"]
+    check("the latest slot at or before now",
+          latest_slot(datetime(2026, 9, 29, 15, 20), slots), "15:00")
+    check("nothing before the first", latest_slot(datetime(2026, 9, 29, 9, 0), slots),
+          None)
+    check("15:00 looks back to the 14:00 main sweep",
+          hours_since_previous("15:00", times=slots, main_time="14:00"), 1)
+    check("11:00 looks back to last night's last slot",
+          hours_since_previous("11:00", times=slots, main_time="14:00"), 19)
+    check("bad entries are ignored", check_slots(["25:00", "9:05", "x"]), ["09:05"])
+
+    print("\nthe strategy section")
+    doc = "# T\n\n## 1. Who\nx\n\n## 2. What we sell\n| A | B |\n### sub\ny\n## 3. Goals\nz"
+    sec = extract_section(doc, "What we sell")
+    check("it starts at the heading", sec.splitlines()[0], "## 2. What we sell")
+    check("it keeps sub-headings", "### sub" in sec, True)
+    check("it stops at the next section", "Goals" in sec, False)
+    check("it is capped", len(extract_section(doc, "What we sell", cap=10)), 10)
+
+    print("\nthe screen")
     rows = parse_screen(
         "SCREEN | Nebius | fits use case C, inference infra | https://n.com/1\n"
         "SCREEN | Priority Tech | no fit, payments | https://p.com/2\n"
     )
     check("both screens read", len(rows), 2)
-    check("the verdict survives", "fits use case C" in rows[0]["verdict"], True)
+    check("the screen prompt carries the use cases",
+          "MEMBRANE'S USE CASES" in screen_prompt([S("evals", "x")], ["Acme"],
+                                                   use_cases="| A | x |"), True)
+    check("it asks before adding", "without a yes" in render_screen(rows), True)
 
     print("\nfound-nothing")
-    check("the people pass can come back empty",
-          found_nothing("NOTHING FOUND"), True)
+    check("an honest empty", found_nothing("NOTHING FOUND"), True)
     check("...and the screen too", found_nothing("NOTHING NEW"), True)
-    check("a real answer is not empty", found_nothing("STORY | A | b | c"), False)
-
-    print("\nattribution")
-    check("a story about our PoC names the row",
-          attribute({"about": "Ada Lovelace"}, targets),
-          "Ada Lovelace — Acme, on our Outreach PoCs")
-    check("a stranger gets nothing", attribute({"about": "Someone Else"}, targets), "")
-    check("a partial name still matches",
-          bool(attribute({"about": "Ada Lovelace, CEO"}, targets)), True)
-
-    print("\nrendering")
-    body = render(got, mode=MODE_PEOPLE, targets=targets)
-    check("every story carries its link", body.count("<http"), 2)
-    check("the row is named", "on our Outreach PoCs" in body, True)
-    check("people mode does not announce a fallback",
-          "Nothing on our contacts" in body, False)
-    field = render(got, mode=MODE_FIELD, targets=[])
-    check("field mode says so in plain words",
-          field.startswith("Nothing on our contacts today"), True)
-    check("the cap is honoured",
-          render(got * 5, mode=MODE_PEOPLE, targets=[], limit=3).count("<http"), 3)
-    check("no stories, no text", render([], mode=MODE_PEOPLE, targets=[]), "")
-
-    print("\nthe screen's text")
-    screen = render_screen(rows)
-    check("it names the company", "Nebius" in screen, True)
-    check("it asks before adding", "without a yes" in screen, True)
+    check("a real answer is not empty", found_nothing("STORY | a | b | c | d | 3"), False)
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

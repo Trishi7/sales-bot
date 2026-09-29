@@ -481,22 +481,26 @@ def row_gate(row: dict, *, today: date, snoozes: dict) -> tuple:
 
 
 def _r_ai_news(rule, ctx) -> list:
-    """R1 — the daily news sweep. WEB-DEPENDENT.
+    """R1 — the daily AI industry feed on a topic list. WEB-DEPENDENT.
 
-    Funding rounds, AI/ML and leadership hires, papers by our PoCs, PoCs
-    speaking at events or changing companies, job posts for evals / annotation /
-    model-training roles, competitor news, major global AI news, regulation.
+    The 24/29 Sep decision: R1 is no longer about our people. The main sweep
+    covers the last 24 hours on NEWS_TOPICS (seeds, not limits) and the
+    research layer (`bot._news_run`) expands this item into up to
+    NEWS_MAX_ITEMS stories. The hourly breaking checks are not items at all —
+    they post from the sweep tick, outside the drip.
 
-    ONE ITEM, not one per story. The research layer will expand it into the
-    stories it found; until then it is a single placeholder so the schedule is
-    visible without pretending to have read anything.
+    ONE ITEM, not one per story, and PINNED TO NEWS_MAIN_TIME through the
+    drip's fixed-time field, rather than taking whichever slot its rank lands
+    on: the main post covers "overnight plus 11:00-14:00" and the team reads
+    it at a known time.
     """
     today = ctx["today"]
     return [_item(
         rule=rule, trigger=R_AI_NEWS, today=today, due=today,
-        why="R1 runs every weekday",
-        text="AI news: funding, hires, papers by our PoCs, competitor and regulation news",
+        why=f"R1 runs every weekday at {config.NEWS_MAIN_TIME}",
+        text="AI news: the last 24 hours on the team's topic list",
         web_pending=True,
+        extra={"dayof_time": config.NEWS_MAIN_TIME},
     )]
 
 
@@ -571,53 +575,115 @@ def _r_events(rule, ctx) -> list:
 
 
 def _r_deliverables(rule, ctx) -> list:
-    """R4 — P1 deliverables due within DELIVERABLE_NEAR_DAYS, or already past.
+    """R4 — every open deliverable due by the END OF THIS WEEK, or already past.
 
-    THE OWNER IS THE Functional Dependency CELL, and blank means
-    DELIVERABLE_DEFAULT_OWNER (Vaishnavi). Blank is common and it is not the
-    same as unowned — a deliverable nobody is addressed about is a deliverable
-    nobody chases.
+    ONE MONDAY POST, THE WHOLE WEEK. The window runs to the Sunday of the week
+    it runs in, so Monday's message is the week's checklist rather than a drip
+    of whatever falls inside DELIVERABLE_NEAR_DAYS. Anything already past its
+    deadline is in too, however old.
 
-    STATUS BLANK OR NOT DONE. Only the values in DELIVERABLE_DONE_MARKERS count
-    as finished; everything else, blank included, is still open. The safe
-    direction: chasing a finished item costs one correction, and skipping an
-    unfinished one costs the deadline.
+    PRIORITY IS ORDER, NOT A FILTER. It used to drop everything that was not
+    P1; now every open row is listed and P1s lead (`drip.render_deliverables`
+    sorts P1 first, then by deadline). The one place the old P1 + NEAR_DAYS
+    test survives is a SUNDAY run — the exception is "a P1 due on Monday", and
+    widening a Sunday post to the whole week would spend the weekend's one
+    message on things with four working days left.
 
-    DEADLINES CARRY NO YEAR on this tab ("25-Sep"), so they go through
-    `gtm_sheet.parse_bare_deadline`, which reads them as the NEXT occurrence.
+    THE TEAM IS THE Functional Dependency CELL (Engineering, Sales, Legal …),
+    and blank means DELIVERABLE_DEFAULT_OWNER. Blank is common and it is not
+    the same as unowned.
+
+    STATUS BLANK OR NOT DONE. Only DELIVERABLE_DONE_MARKERS count as finished;
+    everything else, blank included, is open — chasing a finished item costs
+    one correction, skipping an unfinished one costs the deadline.
+
+    DEADLINES CARRY NO YEAR on this tab ("25-Sep"); see `_deliverable_due` for
+    how one that has just passed is read as overdue rather than as next year's.
+    A row with no readable deadline is left out: "due ?" is not a line anybody
+    can act on.
     """
     today = ctx["today"]
-    near = max(0, int(config.DELIVERABLE_NEAR_DAYS))
+    sunday = today.weekday() == 6
+    monday = today - timedelta(days=today.weekday())
+    if sunday:
+        window_end = today + timedelta(days=max(0, int(config.DELIVERABLE_NEAR_DAYS)))
+    else:
+        window_end = monday + timedelta(days=6)
     out = []
     for row in ctx.get("deliverables") or ():
         item_name = _text(row, "action_item")
         if not item_name:
             continue
-        if not _matches_any(row.get("priority"), config.DELIVERABLE_P1_MARKERS):
-            continue
         if _matches_any(row.get("status"), config.DELIVERABLE_DONE_MARKERS):
             continue
+        is_p1 = bool(_matches_any(row.get("priority"), config.DELIVERABLE_P1_MARKERS))
+        if sunday and not is_p1:
+            continue
         raw = row.get("deadline")
-        due = gtm_sheet.parse_bare_deadline(raw) or gtm_sheet.sheet_date(raw)
-        if due is None:
+        due = _deliverable_due(raw, today=today)
+        if due is None or due > window_end:
             continue
         days = (due - today).days
-        if days > near:
-            continue
-        owner = _text(row, "dependency") or config.DELIVERABLE_DEFAULT_OWNER
+        team = _text(row, "dependency") or config.DELIVERABLE_DEFAULT_OWNER
         status = _text(row, "status") or "(blank)"
+        priority = _text(row, "priority")
         when = ("overdue by %d day(s)" % -days if days < 0
                 else "due today" if days == 0 else "due in %d day(s)" % days)
         out.append(_item(
             rule=rule, trigger=R_DELIVERABLES, today=today, due=due,
-            why=f"R4 (Mondays): P1, status {status}, {when}",
-            text=f"{item_name} — {when}",
-            owner=owner, company=item_name, sheet_row=row.get("_row"),
-            extra={"deliverable": item_name, "status": status,
-                   "dependency": _text(row, "dependency"),
-                   "link": _text(row, "link")},
+            why=(f"R4 ({'Sunday: P1 due soon' if sunday else 'Mondays: due this week'})"
+                 f": {priority or 'no priority'}, status {status}, {when}"),
+            text=f"{item_name} — {team}, {when}",
+            owner=team, company=item_name, sheet_row=row.get("_row"),
+            extra={
+                "deliverable": item_name, "item": item_name, "team": team,
+                "deadline": dl.iso(due), "deadline_pretty": _short_date(due),
+                "status": status, "remarks": _text(row, "remarks"),
+                "link": _text(row, "link"),
+                # NOT `priority`: that key is the item's numeric band, which
+                # every sort in this module reads.
+                "sheet_priority": priority, "is_p1": is_p1,
+                "days_left": days, "week_of": dl.iso(monday),
+                "dependency": _text(row, "dependency"),
+            },
         ))
     return out
+
+
+# How recently a yearless deadline must have passed to be read as OVERDUE this
+# year rather than as next year's. Three months: nothing on a weekly checklist
+# is overdue by more than a quarter and still meant, and nothing is planned a
+# full nine months out in "25-Sep" shorthand.
+_BARE_LOOKBACK_DAYS = 90
+
+
+def _deliverable_due(raw, *, today):
+    """A deliverable's deadline as a date, or None.
+
+    `gtm_sheet.parse_bare_deadline` reads "25-Sep" as the NEXT 25 September —
+    right for planning, wrong for a checklist: on 29 Sep a row due "25-Sep"
+    and still open came back as September NEXT YEAR, so "already past" could
+    never fire for this tab. Here a next occurrence more than nine months away
+    whose previous occurrence passed within `_BARE_LOOKBACK_DAYS` is read as
+    that previous one — overdue. The rule's own `today` is passed through, so
+    a test day or a simulation reads the sheet as of the day it pretends.
+    """
+    nxt = gtm_sheet.parse_bare_deadline(raw, today=today)
+    if nxt is None:
+        return gtm_sheet.sheet_date(raw)
+    if (nxt - today).days > 270:
+        try:
+            prev = nxt.replace(year=nxt.year - 1)
+        except ValueError:                      # 29 Feb
+            prev = None
+        if prev is not None and 0 < (today - prev).days <= _BARE_LOOKBACK_DAYS:
+            return prev
+    return nxt
+
+
+def _short_date(d) -> str:
+    """"Thu 2 Oct" — how a deliverable's deadline is written in the list."""
+    return f"{d.strftime('%a')} {d.day} {d.strftime('%b')}"
 
 
 def _role_rank(designation: str) -> int:
@@ -1006,8 +1072,11 @@ def _r_closure_support(rule, ctx) -> list:
             why=(f"R10 (Mondays): prospect status {_text(row, 'prospect_status')!r} "
                  f"({stage}) and closure {pct}%, above CLOSURE_SUPPORT_MIN ({floor}%) "
                  f"— exactly {floor}% would not qualify"),
-            text=(f"{_describe(row)} — {pct}% at {_text(row, 'prospect_status')}. "
-                  "What is needed to move it to the next stage?"),
+            # THE SUPPORTIVE VERSION, from the call: an offer of help, not a
+            # "what is needed" that reads as a chase.
+            text=(f"{_describe(row)} is in the closure stage — anything I can pull "
+                  "together to help it along: the PoC's background, the company, a "
+                  "package summary? Say the word."),
             company=_text(row, "company"), poc=_text(row, "name"),
             designation=_text(row, "designation"), sheet_row=row.get("_row"),
             row_key=_contact_key(row), contact_key=_contact_key(row),
@@ -1114,7 +1183,11 @@ def _scheduled_reminders(ctx) -> list:
             when = dl.parse_date(str((entry or {}).get("due_date") or ""))
             if when is None or when > today:
                 continue
-            about = str((entry or {}).get("about") or "").strip()
+            # The table calls it `what`; `about` is kept for any caller that
+            # still hands that name in. Reading only `about` meant every
+            # reminder's text came out as "the reminder you asked for".
+            about = str((entry or {}).get("what") or (entry or {}).get("about")
+                        or "").strip()
             out.append(_item(
                 rule=None, trigger=SCHEDULED_REMINDER, today=today, due=when,
                 why=f"you asked me to come back to this on {dl.format_date(when)}",
@@ -1427,12 +1500,13 @@ def preview_text(result: dict, *, max_lines: Optional[int] = None) -> str:
             )
             for item in items:
                 # The placeholder is already inside `text` (see `_item`), so it
-                # is not repeated here. One marker, one place, greppable in one
-                # pass when the research layer lands.
+                # is not repeated here — only reworded, because a preview is
+                # un-researched by design and the research comes at send time.
                 overdue = (f" · {item['overdue_days']}d overdue"
                            if item.get("overdue_days") else "")
                 owner = f" → {item['owner']}" if item.get("owner") else ""
-                lines.append(f"  • {item.get('text', '')}{overdue}{owner}")
+                lines.append(f"  • {rules_mod.preview_text_of(item.get('text', ''))}"
+                             f"{overdue}{owner}")
                 lines.append(f"    _why: {item.get('why', '')}_")
             lines.append("")
 
@@ -1464,10 +1538,10 @@ def preview_text(result: dict, *, max_lines: Optional[int] = None) -> str:
     pending = int(result.get("web_pending") or 0)
     if pending:
         lines.append(
-            f"_{pending} item(s) are marked **{rules_mod.WEB_PENDING}** — those rules "
-            "need web research this bot cannot do yet, so the schedule is real but the "
-            "researched half of each line is not there. They are shown rather than "
-            "skipped so a configured rule never looks like a quiet week._"
+            f"_{pending} item(s) say **{rules_mod.RESEARCH_AT_SEND}** — their web "
+            "research is done for each message just before it goes out, not for the "
+            "preview, so the schedule is real and the researched half of each line "
+            "arrives with the message itself._"
         )
 
     silent = result.get("silent") or {}
@@ -1650,26 +1724,42 @@ def _self_test() -> int:
     check("blank and No are selected, Yes is not",
           sorted(a["company"] for a in got), ["Hinglish STT", "Image A/B"])
 
-    print("\nR4 deliverables — P1, not done, near or passed")
+    print("\nR4 deliverables — open, due by Sunday or already past, any priority")
+    # MON is Mon 21 Sep 2026, so the week ends Sun 27 Sep.
     dl_rows = [
         {"_row": 2, "_extra": {}, "action_item": "MSA", "priority": "P1",
          "status": "", "deadline": "22-Sep", "dependency": "Sid"},
         {"_row": 3, "_extra": {}, "action_item": "NDA", "priority": "P1",
          "status": "Done", "deadline": "22-Sep", "dependency": ""},
         {"_row": 4, "_extra": {}, "action_item": "Website", "priority": "P2",
-         "status": "", "deadline": "22-Sep", "dependency": ""},
+         "status": "", "deadline": "27-Sep", "dependency": "", "remarks": "copy"},
         {"_row": 5, "_extra": {}, "action_item": "Dashboard", "priority": "P1",
          "status": "", "deadline": "31-Dec", "dependency": ""},
+        {"_row": 6, "_extra": {}, "action_item": "Pitch deck", "priority": "P3",
+         "status": "In progress", "deadline": "10-Sep", "dependency": "Sales"},
+        {"_row": 7, "_extra": {}, "action_item": "Next week", "priority": "P1",
+         "status": "", "deadline": "28-Sep", "dependency": ""},
     ]
     got = run(today=MON, rows=[], deliverables=dl_rows,
               day_rules=[rules_mod.by_id("R4")])["actions"]
-    check("only the near P1 that is not done", [a["deliverable"] for a in got], ["MSA"])
-    check("owner comes from Functional Dependency", got[0]["owner"], "Sid")
-    dl_rows[0]["dependency"] = ""
-    got = run(today=MON, rows=[], deliverables=dl_rows,
+    check("every open row due by Sunday or past, P2/P3 included",
+          sorted(a["deliverable"] for a in got), ["MSA", "Pitch deck", "Website"])
+    check("a deadline 11 days ago is read as overdue, not as next year",
+          next(a["days_left"] for a in got if a["deliverable"] == "Pitch deck"), -11)
+    check("the team comes from Functional Dependency",
+          next(a["team"] for a in got if a["deliverable"] == "MSA"), "Sid")
+    check("blank team -> the default owner",
+          next(a["team"] for a in got if a["deliverable"] == "Website"),
+          config.DELIVERABLE_DEFAULT_OWNER)
+    check("extra carries remarks, priority and the pretty date",
+          next((a["remarks"], a["sheet_priority"], a["deadline_pretty"])
+               for a in got if a["deliverable"] == "Website"),
+          ("copy", "P2", "Sun 27 Sep"))
+    sun = MON + timedelta(days=6)
+    got = run(today=sun, rows=[], deliverables=dl_rows,
               day_rules=[rules_mod.by_id("R4")])["actions"]
-    check("blank dependency -> the default owner",
-          got[0]["owner"], config.DELIVERABLE_DEFAULT_OWNER)
+    check("a Sunday run (if R4 ran on Sundays) keeps P1 + DELIVERABLE_NEAR_DAYS",
+          sorted(a["deliverable"] for a in got), ["MSA", "Next week"])
 
     print("\nDEDUP — one contact, one mention, per day")
     dup = row(li_connected_date="15-09-2026")      # R5 eligible AND R6 due

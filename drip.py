@@ -58,6 +58,7 @@ import config
 import deadlines as dl
 import gtm_sheet
 import nextaction
+import rules
 
 log = logging.getLogger(__name__)
 
@@ -87,14 +88,23 @@ def owner_label(action: dict) -> str:
     return str(action.get("owner") or "").strip()
 
 
+# RULES THAT ARE ONE MESSAGE WHATEVER THE OWNERS. R4 is the week's checklist:
+# split by team it became three Monday posts about one list. Its message is
+# addressed to DELIVERABLE_DEFAULT_OWNER, who owns the checklist; each line
+# names its own team.
+RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES})
+
+
 def group_key(action: dict) -> str:
     """"<type>|<owner key>" — the identity of one message's subject.
 
     Type AND owner, never one or the other. Keying on type alone would put two
     people's work in one message; keying on owner alone would mix a quote chase
     with a DM check, and a message asking two different kinds of thing gets half
-    an answer.
+    an answer. THE EXCEPTION is RULE_ONLY_TYPES, grouped by rule alone.
     """
+    if action.get("type") in RULE_ONLY_TYPES:
+        return f"{action.get('type')}|*"
     return f"{action.get('type')}|{owner_key(action)}"
 
 
@@ -149,8 +159,10 @@ def group(actions: list) -> list:
                 (m.get("dayof_time") for m in members if m.get("dayof_time")), ""
             ),
             "type_label": nextaction.TYPE_LABELS.get(best["type"], best["type"]),
-            "owner_key": owner_key(best),
-            "owner": owner_label(best),
+            "owner_key": (gtm_sheet.normalise_header(config.DELIVERABLE_DEFAULT_OWNER)
+                          if best["type"] in RULE_ONLY_TYPES else owner_key(best)),
+            "owner": (config.DELIVERABLE_DEFAULT_OWNER
+                      if best["type"] in RULE_ONLY_TYPES else owner_label(best)),
             "priority": best["priority"],
             "priority_label": best["priority_label"],
             "due_date": best.get("due_date"),
@@ -613,10 +625,11 @@ def plan(
                 ),
             })
             continue
-        # THE ONE EXCEPTION TO THE WINDOW. R8's day-of touch fires at
-        # MEETING_DAYOF_TIME (10:00), before the window opens, because it is
-        # about something happening today and the window is about not
-        # interrupting anybody's evening — a different problem.
+        # THE FIXED-TIME SLOTS. R8's day-of touch fires at MEETING_DAYOF_TIME
+        # (10:00), before the window opens, because it is about something
+        # happening today and the window is about not interrupting anybody's
+        # evening — a different problem. R1's main news post rides the same
+        # field, pinned to NEWS_MAIN_TIME (14:00).
         send_at = times[next_slot - 1]
         if g.get("dayof_time"):
             try:
@@ -672,8 +685,8 @@ def plan(
 # the day the API is down.
 _ASK = {
     nextaction.R_AI_NEWS: (
-        "{who}here is what moved in AI since yesterday — funding, hires, papers from "
-        "people we are talking to. Skim it when you have a minute."
+        "{who}here is what moved in AI in the last 24 hours on our topic list. Skim "
+        "it when you have a minute."
     ),
     nextaction.R_NEWS_SCREEN: (
         "{who}a few companies in the news this week are not in the Master Pipeline. "
@@ -684,9 +697,11 @@ _ASK = {
         "{who}{companies} is coming up and we are not registered. Worth a look before "
         "registration closes — tell me if it is not for us and I will leave it."
     ),
+    # R4 IS ALWAYS POINTS (see `points_of`); this sentence is only the
+    # never-expected case of a deliverables message with no items on it.
     nextaction.R_DELIVERABLES: (
-        "{who}{companies} is a P1 on the checklist and its deadline is nearly here. "
-        "Where has it got to? No rush if it is in hand, just say."
+        "{who}here is the deliverables list for this week. Shout if any of these "
+        "have moved and I'll update my list."
     ),
     nextaction.R_PROSPECTS: (
         "{who}{companies} — nobody has made first contact with these yet. Worth a "
@@ -710,9 +725,12 @@ _ASK = {
         "against it. What came out of it, which package came up, and roughly what "
         "size? Tell me and I will stop asking."
     ),
+    # THE SUPPORTIVE VERSION, from the call. Two or more deals go as points
+    # with the same offer as the close (see `points_of`).
     nextaction.R_CLOSURE_SUPPORT: (
-        "{who}{companies} is sitting above 50% and has not moved stage. What would it "
-        "take to get it to the next one? Happy to dig anything out."
+        "{who}{companies} is in the closure stage — anything I can pull together to "
+        "help it along: the PoC's background, the company, a package summary? Say "
+        "the word."
     ),
     nextaction.R_NEW_COMPANY: (
         "{who}{companies} is new in the Master Pipeline. I can fill in the funding, "
@@ -872,6 +890,163 @@ def with_sources(body: str, message: dict) -> str:
     return (body or "").rstrip() + "\n" + websearch.format_sources(missing)
 
 
+# -- points: the deterministic lists ------------------------------------------
+#
+# THE STRUCTURE RULE (tone.STRUCTURE_RULE): more than two facts go in points,
+# one per line. The lines are rendered HERE, deterministically, never by the
+# model — a model that re-typed a deadline or dropped a row would change the
+# facts. With DRIP_LLM_COMPOSE on, the model writes only a one-line opener and
+# a one-line close around them, and `llm._proactive_problem` rejects any
+# composition that lost or reworded a line (logged as `structure`).
+
+DELIVERABLES_CLOSE = "Shout if any of these have moved and I'll update my list."
+CLOSURE_CLOSE = ("Anything I can pull together to help them along — the PoC's "
+                 "background, the company, a package summary? Say the word.")
+GENERIC_CLOSE = "Tell me when they are done and I will move on."
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def render_deliverables(items: list, *, today: Optional[date] = None,
+                        limit: int = 20) -> list:
+    """R4's lines: the header, then one numbered line per deliverable.
+
+        Deliverables for the week of Mon 28 Sep — 6 open:
+        1. Pulse overview doc — Sales, due Thu 1 Oct, overdue by 3 days — waiting on pricing
+
+    P1 FIRST, THEN BY DEADLINE — priority is the order, not a filter. The link
+    is appended only when the row has one; remarks only when there are any.
+    Past `limit` the rest are counted in one closing line, never dropped
+    silently.
+    """
+    today = today or dl.today_ist()
+    rows = sorted(
+        (a for a in (items or []) if a.get("item") or a.get("deliverable")),
+        key=lambda a: (0 if a.get("is_p1") else 1,
+                       str(a.get("deadline") or "9999"),
+                       str(a.get("item") or a.get("deliverable") or "").lower()),
+    )
+    week = dl.parse_date(str((rows[0].get("week_of") if rows else "") or "")) or (
+        today - timedelta(days=today.weekday()))
+    header = (f"Deliverables for the week of {week.strftime('%a')} {week.day} "
+              f"{week.strftime('%b')} — {len(rows)} open:")
+    lines = [header]
+    for i, a in enumerate(rows[:max(1, int(limit))], 1):
+        name = str(a.get("item") or a.get("deliverable")).strip()
+        team = str(a.get("team") or config.DELIVERABLE_DEFAULT_OWNER).strip()
+        line = f"{i}. {name} — {team}, due {a.get('deadline_pretty') or a.get('deadline')}"
+        days = a.get("days_left")
+        if isinstance(days, int) and days < 0:
+            line += f", overdue by {_plural(-days, 'day')}"
+        remarks = " ".join(str(a.get("remarks") or "").split())
+        if remarks:
+            line += f" — {remarks}"
+        link = str(a.get("link") or "").strip()
+        if link.startswith("http"):
+            line += f" <{link}>"
+        lines.append(line)
+    if len(rows) > limit:
+        lines.append(f"(+{len(rows) - limit} more due this week — ask and I'll list them)")
+    return lines
+
+
+def render_closure(items: list) -> list:
+    """R10's lines: one numbered line per deal. "1. Acme AI — Ada Lovelace, 70% at Quote" """
+    lines = []
+    seen = set()
+    for a in items or []:
+        key = (a.get("company"), a.get("poc"))
+        if key in seen or not a.get("company"):
+            continue
+        seen.add(key)
+        bits = [str(a.get("poc") or "").strip()]
+        pct, stage = a.get("closure_pct"), str(a.get("stage") or "").strip()
+        if pct is not None:
+            bits.append(f"{pct}% at {stage}" if stage else f"{pct}%")
+        detail = ", ".join(b for b in bits if b)
+        lines.append(f"{len(lines) + 1}. {a['company']}" + (f" — {detail}" if detail else ""))
+    return lines
+
+
+def points_of(message: dict) -> Optional[dict]:
+    """{"header", "lines", "close"} when this message goes out as points, else None.
+
+    R4 always; R10 with two or more deals; any other rule with three or more
+    companies (the structure rule's "more than two facts"). `lines` are the
+    numbered lines only — what the post-check requires verbatim.
+    """
+    kind = message.get("type")
+    actions = list(message.get("actions") or [])
+    cap = int(message.get("max_items_per_post") or 0) or 20
+    if kind == nextaction.R_DELIVERABLES:
+        rendered = render_deliverables(actions, limit=cap)
+        if len(rendered) < 2:
+            return None
+        body = rendered[1:]
+        numbered = [l for l in body if l[:1].isdigit()]
+        extra = [l for l in body if not l[:1].isdigit()]
+        return {"header": rendered[0], "lines": numbered, "extra": extra,
+                "close": DELIVERABLES_CLOSE}
+    if kind == nextaction.R_CLOSURE_SUPPORT:
+        lines = render_closure(actions)
+        if len(lines) < 2:
+            return None
+        return {"header": "These deals are in the closure stage:", "lines": lines,
+                "extra": [], "close": CLOSURE_CLOSE}
+    companies = [c for c in (message.get("companies") or []) if str(c).strip()]
+    if len(companies) >= 3:
+        lines = []
+        for i, c in enumerate(companies[:max(3, cap)], 1):
+            poc = next((str(a.get("poc") or "").strip() for a in actions
+                        if a.get("company") == c and a.get("poc")), "")
+            lines.append(f"{i}. {c}" + (f" — {poc}" if poc else ""))
+        extra = ([f"(+{len(companies) - len(lines)} more next time)"]
+                 if len(companies) > len(lines) else [])
+        label = message.get("type_label") or "To look at"
+        return {"header": f"{label} — {len(companies)}:", "lines": lines,
+                "extra": extra, "close": GENERIC_CLOSE}
+    return None
+
+
+def points_block(points: dict) -> str:
+    """The verbatim block: header, numbered lines, any overflow line."""
+    return "\n".join([points["header"]] + points["lines"] + points.get("extra", []))
+
+
+def fact_count(message: dict) -> int:
+    """How many facts the message carries — companies, items or reasons."""
+    actions = message.get("actions") or []
+    reasons = {str(a.get("why") or "") for a in actions if a.get("why")}
+    return max(len(message.get("companies") or []), len(actions),
+               len(reasons) if len(actions) > 1 else 0)
+
+
+def required_lines(message: dict) -> list:
+    """The point lines a composed message must carry unchanged."""
+    points = points_of(message)
+    return list(points["lines"]) if points else []
+
+
+def split_on_lines(body: str, *, limit: int = 1900) -> list:
+    """Discord's 2000-character cap, met by splitting BETWEEN lines — never
+    inside a bullet. Each part is a separate message; the caller counts them as
+    ONE drip slot."""
+    parts: list = []
+    current = ""
+    for line in str(body or "").split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit and current:
+            parts.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts or [""]
+
+
 def compose_fallback(message: dict, *, address: str = "") -> str:
     """The message text WITHOUT the model. Always sendable.
 
@@ -896,6 +1071,17 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
     # no message at all; and the stories are already one short line each with
     # their links, which is exactly what a template would be trying to produce.
     research = research_of(message)
+
+    # POINTS: the deterministic list, with its opener and its close. Research
+    # (R10's news) rides underneath rather than replacing the list.
+    points = points_of(message)
+    if points:
+        body = (who + points_block(points) + "\n" + points["close"]).strip()
+        if research:
+            body += "\n\n" + research
+        note = note_of(message)
+        return f"{body}\n({note})" if note else body
+
     if research:
         note = note_of(message)
         return (who + research + (f"\n({note})" if note else "")).strip()
@@ -916,6 +1102,7 @@ def compose_prompt(message: dict, *, address: str = "") -> str:
     output inline, because the exemplars live in the policy file where a human
     can edit them without touching code.
     """
+    points = points_of(message)
     lines = [
         "Write ONE short proactive message for the sales channel.",
         "",
@@ -923,10 +1110,30 @@ def compose_prompt(message: dict, *, address: str = "") -> str:
         f"Address them as EXACTLY this, once, at the start: "
         f"{address or message.get('owner') or '(do not address anyone by name)'}",
         f"What it is about: {message.get('type_label')}",
-        f"Companies (name every one of these, comma-separated, in one sentence): "
-        f"{companies_sentence(message.get('companies') or [])}",
-        f"How overdue: {message.get('overdue_days') or 0} day(s)",
     ]
+    if points:
+        # THE MODEL WRITES TWO LINES. The list is rendered in code and must
+        # arrive unchanged; a composition missing any of its lines is thrown
+        # away for the template (`llm._proactive_problem`, logged `structure`).
+        lines += [
+            "",
+            "THIS MESSAGE IS A LIST, and you write ONLY two lines of it: a one-line "
+            "OPENER (addressing them as above) and a one-line CLOSE in your voice "
+            f"(the close should say what this says: \"{points['close']}\").",
+            "Between your opener and your close, include the block below EXACTLY as "
+            "written — every line, character for character, in this order. Do not "
+            "renumber, reword, merge, drop or add anything to it, and do not add "
+            "the <<< >>> markers:",
+            "<<<",
+            points_block(points),
+            ">>>",
+        ]
+    else:
+        lines += [
+            f"Companies (name every one of these, in one sentence): "
+            f"{companies_sentence(message.get('companies') or [])}",
+        ]
+    lines += [f"How overdue: {message.get('overdue_days') or 0} day(s)"]
     if message.get("stage") == STAGE_REASK:
         lines += [
             "",
@@ -1005,6 +1212,10 @@ def preview_text(planned: dict) -> str:
             f"{m['owner'] or '(unassigned)'} · {m['stage']} · P{m['priority']}"
         )
         lines.append(f"      {compose_fallback(m, address=m.get('owner') or '')}")
+        if m.get("web_pending"):
+            # THE PLAN IS UN-RESEARCHED BY DESIGN; the research is done for this
+            # message at its slot. Say so rather than showing a gap.
+            lines.append(f"      ({rules.RESEARCH_AT_SEND})")
     lines.append("")
 
     for row in planned.get("rolled") or []:

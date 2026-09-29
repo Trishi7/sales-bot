@@ -575,6 +575,113 @@ def _next_weekday(today: date, weekday: int) -> date:
     return today + timedelta(days=ahead or 7)
 
 
+# -- one-off reminders: the date and the time ---------------------------------
+#
+# "remind me tomorrow at 2pm", "on Saturday", "next friday 10:30". The reminder
+# FIRES at an exact minute (bot._reminder_loop), so both halves have to come out
+# as something a clock can compare: a date, and "HH:MM" in 24-hour IST.
+
+_REL_DAYS = re.compile(
+    r"^(?:the\s+)?(today|tonight|tomorrow|tmrw|tmr|day\s+after\s+tomorrow)$",
+    re.IGNORECASE,
+)
+_NEXT_WEEKDAY = re.compile(
+    r"^(?:(next|this|coming|on)\s+)?(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)"
+    r"[a-z]*$",
+    re.IGNORECASE,
+)
+_IN_N = re.compile(r"^in\s+(\d{1,3})\s*(day|days|week|weeks)$", re.IGNORECASE)
+_NTH = re.compile(r"^(?:on\s+)?the\s+(\d{1,2})(?:st|nd|rd|th)?$", re.IGNORECASE)
+_SHORT_WEEKDAY = {"mon": 0, "tue": 1, "tues": 1, "wed": 2, "thu": 3, "thur": 3,
+                  "thurs": 3, "fri": 4, "sat": 5, "sun": 6}
+
+# Words people use for a time of day, and the minute each one fires at.
+_TIME_WORDS = {
+    "morning": "10:00", "noon": "12:00", "midday": "12:00", "lunch": "13:00",
+    "afternoon": "14:00", "eod": "18:00", "end of day": "18:00",
+    "evening": "18:00", "tonight": "20:00",
+}
+
+
+def parse_reminder_time(raw: str) -> str:
+    """"2pm" / "2:30 pm" / "14:00" / "noon" / "morning" -> "HH:MM", or "".
+
+    24-hour IST. "" means it could not be read — the caller says so rather than
+    guessing, because a reminder at a minute nobody asked for is a wrong one.
+    """
+    text = " ".join(str(raw or "").lower().replace(".", "").split())
+    if not text:
+        return ""
+    if text in _TIME_WORDS:
+        return _TIME_WORDS[text]
+    m = re.fullmatch(r"(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if not m:
+        return ""
+    hour, minute, half = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if half:
+        if not 1 <= hour <= 12:
+            return ""
+        hour = (hour % 12) + (12 if half == "pm" else 0)
+    elif m.group(2) is None:
+        return ""                      # a bare "2" is not a time anybody meant
+    if hour > 23 or minute > 59:
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_reminder_date(raw: str, *, today: Optional[date] = None) -> Optional[date]:
+    """"tomorrow" / "saturday" / "next friday" / "in 3 days" / "the 14th" /
+    "2026-10-02" -> a date, or None.
+
+    "NEXT FRIDAY" IS THE NEXT FRIDAY — the coming one, never today — exactly
+    what `_next_weekday` does for "friday". The confirmation names the date in
+    words, so if somebody meant the one after, they see it at once.
+    """
+    today = today or dl.today_ist()
+    text = " ".join(str(raw or "").lower().replace(",", " ").split())
+    if not text:
+        return None
+    m = _REL_DAYS.match(text)
+    if m:
+        word = m.group(1)
+        if word in ("today", "tonight"):
+            return today
+        if word.startswith("day after"):
+            return today + timedelta(days=2)
+        return today + timedelta(days=1)
+    m = _NEXT_WEEKDAY.match(text)
+    if m:
+        return _next_weekday(today, _SHORT_WEEKDAY[m.group(2).lower()[:3]])
+    m = _IN_N.match(text)
+    if m:
+        n = int(m.group(1)) * (7 if m.group(2).startswith("week") else 1)
+        return today + timedelta(days=n) if 0 <= n <= 365 else None
+    m = _NTH.match(text)
+    if m:
+        return _next_month_day(today, int(m.group(1)))
+    return dl.parse_date(raw)
+
+
+def split_date_and_time(raw: str) -> tuple:
+    """("tomorrow", "2pm") from "tomorrow at 2pm" — for a model that put both
+    halves in the date field. The time half is returned as written."""
+    text = " ".join(str(raw or "").split())
+    m = _CLOCK.search(text)
+    if not m:
+        return text, ""
+    rest = (text[:m.start()] + text[m.end():]).strip()
+    rest = re.sub(r"\s+at$", "", rest, flags=re.IGNORECASE).strip()
+    return rest, m.group(0)
+
+
+def reminder_moment_words(day: date, hhmm: str) -> str:
+    """"Wednesday 30 Sep, 2:00 pm" — the way a confirmation says it."""
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    half = "am" if hour < 12 else "pm"
+    h12 = hour % 12 or 12
+    return f"{day.strftime('%A')} {day.day} {day.strftime('%b')}, {h12}:{minute:02d} {half}"
+
+
 def snooze_confirmation(plan: dict, *, company: str) -> str:
     """One line confirming a snooze or a scheduled reminder. The plan's voice."""
     when = dl.format_date(plan["date"])
@@ -619,6 +726,30 @@ def _self_test() -> int:
     check("silence does not", bool(said_terminal_words("no reply yet")), False)
     check("Dead is a terminal value", is_terminal_status("Dead"), True)
     check("Demo is not", is_terminal_status("Demo"), False)
+
+    print("\none-off reminder dates and times")
+    tue = date(2026, 9, 29)
+    check("tomorrow", parse_reminder_date("tomorrow", today=tue), date(2026, 9, 30))
+    check("saturday", parse_reminder_date("Saturday", today=tue), date(2026, 10, 3))
+    check("next friday", parse_reminder_date("next friday", today=tue), date(2026, 10, 2))
+    check("monday", parse_reminder_date("monday", today=tue), date(2026, 10, 5))
+    check("a weekday never means today",
+          parse_reminder_date("tuesday", today=tue), date(2026, 10, 6))
+    check("in 3 days", parse_reminder_date("in 3 days", today=tue), date(2026, 10, 2))
+    check("the 14th", parse_reminder_date("the 14th", today=tue), date(2026, 10, 14))
+    check("ISO", parse_reminder_date("2026-10-02", today=tue), date(2026, 10, 2))
+    check("nonsense", parse_reminder_date("whenever", today=tue), None)
+    check("2pm", parse_reminder_time("2pm"), "14:00")
+    check("2:30 pm", parse_reminder_time("2:30 pm"), "14:30")
+    check("12am", parse_reminder_time("12am"), "00:00")
+    check("14:00", parse_reminder_time("14:00"), "14:00")
+    check("noon", parse_reminder_time("noon"), "12:00")
+    check("a bare 2 is refused", parse_reminder_time("2"), "")
+    check("25:00 is refused", parse_reminder_time("25:00"), "")
+    check("both halves in one field",
+          split_date_and_time("tomorrow at 2pm"), ("tomorrow", "2pm"))
+    check("the words", reminder_moment_words(date(2026, 9, 30), "14:00"),
+          "Wednesday 30 Sep, 2:00 pm")
 
     print("\nsnooze parsing")
     p = parse_snooze("follow up in 15 days", today=today)

@@ -321,6 +321,137 @@ The engine reports which it was through `outcome["model_error"]`, because a bare
 `None` return cannot tell the two apart, and `_answer_with_engine` answers the
 failure itself rather than letting it fall through to the "no progress" path.
 
+### What every model call costs, and why it costs less now
+
+Every Anthropic call goes through one of three places — `llm.LLM._create`,
+`llm.LLM.web_research`, `query_engine.QueryEngine` — and each hands the API's
+own accounting to `usage.record`, which logs one line and stores one row in
+`llm_calls` under the calling method's name:
+
+```
+[tokens] site=engine in=4264 cache_r=16039 cache_w=0 out=106 t=3.4s
+```
+
+**Prompt caching.** The reply-path system prompt is sent as a list of blocks,
+static first — `[persona] [strategy ✱] [policy ✱] [source statuses, citation
+rule, the call's own prompt]` — with the strategy and the policy as cache
+breakpoints (`persona.system_blocks`). Their text is byte-identical to the old
+single string; a repeat within five minutes reads them from the cache at a
+tenth of the price. The question engine adds the other two breakpoints the API
+allows: the last tool definition, and the last block of the newest tool_result
+turn, moved forward every iteration so each request reuses the one before. The
+web-search budget line ("N searches left today"), which changes after every
+search, moved from the front of the prompt to after the last breakpoint. The
+lean web-search prompt (~1,900 characters) is a plain string: nothing in it is
+worth caching.
+
+**Leaner calls.** The router (`parse_query`), the sheet-update extractor, the
+commitment detector and the leave classifier no longer carry the 15k-character
+strategy (`include_strategy=False`) — they classify and extract, and it steered
+none of them. The policy is capped at `POLICY_PROMPT_MAX_CHARS` (16,000) like
+the strategy. The research brief no longer loads the policy a second time into
+its material, and its fetched pages are capped at
+`RESEARCH_FETCH_TOTAL_MAX_CHARS` (12,000) in total. `llm.chase_nudge` (no
+callers) is gone.
+
+**Fewer calls per question.** The sheet-update extractor used to run on every
+addressed message before the router. It now runs only when a cheap local
+prefilter says the message looks like an update — a word from
+`SHEET_UPDATE_HINT_WORDS`, a company on the Outreach PoCs tab, a reply to a drip
+message about a row, or "undo" — and never for "remind me …". Each message logs
+which way it went (`[sheetwrite] prefilter msg=… RUN the extractor — hint word
+'mark'`). The engine's iteration cap is 5 (was 8); tool results are capped at
+`QUERY_TOOL_RESULT_MAX_CHARS` (6,000) and shrink to
+`QUERY_TOOL_RESULT_KEEP_CHARS` (600) once older than the two most recent
+iterations, marked "(truncated — already read)".
+
+**"@Saley what did you cost this week"** (or "token usage", "how many searches
+today") is answered from the ledgers with no model call: web searches today and
+over 7 days, model tokens per calling method today and over 7 days (input,
+cache reads, cache writes, output), and p50/p90 answer seconds per route.
+
+**One thing the prompt cannot shrink.** An hourly news check's own prompt is
+~1,040 tokens, but the `web_search_20260318` tool definition adds ~4,475 of its
+own (measured with `count_tokens`); the basic `web_search_20250305` adds ~2,200.
+Changing the tool version changes how search behaves, so it is left as it is.
+
+`python verify_llm_audit.py` drives every call site through its real code path
+with the client recorded and prints the table (system size, max_tokens,
+strategy/policy present, tools, cache breakpoints, message size, frequency).
+`python verify_tokens.py [--live]` checks caching against the real API, the
+trimming, the prefilter and the check's token count.
+
+### A slow answer says so — once
+
+A 40-second silence reads as ignored; a "one moment" that arrives two seconds
+before the answer reads as broken. So there are two layers:
+
+1. **Discord's typing indicator, always.** From the moment `should_respond` says
+   yes until the reply lands, `_handle_query` holds `channel.typing()` —
+   "Saley is typing…". It is free and covers the ordinary 3–8 s answer on its
+   own. The simulations and test commands are the exception (they narrate
+   themselves). A channel that refuses the typing call still gets its answer.
+2. **ONE interim line, only when it is actually slow.** `_answer_with_engine`
+   runs the engine as a task; if it has not finished after
+   `INTERIM_AFTER_SECONDS` (10) — or `INTERIM_AFTER_WEB_SECONDS` (6) on a web
+   turn — one line goes to the asker as a normal reply, and the answer follows
+   it. The engine finishing first means nothing is sent. At most one per
+   question, ever (an edited message re-firing the same question does not get a
+   second), never edited or deleted afterwards. `INTERIM_ENABLED=false` turns it
+   off.
+
+The line is **deterministic** — a line that exists because the model is slow
+must not wait on the model. It is picked at random from `persona.INTERIM_LINES_*`:
+
+| Turn | Lines |
+|---|---|
+| web | "On it — checking the web for this, give me a minute or two." / "Looking this up now, back shortly with what I find." |
+| engine | "Give me a moment, digging through the sheet and notes for that." / "One sec — pulling this together." |
+
+**What counts as a web turn.** Web search is attached to nearly every engine
+turn (whenever it is on and the budget has room), so "attached" alone would put
+every question on the 6 s clock and have Saley say "checking the web" while it
+reads the sheet. A web turn is attached **and** either a search has already run
+this turn or the question plainly asks about the outside world
+(`bot._WEB_HINT_RE`: news, funding, raised, acquisitions, launches, papers,
+conferences, "look it up"…). Words that are as often about our own sheet —
+"today", "this week" — are left out on purpose.
+
+**Honest failure still wins.** If the model fails after the interim went out,
+the `model_failure_reply` sentence follows it exactly as it would have without
+one.
+
+**Not for the drip.** Proactive posts are scheduled and nobody is waiting, so
+they get neither the typing indicator nor an interim line.
+
+#### The latency log — tune the thresholds from data
+
+Every answered question writes one `reply_latency` row: `ts`, `route`
+(`social` | `capability` | `engine` | `sheet_update`), `seconds` (from the gate's
+yes to the answer's first chunk — the interim line does not stop the clock),
+`used_web`, `tool_calls` (client tools dispatched + searches billed) and
+`interim_sent`. The log line is
+`[latency] msg=… route=engine 22.0s web=False tool_calls=3 interim=True`.
+
+**"@Saley what did you cost?"** is answered from the ledgers with no model call
+(a minimal version of the cost answer: web searches today and over 7 days, a
+plain "model tokens: not tracked yet", then p50 and p90 answer seconds per route
+over the last 7 days and how many interim lines were sent). After a week, set
+`INTERIM_AFTER_SECONDS` to roughly the engine p50 so the line appears only on
+the slower half.
+
+**The source probe runs on a thread.** The engine's system prompt includes the
+live source statuses, and building it probes Google Sheets. That used to run on
+the event loop and froze everything for its duration — the Discord heartbeat,
+the typing indicator and the interim timer, which fired at 37 s instead of 10
+in the first verification run. It is now built with `asyncio.to_thread`, as are
+the social and capability replies' preambles. A cold probe still costs ~8 s of
+every first engine answer after a restart; that is real latency, not a stall,
+and the latency log will show it.
+
+`python verify_interim.py` drives the real question path and the real engine
+loop with the model faked (it sleeps for real) and prints wall-clock timelines.
+
 ---
 
 ## The two documents the bot thinks with
@@ -693,9 +824,9 @@ everything built on it goes quiet without saying why.
 Their columns:
 
 ```
-Deliverables Checklist  Sr No · Action Item · Functional Dependency · Priority ·
-                        Tentative Deadline · Timelines · Link/Destination ·
-                        Status · Reminder Freq
+Deliverables Checklist  Sr No · Action Item · Functional Dependency (the team) ·
+                        Priority · Tentative Deadline · Timelines ·
+                        Link/Destination · Status · Reminder Freq · [Remarks]
 Master Pipeline         Sr no. · Company · Industry · Geography ·
                         Approx. Funding · Outreach Line - Researchers · Dates
 Sales Packages          Package · Name · Purpose · Use Case · Size ·
@@ -1286,6 +1417,62 @@ Got it — I will bring Acme back up on Sat 12 Sep at 6pm. Nothing from me on it
 before then.
 ```
 
+### "Remind me tomorrow at 2pm" — one-off reminders at an exact minute
+
+> *"Saley, remind me tomorrow at 2pm about the pulse product overview doc"*
+
+At **14:00 tomorrow**, in the channel it was asked in:
+
+```
+@Vaishnavi — you asked me to remind you: the pulse product overview doc
+```
+
+**No company needed, weekends included, exact time.** The engine's
+`schedule_reminder` tool used to refuse anything without a company; `company`
+is now optional, and the system prompt says so in one line ("When somebody asks
+to be reminded of something, use schedule_reminder even if no company is
+mentioned"). It takes:
+
+| Field | |
+|---|---|
+| `what` | required — in their words |
+| `date` | required — `tomorrow`, `saturday`, `next friday`, `in 3 days`, `the 14th`, `2026-10-02`, or anything `dl.parse_date` reads. A weekday never means today; "next friday" is the coming Friday |
+| `time` | optional — `2pm`, `14:30`, `noon`, `morning`. 24-hour IST once stored. With only a date, `REMINDER_DEFAULT_TIME` (14:00). "tomorrow at 2pm" all in `date` is split and read the same |
+| `company`, `poc` | optional — when it is about an account |
+
+The confirmation names the **date and the time in words** — *"Got it — Wednesday
+30 Sep, 2:00 pm."* — so a misread "next friday" is caught at once. **A time
+already past is refused**, and the reply says so rather than scheduling it.
+Parsing is `sheetwrite.parse_reminder_date` / `parse_reminder_time`, next to the
+snooze parser whose weekday arithmetic they reuse.
+
+**It fires on its own light loop**, `_reminder_loop`, every
+`REMINDER_CHECK_SECONDS` (60) — not on the 15-minute sweep, because "at 2pm" that
+arrives at 2:14 is not at 2pm. Each tick reads the open reminders dated today
+whose minute has come and posts each one with `guardrails.send`, tagging the
+asker through `mention_for` (a real ping only for the roster), adding
+" (Company)" when there is one. It runs **every day of the week**, writes **no
+`drip_sends` row**, takes **no slot in the daily cap**, and makes **no model
+call**. A row is **claimed (closed) before it is posted**, so two ticks or a
+restart can never send it twice; a post that fails re-opens it, three tries at
+most. `scheduled_reminders` gained `channel_id` and `asker_id`; older rows have
+neither and fire in the posting channel, naming the asker in plain text.
+
+**Reminders with a company keep surfacing in the drip** on their day, exactly as
+before — the exact-time post closes the row, so the drip does not repeat it
+afterwards. (The drip line now carries the reminder's own words: it used to read
+a field the table does not have and always said "the reminder you asked for".)
+
+**"What reminders do I have" / "cancel that reminder"** are two small engine
+tools, `list_reminders` (the asker's own; `everyone` for the team's) and
+`cancel_reminder` (by id — the model lists first and asks if it is ambiguous).
+
+**Test mode.** The loop reads the bot's clock, so under the persistent pretend
+clock a reminder for the pretend "tomorrow 2pm" fires when the tester's day
+reaches 14:00 — `next day` / `make it Wednesday` and the test day's 14:00 stop.
+The test day also fires due reminders at each of its stops, so they land in the
+transcript where they belong instead of up to a minute later.
+
 ### SQLite is still the brain
 
 The sheet is what the **team** reads; SQLite is what the **bot** knows. Deadlines,
@@ -1561,7 +1748,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R1** | AI news | weekdays | `ai_news` | 5 | yes |
 | **R2** | News-company screen | Tue, Fri | `news_company_screen` | 5 | yes |
 | **R3** | AI events & summits | alternate Wed | `events` | 5 | yes |
-| **R4** | Deliverables checklist | Mon | `deliverables` | 5 | yes |
+| **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
 | **R6** | LinkedIn connected, no DM | Tue, Fri | `li_no_dm` | 5 | yes |
 | **R7** | DM sent, no meeting | Mon | `dm_no_meeting` | 5 | yes |
@@ -1587,13 +1774,67 @@ a conference in November whose registration shut in September is not a November
 problem. An event whose date the sheet *cannot read* is **not** skipped; it is
 carried with the reason, because that is a thing somebody should fix.
 
-**R4 chases P1 only**, where status is blank or not done and the deadline is
-within `DELIVERABLE_NEAR_DAYS` (3) or already passed. The owner is the
-**Functional Dependency** cell; blank means `DELIVERABLE_DEFAULT_OWNER`
-(Vaishnavi) — blank is common and it is not the same as unowned. Only the values
-in `DELIVERABLE_DONE_MARKERS` count as finished; everything else, blank
-included, is still open. That is the safe direction: chasing a finished item
-costs one correction, skipping an unfinished one costs the deadline.
+**R4 is the week's checklist, in ONE Monday post.** Every row whose status is
+not in `DELIVERABLE_DONE_MARKERS` (blank included — chasing a finished item
+costs one correction, skipping an unfinished one costs the deadline) and whose
+deadline falls **by the end of this week (the Sunday)** or has **already
+passed**. Priority is no longer a filter: it is the **order** — P1s first, then
+by deadline. The **team** is the **Functional Dependency** cell (Engineering,
+Sales, Legal …; `team` is an alias); blank means `DELIVERABLE_DEFAULT_OWNER`
+(Vaishnavi). An optional **Remarks** column (`remarks`, `notes`, `comments`,
+`what is pending`, `pending`, `details`) is carried when the tab has one.
+
+```
+@Vaishnavi @Sid
+Vaishnavi — Deliverables for the week of Mon 5 Oct — 6 open:
+1. MSA template — Legal, due Wed 30 Sep, overdue by 5 days <https://docs.google.com/…>
+2. DPA review — Vaishnavi, due Wed 7 Oct
+3. API rate limits — Engineering, due Thu 8 Oct — needs the load test first
+4. Case study: Hinglish STT — Sales, due Tue 6 Oct
+5. Pulse product overview doc — Sales, due Fri 9 Oct — waiting on the pricing table
+6. Dashboard SSO — Engineering, due Sun 11 Oct
+Shout if any of these have moved and I'll update my list.
+```
+
+- **Grouped by rule only** (`drip.RULE_ONLY_TYPES`), never by team, so Monday is
+  one post; `max_items_per_post: 20`. A list past Discord's 2000 characters is
+  split **between lines** into consecutive messages that count as **one** slot.
+- **The lines are deterministic** (`drip.render_deliverables`). With
+  `DRIP_LLM_COMPOSE` on, the model writes only a one-line opener and a one-line
+  close; the block is handed to it verbatim, and a composition missing or
+  rewording any line is thrown away for the template (logged `structure`).
+- **Yearless deadlines that just passed are overdue.** `parse_bare_deadline`
+  reads "25-Sep" as the NEXT 25 September, which on 29 Sep made an open row
+  due four days ago look a year away — "already past" could never fire. R4
+  reads a date that passed within 90 days as overdue (`nextaction._deliverable_due`),
+  and passes the rule's own day through so a test day reads the sheet as of
+  the day it pretends.
+- **Sunday** keeps the old test — P1 and within `DELIVERABLE_NEAR_DAYS` — for
+  the `SUNDAY_RULE_IDS` exception. R4 is `weekdays: [mon]` in bot_rules.yaml,
+  so that branch runs only if a Sunday is added there.
+
+**R10 is supportive, and in points.** Each deal's line is *"{deal} is in the
+closure stage — anything I can pull together to help it along: the PoC's
+background, the company, a package summary? Say the word."* Two or more deals
+go out as a numbered list (company — PoC, % at stage) with that offer as the
+close.
+
+### The structure rule — everywhere Saley writes something long
+
+The same words in `persona.PROACTIVE_VOICE`, `tone.prompt_block` and the
+question engine's OUTPUT section (defined once, as `tone.STRUCTURE_RULE`):
+
+> When there are more than two facts, use numbered or bulleted points, one fact
+> per line, each line under ~15 words. No paragraph longer than two sentences.
+> Lead with the point; put the detail after a dash. Never pad.
+
+It is **checked**, not just asked for: `tone.check` fails a proactive message
+that carries 3+ facts (companies, items or reasons in the message dict) with no
+line starting with a bullet or a number, and the template goes instead, logged
+`structure`. Bullets are therefore no longer banned in proactive messages
+(headers and bold still are), the sentence cap counts prose only, and any rule
+with three or more companies renders them as numbered points in its template
+too — so the fallback obeys the rule the check enforces.
 
 **R5 has four constraints and they interact.** Eligible rows are those where
 First Contact is FALSE or blank *and* no first-contact date is recorded. It
@@ -2699,8 +2940,8 @@ header.
 
 | Rule | What it searches for |
 |---|---|
-| **R1** | **our own contacts by name**, on rotation — see below. Falls back to the wider AI field when nothing about them turns up, and says which mode it is in |
-| **R2** | Companies in the news **not** in the Master Pipeline, judged against the use-case table in `sales_strategy.md` §2 (A–J and who buys each). **Re-reads R1's results** rather than searching again |
+| **R1** | **The AI news on the `NEWS_TOPICS` list** — one main sweep of the last 24 hours at `NEWS_MAIN_TIME`, plus hourly silent checks that post only what is major. Nobody is searched for by name — see below |
+| **R2** | Companies in the news **not** in the Master Pipeline, judged against the use-case table in `sales_strategy.md` §2 (A–J and who buys each). **Reads the stories R1 posted today** (`news_stories`) rather than searching again |
 | **R3** | Events not already on the tab, in the current and next month — plus the **registration-deadline backfill** for rows that lack one |
 | **R6** | A published public email — **only when column F is empty** (see below) |
 | **R8** | Recent news about the person and company, for meeting prep |
@@ -2761,131 +3002,133 @@ dispatched locally, and the API's `server_tool_use` blocks are reported through
 > carries no links of its own. A claim from the web with no link is
 > indistinguishable from one the model made up.
 
-### R1 searches for our people first
+### R1 is a daily AI industry feed on a topic list
 
-**R1 is not a general AI news feed**, and reading it as one was the bug. The Bot
-Rules tab asks for news about *our* contacts — a funding round at a company we
-are talking to, a paper by a PoC, somebody we have been chasing changing jobs.
-Those are things the team can act on this week. A bigger story about a stranger
-is reading material, and a post full of reading material is one people stop
-opening.
+**The decision from the 24 and 29 Sep calls.** R1 used to search for our own
+people by name — active Outreach PoCs, T1/T2 researchers from the mapping,
+Master Pipeline companies, on a rotation, minus the departures list. Most days
+nothing is written about eight particular mid-market AI people, so the post was
+either empty or a fallback that announced itself. The team asked for the other
+thing: **what moved in AI on the topics they care about, once a day, and a tap
+on the shoulder when something big happens.** Nothing in R1 reads the PoCs, the
+mapping, the pipeline or the departures list any more. These settings take
+precedence over the R1 row on the Bot Rules tab.
 
-**Who gets searched for, in this order** (`news.collect_targets`):
+Two shapes of **one** prompt (`news.sweep_prompt`):
 
-| Tier | Where from | Which |
-|---|---|---|
-| 1 | Outreach PoCs | the PoCs on **active** rows — a stopped row is one we are not pursuing |
-| 2 | researcher/buyer mapping | **T1 and T2** only. T3 is "possible fit, thin evidence" and searching those spends the rotation on people we are not yet chasing |
-| 3 | Master Pipeline | the companies |
+| | When | Covers | Where it goes |
+|---|---|---|---|
+| **Main** | `NEWS_MAIN_TIME` (14:00), weekdays | the last 24 hours — overnight plus 11:00–14:00 | R1's **drip slot, pinned to that time**; counts toward the day's cap |
+| **Check** | every `NEWS_CHECK_TIMES` slot (11:00–23:00 hourly, 14:00 excepted), **every day** | the hours since the previous slot or the main sweep | **silent** unless something is major; then ONE grouped message straight to the channel |
 
-**Nobody on the departures list is ever searched**, and they are *removed* from
-the rotation rather than merely skipped — skipping is not enough once somebody
-is already in it, or they come up every few weeks forever and spend a search on
-a dead contact. `do_not_recommend` on a mapping row does the same.
+**The topics are seeds, not limits**, and the prompt says so in the sheet's own
+words (*"not limited to these"*). `NEWS_TOPICS` is the Bot Rules tab's "Sample
+Keywords" column minus the four words too broad to steer anything (AI, ML,
+models, research). Important news off the list is welcome and is tagged
+`[Other]`. `NEWS_KEYWORDS` is the old name and still works: it is read into
+`NEWS_TOPICS` when that is empty, so nobody's `.env` breaks.
 
-### The rotation, and why there has to be one
-
-There are several hundred of those and one day's budget carries
-`NEWS_PEOPLE_PER_RUN` (8). Taking the first eight off the sheet each day would
-mean **the ninth person is never searched once, ever** — so whose turn it is is a
-fact in SQLite rather than an accident of sheet order.
-
-`news_targets` keeps a `last_searched` date per person and company, and the
-**least-recently-searched come up first**. `last_searched` is `''` for a target
-nobody has searched yet and the empty string sorts before any ISO date, so a PoC
-added this morning is picked up on the **next** run rather than after everybody
-else has had a turn.
-
-**Tier order first, rotation within it.** Filling the quota from PoCs before
-researchers before companies is the rules sheet's own priority; oldest-first then
-decides *which* PoCs. Pure oldest-first across everything would let four hundred
-pipeline companies crowd out the people we are actually talking to.
-
-**A search that found nothing still counts as a turn.** If only hits moved the
-clock, somebody nobody writes about would be searched every single run forever,
-which is the opposite of a rotation. `hits` is tracked separately and is
-diagnostic only — it is how you notice that a third of the rotation never
-produces anything.
-
-### The three passes, and the fallback that is not a failure
+**Every line is demanded in one shape and parsed strictly** (`news.parse_stories`):
 
 ```
-1. OUR PEOPLE, restricted to NEWS_PREFERRED_DOMAINS      (skipped if unset)
-2. OUR PEOPLE again, open across the web                 (if 1 was thin)
-3. THE WIDER FIELD, open                                 (if 1 and 2 found nothing)
+STORY | <topic from the list, or OTHER> | <headline> | <what happened, one clause> | <url> | <importance 1-5>
 ```
 
-> **Some sites block Anthropic's crawler, and naming one is a 400 on the whole
-> request** — not a thinner result, *no* result. Five of the shipped
-> `NEWS_PREFERRED_DOMAINS` turned out to be in that category (Reuters, the WSJ,
-> The Verge, Ars Technica, the Indian Express), so R1's preferred pass failed
-> every single time and the rule limped along on its fallback. The error names
-> them, so `websearch.inaccessible_domains` reads them back out and
-> `llm.web_research` retries once without them, logging which at WARNING so the
-> `.env` can be pruned. A static block-list would have been wrong within a
-> quarter — sites change their robots.txt and nobody is tracking it — so the
-> list self-heals and a newly blocking site costs one retry, not a broken rule.
+The importance scale is defined in the prompt: **5** = the whole industry is
+talking about it today; **4** = a sales team must know this week; **3** =
+useful; **2–1** = filler. An unreadable importance is 3, which can never break
+through on its own. **No url, no line**: a line without one is dropped and
+logged — a claim nobody can check does not go into a sales channel.
 
-**Preferred sites are a preference, not a restriction.** The first pass is
-limited to `NEWS_PREFERRED_DOMAINS`; if it comes back with fewer than
-`NEWS_MIN_ITEMS` (3) the open pass runs and the results are **merged**, because a
-story the preferred sites had is not made worse by the fact that they only had
-one. Getting the domain list wrong must cost relevance and never the day's news.
-Which pass produced each story is logged, so the list can be tuned in the `.env`
-rather than guessed at. A caller's preference can never reach outside
-`WEB_SEARCH_ALLOWED_DOMAINS` when that is set — a preference is about taste and
-the allow-list is about policy.
+**Preferred sites are a line in the prompt** — *"Prefer these sources when they
+have the story: …"* — and never a search-tool `allowed_domains` restriction.
+Naming a site that blocks the search crawler used to be a 400 on the whole
+call; as a preference it cannot fail anything, and the blocked-domain retry in
+`llm.web_research` is gone because nothing passes a domain restriction any more.
 
-**Pass 3 is the fallback and the post says so, in plain words:**
+### Choosing what goes out — `news.choose`
 
-> Nothing on our contacts today, so here is what moved in AI:
+Most important first, so the cap trims filler rather than the big one. The
+gates, in order, and **every skip is logged with a sentence**:
 
-Most days nothing at all is written about eight particular mid-market AI people,
-and a rule that went silent on those days would look broken. A reader cannot
-otherwise tell "quiet week for our contacts" from "the bot has stopped looking",
-so the mode is never left to be inferred.
+1. *(checks only)* importance below `NEWS_BREAKING_MIN_IMPORTANCE` (4) — a check
+   posts only the major;
+2. **already posted within `NEWS_REPEAT_DAYS` (30), by url_key OR headline_key.**
+   Four outlets give one funding round four URLs, so the headline — its first
+   eight significant lowercase words, stopwords/digits/punctuation dropped — is
+   the second key. This is what keeps a story that broke at 16:00 out of the
+   next day's 14:00 post:
+   `main sweep skipped 'Frontier Lab Ships Open-Weights Reasoning Model' — already posted on 2026-09-29 (breaking post) — the same headline, within 30 days`;
+3. per-topic room — `NEWS_PER_TOPIC_PER_DAY` (2), main and breaking together;
+4. topics-per-week room — `NEWS_TOPICS_PER_WEEK` (6) distinct topics in an ISO week;
+5. the cap — `NEWS_MAX_ITEMS` (5) for the main post.
 
-### The message carries links, and that is enforced rather than requested
+Gates 3 and 4 **yield to importance**: a story at or above the breaking bar
+walks past both, because a spread rule that hid the day's biggest story would be
+the wrong rule. Two lines in one batch that are the same story count once. The
+table **fails closed**: an unreadable `news_stories` reports "seen".
 
-Each story is **one short line**: what happened, who it concerns, and its link.
-`NEWS_MAX_ITEMS` (5) per post. A story about somebody on our sheets names the row
-it came from:
+### The main post
 
 ```
-• Sahaj Garg — raised a $30m Series B for Wispr Flow <https://techcrunch.com/wispr>
-  (Sahaj Garg — Wispr Flow, on our Outreach PoCs)
-• Alan Turing — published a paper on model evaluations <https://arxiv.org/abs/1234>
-  (Alan Turing — Globex, on our researcher mapping (T1))
+• [AI regulation] EU publishes AI Act code of practice — final text for general-purpose models <https://reuters.com/eu-code>
+• [evals] Lab releases open agent eval suite — a public benchmark for tool-using agents <https://techcrunch.com/evals-suite>
+• [RLHF] Startup raises $40m for RLHF tooling — Series B led by a frontier fund <https://techcrunch.com/rlhf-round>
+• [voice agent] Indic voice agent launches in Hindi and Tamil — a Bengaluru startup's launch <https://inc42.com/voice>
+• [Other] Chipmaker posts record data-centre quarter — AI demand <https://reuters.com/chips>
 ```
 
-**A line that arrives without a URL is dropped**, silently and on purpose
-(`news.parse_stories`) — the prompt says every line needs one, and a line without
-one is a claim nobody can check. And because the *composer* can also lose a link
-while tidying a sentence, `drip.with_sources` re-attaches any that went missing
-immediately before the send. "Never post a story with no source link" cannot be
-a request the model is free to decline.
+One line per story, tag and link on the line. No attribution block and no
+fallback announcement: the feed is the feed. The prompt is told every headline
+already posted today (main **and** breaking, at most 25) so it does not spend a
+search re-finding them; `choose` enforces it anyway. The sweep is cached for the
+day as `R1|news-run`, so a failed send or a restart does not search twice.
+`drip.with_sources` still re-attaches any link the composer drops.
 
-### No repeats
+### The hourly check — `_maybe_breaking_news`
 
-Every posted story's normalised URL and title go into `news_stories`, and
-anything posted within `NEWS_REPEAT_DAYS` (30) is skipped.
+Called from `_sweep_once` on **every tick, weekdays and weekends**. It finds the
+latest `NEWS_CHECK_TIMES` slot at or before now; if that slot is already in
+`news_checks` for today, or there is none yet, it returns without a word. A
+slot missed while the bot was down is skipped, not replayed. Otherwise it
+**claims the slot first** (so two ticks, or a restart mid-search, cannot run it
+twice) and runs one lean search of at most `NEWS_CHECK_MAX_USES` (2), banked
+through `_one_search` like every other search.
 
-**Keyed on the URL, not the headline.** The same funding round is reported by
-four outlets with four headlines, and one outlet re-runs its own piece with
-`utm_` parameters bolted on. `news.url_key` strips the scheme, `www.`, the query
-string, the fragment and any trailing slash so those collapse to one row — and
-the title is kept only for the log, because it is not stable enough to match on.
-The check **fails closed**: an unreadable table reports "seen" and the story is
-skipped, since the alternative failure is the same story posted every day until
-somebody notices.
+| What the check found | What happens |
+|---|---|
+| NOTHING FOUND, or nothing at importance ≥ 4 that is new | **one INFO line**, no post, no rows stored |
+| important stories, valve open | **ONE grouped message** — `Worth knowing now:` then one line per story — to the sales channel (the test channel under `SALES_TEST_MODE`) via `guardrails.send`. **Not** through `drip_sends`, **not** counted toward `DAILY_MESSAGE_CAP`, **no @-mentions** (web text is stripped of mention tokens). Recorded as `kind=breaking` |
+| important stories, valve full (`NEWS_BREAKING_MAX_PER_DAY`, default 2) | nothing posted, **nothing stored**, and a log line saying it is *held for the next main post* — tomorrow's main sweep finds it again. `99` disables the valve |
 
-### R2 re-reads R1's results rather than searching again
+`SALES_DIGEST_ENABLED=false` stops the checks too, and a check it stops is not
+recorded, so the next slot runs once the switch is back on.
 
-The news-company screen wants companies that turned up in today's news and are
-**not** in the Master Pipeline. That is the result set R1 already paid for, so R2
-costs one cheap call to judge it rather than a second search of the web. Each one
-gets a line on whether it fits membrane and **why**, judged against the use-case
-table (A–J) in `sales_strategy.md`, with its link:
+### The search prompt is lean
+
+`llm.web_research(lean=True)` sends the **safety preamble plus one line** — *"You
+research for the sales team at membrane (membrane.social), an AI-data company in
+Bengaluru. Answer in the exact format the prompt asks for and nothing else."* —
+and no persona, policy or strategy. The full persona is ~32,000 characters; the
+lean system prompt is 1,884, and every call logs its size:
+`[websearch] R6: lean prompt, 2410 chars (system 1884 + user 526)`.
+
+R1 (main and check), R2, R3's discovery and deadline backfill, and the per-row
+research loop (R6, R8, R10, R11) all run lean; the per-row loop keeps
+`_research_context` as the sheet context in the user prompt. R2 needs the
+use-case table, so the **"What we sell"** section of `sales_strategy.md` is cut
+out (4,000 characters at most) and put in R2's *user* prompt. `lean=False`
+keeps the old behaviour for any caller not named here.
+
+### R2 reads what R1 posted
+
+The news-company screen wants companies in today's news that are **not** in
+the Master Pipeline. It reads **today's rows from `news_stories`** — the main
+post and any breaking ones, i.e. what the team was actually shown — and makes
+one cheap call to judge them. R2 can come round before the 14:00 main post; it
+then reads the previous day's rows and logs which day it read. Each company gets
+a line on whether it fits membrane and **why**, judged against the use-case
+table (A–J), with its link:
 
 ```
 In the news today and not in the Master Pipeline:
@@ -2894,16 +3137,18 @@ Say the word and I'll add any of these — I won't add anything without a yes.
 ```
 
 **It asks. It never writes.** Adding a row is `approvals` plus
-`gtm_sheet.append_row`, and neither is reachable from here.
+`gtm_sheet.append_row`, and neither is reachable from here. R2 is the one news
+path that reads the sheet — `_known_companies`, the tracked list it screens
+against — because "not in the pipeline" is its whole question.
 
-### Keywords come from the sheet, and they are seeds
+### Test mode
 
-`NEWS_KEYWORDS` and `EVENT_KEYWORDS` are the "Sample Keywords" column of the Bot
-Rules tab, in the `.env` rather than in code so Vaishnavi can tune them where she
-owns them. Both prompts say so explicitly: the sheet says *"not limited to
-these"*, so they are a starting point and adjacent terms are fair game. Which
-keywords produced results is logged, so there is something to tune **against**.
-Every story still needs a source link whatever matched it.
+`make it Monday` / `next day` (the live test day) runs the main sweep exactly as
+live, in R1's pinned slot, against the test DB — and then runs **one hourly
+check immediately**, so the tester can see a breaking post without waiting for
+a slot. The check is recorded in `news_checks` as `test HH:MM` under the pretend
+date. `simulate …` does the same inside its throwaway sandbox, at the main
+post's time on the simulated day.
 
 ### Failures degrade honestly
 
@@ -2912,7 +3157,7 @@ Every story still needs a source link whatever matched it.
 | `WEB_SEARCH_ENABLED=false` | "web research unavailable today — WEB_SEARCH_ENABLED is off", and the item keeps its place in the queue |
 | The budget is spent | "the daily search budget is spent (20/20 searches used)" |
 | The call failed | the reason, and **no invented stories** |
-| It searched and found nothing | "I searched and found nothing today", and the pending marker is **cleared** |
+| It searched and found nothing | "I searched the last 24 hours and found nothing new worth posting", and the pending marker is **cleared** |
 
 That last row is the one worth reading twice. `web research pending` means *not
 searched yet*, not *needs searching*: an item whose search ran and came back
@@ -3026,10 +3271,14 @@ deadline that later turns up clears the miss.
 ### One search call per rule run, and the budget is banked by the caller
 
 Everything above goes through **`llm.web_research`** — the safety preamble
-always, web content is data and never instructions, `only_domains` narrowing one
-call for R1's preferred pass and never widening past the operator's allow-list.
+always, web content is data and never instructions, and `lean=True` for every
+caller named above. No caller restricts a call's domains any more;
+`WEB_SEARCH_ALLOWED_DOMAINS` / `WEB_SEARCH_BLOCKED_DOMAINS` remain the operator's
+policy for every search.
 
-`bot._one_search` is the single banked-search helper both R1 and R3 go through,
+`bot._one_search` is the single banked-search helper R1 (main and check) and R3
+go through, taking `lean` and an optional `max_uses` (the check's
+`NEWS_CHECK_MAX_USES`),
 so the budget cannot be spent by a path that forgot to record it:
 
 - **checked before** the call, because a call made with nothing left bills anyway;
@@ -3038,7 +3287,7 @@ so the budget cannot be spent by a path that forgot to record it:
   nothing;
 - **logged both ways**: `[websearch] R1: 2 search(es) billed, 17 left of 20 today`.
 
-Recorded under the rule's own id (`R1`, `R2`, `R3`, `R3-deadlines`), so
+Recorded under the rule's own id (`R1`, `R1-check`, `R2`, `R3`, `R3-deadlines`), so
 `web_search_breakdown` still shows where a day went.
 
 ### R6's order: column F first, web second
@@ -3098,6 +3347,43 @@ web research unavailable today — the daily search budget is spent (60/60 searc
 Going quiet instead would look exactly like a quiet week. The ledger read **fails
 closed** — an unreadable table reports the budget as spent rather than permitting
 an unbounded number of searches.
+
+### Research runs at send time, once per item per day
+
+The sweeper re-plans the whole day on every tick (every
+`COS_FOLLOWUP_CHECK_INTERVAL_MINUTES`, 15), and a post goes out roughly every
+`MESSAGE_GAP_MINUTES` (90). Planning used to include the web research, so about
+four complete research passes were paid for and discarded between each pair of
+posts. Now:
+
+- **`_plan_drip` plans un-researched.** `drip.plan` groups and ranks on rule,
+  owner, priority, due date and company. Research changes none of those, so the
+  web-pending placeholders plan exactly as the researched items would.
+- **`_research_message` researches the one message that is due**, immediately
+  before `_send_drip_message`. The rest of the plan waits for its own slot.
+- **`research_cache` (SQLite) holds each item's research for the day**, keyed
+  on `rule|row_key` (or the company). A send that fails, or a restart before the
+  next slot, reuses the cached research instead of searching again. The log says
+  `[research-cache] hit …` or `miss …`. Only real answers are cached: research
+  that arrived, or a search that ran and found nothing. "Budget spent", "search
+  off" and errored calls are not cached, so a later attempt can still succeed.
+- **R1's main sweep is cached for the day as `R1|news-run`**, so a retry does
+  not find its own stories in `news_stories` and skip them all. R2 reads the
+  day's posted stories from `news_stories` at its own slot.
+- **The budget checks are unchanged.** They are simply reached far less often.
+- **Previews say `(research runs at send time)`** where they used to show the
+  pending marker: `cadence preview`, the rules preview and `--dry-run-drip`. A
+  preview is un-researched by design.
+
+`verify_research_timing.py` drives a whole day of real sweep ticks (production
+timing, stubbed search that bills 1 per call) and asserts the following:
+
+- idle ticks log zero `[websearch]` lines;
+- slot 1 researches R1 once, immediately before its send;
+- a kill between the research and the send, or a restart between slots, hits
+  the cache.
+
+On that day the old code billed **31** searches and the new code bills **3**.
 
 ### Two things the live API taught us
 
@@ -3724,11 +4010,30 @@ python verify_simulation.py --templates   # skip the API calls; schedule only
 python simulation.py                      # the parsers, the sandbox, the gates
 python verify_testday.py                  # "make it Monday" end to end, nothing sent
 python clock.py                           # the pretend clock's arithmetic
+python verify_news_feed.py                # R1's main sweep + hourly checks, valve, ledgers
+python verify_interim.py                  # typing indicator, interim line, latency log (real timings)
+python verify_reminders.py                # one-off reminders at an exact minute (real 60 s loop)
+python verify_points.py                   # R4 as one Monday list, R10 as points, the structure check
+python verify_llm_audit.py                # every API call site, measured (system size, caching, tools)
+python verify_tokens.py --live            # prompt caching, trimming, the prefilter, a check's tokens
 python verify_news_events.py              # R1/R2/R3's web half, stubbed search
 python verify_news_events.py --live       # ...against the real API, spends budget
-python news.py                            # selection, prompts, parsing, rendering
+python verify_research_timing.py          # research at send time + the day cache
+python news.py                            # prompts, parsing, choosing, rendering
 python events_discovery.py                # matching, windows, limits, parsing
 ```
+
+`verify_news_events.py --live` was last run against the real API before R1
+became a topic feed (it then confirmed the people rotation, now retired). It has
+not yet been re-run live against the topic feed.
+
+`verify_news_feed.py` runs the REAL `llm.web_research` with the Anthropic client
+faked, against a throwaway DB, a pretend clock and a recording channel: one
+main sweep (5 tagged, linked lines, distinct headline keys), a 16:00 breaking
+post that does not reappear in the next day's main post (and the skip reason),
+a two-story check posted as ONE message outside `drip_sends`, a quiet check
+that logs one line, a held story when the valve is full, each `news_checks`
+slot once after two back-to-back ticks, and the lean prompt sizes for R3 and R6.
 
 `verify_testday.py` drives `make it Monday` -> the two stops -> the footer
 against a fake channel that collects instead of sending, on a throwaway
@@ -4134,13 +4439,14 @@ guardrails forbid.
 | `mapping_sheet.py` | the researcher/buyer mapping — **read-only**: no write method, read-only scope, and the legend loaded as enforced rules |
 | `tracker.py` | the canonical tab read as a pipeline: last touch, open/engaged, the twice-weekly reminder, the playbook's six-stage funnel definition, and the week's leading/lagging metrics. **The three flags are removed** — see `nextaction.py` |
 | `clock.py` | **what time the bot thinks it is**, and the only place that decides. Real IST, or the persistent pretend clock a tester set with "make it Monday" (stored in SQLite, so it survives a restart). No dependencies but `config` |
-| `news.py` | **R1 and R2**: who to search for and in what order, the rotation's selection rule, the three prompts, story parsing and the no-repeat URL key, and how a story line is rendered. No I/O — the search is `llm.web_research`, made by bot.py |
+| `news.py` | **R1 and R2**: the one sweep prompt (main and check), STORY parsing, the url and headline keys, `choose` (no-repeats, per-topic, per-week, cap, breaking bar), rendering, the check-slot clock, and R2's screen prompt. No I/O — the search is `llm.web_research(lean=True)`, made by bot.py |
 | `events_discovery.py` | **R3's web half**: event discovery in the current and next month, tolerant matching against what the tab already has, the per-run and per-month limits, and the registration-deadline backfill. Proposes; never writes. No I/O |
 | `gtm_sheet.write_cells_on` | a **tab-aware** single-cell write for the Events tab: allow-listed tabs, mapped columns, one cell at a time, and it **never overwrites a non-empty cell** |
 | `deadlines.py` | IST working-day maths, cadence resolution, the announcement. `today_ist()`/`now_ist()` go through `clock`, and they are the ONLY functions in the codebase that answer "what time is it" |
 | `notes.py` | syncs the Drive meeting notes into `NOTES_DIR`, filters them to the sales ones, reads those |
 | `query.py` | Discord read primitives, scoped to the sales channels |
-| `query_engine.py` | the bounded tool-use loop; holds no tools of its own |
+| `query_engine.py` | the bounded tool-use loop; holds no tools of its own. Caches the prompt (4 breakpoints) and trims old tool results |
+| `usage.py` | the token log: one `[tokens]` line and one `llm_calls` row per Anthropic call |
 | `llm.py` | the short model calls: routing, replies, commitment detection |
 | `followups.py` | commitment prefilter, due-time maths, fallback nudge text |
 | `db.py` | SQLite: `chases`, `nudges`, `deadlines`, `flags_sent`, `digest_items` (carry-forward ages), `nextstep_state` (rule (i)'s clock), `prep_briefs` (one brief per meeting), `meta` (the once-a-day digest marker, the to-do sheet's id and its announcement marker) |

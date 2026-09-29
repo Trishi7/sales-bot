@@ -87,19 +87,27 @@ CANNED = {
 
 
 async def research(rule_id, trigger, company, live):
-    """One rule's web half. Returns the parsed result dict."""
-    query = websearch.RULE_QUERIES[trigger]
-    context = f"Company: {company}"
+    """One rule's web half. Returns the parsed result dict.
+
+    R1 is the topic feed's main-sweep prompt, as `bot._news_run` sends it;
+    every other rule is its generic query plus the row's context.
+    """
     if trigger == "ai_news":
-        context += "\nCompanies and people already on our sheet:\nWispr Flow, PolyAI, ElevenLabs"
+        import news
+        prompt = news.sweep_prompt(
+            config.NEWS_TOPICS, today=TODAY, since_hours=24, mode=news.MODE_MAIN,
+            preferred=config.NEWS_PREFERRED_DOMAINS,
+        )
+    else:
+        prompt = websearch.RULE_QUERIES[trigger] + "\n\n" + f"Company: {company}"
     if not live:
         return dict(CANNED)
 
     import llm as llmmod
     engine = llmmod.LLM(os.environ["ANTHROPIC_API_KEY"], config.MODEL)
     return await engine.web_research(
-        rule=rule_id, prompt=query + "\n\n" + context,
-        max_uses=min(3, config.WEB_SEARCH_MAX_USES),
+        rule=rule_id, prompt=prompt,
+        max_uses=min(3, config.WEB_SEARCH_MAX_USES), lean=True,
     )
 
 
@@ -132,7 +140,7 @@ async def main() -> int:
     results = {}
     for rule_id, trigger, text in (
         ("R1", nextaction.R_AI_NEWS,
-         "AI news: funding, hires, papers by our PoCs, competitor and regulation news"),
+         "AI news: the last 24 hours on the team's topic list"),
         ("R11", nextaction.R_NEW_COMPANY,
          f"{COMPANY} is new in the Master Pipeline. I can fill in funding, location "
          "and industry and suggest PoCs — shall I?"),

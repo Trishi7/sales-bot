@@ -38,6 +38,7 @@ from typing import Optional
 
 import config
 import sources
+import tone as _tone_rules
 
 log = logging.getLogger(__name__)
 
@@ -119,8 +120,10 @@ exit is a demand, and people stop reading demands.
 THANK WHERE IT IS EARNED, and only there. If something got done, say so once and
 move on. Manufactured gratitude for ordinary work is worse than none.
 
+STRUCTURE: """ + _tone_rules.STRUCTURE_RULE + """
+
 NEVER:
-- headers, bullets, bold, or a "Company - status - action" shape. Prose only.
+- headers, bold, or a table-like "Company | status | action" shape.
 - STACKED IMPERATIVES. "Follow up with Acme. Send the deck. Update the tracker."
   is three demands wearing one message.
 - emojis. Not one.
@@ -129,11 +132,12 @@ NEVER:
 - restating what you are about to do before doing it.
 - a sign-off, a subject line, or quotes around the message.
 
-LENGTH: one or two sentences. Three at the absolute most, and only when the
-third is the out.
+LENGTH: one or two sentences of your own words. Three at the absolute most,
+and only when the third is the out. Points (above) do not count against this.
 
-NAME EVERY COMPANY YOU ARE GIVEN, comma-separated inside the sentence. Do not
-summarise them as "a few accounts" — the person needs to know which.
+NAME EVERY COMPANY YOU ARE GIVEN — inside the sentence for one or two, as points
+for more. Do not summarise them as "a few accounts" — the person needs to know
+which.
 
 ADDRESS THE OWNER BY NAME ONCE, at the start, if you are given one. Never twice.
 
@@ -163,6 +167,17 @@ def _exemplars_from_policy(text: str) -> str:
         if found >= 0:
             end = min(end, found)
     return rest[:end].strip()
+
+
+def proactive_voice_blocks(*, recent_openers=None) -> list:
+    """The proactive system prompt as blocks: the STRATEGY (cached), then the
+    tone, the voice, the exemplars and the rules (not cached — the tone block
+    carries the recent openers, which change after every send)."""
+    text = proactive_voice_prompt(recent_openers=recent_openers)
+    strategy = strategy_preamble()
+    if text.startswith(strategy):
+        return [cached_block(strategy), {"type": "text", "text": text[len(strategy):]}]
+    return [{"type": "text", "text": text}]
 
 
 def proactive_voice_prompt(*, recent_openers=None) -> str:
@@ -402,6 +417,88 @@ def load_policy(path: Optional[str] = None) -> str:
     return text
 
 
+_POLICY_HEADER = (
+    "=== SALES POLICY (the operating policy you work under; it is re-read on "
+    "every question, so this is always the current version. Where it conflicts "
+    "with the STRATEGY above, the strategy wins) ===\n"
+)
+
+
+def policy_block() -> str:
+    """The policy as it rides in a prompt: header, text, and — past
+    POLICY_PROMPT_MAX_CHARS — a declared truncation, exactly as the strategy is
+    cut. The missing-file note when there is no policy."""
+    policy = load_policy()
+    if not policy:
+        return (_POLICY_MISSING_NOTE.format(
+            path=config.SALES_POLICY_FILE or "sales_policy.md") + "\n\n")
+    limit = int(getattr(config, "POLICY_PROMPT_MAX_CHARS", 0) or 0)
+    truncated = ""
+    if limit and len(policy) > limit:
+        policy = policy[:limit]
+        truncated = (
+            f"\n\n[...TRUNCATED. The policy is longer than the {limit} characters "
+            "carried in the prompt. You are reading the beginning of it only — say so "
+            "if a question turns on a part you cannot see.]"
+        )
+    return _POLICY_HEADER + policy + truncated + "\n\n"
+
+
+def cached_block(text: str) -> dict:
+    """A system text block that is a prompt-cache breakpoint.
+
+    BYTE-STABLE ON PURPOSE: the strategy and the policy are read through the
+    (mtime, size) caches above, so between edits every call sends exactly the
+    same bytes and the cache key holds.
+    """
+    return {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
+
+
+def system_blocks(*, include_sources: bool = True, tail: str = "",
+                  front: str = "") -> list:
+    """`system_preamble()` as a LIST OF BLOCKS, static first, for prompt caching:
+
+        [front]      optional, static (the web-search safety rules)
+        [persona]    the voice
+        [strategy]   cache_control — byte-identical between calls
+        [policy]     cache_control — byte-identical between calls
+        [tail]       dynamic: source statuses, the citation rule, the call's own prompt
+
+    Two breakpoints, so a caller may add two more (the query engine adds the
+    last tool and the latest tool result) without passing the API's limit of
+    four. Empty blocks are left out — the API rejects an empty text block.
+    """
+    blocks: list = []
+    head = (front.rstrip() + "\n\n" if front.strip() else "") + cos_preamble()
+    if head.strip():
+        blocks.append({"type": "text", "text": head})
+    blocks.append(cached_block(strategy_preamble()))
+    blocks.append(cached_block(policy_block()))
+    rest = ""
+    if include_sources:
+        rest += sources.describe_for_prompt() + "\n\n" + CITATION_RULE + "\n\n"
+    rest += tail or ""
+    if rest.strip():
+        blocks.append({"type": "text", "text": rest})
+    return blocks
+
+
+def strategy_blocks(tail: str = "") -> list:
+    """The strategy (cached) in front of a call's own prompt — for the calls
+    that carry the plan and nothing else of the persona."""
+    blocks = [cached_block(strategy_preamble())]
+    if (tail or "").strip():
+        blocks.append({"type": "text", "text": tail})
+    return blocks
+
+
+def blocks_text(system) -> str:
+    """A system prompt's text, whether it is a string or a list of blocks."""
+    if isinstance(system, list):
+        return "".join(str((b or {}).get("text") or "") for b in system)
+    return str(system or "")
+
+
 def policy_status() -> dict:
     """{path, loaded, chars} — so the bot can answer "what are you working from"
     about its own configuration, not just about its sources."""
@@ -437,20 +534,7 @@ def system_preamble(*, include_sources: bool = True) -> str:
     # what follows it.
     parts.append(strategy_preamble())
 
-    policy = load_policy()
-    if policy:
-        parts.append(
-            "=== SALES POLICY (the operating policy you work under; it is re-read on "
-            "every question, so this is always the current version. Where it conflicts "
-            "with the STRATEGY above, the strategy wins) ===\n"
-            + policy
-            + "\n\n"
-        )
-    else:
-        parts.append(
-            _POLICY_MISSING_NOTE.format(path=config.SALES_POLICY_FILE or "sales_policy.md")
-            + "\n\n"
-        )
+    parts.append(policy_block())
 
     if include_sources:
         parts.append(sources.describe_for_prompt() + "\n\n")
@@ -526,27 +610,8 @@ HARD RULES:
 - Output ONLY the reply text. No preamble, no code fences, no headers."""
 
 
-CHASE_NUDGE_PROMPT = f"""You are {NAME}. Someone told a sales channel they'd come
-back with something, the time they gave themselves has passed, and nothing has
-come back. You are reminding them.
+# CHASE_NUDGE_PROMPT is gone with llm.chase_nudge, which had no callers.
 
-You'll be given: who promised (as a mention token), WHAT they promised, how long
-ago, and a link to their message. Write the reminder.
-
-HARD RULES:
-- ONE short line. Two at the absolute most. This lands in a busy channel.
-- Address them using the EXACT token you're given (e.g. <@123>) — paste it
-  verbatim. Do not rewrite it into a name or an @handle of your own, and do not
-  add any other mention.
-- Reference what they actually said, concretely: "you said the Acme deck would go
-  out yesterday — has it?" Never a generic "following up on your pending item".
-- It's a QUESTION, and a straight one. You're asking, not chasing. No scolding, no
-  "as per my last message", no implying they've blocked anyone, no new deadline.
-- NO EMOJIS.
-- You are REMINDING a human. You have not done anything about it yourself and you
-  are not about to — never offer to send it, write it, or contact anyone.
-- Include the link at the end if you're given one, in plain form.
-- Output ONLY the reminder text. No preamble, no code fences, no headers."""
 
 
 COMMITMENT_PROMPT = """You read one message from a sales team's Discord channel and
@@ -646,6 +711,30 @@ def model_failure_reply(reason: str = "") -> str:
         f"I can't think right now — the AI service behind me isn't responding "
         f"({detail}). Your message was fine; try again shortly."
     )
+
+
+# THE INTERIM LINES — what Saley says when an answer is taking a while.
+#
+# DETERMINISTIC, no model call: a line that exists because the model is slow
+# must not itself wait on the model. Short, first person, no emoji, and each one
+# promises only what is true — the web lines are used only once a search has
+# actually run this turn (see bot._answer_with_engine), so Saley never says it
+# is checking the web while it is reading the sheet.
+INTERIM_LINES_WEB = (
+    "On it — checking the web for this, give me a minute or two.",
+    "Looking this up now, back shortly with what I find.",
+)
+INTERIM_LINES_ENGINE = (
+    "Give me a moment, digging through the sheet and notes for that.",
+    "One sec — pulling this together.",
+)
+
+
+def interim_line(*, web: bool) -> str:
+    """One interim line, picked at random from the right list."""
+    import random
+
+    return random.choice(INTERIM_LINES_WEB if web else INTERIM_LINES_ENGINE)
 
 
 def sources_checked_line() -> str:

@@ -8,21 +8,27 @@ which runs a tool-use loop. What lives here are the four short calls around it:
   capability_reply()  the honest "what can you do" answer, built from the policy
                       and the LIVE source statuses.
   detect_commitment() is this someone promising to come back with something?
-  chase_nudge()       the persona-voiced reminder text for an overdue promise.
-                      NO LONGER ON THE CHASE PATH: an overdue promise is a
-                      deterministic line in the daily digest (digest.py), because
-                      forty model calls to build one message would be slow, and
-                      unpredictable in a message people are meant to skim. Kept
-                      for a one-off, hand-asked reminder.
 
-Two rules run through all of them:
+(`chase_nudge` is gone: it had no callers — an overdue promise is a
+deterministic line — and its prompt was paid for in nobody's reply.)
+
+Three rules run through all of them:
 
   EVERY REPLY-PATH CALL CARRIES THE POLICY. The system prompt is built from
-  `persona.system_preamble()`, which re-reads sales_strategy.md (THE CORE BRAIN,
-  injected into every call by `_create` whether the prompt asked for it or not)
-  and sales_policy.md, and appends the
-  current source statuses. A path that spoke without them would be a path
-  operating under a different policy than the rest of the bot.
+  `persona.system_blocks()` — persona, STRATEGY, POLICY, then the current
+  source statuses — as a LIST OF BLOCKS, with the strategy and the policy as
+  prompt-cache breakpoints. Their text is byte-identical to the old single
+  string; only the packaging changed, so a repeated call reads them from the
+  cache instead of paying for them again.
+
+  THE ROUTERS AND EXTRACTORS DO NOT CARRY THE PLAN. parse_query,
+  extract_sheet_update, detect_commitment and classify_leave pass
+  `include_strategy=False`: they classify or extract, and the 15k-character
+  strategy steered none of them.
+
+  EVERY CALL IS COUNTED. `usage.record` logs the API's own token accounting —
+  input, cache writes, cache reads, output — and the bot stores it in
+  `llm_calls`, one row per call, under the calling method's name.
 
   NOTHING HERE EVER RAISES INTO THE CALLER. A failed model call degrades to a
   deterministic fallback (a nudge that must still go out, a reply that must still
@@ -37,16 +43,16 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 from anthropic import Anthropic
 
 import config
 import persona
-from followups import fallback_nudge
+import usage
 from persona import (
     CAPABILITY_PROMPT,
-    CHASE_NUDGE_PROMPT,
     COMMITMENT_PROMPT,
     QUERY_PARSE_PROMPT,
     SOCIAL_REPLY_PROMPT,
@@ -91,25 +97,38 @@ def _text_of(resp) -> str:
 # allowed and SALEY_LENGTH decides how many sentences. The old rules could not
 # express either — one banned every emoji outright, and the other capped bytes,
 # which is not what "one to three sentences" means.
+#
+# BULLETS ARE NO LONGER BANNED. The structure rule asks for numbered or
+# bulleted points when there are more than two facts (tone.STRUCTURE_RULE), so
+# the shape check keeps only what is still never the voice: headers and bold.
 _PROACTIVE_BANNED = (
-    "\n- ", "\n* ", "\n1. ",
-    "**", "##", "•",
+    "**", "##",
 )
 
 
-def _proactive_problem(text: str) -> str:
+def _proactive_problem(text: str, *, facts: int = 0,
+                       required_lines=()) -> str:
     """Why this composed message cannot be sent, or "" when it is fine.
 
     THREE KINDS OF CHECK, and the middle one is new:
 
-      SHAPE     headers, bullets, more than two paragraphs. Constants — no tone
-                setting makes a bulleted nudge acceptable.
+      SHAPE     headers, bold, more than three prose paragraphs, and the
+                STRUCTURE checks: 3+ facts with no points (`tone.check`), or a
+                required point line missing. Bullets themselves are allowed —
+                the structure rule asks for them.
       TONE      emoji count and sentence count, from `tone.check`. These are
                 SETTINGS, and they are the two of the five that are enforced
-                rather than merely asked for.
-      SANITY    a hard byte ceiling, kept as a backstop well above any tone
-                setting — a model that returns two thousand characters has
-                malfunctioned rather than been slightly verbose.
+                rather than merely asked for. Sentences are counted on the
+                prose only; point lines are facts.
+      SANITY    a hard byte ceiling on the prose, kept as a backstop well above
+                any tone setting — a model that returns two thousand characters
+                of its own has malfunctioned rather than been slightly verbose.
+
+    `required_lines` are the VERBATIM point lines the caller rendered (R4's
+    deliverables, R10's deals, any 3+ list). Every one must appear unchanged;
+    a composer that dropped or reworded one has changed the facts, and the
+    template — which carries them exactly — goes instead. Logged as
+    `structure`, like the no-points check in `tone.check`.
     """
     import tone as _tone
 
@@ -117,13 +136,21 @@ def _proactive_problem(text: str) -> str:
         return "empty"
     for token in _PROACTIVE_BANNED:
         if token in text:
-            return f"contains {token!r} — headers and bullets are not the voice"
-    if text.count(chr(10) * 2) >= 2:
-        return "more than two paragraphs — one thought per message"
-    problem = _tone.check(text)
+            return f"contains {token!r} — headers and bold are not the voice"
+    wanted = [str(l).strip() for l in (required_lines or ()) if str(l).strip()]
+    missing = [l for l in wanted if l not in text]
+    if missing:
+        return (f"structure: {len(missing)} of {len(wanted)} point line(s) missing "
+                f"or rewritten (first: {missing[0][:60]!r})")
+    prose_paras = [p for p in text.split(chr(10) * 2)
+                   if p.strip() and not all(_tone.is_point_line(l)
+                                            for l in p.splitlines() if l.strip())]
+    if len(prose_paras) > 3:
+        return "more than three paragraphs — one thought per message"
+    problem = _tone.check(text, facts=facts)
     if problem:
         return problem
-    if len(text) > 1200:
+    if len(_tone.prose_of(text)) > 1200:
         return f"far too long ({len(text)} chars) — the model has malfunctioned"
     return ""
 
@@ -210,8 +237,16 @@ class LLM:
         self._client = Anthropic(api_key=api_key)
         self._model = model
 
-    async def _create(self, *, system: str, prompt: str, max_tokens: int):
+    async def _create(self, *, system, prompt: str, max_tokens: int,
+                      site: str = "?", include_strategy: bool = True):
         """One model call, with the STRATEGY DOC in front of the system prompt.
+
+        `system` is a string or a LIST OF BLOCKS (persona.system_blocks). With
+        `include_strategy` (the default) a prompt that does not already carry
+        the plan gets it prepended as a CACHED block; `include_strategy=False`
+        is for the routers and extractors that never needed it.
+
+        EVERY CALL IS COUNTED under `site` — see `usage.record`.
 
         THE INJECTION LIVES HERE, AT THE CHOKEPOINT, AND NOT AT THE CALL SITES.
         Every call this class makes goes through this method, so putting it here
@@ -228,15 +263,26 @@ class LLM:
         `persona.system_preamble()` already carry the block; prepending blindly
         would send it twice and pay for it twice.
         """
-        if persona.STRATEGY_MARKER not in system:
-            system = persona.strategy_preamble() + system
-        return await asyncio.to_thread(
-            self._client.messages.create,
-            model=self._model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        if include_strategy and persona.STRATEGY_MARKER not in persona.blocks_text(system):
+            system = (persona.strategy_blocks(system) if isinstance(system, str)
+                      else persona.strategy_blocks() + list(system))
+        t0 = time.monotonic()
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception:
+            await asyncio.to_thread(lambda: usage.record(
+                site=site, model=self._model, seconds=time.monotonic() - t0, ok=False))
+            raise
+        await asyncio.to_thread(lambda: usage.record(
+            site=site, model=self._model, response=resp,
+            seconds=time.monotonic() - t0))
+        return resp
 
     # -- routing ------------------------------------------------------------
 
@@ -281,7 +327,9 @@ class LLM:
         )
         log.info("[llm.parse] routing %r (history=%d)", (text or "")[:120], len(turns))
         try:
-            resp = await self._create(system=QUERY_PARSE_PROMPT, prompt=prompt, max_tokens=200)
+            resp = await self._create(system=QUERY_PARSE_PROMPT, prompt=prompt,
+                                      max_tokens=200, site="parse_query",
+                                      include_strategy=False)
         except Exception:
             log.exception("[llm.parse] call raised; no verdict")
             return None
@@ -326,10 +374,15 @@ class LLM:
             "Reply to them now, in your own voice, per the rules above."
         )
         try:
+            # The preamble probes the sources live (Sheets among them): built
+            # on a thread so it cannot freeze the event loop.
+            blocks = await asyncio.to_thread(
+                lambda: persona.system_blocks(tail=SOCIAL_REPLY_PROMPT))
             resp = await self._create(
-                system=persona.system_preamble() + SOCIAL_REPLY_PROMPT,
+                system=blocks,
                 prompt=prompt,
                 max_tokens=250,
+                site="social_reply",
             )
         except Exception as e:
             # A RAISED CALL IS NEVER "I'm not sure what you're after". That line
@@ -351,7 +404,8 @@ class LLM:
         return reply
 
     async def proactive_message(self, *, prompt: str, fallback: str,
-                                recent_openers=None) -> tuple[str, bool]:
+                                recent_openers=None, facts: int = 0,
+                                required_lines=()) -> tuple[str, bool]:
         """Compose ONE proactive message in the warm-sales-head voice.
 
         Returns (text, used_model). `fallback` is a complete, sendable sentence
@@ -381,16 +435,18 @@ class LLM:
                 # TONE IS READ HERE, AT COMPOSE TIME, not at import. A change to
                 # SALEY_WARMTH is in force on the very next message with no
                 # restart — which is the point of the setting existing.
-                system=persona.proactive_voice_prompt(recent_openers=recent_openers),
+                system=persona.proactive_voice_blocks(recent_openers=recent_openers),
                 prompt=prompt,
                 max_tokens=320,
+                site="proactive_message",
             )
         except Exception:
             log.exception("[llm.proactive] call raised; sending the template instead")
             return fallback, False
 
         text = (_text_of(resp) or "").strip().strip('"').strip()
-        problem = _proactive_problem(text)
+        problem = _proactive_problem(text, facts=facts,
+                                     required_lines=required_lines)
         if problem:
             log.warning(
                 "[llm.proactive] rejected the composed message (%s); sending the "
@@ -409,21 +465,17 @@ class LLM:
         somebody who is away, and the cost of failing closed would be silently
         redirecting everybody's work to Vaishnavi whenever the API blinked.
 
-        THE STRATEGY DOC IS NOT IN THIS PROMPT and should not be. `_create`
-        prepends it to everything by default; this one call is about reading
-        prose for dates and names, and the plan has no bearing on whether
-        somebody said they were off on Thursday. It is passed the marker already
-        present so the injection skips it.
+        THE STRATEGY DOC IS NOT IN THIS PROMPT and should not be: this call
+        reads prose for dates and names, and the plan has no bearing on whether
+        somebody said they were off on Thursday. `include_strategy=False` says
+        so directly (it used to fake the strategy marker to dodge the injection).
         """
         import leave as _leave
 
-        system = (
-            persona.STRATEGY_MARKER
-            + " — not needed for this call ===\n"
-            + _leave.LEAVE_PROMPT
-        )
         try:
-            resp = await self._create(system=system, prompt=prompt, max_tokens=800)
+            resp = await self._create(system=_leave.LEAVE_PROMPT, prompt=prompt,
+                                      max_tokens=800, site="classify_leave",
+                                      include_strategy=False)
         except Exception:
             log.exception("[llm.leave] call raised; treating everyone as IN")
             return ""
@@ -463,6 +515,7 @@ class LLM:
         try:
             resp = await self._create(
                 system=SHEET_UPDATE_PROMPT, prompt=prompt, max_tokens=700,
+                site="extract_sheet_update", include_strategy=False,
             )
         except Exception:
             log.exception("[llm.sheet] call raised; treating as no update")
@@ -505,8 +558,7 @@ class LLM:
         return out
 
     async def web_research(self, *, rule: str, prompt: str,
-                           max_uses: int = 0,
-                           only_domains: Optional[list] = None) -> dict:
+                           max_uses: int = 0, lean: bool = False) -> dict:
         """Run ONE web-search call for a rule. Returns what websearch parsed.
 
         {"ok", "text", "sources", "searches", "errors", "note"} — and `ok` is
@@ -525,13 +577,17 @@ class LLM:
         contains can appear earlier in the system prompt than the rule that
         governs how to read it.
 
+        `lean=True` IS THE SEARCH PROMPT FOR A SEARCH. The safety preamble plus
+        ONE line saying who the research is for — no persona, no policy, no
+        strategy. A search call answers a formatted question; the ~20k-character
+        persona made each call slower and dearer and steered nothing. Anything
+        the question needs from the strategy doc goes into the USER prompt, cut
+        to the section it needs. `lean=False` keeps the full persona for any
+        caller not yet moved over.
+
         NO BUDGET CHECK HERE. The caller owns the ledger (it is a database
         write, and this class is not the place for one); this method reports
         what was billed and the caller banks it.
-
-        `only_domains` NARROWS THIS ONE CALL — R1's preferred-sites pass. It
-        can never widen past WEB_SEARCH_ALLOWED_DOMAINS; see
-        `websearch.tool_definition`.
         """
         import websearch
 
@@ -543,71 +599,46 @@ class LLM:
                 ),
             }
 
-        tool = websearch.tool_definition(max_uses=max_uses or None,
-                                         only_domains=only_domains)
-        system = (
-            websearch.SAFETY_PREAMBLE
-            + "\n\n"
-            + persona.system_preamble(include_sources=False)
-        )
-        async def _call(t):
-            return await asyncio.to_thread(
+        tool = websearch.tool_definition(max_uses=max_uses or None)
+        # THE LEAN PROMPT IS A PLAIN STRING: ~1,900 characters, nothing in it
+        # worth a cache breakpoint. The full one (no caller uses it today) is
+        # blocks, so its strategy and policy would be cached like everywhere else.
+        if lean:
+            system = websearch.SAFETY_PREAMBLE + "\n\n" + websearch.LEAN_LINE
+        else:
+            system = persona.system_blocks(include_sources=False,
+                                           front=websearch.SAFETY_PREAMBLE)
+        system_chars = len(persona.blocks_text(system))
+        log.info("[websearch] %s: %s prompt, %d chars (system %d + user %d)",
+                 rule, "lean" if lean else "full", system_chars + len(prompt),
+                 system_chars, len(prompt))
+        site = "web_research:" + ("R1-main" if rule == "R1" else str(rule))
+
+        t0 = time.monotonic()
+        try:
+            resp = await asyncio.to_thread(
                 self._client.messages.create,
                 model=self._model,
                 max_tokens=4000,
                 system=system,
-                tools=[t],
+                tools=[tool],
                 messages=[{"role": "user", "content": prompt}],
             )
-
-        try:
-            resp = await _call(tool)
         except Exception as e:
-            # SOME SITES BLOCK ANTHROPIC'S CRAWLER, and naming one in
-            # `allowed_domains` is a 400 that kills the WHOLE call — not a
-            # thinner result, no result. Reuters, the WSJ, The Verge and Ars
-            # Technica were all in the shipped NEWS_PREFERRED_DOMAINS, so R1's
-            # preferred pass failed every single time and the feature limped
-            # along on its fallback.
-            #
-            # THE ERROR NAMES THEM, so drop exactly those and go again. A static
-            # block-list would be wrong within a quarter — sites change their
-            # robots.txt, and an operator cannot be expected to track it. The
-            # dropped domains are logged at WARNING so the .env can be pruned,
-            # but nothing breaks until somebody gets round to it.
-            blocked = websearch.inaccessible_domains(e)
-            retried = False
-            if blocked and tool.get("allowed_domains"):
-                keep = [d for d in tool["allowed_domains"]
-                        if d.lower() not in blocked]
-                log.warning(
-                    "[websearch] %s: %d preferred domain(s) block the search "
-                    "crawler and were refused by the API (%s). Retrying without "
-                    "them%s. Remove them from NEWS_PREFERRED_DOMAINS to save the "
-                    "round trip.",
-                    rule, len(blocked), ", ".join(sorted(blocked)),
-                    f" ({len(keep)} left)" if keep else " (searching openly)",
-                )
-                retry = dict(tool)
-                if keep:
-                    retry["allowed_domains"] = keep
-                else:
-                    retry.pop("allowed_domains", None)
-                try:
-                    resp = await _call(retry)
-                    retried = True
-                except Exception as again:
-                    e = again
-            if not retried:
-                log.exception("[websearch] the %s search call raised", rule)
-                return {
-                    "ok": False, "text": "", "sources": [], "searches": 0,
-                    "errors": [{"code": type(e).__name__, "why": str(e)[:200]}],
-                    "note": websearch.unavailable_note(
-                        f"the search call failed ({type(e).__name__})"
-                    ),
-                }
+            await asyncio.to_thread(lambda: usage.record(
+                site=site, model=self._model, seconds=time.monotonic() - t0, ok=False))
+            log.exception("[websearch] the %s search call raised", rule)
+            return {
+                "ok": False, "text": "", "sources": [], "searches": 0,
+                "errors": [{"code": type(e).__name__, "why": str(e)[:200]}],
+                "note": websearch.unavailable_note(
+                    f"the search call failed ({type(e).__name__})"
+                ),
+            }
 
+        await asyncio.to_thread(lambda: usage.record(
+            site=site, model=self._model, response=resp,
+            seconds=time.monotonic() - t0))
         parsed = websearch.parse_results(resp)
 
         # A PAUSED TURN IS NOT A RESULT. The API can pause a long search turn
@@ -651,10 +682,11 @@ class LLM:
         log.info("[llm.brief] composing from %d chars of material", len(material or ""))
         try:
             resp = await self._create(
-                system=persona.system_preamble(include_sources=False)
-                + research.BRIEF_PROMPT,
+                system=persona.system_blocks(include_sources=False,
+                                             tail=research.BRIEF_PROMPT),
                 prompt=material,
                 max_tokens=1600,
+                site="research_brief",
             )
         except Exception:
             log.exception("[llm.brief] call raised")
@@ -689,10 +721,14 @@ class LLM:
             "Answer them now, per the rules above."
         )
         try:
+            # Built on a thread — the source probe must not freeze the loop.
+            blocks = await asyncio.to_thread(
+                lambda: persona.system_blocks(tail=CAPABILITY_PROMPT))
             resp = await self._create(
-                system=persona.system_preamble() + CAPABILITY_PROMPT,
+                system=blocks,
                 prompt=prompt,
                 max_tokens=600,
+                site="capability_reply",
             )
         except Exception as e:
             # The fallback here IS a real answer — it is built from the same live
@@ -711,56 +747,6 @@ class LLM:
             log.warning("[llm.capability] empty reply; using deterministic fallback")
             return fallback_capability_reply()
         return reply
-
-    async def chase_nudge(
-        self, *, mention: str, what: str, when: str, jump_url: str = ""
-    ) -> str:
-        """The reminder for an overdue promise: "<@123> — you said the Acme deck
-        would go out yesterday. Has it?"
-
-        `mention` is pasted verbatim; it was produced by `guardrails.mention_for`,
-        so it is already roster-checked. Always returns something sendable — a
-        chase that silently doesn't fire is the one failure this feature cannot
-        have, so any failure falls back to `followups.fallback_nudge`.
-
-        NOT CALLED BY THE SWEEPER any more — overdue promises are lines in the
-        daily digest, written deterministically. See the module docstring."""
-        log.info("[llm.nudge] composing for %s about %r", mention, (what or "")[:80])
-        item = {
-            "person_id": None,
-            "person_name": mention,
-            "what": what,
-            "promised_at": "",
-            "jump_url": jump_url,
-        }
-        prompt = (
-            f"Who promised (paste this token verbatim): {mention}\n"
-            f"What they promised: {what}\n"
-            f"When they promised it: {when}\n"
-            f"Link to their message: {jump_url or '(none)'}\n\n"
-            "Write the reminder now, in your own voice, per the rules above."
-        )
-        try:
-            resp = await self._create(
-                system=persona.system_preamble() + CHASE_NUDGE_PROMPT,
-                prompt=prompt,
-                max_tokens=250,
-            )
-        except Exception:
-            log.exception("[llm.nudge] call raised; using deterministic fallback")
-            return fallback_nudge(item)
-
-        nudge = _text_of(resp)
-        if not nudge:
-            log.warning("[llm.nudge] empty reply; using deterministic fallback")
-            return fallback_nudge(item)
-
-        # The model was told to paste the token verbatim. If it paraphrased the
-        # mention away, the person never gets pinged — so put it back on the front.
-        if mention.startswith("<@") and mention not in nudge:
-            log.info("[llm.nudge] model dropped the mention token; prepending it")
-            nudge = f"{mention} — {nudge}"
-        return nudge
 
     # -- extraction ----------------------------------------------------------
 
@@ -787,7 +773,9 @@ class LLM:
             "Is this a commitment to come back with something? Decide now."
         )
         try:
-            resp = await self._create(system=COMMITMENT_PROMPT, prompt=prompt, max_tokens=250)
+            resp = await self._create(system=COMMITMENT_PROMPT, prompt=prompt,
+                                      max_tokens=250, site="detect_commitment",
+                                      include_strategy=False)
         except Exception:
             log.exception("[llm.commitment] call raised; not tracking this one")
             return None

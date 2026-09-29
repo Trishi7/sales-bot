@@ -618,10 +618,14 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
         "action_item": ("action item", "action", "deliverable", "item", "task",
                         "work item"),
-        # WHAT IT IS BLOCKED ON. The reason a deadline slipping is sometimes
-        # somebody else's deadline slipping, and worth saying in that order.
+        # THE TEAM THAT OWNS IT — Engineering, Sales, Legal, … The column is
+        # headed "Functional Dependency" and it names a FUNCTION, not a blocker:
+        # it is who the item sits with. Blank means DELIVERABLE_DEFAULT_OWNER.
+        # The role keeps its old name so every reader of it keeps working;
+        # `team` is the word the team uses for it, so it is an alias too.
         "dependency": ("functional dependency", "dependency", "dependencies",
-                       "depends on", "blocked by", "blocker"),
+                       "depends on", "blocked by", "blocker", "team",
+                       "functional team", "owning team"),
         "priority": ("priority", "priority level", "tier", "band"),
         "deadline": ("tentative deadline", "deadline", "due date", "due",
                      "target date", "eta"),
@@ -631,6 +635,10 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "status": ("status", "state", "progress", "current status"),
         "reminder_freq": ("reminder freq", "reminder frequency", "reminder",
                           "frequency", "cadence", "remind every"),
+        # WHAT IS STILL PENDING on the item, in the team's words. Optional: a tab
+        # with no such column reads "" for every row, never an error.
+        "remarks": ("remarks", "notes", "comments", "what is pending", "pending",
+                    "details"),
     },
     # THE SALES PACKAGES TAB, found by name (GTM_PACKAGES_TAB_TITLES).
     # WHAT CAN ACTUALLY BE SOLD TODAY, and how finished each package is.

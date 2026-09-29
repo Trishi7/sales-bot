@@ -44,6 +44,14 @@ EMOJI_VALUES = ("none", "light", "expressive")
 LENGTH_VALUES = ("short", "medium")
 HUMOUR_VALUES = ("off", "light")
 
+# THE STRUCTURE RULE — the same words in the proactive voice, the tone block
+# and the question engine's output section, so every long thing Saley writes
+# is held to one standard. Defined here, where the check that enforces it
+# lives; persona.py and query_engine.py import it rather than copy it.
+STRUCTURE_RULE = (
+    "When there are more than two facts, use numbered or bulleted points, one fact per line, each line under ~15 words. No paragraph longer than two sentences. Lead with the point; put the detail after a dash. Never pad."
+)
+
 DEFAULTS = {
     "warmth": "high",
     "formality": "balanced",
@@ -207,6 +215,8 @@ def prompt_block(*, recent_openers: Optional[list] = None) -> str:
         _HUMOUR_TEXT[s["humour"]],
         "",
         HUMAN_TOUCHES,
+        "",
+        "STRUCTURE: " + STRUCTURE_RULE,
     ]
     openers = [o for o in (recent_openers or []) if str(o).strip()]
     if openers:
@@ -250,6 +260,24 @@ _EMOJI_RE = re.compile(
 _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 
 
+# A line that is a point: "1. ", "2) ", "- ", "* ", "• ".
+_POINT_RE = re.compile(r"^\s*(?:[-*•]|\d{1,2}[.)])\s+")
+
+
+def is_point_line(line: str) -> bool:
+    return bool(_POINT_RE.match(str(line or "")))
+
+
+def prose_of(text: str) -> str:
+    """The message without its point lines — what the sentence cap applies to.
+
+    A numbered list is facts, one per line, and "1. " is not a sentence end:
+    counting a six-line list as six sentences would throw away exactly the
+    message the structure rule asks for.
+    """
+    return "\n".join(l for l in str(text or "").splitlines() if not is_point_line(l))
+
+
 def count_emoji(text: str) -> int:
     return len(_EMOJI_RE.findall(str(text or "")))
 
@@ -271,13 +299,25 @@ def count_sentences(text: str) -> int:
     return max(1, ends)
 
 
-def check(text: str) -> str:
+def check(text: str, *, facts: int = 0) -> str:
     """Why this message breaks the ENFORCED tone settings, or "".
 
-    Only the two that are enforced. Warmth, formality and humour are prompt-only
-    on purpose: a message that is 10% too formal is still a good message, and
-    throwing it away would cost more than it saved.
+    Only the ones that are enforced. Warmth, formality and humour are
+    prompt-only on purpose: a message that is 10% too formal is still a good
+    message, and throwing it away would cost more than it saved.
+
+    STRUCTURE: a message carrying 3+ facts (`facts` — the companies, items or
+    reasons in the message dict) with NO line starting with a bullet or a
+    number fails, and the caller sends the template. The reason starts with
+    "structure" so it reads as one in the log.
+
+    THE SENTENCE CAP COUNTS PROSE ONLY — the point lines are facts, and "1. "
+    is not a sentence end.
     """
+    if int(facts or 0) >= 3 and not any(
+            is_point_line(l) for l in str(text or "").splitlines()):
+        return (f"structure: {int(facts)} facts and no numbered or bulleted line — "
+                "more than two facts go in points")
     s = settings()
     emoji = count_emoji(text)
     allowed = EMOJI_BUDGET[s["emoji"]]
@@ -285,7 +325,7 @@ def check(text: str) -> str:
         return (
             f"{emoji} emoji but SALEY_EMOJI={s['emoji']} allows {allowed}"
         )
-    sentences = count_sentences(text)
+    sentences = count_sentences(prose_of(text))
     cap = SENTENCE_BUDGET[s["length"]]
     if sentences > cap:
         return (

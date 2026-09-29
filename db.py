@@ -35,6 +35,7 @@ import logging
 import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import date, timedelta
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -659,6 +660,44 @@ CREATE TABLE IF NOT EXISTS web_search_usage (
     PRIMARY KEY (on_date, rule_id)
 );
 
+-- EVERY ANTHROPIC CALL, with the API's own token accounting (usage.py).
+--
+-- `site` is the calling method — parse_query, engine, engine:final,
+-- web_research:R1-main, web_research:R1-check … — so "where did the tokens
+-- go" is a GROUP BY. cache_write / cache_read are
+-- usage.cache_creation_input_tokens / cache_read_input_tokens; input_tokens
+-- is the uncached tail only.
+CREATE TABLE IF NOT EXISTS llm_calls (
+    ts            TEXT NOT NULL,             -- ISO datetime
+    site          TEXT NOT NULL,
+    model         TEXT NOT NULL DEFAULT '',
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write   INTEGER NOT NULL DEFAULT 0,
+    cache_read    INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    seconds       REAL NOT NULL DEFAULT 0,
+    ok            INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS ix_llm_calls_ts ON llm_calls(ts);
+
+-- HOW LONG EACH ANSWER TOOK. One row per answered question.
+--
+-- Here so INTERIM_AFTER_SECONDS / INTERIM_AFTER_WEB_SECONDS can be tuned from
+-- data rather than guessed: the "what did you cost" answer reads p50 and p90
+-- per route over the last 7 days from this table. `seconds` runs from the
+-- moment the gate said yes to the first chunk of the ANSWER (an interim line
+-- does not count as the answer). `route` is social | capability | engine |
+-- sheet_update.
+CREATE TABLE IF NOT EXISTS reply_latency (
+    ts           TEXT NOT NULL,              -- ISO datetime, IST
+    route        TEXT NOT NULL,
+    seconds      REAL NOT NULL,
+    used_web     INTEGER NOT NULL DEFAULT 0, -- 1 when a web search ran this turn
+    tool_calls   INTEGER NOT NULL DEFAULT 0,
+    interim_sent INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_reply_latency_ts ON reply_latency(ts);
+
 -- THE LAST FEW OPENINGS, so the bot does not start five messages the same way.
 --
 -- Repeating an opening is the single clearest tell that a human is not writing
@@ -685,21 +724,13 @@ CREATE TABLE IF NOT EXISTS meeting_followups (
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- R1: WHO HAS BEEN SEARCHED FOR, AND WHEN.
+-- R1: THE OLD NEWS ROTATION — RETIRED, NOT DROPPED.
 --
--- THE ROTATION LEDGER. R1 searches for our own people first, and there are far
--- more of them than one day's search budget can carry — several hundred PoCs,
--- the researcher mapping, every company in the Master Pipeline. Taking the
--- first eight off the sheet each day would mean the ninth is never searched at
--- all, so the least-recently-searched come up first and everybody comes round.
---
--- ONE ROW PER TARGET, keyed on a normalised name so a spelling change in the
--- sheet does not reset somebody's turn. `last_searched` is the ordering key and
--- is empty for a target that has never been searched — which sorts first, so a
--- newly added PoC is picked up on the next run rather than last.
---
--- `kind` is poc | researcher | company, which is also the priority order the
--- selector uses before falling back to least-recently-searched.
+-- R1 used to search for our PoCs, researchers and pipeline companies by name,
+-- in turn, and this table kept whose turn it was. Since the 24/29 Sep decision
+-- R1 is an AI industry feed on a topic list and searches for nobody by name, so
+-- nothing reads or writes this table any more. It is left in place rather than
+-- dropped: a DROP on startup is irreversible, and the rows cost nothing.
 CREATE TABLE IF NOT EXISTS news_targets (
     target_key    TEXT PRIMARY KEY,   -- normalised name + kind
     kind          TEXT NOT NULL,      -- poc | researcher | company
@@ -738,6 +769,26 @@ CREATE TABLE IF NOT EXISTS news_stories (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_news_stories_date ON news_stories(posted_on);
+-- `topic`, `headline_key`, `importance` and `kind` (main | breaking) were added
+-- with the topic feed — see _MIGRATIONS. The headline key is the second half of
+-- the no-repeats check: four outlets give one funding round four URLs.
+
+-- R1: THE HOURLY CHECKS THAT HAVE RUN.
+--
+-- ONE ROW PER (day, slot), claimed BEFORE the search, so a slot runs once a day
+-- even across restarts and two ticks in the same minute cannot both search.
+-- `posted` is how many stories the check's message carried (0 = it stayed
+-- quiet); a row with posted > 0 is one breaking message, which is what the
+-- NEWS_BREAKING_MAX_PER_DAY valve counts.
+CREATE TABLE IF NOT EXISTS news_checks (
+    on_date   TEXT NOT NULL,              -- ISO date
+    slot_hhmm TEXT NOT NULL,              -- "16:00", or "test 14:00" from a test day
+    ran_at    TEXT NOT NULL,              -- ISO datetime, IST
+    searches  INTEGER NOT NULL DEFAULT 0,
+    found     INTEGER NOT NULL DEFAULT 0, -- STORY lines that came back
+    posted    INTEGER NOT NULL DEFAULT 0, -- stories in the message that went out
+    PRIMARY KEY (on_date, slot_hhmm)
+);
 
 -- R3: EVENTS THE BOT HAS PROPOSED ADDING.
 --
@@ -782,6 +833,38 @@ CREATE TABLE IF NOT EXISTS event_deadline_checks (
     note         TEXT NOT NULL DEFAULT '',
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- THE PER-DAY RESEARCH CACHE. One row per researched item per day.
+--
+-- RESEARCH RUNS AT SEND TIME, for the one message whose slot has come, and
+-- this is what stops it running twice. A send that fails after its research,
+-- or a restart between the research and the send, would otherwise search again
+-- for the same item on the same day and bill the budget for an answer it
+-- already had.
+--
+-- KEYED ON (item_key, on_date). `item_key` is the rule plus the row key (or
+-- the company) — see `bot._research_key`. The day is part of the key because
+-- yesterday's research is not today's: the news moves and the budget resets.
+--
+-- ONLY A SEARCH THAT RAN IS CACHED — one that found something or honestly
+-- found nothing. "The budget is spent" and "web search is off" are not answers
+-- about the item, and caching them would keep an item unresearched after the
+-- setting changed.
+--
+-- `payload_json` carries the other fields the research sets on an item (its
+-- rewritten text, R1's mode, R3's proposals) so a hit restores the item
+-- exactly rather than approximately.
+CREATE TABLE IF NOT EXISTS research_cache (
+    item_key     TEXT NOT NULL,
+    on_date      TEXT NOT NULL,      -- ISO date
+    rule_id      TEXT NOT NULL DEFAULT '',
+    research     TEXT NOT NULL DEFAULT '',
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    note         TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (item_key, on_date)
+);
 """
 
 
@@ -794,6 +877,28 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # drip row — so a reply of "yes" has something concrete to apply. Added
     # after drip_sends first shipped, hence the migration.
     ("drip_sends", "offer", "TEXT NOT NULL DEFAULT ''"),
+    # THE TOPIC FEED. R1 became an AI industry feed on a topic list (24/29 Sep),
+    # and a posted story now carries its topic (for the spread rules), its
+    # headline key (for the no-repeats check across outlets), the importance
+    # the model gave it, and whether it went out in the main post or a
+    # breaking one.
+    ("news_stories", "topic", "TEXT NOT NULL DEFAULT ''"),
+    ("news_stories", "headline_key", "TEXT NOT NULL DEFAULT ''"),
+    ("news_stories", "importance", "INTEGER NOT NULL DEFAULT 3"),
+    ("news_stories", "kind", "TEXT NOT NULL DEFAULT 'main'"),
+    # ONE-OFF REMINDERS FIRE WHERE THEY WERE ASKED, TAGGING WHO ASKED. Rows from
+    # before this carry '' for both: they fire in the posting channel and name
+    # the asker in plain text.
+    ("scheduled_reminders", "channel_id", "TEXT NOT NULL DEFAULT ''"),
+    ("scheduled_reminders", "asker_id", "TEXT NOT NULL DEFAULT ''"),
+]
+
+# Indexes on migrated columns. They cannot live in SCHEMA — on an existing DB
+# the columns do not exist until `_migrate` has run — so they are created after
+# it. Idempotent.
+_POST_MIGRATION_SQL: list[str] = [
+    "CREATE INDEX IF NOT EXISTS ix_news_stories_headline "
+    "ON news_stories(headline_key, posted_on)",
 ]
 
 
@@ -814,6 +919,8 @@ class DB:
             if column not in cols:
                 log.info("[db] migrating: adding %s.%s", table, column)
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        for sql in _POST_MIGRATION_SQL:
+            c.execute(sql)
 
     @contextmanager
     def conn(self):
@@ -1619,7 +1726,7 @@ class DB:
     def add_scheduled_reminder(
         self, *, row_key: str = "", company: str = "", poc: str = "",
         due_date: str, due_time: str = "", what: str, requested_by: str = "",
-        on_date: str = "",
+        on_date: str = "", channel_id: str = "", asker_id: str = "",
     ) -> int:
         """Record a one-off reminder somebody asked for at a specific time.
 
@@ -1629,11 +1736,11 @@ class DB:
         with self.conn() as c:
             cur = c.execute(
                 "INSERT INTO scheduled_reminders (row_key, company, poc, due_date, "
-                "due_time, what, requested_by, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                "due_time, what, requested_by, status, created_at, channel_id, "
+                "asker_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
                 (str(row_key or ""), str(company or ""), str(poc or ""), str(due_date),
                  str(due_time or ""), str(what), str(requested_by or ""),
-                 str(on_date or "")),
+                 str(on_date or ""), str(channel_id or ""), str(asker_id or "")),
             )
             new_id = int(cur.lastrowid)
         log.info(
@@ -1665,16 +1772,52 @@ class DB:
             out.setdefault(str(r["row_key"]), []).append(dict(r))
         return out
 
-    def list_scheduled_reminders(self, limit: int = 200) -> list[dict]:
-        """Every OPEN reminder, soonest first — including ones not tied to a row."""
+    def list_scheduled_reminders(self, limit: int = 200,
+                                 asker_id: str = "") -> list[dict]:
+        """Every OPEN reminder, soonest first — including ones not tied to a row.
+        `asker_id` narrows it to one person's."""
+        sql = ("SELECT id, row_key, company, poc, due_date, due_time, what, "
+               "requested_by, created_at, channel_id, asker_id "
+               "FROM scheduled_reminders WHERE status = 'open'")
+        params: list = []
+        if asker_id:
+            sql += " AND asker_id = ?"
+            params.append(str(asker_id))
+        sql += " ORDER BY due_date ASC, due_time ASC LIMIT ?"
+        params.append(max(1, int(limit)))
         with self.conn() as c:
-            rows = c.execute(
-                "SELECT id, row_key, company, poc, due_date, due_time, what, "
-                "requested_by, created_at FROM scheduled_reminders "
-                "WHERE status = 'open' ORDER BY due_date ASC LIMIT ?",
-                (max(1, int(limit)),),
-            ).fetchall()
+            rows = c.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def scheduled_reminders_due_on(self, on_date: str) -> list[dict]:
+        """OPEN reminders dated `on_date`, for the exact-time loop. FAILS QUIET:
+        an unreadable table means no reminder fires this minute, and the next
+        tick tries again."""
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT id, row_key, company, poc, due_date, due_time, what, "
+                    "requested_by, channel_id, asker_id FROM scheduled_reminders "
+                    "WHERE status = 'open' AND due_date = ? ORDER BY id",
+                    (str(on_date),),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            log.exception("[reminders] could not read today's reminders")
+            return []
+
+    def scheduled_reminder(self, reminder_id: int) -> Optional[dict]:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM scheduled_reminders WHERE id = ?",
+                            (int(reminder_id),)).fetchone()
+        return dict(row) if row else None
+
+    def reopen_scheduled_reminder(self, reminder_id: int) -> None:
+        """Put a claimed reminder back to open — its post failed, so the next
+        tick tries again."""
+        with self.conn() as c:
+            c.execute("UPDATE scheduled_reminders SET status = 'open' "
+                      "WHERE id = ? AND status = 'done'", (int(reminder_id),))
 
     def close_scheduled_reminder(self, reminder_id: int, status: str = "done") -> bool:
         """Mark one reminder done or cancelled. True when it was open."""
@@ -2531,6 +2674,108 @@ class DB:
             log.exception("[websearch] the ledger breakdown could not be read")
             return []
 
+    def web_searches_between(self, start_iso: str, end_iso: str) -> list:
+        """[{rule_id, searches, calls}] summed over a date range, inclusive."""
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT rule_id, SUM(searches) AS searches, SUM(calls) AS calls "
+                    "FROM web_search_usage WHERE on_date BETWEEN ? AND ? "
+                    "GROUP BY rule_id ORDER BY searches DESC",
+                    (str(start_iso), str(end_iso)),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            log.exception("[websearch] the ledger range could not be read")
+            return []
+
+    # -- the token log ------------------------------------------------------
+
+    def record_llm_call(self, row: dict) -> None:
+        """One Anthropic call. Never raises — a lost row must not cost a reply."""
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO llm_calls (ts, site, model, input_tokens, cache_write, "
+                    "cache_read, output_tokens, seconds, ok) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (str(row.get("ts")), str(row.get("site")), str(row.get("model") or ""),
+                     int(row.get("input_tokens") or 0), int(row.get("cache_write") or 0),
+                     int(row.get("cache_read") or 0), int(row.get("output_tokens") or 0),
+                     float(row.get("seconds") or 0), 1 if row.get("ok", True) else 0),
+                )
+        except Exception:
+            log.exception("[tokens] could not record an API call")
+
+    def llm_usage_by_site(self, since_ts: str) -> list[dict]:
+        """[{site, calls, input_tokens, cache_write, cache_read, output_tokens}]
+        since `since_ts`, the biggest spender first."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT site, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens, "
+                "SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read, "
+                "SUM(output_tokens) AS output_tokens FROM llm_calls WHERE ts >= ? "
+                "GROUP BY site ORDER BY SUM(input_tokens + cache_write + cache_read "
+                "+ output_tokens) DESC", (str(since_ts),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def llm_calls_since(self, since_ts: str) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute("SELECT * FROM llm_calls WHERE ts >= ? ORDER BY ts, rowid",
+                             (str(since_ts),)).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- how long answers take ---------------------------------------------
+
+    def record_reply_latency(self, *, ts: str, route: str, seconds: float,
+                             used_web: bool = False, tool_calls: int = 0,
+                             interim_sent: bool = False) -> None:
+        """One row per answered question. Never raises — a lost timing row must
+        not cost somebody their answer."""
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO reply_latency (ts, route, seconds, used_web, "
+                    "tool_calls, interim_sent) VALUES (?,?,?,?,?,?)",
+                    (str(ts), str(route), round(float(seconds), 3),
+                     1 if used_web else 0, max(0, int(tool_calls or 0)),
+                     1 if interim_sent else 0),
+                )
+        except Exception:
+            log.exception("[latency] could not record a reply timing")
+
+    def reply_latency_since(self, since_ts: str) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM reply_latency WHERE ts >= ? ORDER BY ts",
+                (str(since_ts),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def reply_latency_summary(self, since_ts: str) -> dict:
+        """{"routes": {route: {n, p50, p90}}, "interims": int, "total": int}.
+
+        Nearest-rank percentiles: with a handful of rows an interpolated p90 is
+        a number that never happened, and this is read by a person deciding a
+        threshold.
+        """
+        rows = self.reply_latency_since(since_ts)
+        by_route: dict = {}
+        for r in rows:
+            by_route.setdefault(r["route"], []).append(float(r["seconds"]))
+
+        def rank(vals, pct):
+            vals = sorted(vals)
+            k = max(1, -(-len(vals) * pct // 100))   # ceil
+            return vals[int(k) - 1]
+
+        return {
+            "routes": {route: {"n": len(v), "p50": rank(v, 50), "p90": rank(v, 90)}
+                       for route, v in sorted(by_route.items())},
+            "interims": sum(1 for r in rows if r["interim_sent"]),
+            "total": len(rows),
+        }
+
     # -- the opening-variety ledger ----------------------------------------
 
     def recent_openers(self, limit: int = 5) -> list:
@@ -2686,160 +2931,73 @@ class DB:
             )
         return bool(cur.rowcount)
 
-    # -- R1: the news rotation ---------------------------------------------
-    #
-    # WHY A ROTATION AT ALL. R1 is supposed to search for OUR people, and there
-    # are several hundred of them across the three sheets. One day's search
-    # budget carries eight. Taking the first eight off the sheet every day would
-    # mean the ninth person is never searched once, ever — so whose turn it is
-    # has to be a fact in the database rather than an accident of sheet order.
-
-    def sync_news_targets(self, targets: list) -> int:
-        """Add any target we have not seen. Returns how many were new.
-
-        UPSERT THAT LEAVES `last_searched` ALONE. A person's turn in the
-        rotation survives their row being edited, re-sorted or re-typed in the
-        sheet: only the display fields are refreshed. Resetting the clock on an
-        edit would let a frequently-edited row monopolise the rotation.
-
-        Targets that have LEFT are not removed here — see `drop_news_targets`.
-        """
-        rows = [
-            (str(t["target_key"]), str(t.get("kind") or "company"),
-             str(t.get("name") or ""), str(t.get("company") or ""),
-             str(t.get("source") or ""), t.get("sheet_row"))
-            for t in (targets or []) if str(t.get("target_key") or "").strip()
-        ]
-        if not rows:
-            return 0
-        with self.conn() as c:
-            before = c.execute("SELECT COUNT(*) AS n FROM news_targets").fetchone()["n"]
-            c.executemany(
-                "INSERT INTO news_targets "
-                "(target_key, kind, name, company, source, sheet_row) "
-                "VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(target_key) DO UPDATE SET "
-                "  name = excluded.name, company = excluded.company, "
-                "  source = excluded.source, sheet_row = excluded.sheet_row",
-                rows,
-            )
-            after = c.execute("SELECT COUNT(*) AS n FROM news_targets").fetchone()["n"]
-        new = max(0, after - before)
-        if new:
-            log.info("[news] %d new search target(s); %d tracked in total", new, after)
-        return new
-
-    def drop_news_targets(self, keys: list) -> int:
-        """Remove targets that should never be searched again.
-
-        The departures list is the reason this exists: somebody who has left is
-        not news we want, and leaving them in the rotation would spend a search
-        on them every few weeks forever.
-        """
-        keys = [str(k) for k in (keys or []) if str(k or "").strip()]
-        if not keys:
-            return 0
-        with self.conn() as c:
-            cur = c.executemany(
-                "DELETE FROM news_targets WHERE target_key = ?", [(k,) for k in keys]
-            )
-        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(keys)
-
-    def news_targets_due(self, *, limit: int, kinds: tuple = ()) -> list[dict]:
-        """The least-recently-searched targets, oldest first.
-
-        NEVER-SEARCHED FIRST, because `last_searched` is '' for those and the
-        empty string sorts before any ISO date. A PoC added to the sheet this
-        morning is therefore picked up on the next run rather than after
-        everybody else has had a turn.
-
-        `kinds` restricts to poc / researcher / company. The caller asks for the
-        priority tiers in order rather than this method knowing the policy.
-        """
-        sql = "SELECT * FROM news_targets"
-        params: list = []
-        if kinds:
-            sql += " WHERE kind IN (" + ",".join("?" * len(kinds)) + ")"
-            params.extend([str(k) for k in kinds])
-        sql += " ORDER BY last_searched ASC, searches ASC, name ASC LIMIT ?"
-        params.append(max(1, int(limit)))
-        with self.conn() as c:
-            return [dict(r) for r in c.execute(sql, params).fetchall()]
-
-    def mark_news_targets_searched(self, keys: list, *, on_date: str,
-                                   hit_keys: tuple = ()) -> None:
-        """Stamp a run against these targets, whether or not it found anything.
-
-        A SEARCH THAT FOUND NOTHING STILL COUNTS AS A TURN. If only hits moved
-        the clock, somebody nobody writes about would be searched every single
-        run forever — and the whole point of the rotation is that the budget
-        goes round.
-
-        `hit_keys` additionally bumps `hits`, which is diagnostic only: it is
-        how you notice that a third of the rotation never produces anything.
-        """
-        marker = str(on_date)
-        hits = {str(k) for k in (hit_keys or ())}
-        with self.conn() as c:
-            c.executemany(
-                "UPDATE news_targets SET last_searched = ?, searches = searches + 1, "
-                "hits = hits + ? WHERE target_key = ?",
-                [(marker, 1 if str(k) in hits else 0, str(k)) for k in (keys or [])],
-            )
-
-    def news_rotation_status(self) -> dict:
-        """{tracked, never_searched, oldest} — for the log and `cadence preview`."""
-        with self.conn() as c:
-            row = c.execute(
-                "SELECT COUNT(*) AS tracked, "
-                "  SUM(CASE WHEN last_searched = '' THEN 1 ELSE 0 END) AS never, "
-                "  MIN(NULLIF(last_searched, '')) AS oldest FROM news_targets"
-            ).fetchone()
-        return {
-            "tracked": int(row["tracked"] or 0),
-            "never_searched": int(row["never"] or 0),
-            "oldest": str(row["oldest"] or ""),
-        }
-
     # -- R1: stories already posted ----------------------------------------
+    #
+    # `news_targets` and its four methods are RETIRED with the people rotation;
+    # the table is left in place (see SCHEMA) and nothing touches it.
 
-    def news_story_seen(self, url_key: str, *, since_iso: str) -> bool:
-        """Has this story been posted since `since_iso`? FAILS CLOSED.
+    def news_story_seen(self, url_key: str, headline_key: str = "", *,
+                        since_iso: str) -> Optional[dict]:
+        """The posted row matching this link OR this headline since `since_iso`,
+        or None. FAILS CLOSED.
 
-        An unreadable table reports "yes, seen" and the story is skipped. The
-        cost of failing this way is one story missed; the cost of the other way
-        is the same story posted every day until somebody notices, which is the
+        An unreadable table reports a match and the story is skipped. The cost
+        of failing this way is one story missed; the cost of the other way is
+        the same story posted every day until somebody notices, which is the
         failure this table exists to prevent.
         """
+        ukey = str(url_key or "").strip()
+        hkey = str(headline_key or "").strip()
+        if not ukey and not hkey:
+            return None
         try:
             with self.conn() as c:
                 row = c.execute(
-                    "SELECT 1 FROM news_stories WHERE url_key = ? AND posted_on >= ? "
-                    "LIMIT 1", (str(url_key), str(since_iso)),
+                    "SELECT url_key, headline_key, posted_on, kind FROM news_stories "
+                    "WHERE posted_on >= ? AND ((? <> '' AND url_key = ?) "
+                    "  OR (? <> '' AND headline_key = ?)) "
+                    "ORDER BY posted_on DESC LIMIT 1",
+                    (str(since_iso), ukey, ukey, hkey, hkey),
                 ).fetchone()
-            return row is not None
+            return dict(row) if row is not None else None
         except Exception:
             log.exception("[news] could not check whether a story was already posted; "
                           "treating it as seen")
-            return True
+            return {"url_key": ukey, "headline_key": hkey, "posted_on": "?",
+                    "kind": "unreadable"}
 
     def record_news_stories(self, stories: list, *, on_date: str,
-                            rule_id: str = "", mode: str = "") -> int:
-        """Remember what went out. Returns how many were newly recorded."""
+                            rule_id: str = "", kind: str = "main") -> int:
+        """Remember what went out. Returns how many rows were written.
+
+        AN UPSERT ON THE LINK, so a story re-posted after NEWS_REPEAT_DAYS moves
+        its date forward and is remembered for another window — INSERT OR
+        IGNORE would keep the old date and let it repeat daily from then on.
+        """
         rows = [
-            (str(s["url_key"]), str(s.get("url") or ""), str(s.get("title") or "")[:300],
-             str(s.get("about") or "")[:200], str(rule_id), str(mode), str(on_date))
+            (str(s["url_key"]), str(s.get("url") or ""),
+             str(s.get("headline") or s.get("title") or "")[:300],
+             str(s.get("what") or s.get("about") or "")[:300], str(rule_id),
+             str(kind), str(on_date), str(s.get("topic") or ""),
+             str(s.get("headline_key") or ""), int(s.get("importance") or 3), str(kind))
             for s in (stories or []) if str(s.get("url_key") or "").strip()
         ]
         if not rows:
             return 0
         with self.conn() as c:
-            cur = c.executemany(
-                "INSERT OR IGNORE INTO news_stories "
-                "(url_key, url, title, about, rule_id, mode, posted_on) "
-                "VALUES (?,?,?,?,?,?,?)", rows,
+            c.executemany(
+                "INSERT INTO news_stories "
+                "(url_key, url, title, about, rule_id, mode, posted_on, topic, "
+                " headline_key, importance, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(url_key) DO UPDATE SET "
+                "  url = excluded.url, title = excluded.title, about = excluded.about, "
+                "  rule_id = excluded.rule_id, mode = excluded.mode, "
+                "  posted_on = excluded.posted_on, topic = excluded.topic, "
+                "  headline_key = excluded.headline_key, "
+                "  importance = excluded.importance, kind = excluded.kind",
+                rows,
             )
-            return max(0, cur.rowcount or 0)
+        return len(rows)
 
     def news_stories_posted(self, *, since_iso: str) -> int:
         with self.conn() as c:
@@ -2848,6 +3006,107 @@ class DB:
                 (str(since_iso),),
             ).fetchone()
         return int(row["n"] or 0)
+
+    def news_stories_on(self, on_date: str) -> list[dict]:
+        """Every story posted on one day, main and breaking, oldest first.
+
+        R2 reads this: the screen is about the companies in the news the team
+        was shown, not a second search.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT url, title AS headline, about AS what, topic, importance, "
+                "  kind, url_key FROM news_stories WHERE posted_on = ? "
+                "ORDER BY created_at ASC, rowid ASC", (str(on_date),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def news_headlines_today(self, on_date: str) -> list[str]:
+        """The day's posted headlines, main AND breaking, for the "do not return
+        these" line of the next search. At most 25."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT title FROM news_stories WHERE posted_on = ? AND title <> '' "
+                "ORDER BY created_at ASC, rowid ASC LIMIT 25", (str(on_date),),
+            ).fetchall()
+        return [str(r["title"]) for r in rows]
+
+    def news_topic_count_today(self, topic: str, on_date: str) -> int:
+        """How many stories on `topic` went out on `on_date`, main and breaking."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM news_stories WHERE posted_on = ? "
+                "AND lower(topic) = lower(?)", (str(on_date), str(topic or "")),
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def news_topics_this_week(self, iso_week: str) -> list[str]:
+        """The distinct topics posted in an ISO week ("2026-W40")."""
+        try:
+            year, week = str(iso_week).split("-W")
+            monday = date.fromisocalendar(int(year), int(week), 1)
+        except (ValueError, TypeError):
+            log.warning("[news] %r is not an ISO week; no topics counted", iso_week)
+            return []
+        sunday = monday + timedelta(days=6)
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT topic FROM news_stories WHERE posted_on BETWEEN ? AND ? "
+                "AND topic <> ''", (monday.isoformat(), sunday.isoformat()),
+            ).fetchall()
+        return [str(r["topic"]) for r in rows]
+
+    # -- R1: the hourly checks ---------------------------------------------
+
+    def news_check_done(self, on_date: str, slot: str) -> bool:
+        """Has this check slot run on `on_date`? FAILS CLOSED — an unreadable
+        table says yes, and the slot is skipped rather than searched twice."""
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT 1 FROM news_checks WHERE on_date = ? AND slot_hhmm = ?",
+                    (str(on_date), str(slot)),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            log.exception("[news-check] could not read news_checks; skipping the slot")
+            return True
+
+    def claim_news_check(self, on_date: str, slot: str, *, ran_at: str) -> bool:
+        """Claim a check slot BEFORE searching. False when it was already taken,
+        so two ticks — or a restart mid-search — cannot run it twice."""
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO news_checks (on_date, slot_hhmm, ran_at) "
+                "VALUES (?, ?, ?)", (str(on_date), str(slot), str(ran_at)),
+            )
+            return cur.rowcount > 0
+
+    def finish_news_check(self, on_date: str, slot: str, *, searches: int,
+                          found: int, posted: int) -> None:
+        with self.conn() as c:
+            c.execute(
+                "UPDATE news_checks SET searches = ?, found = ?, posted = ? "
+                "WHERE on_date = ? AND slot_hhmm = ?",
+                (int(searches), int(found), int(posted), str(on_date), str(slot)),
+            )
+
+    def news_breaking_messages_today(self, on_date: str) -> int:
+        """Breaking MESSAGES sent on `on_date`: checks whose message went out."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM news_checks WHERE on_date = ? AND posted > 0",
+                (str(on_date),),
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def news_checks_on(self, on_date: str) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_checks WHERE on_date = ? ORDER BY slot_hhmm",
+                (str(on_date),),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # -- R3: discovered events ---------------------------------------------
 
@@ -2893,6 +3152,88 @@ class DB:
                 "UPDATE event_discoveries SET status = ? WHERE event_key = ?",
                 (str(status), str(event_key)),
             )
+
+    # -- the per-day research cache ----------------------------------------
+
+    @staticmethod
+    def _cache_encode(value) -> str:
+        """JSON with dates tagged, so R3's proposals come back as dates."""
+        import json
+        from datetime import date as _date
+
+        def enc(v):
+            if isinstance(v, _date):
+                return {"__date__": v.isoformat()}
+            raise TypeError(f"not JSON-serialisable: {type(v).__name__}")
+
+        return json.dumps(value, default=enc)
+
+    @staticmethod
+    def _cache_decode(raw: str, empty):
+        import json
+        from datetime import date as _date, datetime as _datetime
+
+        def dec(obj):
+            if set(obj) == {"__date__"}:
+                text = str(obj["__date__"])
+                return (_datetime.fromisoformat(text) if "T" in text
+                        else _date.fromisoformat(text))
+            return obj
+
+        try:
+            return json.loads(raw or "", object_hook=dec)
+        except (TypeError, ValueError):
+            return empty
+
+    def research_cache_get(self, item_key: str, *, on_date: str) -> Optional[dict]:
+        """Today's research for one item, or None. FAILS OPEN, to a miss.
+
+        An unreadable cache costs one search, which the budget check still
+        bounds; failing the other way would leave an item unresearched for the
+        rest of the day.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT * FROM research_cache WHERE item_key = ? AND on_date = ?",
+                    (str(item_key), str(on_date)),
+                ).fetchone()
+        except Exception:
+            log.exception("[research-cache] could not read %s; treating it as a miss",
+                          item_key)
+            return None
+        if row is None:
+            return None
+        return {
+            "item_key": row["item_key"], "on_date": row["on_date"],
+            "rule_id": row["rule_id"], "research": row["research"] or "",
+            "sources": self._cache_decode(row["sources_json"], []),
+            "note": row["note"] or "",
+            "payload": self._cache_decode(row["payload_json"], {}),
+        }
+
+    def research_cache_put(self, item_key: str, *, on_date: str, rule_id: str = "",
+                           research: str = "", sources: Optional[list] = None,
+                           note: str = "", payload: Optional[dict] = None) -> bool:
+        """Remember one item's research for today. Last write wins."""
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO research_cache (item_key, on_date, rule_id, research, "
+                    "sources_json, note, payload_json) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(item_key, on_date) DO UPDATE SET "
+                    "rule_id = excluded.rule_id, research = excluded.research, "
+                    "sources_json = excluded.sources_json, note = excluded.note, "
+                    "payload_json = excluded.payload_json, "
+                    "created_at = CURRENT_TIMESTAMP",
+                    (str(item_key), str(on_date), str(rule_id or ""),
+                     str(research or ""), self._cache_encode(list(sources or [])),
+                     str(note or ""), self._cache_encode(dict(payload or {}))),
+                )
+            return True
+        except Exception:
+            log.exception("[research-cache] could not store %s", item_key)
+            return False
 
     def event_discoveries_this_month(self, month: str) -> int:
         """How many have been proposed in `month` (YYYY-MM). FAILS CLOSED HIGH.

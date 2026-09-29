@@ -567,6 +567,11 @@ STRATEGY_DOC_FILE = (
 # isn't told will answer as though it read the whole thing. 0 means no limit.
 STRATEGY_PROMPT_MAX_CHARS = _int("STRATEGY_PROMPT_MAX_CHARS", 24000)
 
+# THE SAME CAP FOR THE POLICY, applied the same way (persona.policy_block): the
+# policy rides in every reply-path prompt, so a long one is paid for on every
+# question. Truncation is declared in the prompt, and warned about at boot.
+POLICY_PROMPT_MAX_CHARS = _int("POLICY_PROMPT_MAX_CHARS", 16000)
+
 # Past this many CALENDAR days without a revision, the plan is reported stale.
 # Calendar, not working, days: a plan going stale over a long weekend is still
 # going stale. 0 turns the currency rule off (the date is still reported).
@@ -668,12 +673,49 @@ QUERY_HISTORY_MAX_MATCHES = _int("QUERY_HISTORY_MAX_MATCHES", 8)
 QUERY_HISTORY_MAX_CONTEXT = _int("QUERY_HISTORY_MAX_CONTEXT", 6)
 
 # Tool-use loop bounds for query_engine.py.
-QUERY_ENGINE_MAX_TOOL_ITERATIONS = _int("QUERY_ENGINE_MAX_TOOL_ITERATIONS", 8)
+# Five, down from eight: most answers finish in two or three, and every extra
+# iteration resends the whole system prompt and history.
+QUERY_ENGINE_MAX_TOOL_ITERATIONS = _int("QUERY_ENGINE_MAX_TOOL_ITERATIONS", 5)
 QUERY_ENGINE_MAX_TOKENS = _int("QUERY_ENGINE_MAX_TOKENS", 1536)
+
+# TOOL RESULTS ARE TRIMMED, NOT DROPPED. Every new tool_result is capped at
+# QUERY_TOOL_RESULT_MAX_CHARS; once a result is older than the two most recent
+# iterations (the current one counts), it shrinks to its first
+# QUERY_TOOL_RESULT_KEEP_CHARS characters — the model has already read it, and
+# resending it whole on every later iteration is what made long questions dear.
+# Both carry "(truncated — already read)" so the model knows.
+QUERY_TOOL_RESULT_MAX_CHARS = _int("QUERY_TOOL_RESULT_MAX_CHARS", 6000)
+QUERY_TOOL_RESULT_KEEP_CHARS = _int("QUERY_TOOL_RESULT_KEEP_CHARS", 600)
+
+# THE SHEET-UPDATE EXTRACTOR ONLY RUNS WHEN A MESSAGE LOOKS LIKE AN UPDATE: it
+# contains one of these words, or names a company on the Outreach PoCs tab, or
+# replies to a drip message about one. A plain question skips the call, and so
+# does "remind me …" (that is the reminder tool's job).
+SHEET_UPDATE_HINT_WORDS = _lower_str_set(
+    "SHEET_UPDATE_HINT_WORDS",
+    "update,mark,set,change,move,stage,status,note,add,record,log,done,replied,"
+    "met,meeting,sent",
+)
 
 # Discord hard-caps a message at 2000 chars; leave room for the reply decoration.
 QUERY_REPLY_CHUNK = _int("QUERY_REPLY_CHUNK", 1900)
 QUERY_REPLY_MAX_MESSAGES = _int("QUERY_REPLY_MAX_MESSAGES", 4)
+
+# THE INTERIM LINE — one short "on it" reply when an answer is SLOW.
+#
+# Discord's own typing indicator covers every question and costs nothing; this
+# is for the ones where even that stops being reassuring. When the engine has
+# not answered within the threshold, ONE deterministic line goes to the asker
+# ("One sec — pulling this together."), then the answer follows it. Never for a
+# quick answer, never twice for one question, never for the drip.
+#
+# Two thresholds: web-searching turns are the slow ones, so they get the
+# shorter wait. Tune both from the reply_latency p50s in the "what did you
+# cost" answer — roughly the engine p50, so the line only shows on the slower
+# half.
+INTERIM_ENABLED = _bool("INTERIM_ENABLED", True)
+INTERIM_AFTER_SECONDS = _float("INTERIM_AFTER_SECONDS", 10.0)
+INTERIM_AFTER_WEB_SECONDS = _float("INTERIM_AFTER_WEB_SECONDS", 6.0)
 
 # Short-term per-channel conversational memory (memory.py).
 QUERY_MEMORY_TURNS = _int("QUERY_MEMORY_TURNS", 5)
@@ -1105,6 +1147,9 @@ WEB_SEARCH_ALLOWED_CALLERS: list[str] = _str_list("WEB_SEARCH_ALLOWED_CALLERS", 
 # slow or enormous page degrades the brief instead of hanging the bot.
 RESEARCH_FETCH_TIMEOUT_SECONDS = _int("RESEARCH_FETCH_TIMEOUT_SECONDS", 12)
 RESEARCH_FETCH_MAX_BYTES = _int("RESEARCH_FETCH_MAX_BYTES", 400000)
+# The research brief's fetched pages, IN TOTAL. Each link is already cut at 6000
+# characters; this caps them all together, so five links cost what two do.
+RESEARCH_FETCH_TOTAL_MAX_CHARS = _int("RESEARCH_FETCH_TOTAL_MAX_CHARS", 12000)
 # Most links one brief will fetch. A row with twelve papers on it is a reading
 # list, not a brief.
 RESEARCH_MAX_LINKS = _int("RESEARCH_MAX_LINKS", 4)
@@ -1608,53 +1653,84 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 # rule silently flips its meaning in any year with 53 weeks.
 EVENTS_ANCHOR_DATE = (os.getenv("EVENTS_ANCHOR_DATE", "2026-09-23") or "").strip()
 
-# -- R1 NEWS: WHO TO SEARCH FOR, AND WHAT COUNTS ------------------------------
+# -- R1 NEWS: A DAILY AI INDUSTRY FEED ON A FIXED TOPIC LIST -----------------
 #
-# R1 searches for OUR PEOPLE FIRST and the wider field only as a fallback. News
-# about somebody already on our sheets is something the team can act on this
-# week; a bigger story about a stranger is reading material.
+# THE DECISION FROM THE 24 AND 29 SEP CALLS. R1 is no longer about our people:
+# nothing is searched for from the Outreach PoCs, the researcher mapping, the
+# Master Pipeline or the departures list. It is an AI industry feed, in two
+# shapes:
 #
-# ROTATION, because the budget cannot carry everyone. Searching every PoC,
-# researcher and pipeline company daily is impossible inside
-# WEB_SEARCH_DAILY_BUDGET, and searching the same eight every day would mean the
-# ninth person is never searched at all. So a last-searched date is kept per
-# person and company in SQLite and the LEAST RECENTLY SEARCHED come up first —
-# everybody comes round, and the order is a fact in the database rather than an
-# accident of sheet order.
+#   ONE MAIN POST at NEWS_MAIN_TIME covering the last 24 hours. It is R1's drip
+#   slot, pinned to that time, and it counts toward the day's cap like any rule.
+#
+#   HOURLY SILENT CHECKS at NEWS_CHECK_TIMES that post ONLY when something is
+#   genuinely important (importance >= NEWS_BREAKING_MIN_IMPORTANCE). A check
+#   post goes straight to the sales channel — never through drip_sends, never
+#   against DAILY_MESSAGE_CAP — and at most NEWS_BREAKING_MAX_PER_DAY of them a
+#   day. Checks run every day, weekends included; the main post is weekdays.
+#
+# These settings take precedence over the R1 row on the Bot Rules tab.
 
-# How many people/companies one R1 run searches for. Eight fits a single search
-# call's query comfortably; raising it makes each query longer and vaguer rather
-# than making the run find more.
-NEWS_PEOPLE_PER_RUN = _int("NEWS_PEOPLE_PER_RUN", 8)
+# When the main post goes out. It is R1's drip slot, pinned to this time
+# rather than to "the first slot".
+NEWS_MAIN_TIME = (os.getenv("NEWS_MAIN_TIME", "14:00") or "").strip() or "14:00"
 
-# The most stories one post may carry. The rule's own max_items_per_post in
-# bot_rules.yaml caps the ITEMS; this caps the STORIES inside the news item.
+# The hourly check slots, HH:MM, IST. The main time is deliberately absent: the
+# main sweep covers it.
+NEWS_CHECK_TIMES = _str_list(
+    "NEWS_CHECK_TIMES",
+    "11:00,12:00,13:00,15:00,16:00,17:00,18:00,19:00,20:00,21:00,22:00,23:00",
+)
+
+# THE TOPIC LIST, seeded from the "Sample Keywords" column of the Bot Rules tab
+# minus the four words too broad to steer anything (AI, ML, models, research).
+# SEEDS, NOT LIMITS: the prompt says important news off the list is welcome.
+_NEWS_TOPICS_DEFAULT = (
+    "artificial intelligence,machine learning,leadership,robot,robotics,"
+    "human reinforcement,RLHF,human data,multimodal,voice agent,STT,TTS,"
+    "AI regulation,responsible AI,AI safety,AI trust,evals,post-training,"
+    "red-teaming"
+)
+
+# NEWS_KEYWORDS IS THE OLD NAME, kept as an alias so nobody's .env breaks: it is
+# read into NEWS_TOPICS when NEWS_TOPICS is empty. Empty by default.
+NEWS_KEYWORDS = _str_list("NEWS_KEYWORDS")
+NEWS_TOPICS = (
+    _str_list("NEWS_TOPICS")
+    or NEWS_KEYWORDS
+    or [t.strip() for t in _NEWS_TOPICS_DEFAULT.split(",") if t.strip()]
+)
+
+# The most stories the main post carries.
 NEWS_MAX_ITEMS = _int("NEWS_MAX_ITEMS", 5)
 
-# PREFERRED SITES, comma-separated bare domains, and it is a PREFERENCE rather
-# than a restriction. The first search is limited to these; if it comes back
-# with fewer than NEWS_MIN_ITEMS stories, a SECOND open search runs across the
-# whole web. Empty (the default) means one open search and no first pass.
-#
-# Why not just use WEB_SEARCH_ALLOWED_DOMAINS: that one is a hard allow-list for
-# every search the bot makes. This is R1's opinion about where the good AI
-# coverage is, and being wrong about it must not cost the day's news.
+# How many stories on one topic may go out in one day, and how many distinct
+# topics in one ISO week. Both are bypassed by a story at or above
+# NEWS_BREAKING_MIN_IMPORTANCE: a spread rule must never hide the big one.
+NEWS_PER_TOPIC_PER_DAY = _int("NEWS_PER_TOPIC_PER_DAY", 2)
+NEWS_TOPICS_PER_WEEK = _int("NEWS_TOPICS_PER_WEEK", 6)
+
+# THE IMPORTANCE SCALE, 1-5, is defined in the prompt: 5 = the whole industry is
+# talking about it today; 4 = a sales team must know this week; 3 = useful;
+# 2-1 = filler. At or above this, a check posts and the spread gates yield.
+NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 4)
+
+# Breaking MESSAGES per day (one message may carry several stories). 99
+# disables the valve.
+NEWS_BREAKING_MAX_PER_DAY = _int("NEWS_BREAKING_MAX_PER_DAY", 2)
+
+# Searches one hourly check may spend. The main sweep uses WEB_SEARCH_MAX_USES.
+NEWS_CHECK_MAX_USES = _int("NEWS_CHECK_MAX_USES", 2)
+
+# PREFERRED SITES, comma-separated bare domains. A PREFERENCE LINE IN THE PROMPT
+# ONLY — "prefer these sources when they have the story" — and never a tool
+# domain restriction, so a site that blocks the search crawler cannot fail the
+# call and a wrong list costs relevance, never the day's news.
 NEWS_PREFERRED_DOMAINS = _str_list("NEWS_PREFERRED_DOMAINS")
 
-# How thin the preferred-domain pass has to be before the open pass runs.
-NEWS_MIN_ITEMS = _int("NEWS_MIN_ITEMS", 3)
-
-# How long a posted story stays remembered, so it is not posted twice. A month:
-# a funding round re-reported three weeks later is the same funding round.
+# How long a posted story stays remembered, so it is not posted twice — main
+# or breaking. Matched on the normalised URL OR the headline key.
 NEWS_REPEAT_DAYS = _int("NEWS_REPEAT_DAYS", 30)
-
-# SEED KEYWORDS FOR R1, from the "Sample Keywords" column of the Bot Rules tab.
-#
-# SEEDS, NOT LIMITS. The sheet says "not limited to these", so the search is
-# told they are a starting point and adjacent terms are fair game. They are here
-# rather than hardcoded so Vaishnavi can tune them in the sheet; which keyword
-# produced which story is logged, so there is something to tune against.
-NEWS_KEYWORDS = _str_list("NEWS_KEYWORDS")
 
 
 # -- R3 EVENTS: DISCOVERY AND DEADLINE BACKFILL -------------------------------
@@ -1677,7 +1753,7 @@ EVENTS_DISCOVERY_MAX_PER_MONTH = _int("EVENTS_DISCOVERY_MAX_PER_MONTH", 8)
 EVENTS_DEADLINE_RECHECK_DAYS = _int("EVENTS_DEADLINE_RECHECK_DAYS", 14)
 
 # SEED KEYWORDS FOR R3's discovery, from the same "Sample Keywords" column.
-# Seeds, not limits — see NEWS_KEYWORDS.
+# Seeds, not limits — see NEWS_TOPICS.
 EVENT_KEYWORDS = _str_list("EVENT_KEYWORDS")
 
 # R4 — DELIVERABLES. An item is chased when its tentative deadline is within
@@ -1868,6 +1944,19 @@ EMAIL_CONTACT_TYPES: list[str] = _str_list(
 # is read on Monday anyway, two days late, and looks like the bot cannot read a
 # calendar.
 NEXT_ACTION_WEEKEND_SHIFT = _bool("NEXT_ACTION_WEEKEND_SHIFT", default=True)
+
+# ONE-OFF REMINDERS FIRE AT THEIR EXACT MINUTE. "Remind me tomorrow at 2pm about
+# the pulse doc" posts at 14:00 tomorrow, in the channel it was asked in,
+# tagging whoever asked — weekends included, no company needed, outside the
+# drip and its daily cap, no model call.
+#
+# The time used when somebody gives a date and no time ("remind me on Friday").
+REMINDER_DEFAULT_TIME = (
+    os.getenv("REMINDER_DEFAULT_TIME", "14:00") or ""
+).strip() or "14:00"
+# How often the reminder loop looks. It is one SQLite query per tick, so a
+# minute costs nothing and means a reminder is at most a minute late.
+REMINDER_CHECK_SECONDS = _int("REMINDER_CHECK_SECONDS", 60)
 
 # How many lines "cadence preview" prints. It is a read-only answer in a Discord
 # message, and a message has a size limit; the count of what was cut is always
@@ -3198,4 +3287,21 @@ def validate() -> list[str]:
             "unreadable."
         )
 
+    # THE PROMPT DOCUMENTS' SIZE. Both ride in every reply-path prompt and are
+    # cut at their cap; a cut plan is a plan the model half-read.
+    for label, path, cap in (
+        ("policy", SALES_POLICY_FILE, POLICY_PROMPT_MAX_CHARS),
+        ("strategy", STRATEGY_DOC_FILE, STRATEGY_PROMPT_MAX_CHARS),
+    ):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                size = len(f.read().strip())
+        except OSError:
+            continue
+        if cap and size > cap:
+            log.warning(
+                "[config] the %s file %s is %d characters, over its prompt cap of %d; "
+                "the model reads only the first %d and is told it is truncated.",
+                label, path, size, cap, cap,
+            )
     return missing

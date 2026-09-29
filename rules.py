@@ -82,6 +82,17 @@ WEB_DEPENDENT = frozenset({
 # status and not a reason.
 WEB_PENDING = "web research pending"
 
+# WHAT A PREVIEW SAYS INSTEAD. The plan is built un-researched on purpose — the
+# research runs for one message at its own slot (see `bot._research_message`) —
+# so in a preview the marker is not a gap, it is the schedule. The item's own
+# text keeps WEB_PENDING; only what a person reads in a preview changes.
+RESEARCH_AT_SEND = "research runs at send time"
+
+
+def preview_text_of(text: str) -> str:
+    """An item's text as a preview shows it: the pending marker, reworded."""
+    return str(text or "").replace(f"[{WEB_PENDING}]", f"({RESEARCH_AT_SEND})")
+
 
 # WHAT EACH RULE IS, IN WORDS SOMEBODY OUTSIDE THE TEAM WOULD FOLLOW.
 #
@@ -597,6 +608,7 @@ def _self_test() -> int:
     check("R9 is outside the cap", by_id("R9").counts_toward_cap, False)
 
     print("\ncaps and destinations")
+    check("R4 carries the week's list, 20 per post", by_id("R4").max_items_per_post, 20)
     check("R5 carries 5 per post", by_id("R5").max_items_per_post, 5)
     check("R11 carries 3 per post", by_id("R11").max_items_per_post, 3)
     check("every destination is valid",
