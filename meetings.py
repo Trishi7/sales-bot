@@ -541,4 +541,4 @@ if __name__ == "__main__":  # pragma: no cover - operator convenience
     print(f"{len(found)} citable fact(s) in the last {config.MEETING_FACTS_DAYS} days")
     for f in found[:40]:
         print(f"  [{f['kind']:<10}] {f['text']}  ({f['citation']})")
-    print(f"\n{datetime.now().isoformat(timespec='seconds')}")
+    print(f"\n{dl.real_now_ist().isoformat(timespec='seconds')}")

@@ -8,8 +8,8 @@ temp directory. It asserts the contract a tester depends on:
 
   - "make it Monday" moves the persistent clock and posts that day;
   - the run stops at 10:00 for the morning item and 14:00 for the rest;
-  - each stop opens with "It's now Monday 28 Sep, 2:00 PM (test time)";
-  - the footer is points (at most six lines): Sent, what rolled, what looked
+  - it posts ONLY the messages — no clock lines, no footer;
+  - "why was it quiet" answers in points: Sent, what rolled, what looked
     and found nothing, what is not today's rule — in plain words;
   - NO rule code (R1, R6, ...) appears anywhere the tester can read;
   - "next day" and "back to today" move and clear the clock;
@@ -111,7 +111,7 @@ async def main():
             {"id": "R4", "name": "Deliverables checklist", "ran": True, "items": 0},
         ]}
 
-    async def fake_plan(*, today, already, queue=None):
+    async def fake_plan(*, today, already, queue=None, only_rule=""):
         return {
             "messages": [
                 _msg(1, 10, 0, "R8", "Meeting preparation", "Vaishnavi"),
@@ -149,25 +149,29 @@ async def main():
             print("   |", sub)
 
     text = "\n".join(str(p) for p in POSTED)
-    check("it opened at 10:00 for the morning item",
-          "It's now Monday" in text and "10:00 AM (test time)" in text)
-    check("...and again at 2:00 PM for the rest",
-          "2:00 PM (test time)" in text)
-    check("the opening line is the agreed wording",
-          any(l.strip().startswith("[TEST] It's now Monday")
-              and "(test time)" in l for l in text.splitlines()))
-    check("the footer counts the posts", "• Sent: 3" in text)
-    check("the footer says what rolled over",
-          "• Rolled to tomorrow: companies that just appeared in the pipeline (1)"
+    check("ONLY the messages: three posts and nothing else",
+          [str(p) for p in POSTED],
+          ["<post slot 1 for Vaishnavi>", "<post slot 2 for Vaishnavi>",
+           "<post slot 3 for Sid>"])
+    check("no clock line, no footer", "It's now" in text or "— done" in text, False)
+    check("the day was lived through to the 2:00 PM stop",
+          dl.now_ist().strftime("%H:%M"), "14:00")
+
+    print('\n"why was it quiet" explains the day instead of a footer')
+    POSTED.clear()
+    handled = await bot._handle_test_command(FakeMessage(), "why was it quiet?")
+    check("handled", handled)
+    text = "\n".join(str(p) for p in POSTED)
+    for sub in text.splitlines():
+        print("   |", sub)
+    check("it counts the posts", "• Sent: 3" in text)
+    check("it says what rolled over",
+          "• Rolled to tomorrow: new companies in the pipeline — asks before looking up PoCs (1)"
           in text)
-    check("the footer says what is not today's rule",
+    check("it says what is not today's rule",
           "• Not a Monday rule: sales packages that aren't ready yet" in text)
     check("...including a rule that ran and found nothing",
           "• Looked, nothing due: deliverables due or overdue" in text)
-    footer = next((p for p in POSTED if "— done" in str(p)), "")
-    check("the footer is at most six lines", 0 < len(footer.splitlines()) <= 6)
-    check("the footer ends with what to say next",
-          footer.rstrip().endswith('Say "next day" to carry on or "back to today" to stop.'))
 
     import re
     codes = re.findall(r"\bR\d{1,2}\b", text)

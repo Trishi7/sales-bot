@@ -156,8 +156,8 @@ class StubLLM:
             text = ("STORY | RLHF | Wispr Flow raises $30m | a Series B "
                     "| https://techcrunch.com/wispr | 4\n")
         elif rule == "R2":
-            text = ("SCREEN | Nebius | fits use case C, buys eval data "
-                    "| https://nebius.com/news\n")
+            text = ("SCREEN | Nebius | builds inference infrastructure | fits evals, "
+                    "buys eval data | https://nebius.com/news\n")
         else:
             text = "no public email found for Ada Lovelace"
         return {"ok": True, "text": text, "sources": [], "searches": 1,

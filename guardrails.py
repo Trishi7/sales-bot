@@ -58,6 +58,7 @@ from typing import Optional
 import discord
 
 import config
+import links
 import state
 
 log = logging.getLogger(__name__)
@@ -396,7 +397,8 @@ async def send(
             rung=int(rung or 0),
             item_key=item_key,
         )
-        body = sanitize(_for_people(text, keep_rule_ids=keep_rule_ids)).strip()
+        body = links.mask_bare(
+            sanitize(_for_people(text, keep_rule_ids=keep_rule_ids)).strip())
         if not body:
             log.info("[guardrails] nothing to DM (empty body) for kind=%s", kind)
             return None
@@ -432,6 +434,10 @@ async def send(
         return None
 
     body = sanitize(_for_people(text, keep_rule_ids=keep_rule_ids)).strip()
+    # NEVER A BARE URL IN A CHANNEL MESSAGE. Every renderer masks its own links
+    # (`links.link`); this catches one that arrived any other way — a model
+    # answer, a reminder somebody typed — and masks it, embed suppressed.
+    body = links.mask_bare(body)
     if not body:
         log.info("[guardrails] nothing to send (empty body) for kind=%s reason=%s", kind, reason)
         return None

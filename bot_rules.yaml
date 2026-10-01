@@ -54,7 +54,7 @@
 #   enabled             false takes the rule out of service without deleting
 #                       it, so the reason it existed is still readable.
 #
-# WEB-DEPENDENT RULES. R1, R2, R3, R6, R8, R10 and R11 need web research the
+# WEB-DEPENDENT RULES. R1, R2, R3, R6, R8 and R10 need web research the
 # bot cannot do yet. They still produce their items, each carrying the
 # placeholder "web research pending", so the schedule is real and visible
 # before the research layer lands (R5 of this series). Nothing is silently
@@ -241,12 +241,13 @@ rules:
   # snapshot is taken by the caller, not by the engine, so the engine stays
   # pure — see nextaction.run's docstring.
   #
-  # Fills in funding, location and industry, and suggests PoCs with name,
-  # designation, LinkedIn URL and research paper link. Permission is asked
-  # before anything is added to Outreach PoCs.
+  # ASKS FIRST. Names the companies and asks whether to look for PoCs. No
+  # web search until an approver says yes; then named people from the
+  # company's own site and public profile links, each with its source.
+  # Permission is asked again before anyone is added to Outreach PoCs.
   - id: R11
     name: New company in Master Pipeline
-    plain: companies that just appeared in the pipeline
+    plain: new companies in the pipeline — asks before looking up PoCs
     weekdays: [mon, tue, wed, thu, fri]
     trigger: new_pipeline_company
     max_items_per_post: 3

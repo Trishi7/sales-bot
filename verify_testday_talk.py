@@ -1,4 +1,4 @@
-"""THE TEST DAY TALKS, STARTS CLEAN, AND CHECKS THE NEWS ONCE. Sends nothing.
+"""THE TEST DAY STAYS SILENT, STARTS CLEAN, AND CHECKS THE NEWS ONCE. Sends nothing.
 
     python verify_testday_talk.py
 
@@ -8,17 +8,17 @@ rules queue and the plan are stubbed (the run's shape is under test, not the
 spreadsheet); the news check is the REAL `_maybe_breaking_news` with only the
 search call stubbed. It shows, with real output:
 
-  (i)   a date with stale sends from an earlier run: the clearing line appears,
-        the posts go out anyway, and the footer says "Sent: N"; another date's
-        rows are untouched;
-  (ii)  the footer is at most six lines;
+  (i)   a date with stale sends from an earlier run: the clearing is LOGGED
+        (not posted), the posts go out anyway; another date's rows are
+        untouched;
+  (ii)  nothing but the posts reaches the channel — no narration, no footer;
   (iii) exactly one news check during the test day — a live tick fired in the
         middle of it and one right after are both held, and a live tick after
         the hold finds the slot already done (log lines and news_checks rows);
   (iv)  a story with a digest url, and one on NEWS_BLOCKED_DOMAINS, are dropped
         and logged;
-  (v)   the progress lines appear within 5 s of the start, inside the typing
-        indicator, and the plan is made from ONE read of the rules.
+  (v)   the whole run sits inside the typing indicator, and the plan is made
+        from ONE read of the rules.
 """
 import asyncio
 import logging
@@ -164,7 +164,7 @@ async def main():
             {"id": "R6", "name": "LinkedIn connected, no DM", "ran": True, "items": 2},
         ]}
 
-    async def fake_plan(*, today, already, queue=None):
+    async def fake_plan(*, today, already, queue=None, only_rule=""):
         PLAN_GOT_QUEUE.append(queue is not None)
         return {
             "messages": [_msg(1, 14, 0, "R6", "Vaishnavi"),
@@ -226,11 +226,8 @@ async def main():
     text = "\n".join(bodies)
 
     print("\n(i) stale sends")
-    check("the clearing line appears",
-          f"2 posts were already recorded for {dl.today_ist().strftime('%A %d %b')} "
-          "from an earlier run — clearing them so today starts clean." in text)
+    check("the clearing is not posted", "earlier run" in text, False)
     check("both posts went out", sum(1 for b in bodies if b.startswith("<post slot")), 2)
-    check("the footer says Sent: 2", "• Sent: 2" in text)
     check("the other date's send is untouched",
           [r["group_key"] for r in bot.db.drip_sent_today(other)], ["keep"])
     check("the other date's news check is untouched",
@@ -239,12 +236,9 @@ async def main():
     print("   log: " + (cleared[0] if cleared else "(none)"))
     check("...and it was logged", len(cleared), 1)
 
-    print("\n(ii) the footer")
-    footer = next((b for b in bodies if "— done" in b), "")
-    check("at most six lines", 0 < len(footer.splitlines()) <= 6)
-    check("no rule codes", re.findall(r"\bR\d{1,2}\b", footer), [])
-    check("every bullet at most 15 words",
-          all(len(l.split()) - 1 <= 15 for l in footer.splitlines() if l.startswith("•")))
+    print("\n(ii) nothing but the posts")
+    check("the channel shows only the two posts",
+          [b for b in bodies if not b.startswith("<post slot")], [])
 
     print("\n(iii) one news check")
     # A LIVE TICK RIGHT AFTER — inside the 5-minute hold.
@@ -285,25 +279,14 @@ async def main():
           ["Lab ships eval suite"])
 
     print("\n(v) it talks while it works")
-    first = POSTED[0] if POSTED else (99, "")
-    check("the opening + working line lands within 5 s",
-          first[0] < 5 and "Working through the day" in first[1])
-    progress = [(t, b) for t, b in POSTED
-                if b.startswith(("[TEST] Rules read", "[TEST] Plan made",
-                                 "[TEST] News check done"))
-                or "Working through the day" in b]
-    check("four progress lines, no more", len(progress), 4)
-    check("the first stage line lands within 5 s",
-          len(progress) > 1 and progress[1][0] < 5)
     check("the whole run sat inside the typing indicator",
           (TYPING["entered"], TYPING["exited"]), (1, 1))
     check("the rules were read ONCE", QUEUE_READS[0], 1)
     check("...and the plan was made from that read", PLAN_GOT_QUEUE, [True])
-    stages = [l for l in LINES if l.startswith("[test-day]") and " took " in l]
-    for l in stages:
+    planned = [l for l in LINES if l.startswith("[test-day]") and "planned" in l]
+    for l in planned:
         print("   log:", l)
-    check("each stage's seconds were logged", len(stages) >= 4)
-
+    check("the plan was logged", len(planned), 1)
 
 try:
     asyncio.run(main())

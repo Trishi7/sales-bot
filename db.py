@@ -57,11 +57,12 @@ def _hours_between(earlier_iso: str, later_iso: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     if (a.tzinfo is None) != (b.tzinfo is None):
-        # One naive, one aware. Compare them as naive rather than raising: both
-        # are written by this bot in IST, and refusing the undo over a tzinfo
-        # mismatch would be a strange thing to explain to somebody.
-        a = a.replace(tzinfo=None)
-        b = b.replace(tzinfo=None)
+        # One naive, one aware. A naive value is read as IST — the convention
+        # every writer here follows — rather than stripping the other side's
+        # zone, which would compare a UTC value as though it were IST.
+        import deadlines as _dl
+        a = a if a.tzinfo else a.replace(tzinfo=_dl.IST)
+        b = b if b.tzinfo else b.replace(tzinfo=_dl.IST)
     return (b - a).total_seconds() / 3600.0
 
 
@@ -1899,12 +1900,18 @@ class DB:
         direction is right for a clock whose whole job is to SUPPRESS: losing it
         costs one extra message, and inverting it would silence a group forever.
         """
+        # THE CUTOFF IS AN IST DATE, computed here. SQLite's date('now') is the
+        # UTC date, and `on_date` is an IST date: between 00:00 and 05:30 IST
+        # the two disagree by a day. Through the bot's clock, so a pretend day
+        # counts back from the pretend date.
+        import deadlines as _dl
+        cutoff = _dl.iso(_dl.today_ist() - timedelta(days=max(1, int(lookback_days))))
         try:
             with self.conn() as c:
                 rows = c.execute(
                     "SELECT group_key, stage, MAX(on_date) AS last_date FROM drip_sends "
-                    "WHERE on_date >= date('now', ?) GROUP BY group_key, stage",
-                    (f"-{max(1, int(lookback_days))} day",),
+                    "WHERE on_date >= ? GROUP BY group_key, stage",
+                    (cutoff,),
                 ).fetchall()
         except Exception:
             log.exception("[db] could not read the drip history; treating every group as new")

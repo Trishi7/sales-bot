@@ -1,8 +1,9 @@
 """SIMULATION — run any rule, any day, against the real sheet, changing nothing.
 
 "@bot simulate monday" in the test channel, and the bot posts the exact messages
-it would send on the next Monday, in order, with a header and a footer saying
-what happened and why.
+it would send on the next Monday, in order — those messages and nothing else,
+built by the same code a real day uses, each tagged "[TEST]". "Why was it
+quiet" afterwards explains what was skipped (`why_quiet`).
 
 WHY THIS EXISTS. Twelve rules, a posting window, per-day caps, a roll-over, an
 approval queue and a leave check interact in ways nobody can hold in their head.
@@ -66,7 +67,9 @@ MODE_WEEK = "week"
 MODE_RULE = "rule"
 
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-_RULE_RE = re.compile(r"\brule\s+(R\d{1,2})\b", re.IGNORECASE)
+_RULE_RE = re.compile(r"\b(?:rule\s+)?(R\d{1,2})\b", re.IGNORECASE)
+# "next monday" / "last week": the one explicit way out of the current week.
+_SHIFT_WORDS = {"next": 1, "last": -1, "previous": -1}
 _SIM_RE = re.compile(r"\bsimulat(?:e|ion)\b", re.IGNORECASE)
 
 # The test helpers, all of them test-channel-and-approver only.
@@ -201,9 +204,10 @@ def is_no(text: str) -> bool:
 def read_day(phrase: str) -> Optional[date]:
     """"monday", "28 Sep", "2026-09-28", "tomorrow" -> a date. None otherwise.
 
-    A WEEKDAY MEANS THE NEXT ONE, TODAY INCLUDED — the same rule `next_weekday`
-    uses for the simulations, because a tester who says "make it Monday" on a
-    Monday means the Monday they are standing in.
+    A BARE WEEKDAY MEANS THAT DAY OF THIS WEEK (Monday to Sunday containing
+    today), passed or not — the same rule `this_week_day` gives the simulations.
+    "make it Monday" on a Wednesday is the Monday two days ago; on a Monday it
+    is today. "next monday" / "last monday" step a week either way.
     """
     want = " ".join(str(phrase or "").split()).strip().lower().strip(".,!?")
     if not want:
@@ -217,7 +221,11 @@ def read_day(phrase: str) -> Optional[date]:
 
     parts = want.split()
     if len(parts) == 1 and parts[0] in _WEEKDAY_INDEX:
-        return next_weekday(_WEEKDAY_INDEX[parts[0]])
+        return this_week_day(_WEEKDAY_INDEX[parts[0]])
+    if (len(parts) == 2 and parts[0] in _SHIFT_WORDS
+            and parts[1] in _WEEKDAY_INDEX):
+        return this_week_day(_WEEKDAY_INDEX[parts[1]]) + timedelta(
+            weeks=_SHIFT_WORDS[parts[0]])
 
     # Anything else is a date, read by the one parser the sheet already uses,
     # so a tester may type a date in any form the spreadsheet accepts.
@@ -247,9 +255,12 @@ def help_text() -> str:
     lines = [
         "Here is everything you can say to me in this channel.",
         "",
-        "  make it Monday      I will act as if today is Monday, and post that",
-        "                      day's messages. Any day works: a weekday name,",
-        "                      'tomorrow', or a date like 28 Sep.",
+        "  make it Monday      This week's Monday: I will act as if today is",
+        "                      that day and post that day's messages. A day",
+        "                      name means that day of THIS week, even if it",
+        "                      has passed; say 'next monday' or 'last monday'",
+        "                      for another week. 'tomorrow' or a date like",
+        "                      28 Sep works too.",
         "  next day            Move on to the following day and post that.",
         "  back to today       Stop pretending. The real date comes back.",
         "  start over          Wipe everything I have recorded while testing",
@@ -260,9 +271,11 @@ def help_text() -> str:
         "the spreadsheet, approving and undoing work, and chasing somebody over",
         "several days works because the days really do move. That is the point.",
         "",
-        "  simulate monday     A quick preview instead. I show you what Monday",
-        "  simulate week       would look like and record none of it: nothing is",
-        "  simulate rule R8    written, and I forget it the moment it finishes.",
+        "  simulate monday     A quick preview instead. I show you what this",
+        "  simulate week       week's Monday (or this whole week) would look",
+        "  simulate rule R8    like and record none of it: nothing is written,",
+        "                      and I forget it the moment it finishes. 'next'",
+        "                      or 'last' before monday/week picks another week.",
         "",
         "  pretend Sid is on leave   See what happens when somebody is away.",
         "  clear leave               Undo that.",
@@ -411,24 +424,41 @@ def parse(text: str) -> Optional[dict]:
         return {"mode": MODE_DAY, "date": when, "rule": "", "fast": fast,
                 "raw": body}
 
-    if re.search(r"\bweek\b", low):
-        return {"mode": MODE_WEEK, "date": None, "rule": "", "fast": fast,
-                "raw": body}
-
-    for token in re.findall(r"[a-z]+", low):
-        if token in _WEEKDAY_INDEX:
-            return {"mode": MODE_DAY, "date": next_weekday(_WEEKDAY_INDEX[token]),
+    # THIS WEEK UNLESS SAID OTHERWISE. A bare "week" or weekday is the current
+    # Monday-to-Sunday week; "next"/"last" right before it steps one week.
+    tokens = re.findall(r"[a-z]+", low)
+    for i, token in enumerate(tokens):
+        if token != "week" and token not in _WEEKDAY_INDEX:
+            continue
+        shift = _SHIFT_WORDS.get(tokens[i - 1], 0) if i else 0
+        if token == "week":
+            return {"mode": MODE_WEEK,
+                    "date": this_week_day(0) + timedelta(weeks=shift),
                     "rule": "", "fast": fast, "raw": body}
+        return {"mode": MODE_DAY,
+                "date": this_week_day(_WEEKDAY_INDEX[token]) + timedelta(weeks=shift),
+                "rule": "", "fast": fast, "raw": body}
 
     return None
 
 
-def next_weekday(index: int, *, from_day: Optional[date] = None) -> date:
-    """The NEXT occurrence of a weekday, today included.
+def this_week_day(index: int, *, from_day: Optional[date] = None) -> date:
+    """That weekday in the week (Monday to Sunday) containing today.
 
-    TODAY COUNTS. "simulate monday" typed on a Monday means today — asking for a
-    simulation of the day you are standing in and being shown next week's is a
-    surprise nobody wants.
+    PASSED OR NOT. "simulate monday" on a Wednesday is the Monday two days ago —
+    a tester means this week. A past pretend date is fine: the research cache
+    and drip_sends are keyed per date, so nothing collides with today.
+    """
+    base = from_day or today()
+    monday = base - timedelta(days=base.weekday())
+    return monday + timedelta(days=int(index))
+
+
+def next_weekday(index: int, *, from_day: Optional[date] = None) -> date:
+    """The first date on or after `from_day` (today) that falls on `index`.
+
+    Forward-only, today included. Bare weekday names do NOT use this — they
+    mean this week (`this_week_day`).
     """
     base = from_day or today()
     delta = (int(index) - base.weekday()) % 7
@@ -436,13 +466,17 @@ def next_weekday(index: int, *, from_day: Optional[date] = None) -> date:
 
 
 def week_of(start: Optional[date] = None) -> list:
-    """Monday to Sunday of the week containing (or next starting) `start`."""
-    monday = next_weekday(0, from_day=start or today())
+    """Monday to Sunday of the week containing `start` (default: today)."""
+    monday = this_week_day(0, from_day=start or today())
     return [monday + timedelta(days=i) for i in range(7)]
 
 
 def next_date_for_rule(rule_id: str, *, from_day: Optional[date] = None) -> Optional[date]:
     """The next date the named rule would fire on. None when it never would.
+
+    THIS WEEK FIRST, THEN NEXT. Unlike a bare weekday this looks forward only:
+    the scan starts at today, so a rule whose day is today or later this week
+    gets that day, and one whose day has already passed gets next week's.
 
     ANCHORED RULES (R8, R9) HAVE NO WEEKDAY, so "the next date it would fire" is
     simply the next working day — their own evaluators decide whether anything
@@ -541,15 +575,8 @@ def dm_line(recipient: str, text: str) -> str:
     return f"[DM to {recipient or 'someone'}] {text}"
 
 
-def header(day: date, *, mode: str = MODE_DAY, rule: str = "") -> str:
-    what = f" · {rule} only" if rule else ""
-    return (
-        f"{config.SIMULATION_PREFIX} Simulating {day.strftime('%a %d %b')}{what}"
-    )
-
-
-# THE DAY IN POINTS — one grouping, used by the test day's footer AND by the
-# simulation footer, so the two can never disagree about what a day was.
+# THE DAY IN POINTS — one grouping, used by the "why was it quiet" answer for a
+# test day and a simulation alike, so the two can never disagree.
 BULLET_MAX_WORDS = 15
 
 
@@ -635,24 +662,50 @@ def point_lines(*, sent: int, points: dict, weekday: str) -> list:
     return lines
 
 
-def footer(result: dict) -> str:
-    """What happened, in points. The half of a simulation people actually read.
+# "WHY WAS IT QUIET" — ASKED, NOT POSTED. A test run posts only the messages a
+# real day would; what it skipped is the answer to a question, matched as plain
+# text before any model call.
+_WHY_QUIET_RE = re.compile(
+    r"\b(?:why\s+(?:was|is)\s+(?:it|today|the\s+day|that)\s+(?:so\s+)?"
+    r"(?:quiet|silent|empty)"
+    r"|what\s+did\s+(?:you|it)\s+skip"
+    r"|why\s+(?:did\s+)?nothing\s+(?:go\s+out|went\s+out|get\s+sent|today))",
+    re.IGNORECASE,
+)
 
-    THE SAME GROUPING AS THE TEST DAY (`day_points`): sent, rolled, looked and
-    found nothing, not today's rule. At most six lines. `note` is one extra
-    line for a day with no plan at all (a weekend, the engine off).
+
+def is_why_quiet(text: str) -> bool:
+    return bool(_WHY_QUIET_RE.search(" ".join(str(text or "").split())))
+
+
+def why_quiet(result: Optional[dict]) -> str:
+    """The last test run's plan, in points: sent, rolled, looked and found
+    nothing, not today's rule. Deterministic, no model, no rule codes.
+
+    `result` is {"date", "planned", "rules_run", "sent", "simulated", "note"},
+    or None when no test run has happened since the bot started.
     """
-    points = result.get("points") or {}
-    head = f"{config.SIMULATION_PREFIX} {result.get('day_label', 'day')} — done"
+    if not result:
+        return ("I haven't run a test day or a simulation since I last started, so "
+                "there is no plan to explain yet. Say \"make it Monday\" to run one.")
+    day = result.get("date")
+    label = day.strftime("%A %d %b") if day else "That day"
+    if result.get("simulated"):
+        label += " (simulated)"
+    if result.get("note"):
+        return f"{label}: {result['note']}"
+    sent = int(result.get("sent") or 0)
+    points = day_points(planned=result.get("planned"),
+                        rules_run=result.get("rules_run"))
+    head = label
     if points.get("failed"):
         head += " · couldn't check " + ", ".join(points["failed"][:2])
     lines = [head] + point_lines(
-        sent=int(result.get("sent") or 0), points=points,
-        weekday=str(result.get("weekday") or "today's"),
-    )
-    if result.get("note"):
-        lines.append(str(result["note"]))
-    return "\n".join(lines[:6])
+        sent=sent, points=points, weekday=day.strftime("%A") if day else "today's")
+    if len(lines) == 2 and not sent:
+        lines.append("Nothing was due, rolled or skipped — the rules found no work.")
+    import rules as rules_mod
+    return rules_mod.render_for_user("\n".join(lines))
 
 
 def pace_seconds(*, fast: bool, count: int) -> float:
@@ -722,17 +775,45 @@ def _self_test() -> int:
     check("empty", parse(""), None)
     check("a bad date is refused", parse("simulate 2026-13-45"), None)
 
-    print("\nnext weekday")
+    print("\nnext weekday (forward-only)")
     check("today counts", next_weekday(1, from_day=base), base)
     check("tomorrow", next_weekday(2, from_day=base), date(2026, 9, 23))
     check("wraps to next week", next_weekday(0, from_day=base), date(2026, 9, 28))
 
+    print("\nthis week's day")
+    check("a passed day stays this week",
+          this_week_day(0, from_day=base), date(2026, 9, 21))
+    check("today is today", this_week_day(1, from_day=base), base)
+    check("later this week", this_week_day(6, from_day=base), date(2026, 9, 27))
+    check("Monday on a Monday", this_week_day(0, from_day=date(2026, 9, 28)),
+          date(2026, 9, 28))
+
     print("\nweek_of")
     days = week_of(base)
     check("seven days", len(days), 7)
-    check("starts Monday", days[0].weekday(), 0)
-    check("ends Sunday", days[-1].weekday(), 6)
+    check("starts this week's Monday", days[0], date(2026, 9, 21))
+    check("ends this week's Sunday", days[-1], date(2026, 9, 27))
     check("in order", days == sorted(days), True)
+
+    print("\nthis week in commands (clock pinned to Tue 22 Sep)")
+    global today
+    real_today = today
+    today = lambda: base  # noqa: E731
+    try:
+        check("simulate monday -> this Monday",
+              parse("simulate monday")["date"], date(2026, 9, 21))
+        check("simulate week -> this Monday",
+              parse("simulate week")["date"], date(2026, 9, 21))
+        check("simulate next monday",
+              parse("simulate next monday")["date"], date(2026, 9, 28))
+        check("simulate last week",
+              parse("simulate last week")["date"], date(2026, 9, 14))
+        check("simulate R4 needs no 'rule'", parse("simulate R4")["rule"], "R4")
+        check("make it monday -> yesterday", read_day("monday"), date(2026, 9, 21))
+        check("make it next monday", read_day("next monday"), date(2026, 9, 28))
+        check("tomorrow unchanged", read_day("tomorrow"), date(2026, 9, 23))
+    finally:
+        today = real_today
 
     print("\nrendering")
     config.ROSTER_DISPLAY_NAMES = {"111": "Vaishnavi", "222": "Sid"}
@@ -748,12 +829,12 @@ def _self_test() -> int:
     check("the prefix is applied", prefix("hello").startswith("[TEST]"), True)
     check("a DM is shown, not sent",
           dm_line("Vaishnavi", "chase this"), "[DM to Vaishnavi] chase this")
-    check("the header names the day",
-          header(date(2026, 9, 28)), "[TEST] Simulating Mon 28 Sep")
-    check("...and the rule when there is one",
-          "R8 only" in header(date(2026, 9, 28), rule="R8"), True)
 
-    print("\nthe footer")
+    print("\nwhy was it quiet")
+    check("asked plainly", is_why_quiet("why was it quiet?"), True)
+    check("asked about skips", is_why_quiet("what did you skip today"), True)
+    check("not every question", is_why_quiet("what is the queue"), False)
+    check("no run yet says so", "no plan to explain" in why_quiet(None), True)
     pts = day_points(
         planned={"rolled": [
             {"rule_id": "R4", "rule_name": "Deliverables checklist", "actions": [1, 2]},
@@ -764,8 +845,19 @@ def _self_test() -> int:
                    {"id": "R6", "name": "LinkedIn", "ran": True, "items": 0},
                    {"id": "R9", "name": "Meeting done", "ran": False,
                     "why": "disabled in bot_rules.yaml"}])
-    text = footer({"day_label": "Mon 28 Sep", "sent": 3, "points": pts,
-                   "weekday": "Monday"})
+    text = why_quiet({
+        "date": date(2026, 9, 28), "sent": 3,
+        "planned": {"rolled": [
+            {"rule_id": "R4", "rule_name": "Deliverables checklist", "actions": [1, 2]},
+            {"rule_id": "R4", "rule_name": "Deliverables checklist", "actions": [3]},
+        ], "held": []},
+        "rules_run": [{"id": "R12", "name": "Sales packages", "ran": False,
+                       "why": "does not run on Monday (runs Thursday)"},
+                      {"id": "R6", "name": "LinkedIn", "ran": True, "items": 0},
+                      {"id": "R9", "name": "Meeting done", "ran": False,
+                       "why": "disabled in bot_rules.yaml"}],
+    })
+    check("same points as day_points", len(pts["rolled"]), 1)
     print("   " + text.replace("\n", "\n   "))
     check("reports the count", "• Sent: 3" in text, True)
     check("rolled is counted per rule", "deliverables due or overdue (3)" in text, True)

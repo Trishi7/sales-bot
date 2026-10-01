@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import config
+import deadlines as dl
 
 log = logging.getLogger(__name__)
 
@@ -42,9 +43,10 @@ AUDIT_FILENAME = "audit.jsonl"
 
 
 def _utcnow_iso() -> str:
-    """UTC, second precision, explicit 'Z'. Every timestamp in both files uses
-    this exact shape so a consumer needs one parser."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    """The REAL clock in IST, second precision, with its explicit +05:30 offset.
+    Every timestamp in both files uses this exact shape so a consumer needs one
+    parser (any ISO-8601 reader handles the offset). The name is historical."""
+    return dl.real_now_ist().replace(microsecond=0).isoformat()
 
 
 def _state_dir() -> str:

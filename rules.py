@@ -66,8 +66,10 @@ KNOWN_TRIGGERS = (
 # visible before the research layer lands. See `needs_web`.
 WEB_DEPENDENT = frozenset({
     "ai_news", "news_company_screen", "events", "li_no_dm",
-    "meeting_prep", "closure_support", "new_pipeline_company",
+    "meeting_prep", "closure_support",
 })
+# R11 IS NOT HERE ON PURPOSE. It asks first ("want me to look for PoCs?") and
+# only searches after an approver's yes — see bot._apply_poc_lookup.
 
 # The placeholder a web-dependent item carries UNTIL ITS SEARCH HAS RUN.
 #
@@ -121,7 +123,7 @@ PLAIN_BY_TRIGGER = {
     "meeting_prep": "meetings coming up that need prep",
     "meeting_followup": "meetings that happened with no next steps recorded",
     "closure_support": "deals close enough to push over the line",
-    "new_pipeline_company": "companies that just appeared in the pipeline",
+    "new_pipeline_company": "new companies in the pipeline — asks before looking up PoCs",
     "sales_packages": "sales packages that aren't ready yet",
 }
 

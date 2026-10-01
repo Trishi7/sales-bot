@@ -93,7 +93,8 @@ _cache: dict = {"at": None, "data": None}
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    # A REAL DURATION (the cache TTL), so the real clock.
+    return dl.real_now_ist()
 
 
 def configured() -> bool:
@@ -123,7 +124,7 @@ def _read_local(path: str) -> dict:
     return {
         "ok": True, "source": "file", "text": text, "name": os.path.basename(path),
         "url": "", "id": "",
-        "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).date().isoformat(),
+        "modified": datetime.fromtimestamp(st.st_mtime, tz=dl.IST).date().isoformat(),
         "error": "", "remedy": "",
     }
 

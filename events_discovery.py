@@ -47,6 +47,7 @@ from typing import Optional
 import config
 import deadlines as dl
 import gtm_sheet
+import links
 
 log = logging.getLogger(__name__)
 
@@ -351,7 +352,7 @@ def render_proposal(events: list) -> str:
             + (dl.format_date(e["deadline"]) if e.get("deadline")
                else "— the page doesn't say")
         )
-        lines.append(f"  <{e['link']}>")
+        lines.append("  " + links.link(e.get("name") or "", e["link"]))
     lines.append("")
     lines.append("Want these on the sheet? Say yes and I'll add them — I won't "
                  "add anything without one.")
@@ -494,7 +495,8 @@ def render_deadline_proposal(found: list) -> str:
     lines = ["I found registration deadlines for these — shall I put them in the sheet?"]
     for f in found:
         lines.append(
-            f"• {f['name']} — closes {dl.format_date(f['deadline'])}  <{f['source']}>"
+            f"• {f['name']} — closes {dl.format_date(f['deadline'])}  "
+            f"{links.link('', f['source'])}"
             + (f"  (row {f['sheet_row']})" if f.get("sheet_row") else "")
         )
     lines.append("")

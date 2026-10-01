@@ -54,7 +54,7 @@ which today" is answerable from one log line.
                          Contacted → Connected → Intro Sent → Positive (P/Y) →
                          Meeting Done → Assets Shared.
     researcher_lines     Signature: "Outreach Line - Researchers" AND "Dates".
-    positioning_matrix   use cases A–I: label, use case, problem, offering,
+    positioning_matrix   the use cases: label, use case, problem, offering,
                          company type, ICP, business impact.
     prospect_priority    scored companies, P1–P3, with a rationale.
 
@@ -104,6 +104,7 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 import config
+import deadlines as dl
 
 log = logging.getLogger(__name__)
 
@@ -1312,7 +1313,7 @@ class Tab:
 
     @property
     def age_seconds(self) -> float:
-        return max(0.0, time.time() - self.read_at)
+        return max(0.0, dl.real_epoch() - self.read_at)
 
     def column_letter(self, role: str) -> Optional[str]:
         idx = self.role_to_col.get(role)
@@ -2170,7 +2171,7 @@ class GTMSheets:
         say so — because a sheet outage must never take the bot down. Raises
         SheetAccessError only when there is NO cached copy to fall back to.
         """
-        now = time.time()
+        now = dl.real_epoch()
         with self._lock:
             cached = {
                 kind: tabs[0] for (sk, kind), tabs in self._cache.items()
@@ -2187,7 +2188,7 @@ class GTMSheets:
             titles = [title for title, _hidden in discovered]
             hidden_by_title = {title: hidden for title, hidden in discovered}
             by_title = self._batch_values(sh, titles)
-            read_at = time.time()
+            read_at = dl.real_epoch()
             groups: dict[str, list[Tab]] = {}
             unrecognised: list[str] = []
             schema_entries: list[dict] = []
@@ -3343,7 +3344,7 @@ def _self_test() -> int:
         print(f"\nrow {row} is not a data row on {tab.title!r}")
         return 1
 
-    probe = f"round-trip {_dt.datetime.now().strftime('%H:%M:%S')}"
+    probe = f"round-trip {dl.real_now_ist().strftime('%H:%M:%S')}"
     print(f"\nround-trip: {tab.title!r} row {row} ({company!r}) {args.role} <- {probe!r}")
     result = SHEETS.write_cells(
         row=row, values={args.role: probe}, expect_company=company,

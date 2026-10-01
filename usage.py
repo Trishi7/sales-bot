@@ -21,6 +21,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Callable, Optional
+import deadlines as dl
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +42,36 @@ def _num(obj, name: str) -> int:
         return 0
 
 
+# THE TEST-RUN TALLY. A test day or a simulation opens one and logs it at the
+# end as `[test-cost] date=… calls=N searches=N cache_hits=N`, so "did the
+# second run cost anything" is one grep. None when no test run is open.
+_tally: Optional[dict] = None
+
+
+def start_tally() -> dict:
+    global _tally
+    _tally = {"calls": 0, "searches": 0, "cache_hits": 0}
+    return _tally
+
+
+def stop_tally() -> dict:
+    global _tally
+    got, _tally = (_tally or {"calls": 0, "searches": 0, "cache_hits": 0}), None
+    return got
+
+
+def count(field: str, n: int = 1) -> None:
+    if _tally is not None:
+        _tally[field] = _tally.get(field, 0) + int(n or 0)
+
+
 def record(*, site: str, model: str, response=None, seconds: float = 0.0,
            ok: bool = True) -> dict:
     """Log one call and hand it to the sink. Never raises."""
+    count("calls")
     usage = getattr(response, "usage", None)
     row = {
-        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "ts": dl.real_now_ist().isoformat(timespec="seconds"),
         "site": str(site or "?"),
         "model": str(model or ""),
         "input_tokens": _num(usage, "input_tokens"),

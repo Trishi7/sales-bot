@@ -53,7 +53,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from time import monotonic as _monotonic
 from typing import Optional
 
@@ -138,6 +138,16 @@ _COST_RE = re.compile(
     r"(cost|spen[dt])|\bcost\s+report\b|what'?s?\s+(your|the\s+bot'?s?)\s+"
     r"(cost|spend)|how\s+(fast|slow)\s+(are|have)\s+you|\btoken\s+usage\b|"
     r"\bhow\s+many\s+tokens\b|how\s+many\s+(web\s+)?searches)",
+    re.IGNORECASE,
+)
+
+# "WHAT TIME IS IT" — answered from `clock.describe()`, never by the model:
+# the bot's own clock is the one thing it must quote exactly, "(test time)"
+# included while a pretend date is set.
+_TIME_RE = re.compile(
+    r"^\s*(what(?:'?s|\s+is)?\s+the\s+time|what\s+time\s+is\s+it|"
+    r"what(?:'?s|\s+is)\s+the\s+(?:date|day)(?:\s+today)?|what\s+day\s+is\s+it)"
+    r"(?:\s+(?:now|today|there))?\s*\??\s*$",
     re.IGNORECASE,
 )
 
@@ -302,11 +312,19 @@ class SalesBot(discord.Client):
         # would be a database wipe authorised by a message somebody sent to a
         # process that no longer exists.
         self._pending_start_over: Optional[dict] = None
-        # THE LIVE NEWS CHECK STANDS DOWN while a test day or a simulation runs
-        # (and NEWS_HOLD_AFTER_TEST_SECONDS after), so the forced check is the
-        # only one. >0 = running; else a real-clock monotonic deadline.
+        # THE WHOLE LIVE LOOP STANDS DOWN — drip, hourly news check, reminders —
+        # while a test day or a simulation runs (and NEWS_HOLD_AFTER_TEST_SECONDS
+        # after), and whenever the pretend clock is set. The test run owns the
+        # day. >0 = running; else a real-clock monotonic deadline.
         self._news_hold_depth: int = 0
         self._news_hold_until: float = 0.0
+        self._hold_logged: str = ""
+        # The last test run's plan, for "why was it quiet": {date, planned,
+        # rules_run, sent}. In memory only; a restart forgets it.
+        self._last_test_plan: Optional[dict] = None
+        # When (real monotonic) a forced news check last ran, per pretend date,
+        # so a second test/simulation of the same date inside an hour skips it.
+        self._forced_news_at: dict = {}
         log.info(
             "[bot.init] %s ready to connect. sales_channels=%s ask_channel=%s roster=%d",
             config.COS_NAME, config.SALES_CHANNEL_IDS, config.SALES_ASK_CHANNEL_ID,
@@ -320,6 +338,14 @@ class SalesBot(discord.Client):
             "[bot] connected as %s (id=%s), in %d guild(s)",
             self.user, getattr(self.user, "id", "?"), len(self.guilds),
         )
+        # THE CLOCK AT BOOT: real IST, any pretend date, and the zone the
+        # process runs in — so a server on UTC is visible at a glance. Nothing
+        # depends on the process zone; every "now" goes through `clock`.
+        st = clock.status()
+        log.info("[boot] real IST now: %s | pretend date: %s | process zone: %s",
+                 clock.format_moment(st["real_now"]),
+                 dl.iso(st["pretend_date"]) if st["pretend_date"] else "none",
+                 clock.process_timezone())
 
         # Report what the bot can actually SEE, at INFO, on every boot. A channel
         # configured but invisible is the most common misconfiguration, and it is
@@ -1094,7 +1120,7 @@ class SalesBot(discord.Client):
                  timing["used_web"], timing["tool_calls"], timing["interim"])
         await asyncio.to_thread(
             lambda: self.db.record_reply_latency(
-                ts=datetime.now(dl.IST).isoformat(timespec="seconds"),
+                ts=dl.real_now_ist().isoformat(timespec="seconds"),
                 route=timing["route"], seconds=took, used_web=timing["used_web"],
                 tool_calls=timing["tool_calls"], interim_sent=timing["interim"],
             )
@@ -1123,6 +1149,13 @@ class SalesBot(discord.Client):
             log.info("[query] msg=%s → cost report (matched directly)", message.id)
             self._mark_route(message, "capability")
             await self._send_cost_report(message)
+            return True
+
+        if _TIME_RE.match(text):
+            log.info("[query] msg=%s → the clock (matched directly)", message.id)
+            self._mark_route(message, "capability")
+            await self._reply(message, f"It's {clock.describe()}.",
+                              reason="said what time the bot thinks it is")
             return True
 
         self._mark_route(message, "sheet_update")
@@ -1290,6 +1323,9 @@ class SalesBot(discord.Client):
         honest failure sentence below — the interim changes nothing about that.
         """
         outcome: dict = {}
+        # find_people's replies, collected so they are posted VERBATIM — the
+        # model reformatted them (bold names, bare urls, its own commentary).
+        people_out: list = []
         web_tools, web_note, web_tail = await self._websearch_tools()
         task = None
         try:
@@ -1303,6 +1339,7 @@ class SalesBot(discord.Client):
                     + self._mapping_tools()
                     + self._todo_tools()
                     + self._strategy_tools()
+                    + self._people_tools(sink=people_out)
                     + web_tools
                 ),
                 history=history,
@@ -1340,6 +1377,16 @@ class SalesBot(discord.Client):
         # turn that searched twice has spent two of the day's searches and the
         # ledger has to agree with the invoice.
         await self._bank_searches(outcome)
+
+        if people_out:
+            # THE TOOL'S TEXT IS THE ANSWER, exactly as rendered: every name,
+            # title and link is one the search returned, and a model rewrite is
+            # the one place that guarantee could be lost.
+            log.info("[query] msg=%s answered with find_people's text verbatim "
+                     "(%d block(s))", message.id, len(people_out))
+            await self._reply(message, "\n\n".join(people_out),
+                              reason="find_people answer, posted verbatim")
+            return True
 
         if not reply:
             if outcome.get("model_error"):
@@ -1447,7 +1494,7 @@ class SalesBot(discord.Client):
 
         lines.append("")
         lines.append("How long my answers took, last 7 days (seconds):")
-        since = (datetime.now(dl.IST) - timedelta(days=7)).isoformat(timespec="seconds")
+        since = (dl.real_now_ist() - timedelta(days=7)).isoformat(timespec="seconds")
         try:
             summary = await asyncio.to_thread(
                 lambda: self.db.reply_latency_summary(since))
@@ -3383,16 +3430,26 @@ class SalesBot(discord.Client):
             else:
                 hhmm = sheetwrite.parse_reminder_time(config.REMINDER_DEFAULT_TIME) \
                     or "14:00"
-            when_words = sheetwrite.reminder_moment_words(due, hhmm)
             hh, mm = (int(x) for x in hhmm.split(":"))
             moment = datetime(due.year, due.month, due.day, hh, mm, tzinfo=dl.IST)
-            if moment <= now:
+            # THE CURRENT MINUTE MEANS "RIGHT AWAY". A time within the next 60 s,
+            # or passed by under 2 minutes, is scheduled for now + 1 minute —
+            # somebody typing the minute they are in is not asking for the past.
+            right_away = (now - timedelta(minutes=2)) < moment <= (now + timedelta(seconds=60))
+            if right_away:
+                soon = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+                log.info("[reminders] %s is the current minute (now %s); scheduling it "
+                         "for %s", moment.strftime("%H:%M"), now.strftime("%H:%M:%S"),
+                         soon.strftime("%H:%M"))
+                moment, due, hhmm = soon, soon.date(), soon.strftime("%H:%M")
+            elif moment <= now:
                 return {
                     "ok": False, "in_the_past": True,
-                    "reason": (f"{when_words} has already passed (it is "
-                               f"{clock.format_moment(now)} now), so I have NOT "
+                    "reason": (f"{clock.describe(moment)} has already passed (it is "
+                               f"{clock.describe(now)} now), so I have NOT "
                                "scheduled it. Say so and ask for a later time."),
                 }
+            when_words = clock.describe(moment)
 
             row = None
             if company:
@@ -3433,6 +3490,7 @@ class SalesBot(discord.Client):
                 "matched_sheet_row": row.get("_row") if row is not None else None,
                 "is_weekend": weekend,
                 "confirm": f"Got it — {when_words}.",
+                "right_away": right_away,
                 "note": (
                     "Confirm with the 'confirm' line, naming the date AND the time "
                     "exactly as written there. At that minute I post in this channel, "
@@ -3603,7 +3661,7 @@ class SalesBot(discord.Client):
                 "schema": {
                     "name": "positioning_matrix",
                     "description": (
-                        "The positioning matrix — use cases A–I with Label, Use Case, Problem "
+                        "The positioning matrix — each use case with Label, Use Case, Problem "
                         "Statement, Offering, Company Type, ICP and Business Impact. THIS is "
                         "how you answer 'what do we pitch to <company type>', 'what's the "
                         "use case for <industry>', 'what's our offering for X'. Pass "
@@ -4812,7 +4870,8 @@ class SalesBot(discord.Client):
                 log.exception("[reminders] tick raised; continuing")
             await asyncio.sleep(interval)
 
-    async def _fire_due_reminders(self, *, channel=None) -> list:
+    async def _fire_due_reminders(self, *, channel=None, from_test: bool = False,
+                                  at: Optional[datetime] = None) -> list:
         """Post every open reminder dated today whose minute has come.
 
         "<@asker> — you asked me to remind you: {what}" (+ " ({company})"), in
@@ -4827,8 +4886,19 @@ class SalesBot(discord.Client):
         TODAY AND NOW ARE THE BOT'S CLOCK — the pretend clock in test mode — so
         a reminder for the pretend "tomorrow 2pm" fires when the tester's day
         reaches 14:00. Returns the ids posted.
+
+        THE LIVE LOOP STANDS DOWN during a test run or while the pretend clock
+        is set; the test run fires them itself (`from_test`, and `at` for a
+        simulated day's "now"), tagged "[TEST]".
         """
-        now = dl.now_ist()
+        # NOT HELD BY A TEST RUN OR A PRETEND DATE: reminders are the thing being
+        # tested, and under a pretend date one set for the pretend "today" fires
+        # at that real IST minute. Only a simulation (a throwaway database
+        # swapped in) holds the live loop. Claimed-before-sent means the loop
+        # and a test run can never both post one.
+        if not from_test and simulation.in_simulation():
+            return []
+        now = at or dl.now_ist()
         marker = dl.iso(now.date())
         rows = await asyncio.to_thread(self.db.scheduled_reminders_due_on, marker)
         default = sheetwrite.parse_reminder_time(config.REMINDER_DEFAULT_TIME) or "14:00"
@@ -4855,6 +4925,7 @@ class SalesBot(discord.Client):
             body = f"{who} — you asked me to remind you: {r['what']}"
             if (r.get("company") or "").strip():
                 body += f" ({r['company']})"
+            body = self._tag_test(drip.with_heading(body, drip.heading("reminder")))
             sent = await guardrails.send(
                 target, body, reason=f"one-off reminder #{r['id']} at {hhmm}",
                 kind="reminder", item_key=f"reminder:{r['id']}",
@@ -5137,6 +5208,12 @@ class SalesBot(discord.Client):
                 decision=why, decided_by=decided_by or author, decided_at=now,
             )
         )
+
+        if decision == approvals.DECLINE and proposal.get("kind") == "poc_lookup":
+            # R11's QUESTION DECLINED: nothing happens, and nothing is said.
+            log.info("[approvals] %s DECLINED — %s; no PoC search runs",
+                     proposal["proposal_key"], why)
+            return True
 
         if decision == approvals.DECLINE:
             # A REVERSAL IS SAID OUT LOUD. If somebody else had already said
@@ -5549,6 +5626,163 @@ class SalesBot(discord.Client):
         await self._reply(message, "\n".join(lines) or "Nothing was written.",
                           reason="event deadlines written")
 
+    async def _open_poc_lookup_proposal(self, message: dict, *, sent,
+                                        marker: str) -> None:
+        """R11 asked "want me to look for PoCs?" — record the question.
+
+        KIND "poc_lookup", PAYLOAD = THE COMPANY NAMES, WRITES NOTHING. An
+        approver's yes runs `find_people` per company (`_apply_poc_lookup`); a
+        no or silence does nothing at all — the sweep expires it quietly.
+        """
+        if message.get("type") != nextaction.R_NEW_COMPANY:
+            return
+        companies = [str(c).strip() for c in (message.get("companies") or [])
+                     if str(c).strip()]
+        if not companies:
+            return
+        key = f"poc_lookup:{marker}:{getattr(sent, 'id', 0)}"
+        await asyncio.to_thread(
+            lambda: self.db.open_proposal(
+                proposal_key=key, kind="poc_lookup", tab=gtm_sheet.RESEARCHER_LINES,
+                sheet_row=0, row_key="", company="", poc="",
+                payload={"companies": companies}, reply_text="", trigger="R11",
+                proposed_text="look for PoCs at " + ", ".join(companies),
+                requested_by="R11",
+                channel_id=int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
+                message_id=str(getattr(sent, "id", "") or ""),
+                created_at=dl.now_ist().isoformat(timespec="seconds"),
+            )
+        )
+        log.info("[approvals] R11 asked to look up PoCs for %s (%s) — a yes runs "
+                 "the search, nothing is written", ", ".join(companies), key)
+
+    async def _apply_poc_lookup(self, message, proposal: dict, *,
+                                decided_by: str) -> None:
+        """An approver said yes to R11's question: find people, per company.
+
+        "yes for Shunya" NARROWS IT to the companies the reply names; a bare
+        yes means all of them. Each company gets its own reply, in the
+        find_people format. Nothing is written anywhere — adding anyone to
+        Outreach PoCs is a separate question with its own yes.
+        """
+        companies = list((proposal.get("payload") or {}).get("companies") or [])
+        said = " ".join(str(getattr(message, "content", "") or "").lower().split())
+        named = [c for c in companies
+                 if any(len(w) >= 3 and re.search(rf"\b{re.escape(w)}\b", said)
+                        for w in re.findall(r"[a-z0-9]+", c.lower()))]
+        chosen = named or companies
+        log.info("[approvals] %s said yes to the PoC lookup for %s%s", decided_by,
+                 ", ".join(chosen), " (narrowed by the reply)" if named else "")
+        if not chosen:
+            await self._reply(message, "There was no company on that one to look up.",
+                              reason="poc lookup had no companies")
+            return
+        for company in chosen:
+            body = await self._find_people(company, rule="R11")
+            await self._reply(message, body, reason=f"PoC lookup for {company}")
+
+    async def _find_people(self, company: str, department: str = "", *,
+                           rule: str = "find_people") -> str:
+        """Named people at a company (and department), with the page each was
+        found on. The ONE search behind R11's yes and the find_people tool.
+
+        ONE LEAN web_research CALL, max_uses=2, BUDGET CHECKED AND BANKED like
+        every other search. The model's PERSON lines are kept only when their
+        pages are among the results the search returned (`websearch.parse_people`)
+        — a name, title or profile the search never produced is dropped and
+        logged, never shown.
+        """
+        import websearch
+
+        company = " ".join(str(company or "").split())
+        department = " ".join(str(department or "").split())
+        if not company:
+            return "Which company should I look at?"
+        if not websearch.enabled() or self.llm is None:
+            return (f"My web search is switched off, so I can't look for people at "
+                    f"{company} right now.")
+        marker = dl.iso(dl.today_ist())
+        left = await asyncio.to_thread(self.db.web_search_budget_left, marker)
+        if left <= 0:
+            used = await asyncio.to_thread(self.db.web_searches_today, marker)
+            budget = max(0, int(config.WEB_SEARCH_DAILY_BUDGET))
+            return (f"I can't look for people at {company} today — "
+                    f"{websearch.budget_note(used=used, budget=budget)}.")
+
+        result = await self.llm.web_research(
+            rule=rule, prompt=websearch.people_prompt(company, department),
+            max_uses=min(2, left), lean=True,
+        )
+        await asyncio.to_thread(
+            lambda: self.db.record_web_search(
+                on_date=marker, rule_id=rule,
+                searches=int(result.get("searches") or 0),
+                errors=len(result.get("errors") or []),
+            )
+        )
+        if not result.get("ok"):
+            return (f"I couldn't search for people at {company} just now — "
+                    f"{result.get('note') or 'the search call failed'}.")
+
+        evidence = websearch.evidence_urls(result)
+        people, dropped = websearch.parse_people(result.get("text") or "", evidence)
+        for line, why in dropped:
+            log.info("[people] %s: dropped %r — %s", company, line[:160], why)
+        log.info("[people] %s%s: %d person/people kept, %d dropped, %d result page(s)",
+                 company, f" ({department})" if department else "", len(people),
+                 len(dropped), len(evidence))
+        state.audit(
+            "people_found", reason="named people from search results, each with its "
+                                   "source; nothing written",
+            company=company, department=department, rule=rule,
+            kept=[p["name"] for p in people], dropped=len(dropped),
+        )
+        return websearch.render_people(company, people, department=department,
+                                       titles=evidence)
+
+    def _people_tools(self, *, sink: Optional[list] = None) -> list[dict]:
+        """find_people — "find PoCs at Shunya Labs in the research team".
+
+        `sink` collects each rendered reply so the caller can post it verbatim.
+        """
+
+        async def _find(inp: dict) -> dict:
+            company = str(inp.get("company") or "").strip()
+            department = str(inp.get("department") or "").strip()
+            text = await self._find_people(company, department)
+            if sink is not None:
+                sink.append(text)
+            return {
+                "text": text,
+                "note": ("Give `text` as your answer, UNCHANGED — every name, title "
+                         "and <url> exactly as written. Add nothing from your own "
+                         "knowledge: no other names, titles or emails."),
+            }
+
+        return [{
+            "schema": {
+                "name": "find_people",
+                "description": (
+                    "Find named people (PoCs) at a company, optionally in one team or "
+                    "department, from the company's own site and public profile pages "
+                    "a web search returns — each with the page it was found on. Use it "
+                    "for 'find PoCs at X', 'who should we contact at X', 'people in X's "
+                    "research team'. Never guesses a name, title or email."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "company": {"type": "string", "description": "The company."},
+                        "department": {"type": "string",
+                                       "description": "Team or department words, "
+                                                      "e.g. 'research team'. Optional."},
+                    },
+                    "required": ["company"],
+                },
+            },
+            "handler": _find,
+        }]
+
     async def _open_event_proposals(self, message: dict, *, sent, marker: str) -> None:
         """Open R3's proposals against the message that just carried them.
 
@@ -5621,6 +5855,9 @@ class SalesBot(discord.Client):
         written until an approver says yes" stays a property of ONE function.
         """
         kind = str(proposal.get("kind") or "cell_update")
+        if kind == "poc_lookup":
+            await self._apply_poc_lookup(message, proposal, decided_by=decided_by)
+            return
         if kind == "event_append":
             await self._apply_event_append(message, proposal, decided_by=decided_by)
             return
@@ -5912,6 +6149,10 @@ class SalesBot(discord.Client):
         EMPTY QUEUE MEANS SILENCE. There is no "nothing to report" message and
         there must never be one.
         """
+        # THE TEST RUN OWNS THE DAY. While a test day or a simulation runs, or
+        # the pretend clock is set, the live drip stands down entirely.
+        if self._live_loop_held("drip"):
+            return
         now = dl.now_ist()
         today = now.date()
         marker = dl.iso(today)
@@ -6075,7 +6316,8 @@ class SalesBot(discord.Client):
                 best = when
         return best
 
-    async def _plan_drip(self, *, today, already: list, queue=None):
+    async def _plan_drip(self, *, today, already: list, queue=None,
+                         only_rule: str = ""):
         """Today's plan, or None when there is nothing to plan against.
 
         Pure up to this point: it reads the queue and the two SQLite clocks and
@@ -6091,7 +6333,8 @@ class SalesBot(discord.Client):
         `_research_message`, for the ONE message whose slot has come.
 
         `queue` is a `_run_next_actions` result the caller already holds — the
-        test day reads it once for its footer and must not read the sheet twice.
+        test day reads it once for "why was it quiet" and must not read the
+        sheet twice. `only_rule` is "simulate rule R8": that rule's items alone.
         """
         if queue is None:
             queue = await self._run_next_actions(today=today)
@@ -6107,6 +6350,9 @@ class SalesBot(discord.Client):
         funnel = await self._funnel_action(today=today)
         if funnel is not None:
             actions.append(funnel)
+        if only_rule:
+            actions = [a for a in actions
+                       if str(a.get("rule_id", "")).upper() == only_rule.upper()]
 
         if not actions and not already:
             # EMPTY QUEUE = SILENCE. Logged once so a quiet day is visibly a
@@ -6334,7 +6580,8 @@ class SalesBot(discord.Client):
             # start with. Read here rather than inside `llm` because it is a
             # database hit and that class does no I/O beyond the model call.
             openers = await asyncio.to_thread(self.db.recent_openers, 5)
-            if self.llm is not None:
+            # R1 AND R4 ARE POSTED EXACTLY AS RENDERED (drip.VERBATIM_TYPES).
+            if self.llm is not None and message.get("type") not in drip.VERBATIM_TYPES:
                 try:
                     body, used_model = await self.llm.proactive_message(
                         prompt=drip.compose_prompt(message, address=address),
@@ -6379,14 +6626,22 @@ class SalesBot(discord.Client):
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
         )
+        opener_text = body
+        # THE HEADING GOES ON LAST, ABOVE THE TAGS LINE: one bold line per
+        # message type, deterministic, never written by the model (drip.HEADINGS).
+        # The "[TEST]" prefix, when there is one, goes in front of it below.
+        try:
+            send_day = date.fromisoformat(marker)
+        except ValueError:
+            send_day = dl.today_ist()
+        body = drip.with_heading(body, drip.heading_for(message, day=send_day))
 
-        # IN TEST MODE A DM IS SHOWN, NOT SENT, exactly as in a simulation —
-        # and the whole message carries the prefix so nothing in the test
-        # channel can be mistaken for something the team received.
-        if config.SALES_TEST_MODE:
-            if str(message.get("destination") or "") in ("dm", "escalation"):
-                body = simulation.dm_line(message.get("owner") or "the owner", body)
-            body = simulation.prefix(body)
+        # IN TEST MODE, OR DURING A TEST RUN, A DM IS SHOWN, NOT SENT. The
+        # "[TEST]" tag goes on each Discord message below, after the split, so
+        # a long list split in three is three tagged messages.
+        tagged = config.SALES_TEST_MODE or self._test_run_active()
+        if tagged and str(message.get("destination") or "") in ("dm", "escalation"):
+            body = simulation.dm_line(message.get("owner") or "the owner", body)
 
         claimed = await asyncio.to_thread(
             lambda: self.db.record_drip_send(
@@ -6406,11 +6661,12 @@ class SalesBot(discord.Client):
         # twenty lines) is split BETWEEN lines to fit Discord's 2000 characters
         # and sent as consecutive messages; the slot, the opener and the reply
         # anchor all belong to the first.
-        parts = drip.split_on_lines(body, limit=int(config.QUERY_REPLY_CHUNK))
+        room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
+        parts = drip.split_on_lines(body, limit=int(config.QUERY_REPLY_CHUNK) - room)
         sent = None
         for i, part in enumerate(parts):
             got = await guardrails.send(
-                channel, part,
+                channel, self._tag_test(part),
                 reason=(f"drip slot {message['slot']} for {marker}: "
                         f"{message['type']} x {message['owner'] or 'the team'}"
                         + (f" (part {i + 1}/{len(parts)})" if len(parts) > 1 else "")),
@@ -6440,7 +6696,7 @@ class SalesBot(discord.Client):
         try:
             await asyncio.to_thread(
                 lambda: self.db.record_opener(
-                    tone.opener_of(body), rule_id=message.get("rule_id", ""),
+                    tone.opener_of(opener_text), rule_id=message.get("rule_id", ""),
                     sent_at=dl.now_ist().isoformat(timespec="seconds"),
                 )
             )
@@ -6466,6 +6722,13 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[approvals] could not open R3's proposals; the message "
                           "went out but a yes will not find them")
+        # R11's QUESTION IS A PROPOSAL TOO, keyed to the message that asked it,
+        # so "yes" finds it the same way. It writes nothing: a yes runs a search.
+        try:
+            await self._open_poc_lookup_proposal(message, sent=sent, marker=marker)
+        except Exception:
+            log.exception("[approvals] could not open R11's PoC-lookup proposal; the "
+                          "message went out but a yes will not find it")
         if offer_json:
             # THE PENDING OFFER, so a reply of "yes" has something concrete to
             # apply. Without it the extractor would have to invent what "yes"
@@ -6878,6 +7141,7 @@ class SalesBot(discord.Client):
                 payload = cached.get("payload") or {}
                 chosen = list(payload.get("stories") or [])
                 skipped = list(payload.get("skipped") or [])
+                usage.count("cache_hits")
                 log.info("[research-cache] hit %s for %s: %d story/stories — not "
                          "searching again", NEWS_RUN_CACHE_KEY, marker, len(chosen))
             else:
@@ -6902,14 +7166,15 @@ class SalesBot(discord.Client):
                     item["research_note"] = ""
                     item["web_pending"] = False
                 else:
-                    self._mark_unresearched(
-                        item,
-                        "I searched the last 24 hours and found nothing new worth "
-                        "posting"
-                        + (f" ({len(skipped)} story/stories skipped — already posted "
-                           "or over the topic limits)" if skipped else ""),
-                        still_pending=False,
-                    )
+                    # A QUIET SWEEP POSTS EXACTLY ONE LINE under its heading.
+                    log.info("[news] %s: the sweep found nothing new%s", marker,
+                             f" ({len(skipped)} skipped — already posted or over "
+                             "the topic limits)" if skipped else "")
+                    item["text"] = news.QUIET_MAIN
+                    item["research"] = news.QUIET_MAIN
+                    item["sources"] = []
+                    item["research_note"] = ""
+                    item["web_pending"] = False
                 touched.append(item)
 
         if screen_items:
@@ -6979,19 +7244,19 @@ class SalesBot(discord.Client):
         return chosen, skipped
 
     @contextlib.contextmanager
-    def _hold_live_news(self, why: str):
-        """Stand the live hourly news check down for the duration, and for
-        NEWS_HOLD_AFTER_TEST_SECONDS after.
+    def _hold_live_loop(self, why: str):
+        """Stand the WHOLE live loop down — drip, hourly news check, reminders —
+        for the duration, and for NEWS_HOLD_AFTER_TEST_SECONDS after.
 
         A TEST DAY MOVES THE PRETEND CLOCK, AND THE LIVE SWEEP FOLLOWS IT:
-        `_sweep_once` reads `dl.now_ist()`, so while a tester stood at "Monday
-        14:00" the live loop was running Monday's hourly checks alongside the
-        forced one — two or three news checks per test day. Held here, the
-        forced check is the only one. Nested (a test day inside nothing else,
-        a simulated week) is fine: a depth counter, not a flag.
+        `_sweep_once` and the reminder loop read `dl.now_ist()`, so while a
+        tester stood at "Monday 14:00" the live loop was running Monday's
+        drip, news checks and reminders alongside the test run's own — paying
+        twice and posting things the test did not. Held here, the test run
+        owns the day. Nested (a simulated week) is fine: a depth counter.
         """
         self._news_hold_depth += 1
-        log.info("[news-check] live checks held: %s", why)
+        log.info("[test-hold] live loop held: %s", why)
         try:
             yield
         finally:
@@ -6999,14 +7264,49 @@ class SalesBot(discord.Client):
             after = max(0, int(config.NEWS_HOLD_AFTER_TEST_SECONDS))
             self._news_hold_until = max(self._news_hold_until, _monotonic() + after)
             if not self._news_hold_depth:
-                log.info("[news-check] %s finished; live checks resume in %ds",
-                         why, after)
+                log.info("[test-hold] %s finished; the live loop resumes in %ds "
+                         "(unless the pretend clock is still set)", why, after)
 
-    def _live_news_held(self) -> bool:
-        return self._news_hold_depth > 0 or _monotonic() < self._news_hold_until
+    def _test_run_active(self) -> bool:
+        """A test day or a simulation is running right now."""
+        return self._news_hold_depth > 0
+
+    def _live_loop_held(self, what: str) -> bool:
+        """True when the live `what` (drip / news check / reminders) must stand
+        down: a test run is going, has just ended, or the pretend clock is set.
+        Logged once per hold, not once per tick."""
+        why = ""
+        if self._news_hold_depth > 0:
+            why = "a test day or simulation is running"
+        elif _monotonic() < self._news_hold_until:
+            why = "a test run just ended"
+        elif clock.pretending():
+            why = f"the pretend clock is set ({dl.iso(dl.today_ist())})"
+        if not why:
+            self._hold_logged = ""
+            return False
+        if self._hold_logged != why:
+            self._hold_logged = why
+            log.info("[test-hold] live drip, news check and reminders held: %s "
+                     "(first skipped: %s)", why, what)
+        return True
+
+    def _tag_test(self, body: str) -> str:
+        """The "[TEST]" tag on anything a test run — or SALES_TEST_MODE — sends.
+
+        ONE PLACE, applied per Discord message: a drip split into three parts
+        is three tagged messages. Inside a simulation the mentions become plain
+        names too (unless SIMULATION_REAL_MENTIONS), so a simulated week does
+        not put forty pings on people's phones.
+        """
+        if not (config.SALES_TEST_MODE or self._test_run_active()):
+            return body
+        if simulation.in_simulation():
+            body = simulation.strip_mentions(body)
+        return simulation.prefix(body)
 
     async def _maybe_breaking_news(self, *, force: bool = False, channel=None,
-                                   wrap=None, at: Optional[datetime] = None
+                                   at: Optional[datetime] = None
                                    ) -> Optional[dict]:
         """The hourly silent check. Posts ONLY when something is major.
 
@@ -7021,15 +7321,17 @@ class SalesBot(discord.Client):
         A POST IS NOT A DRIP MESSAGE. It goes straight to the sales channel
         (the test channel under SALES_TEST_MODE) through `guardrails.send`,
         never through `drip_sends`, never against DAILY_MESSAGE_CAP, with no
-        @-mentions, as ONE grouped "Worth knowing now:" message. At most
+        @-mentions, as ONE grouped "**Breaking AI news**" message. At most
         NEWS_BREAKING_MAX_PER_DAY of those a day; past the valve nothing is
         stored, so tomorrow's main sweep finds the story again.
 
         `force` is the test day's "run one check now": it skips the slot clock,
         the kill switch and the test-day hold, and records itself under the
         SAME slot key the live check would claim at that moment (or "test
-        HH:MM" when there is none, or it is already taken). `channel` and `wrap` let a test or a simulation post
-        where the tester is looking, and `at` is a simulated day's "now".
+        HH:MM" when there is none, or it is already taken). `channel` lets a
+        test or a simulation post where the tester is looking, and `at` is a
+        simulated day's "now". A post made during a test run carries "[TEST]"
+        (`_tag_test`), like everything else a test run sends.
 
         Returns what happened, for the verify scripts; None when nothing ran.
         """
@@ -7048,9 +7350,7 @@ class SalesBot(discord.Client):
             slot = live or "test " + now.strftime("%H:%M")
             since_from = live or now.strftime("%H:%M")
         else:
-            if self._live_news_held():
-                log.debug("[news-check] live check skipped: a test day or "
-                          "simulation holds it")
+            if self._live_loop_held("news check"):
                 return None
             slot = news.latest_slot(now)
             if slot is None:
@@ -7146,9 +7446,7 @@ class SalesBot(discord.Client):
                 await _finish(0)
                 return outcome
 
-        body = news.render(keep, mode=news.MODE_BREAKING)
-        if wrap is not None:
-            body = wrap(body)
+        body = self._tag_test(news.render(keep, mode=news.MODE_BREAKING))
         sent = await guardrails.send(
             channel, body, reason=f"breaking AI news, hourly check {slot}",
             kind="news-breaking",
@@ -7214,8 +7512,8 @@ class SalesBot(discord.Client):
             return []
         return news.parse_stories(text)
 
-    # The heading in sales_strategy.md that holds the use-case table (A-J and
-    # who buys each). R2 judges fit against it.
+    # The heading in sales_strategy.md that holds the offerings, the use cases
+    # (in words) and the Phase 1 focus. R2 judges fit against it.
     STRATEGY_USE_CASE_HEADING = "What we sell"
 
     async def _screen_companies(self, items: list, *, today, marker: str) -> None:
@@ -7226,9 +7524,10 @@ class SalesBot(discord.Client):
         before the 14:00 main post has gone out; then it reads the previous
         day's rows and says which day it read.
 
-        LEAN, WITH THE USE-CASE TABLE IN THE USER PROMPT. The lean system prompt
-        no longer carries the strategy doc, so the one section R2 judges fit
-        against is cut out of sales_strategy.md and put in the question.
+        LEAN, WITH "WHAT WE SELL" IN THE USER PROMPT. The lean system prompt no
+        longer carries the strategy doc, so the one section R2 judges fit
+        against (offerings, use cases, Phase 1 focus) is cut out of
+        sales_strategy.md and put in the question. It judges in words.
         """
         stories = await asyncio.to_thread(self.db.news_stories_on, marker)
         read_day = marker
@@ -7289,6 +7588,11 @@ class SalesBot(discord.Client):
             return
 
         text = result.get("text") or ""
+        # ONLY STORIES ABOUT A SPECIFIC COMPANY are screened. The rest come back
+        # as SKIP lines, and each is logged with its reason.
+        for skip in news.parse_screen_skips(text):
+            log.info("[news] R2 skipped %r — %s", skip["story"][:120],
+                     skip["why"] or "not about a specific company")
         rows = news.parse_screen(text)
         log.info("[news] the screen named %d company/companies not in the pipeline "
                  "(from %s's stories)", len(rows), read_day)
@@ -7514,6 +7818,7 @@ class SalesBot(discord.Client):
                 errors=len(result.get("errors") or []),
             )
         )
+        usage.count("searches", int(result.get("searches") or 0))
         after = await asyncio.to_thread(self.db.web_search_budget_left, marker)
         log.info("[websearch] %s: %d search(es) billed, %d left of %d today",
                  rule_id, int(result.get("searches") or 0), after, budget)
@@ -7575,6 +7880,7 @@ class SalesBot(discord.Client):
             for field, value in (hit["payload"] or {}).items():
                 if field in self._RESEARCH_PAYLOAD_FIELDS:
                     item[field] = value
+            usage.count("cache_hits")
             log.info("[research-cache] hit %s for %s — not searching again (%d "
                      "source(s))", key, marker, len(item["sources"]))
 
@@ -7604,7 +7910,8 @@ class SalesBot(discord.Client):
         """Fill in the web half of every item that is waiting on it.
 
         WHICH ITEMS. Only those the rules marked `web_pending` — R1, R2, R3,
-        R6's email search, R8 and R10's news, and R11. Everything else is left
+        R6's email search, R8 and R10's news. R11 is not one: it asks first and
+        searches only on a yes (`_apply_poc_lookup`). Everything else is left
         exactly as the engine produced it.
 
         THE BUDGET IS CHECKED BEFORE EACH CALL AND BANKED AFTER IT. Before,
@@ -7630,8 +7937,7 @@ class SalesBot(discord.Client):
         stories R1 posted rather than searching again, and R3 discovers events
         and backfills deadlines. Their own methods run
         first; what is left here is the per-row research — R6's email, R8's and
-        R10's news, R11's company fill-in — for which one query per item is
-        exactly right.
+        R10's news — for which one query per item is exactly right.
         """
         import websearch
 
@@ -7831,6 +8137,20 @@ class SalesBot(discord.Client):
             pending = []
         pending = [p for p in pending if p]
 
+        # R11's "want me to look for PoCs?" IS NEVER NUDGED. Silence means no:
+        # it expires quietly at the nudge age and nothing is said.
+        for p in [p for p in pending if p.get("kind") == "poc_lookup"]:
+            await asyncio.to_thread(
+                lambda p=p: self.db.close_proposal(
+                    proposal_key=p["proposal_key"], status="expired",
+                    decision="nobody asked for the PoC lookup",
+                    decided_by="", decided_at=dl.now_ist().isoformat(timespec="seconds"),
+                )
+            )
+            log.info("[approvals] %s expired quietly — nobody said yes to the PoC "
+                     "lookup", p["proposal_key"])
+        pending = [p for p in pending if p.get("kind") != "poc_lookup"]
+
         if not pending:
             if droppable:
                 log.info("[approvals] sweep: %d dropped, nothing left to nudge",
@@ -7841,7 +8161,8 @@ class SalesBot(discord.Client):
         # THE SWEEP TAGS VAISHNAVI AND SID and nobody else: these are approvals,
         # and only they can give one. Tagging the person who ASKED would be
         # tagging somebody who cannot answer.
-        body = drip.with_tags(body)
+        body = self._tag_test(drip.with_heading(drip.with_tags(body),
+                                                drip.heading("approvals")))
         sent = await guardrails.send(
             channel, body,
             reason=f"one nudge for {len(pending)} proposal(s) still awaiting approval",
@@ -7941,6 +8262,18 @@ class SalesBot(discord.Client):
         # THE CONFIRMATION IS ANSWERED FIRST, so "yes" means yes to the
         # question just asked rather than being parsed as something new.
         if self._pending_start_over and await self._resolve_start_over(message, text):
+            return True
+
+        # "WHY WAS IT QUIET" — the explanation a test run no longer posts.
+        # Matched as plain text, before parse_query, behind the same gates.
+        if simulation.is_why_quiet(text):
+            allowed, why = simulation.may_run(cid, uid)
+            if not allowed:
+                if why:
+                    await self._reply(message, why, reason="test command refused")
+                    return True
+                return False
+            await self._answer_why_quiet(message)
             return True
 
         parsed = simulation.parse_test_command(text)
@@ -8085,31 +8418,12 @@ class SalesBot(discord.Client):
         anything, which is what the throwaway-database simulations cost us and
         why this path exists alongside them.
 
-        TWO STOPS, AT 10:00 AND 14:00. The real day has two: the meeting-prep
-        day-of touch is pinned to MEETING_DAYOF_TIME and everything else waits
-        for the posting window to open. Standing at one time would show a day
-        that does not happen — either the morning items never come due, or the
-        afternoon ones all come due at once.
-
-        THE DAY IS PLANNED ONCE, from ONE read of the rules. The queue the
-        footer needs is the queue the plan is made from, so it is handed to
-        `_plan_drip` rather than read from the sheet a second time.
-
-        IT TALKS WHILE IT WORKS. The sheet read, the rules and the news check
-        take a minute or two, and a tester looking at a silent channel for that
-        long assumes it is broken. So: the typing indicator for the whole run,
-        one "working through the day" line at the start, then one short line
-        per stage as it lands — deterministic text, no model, never more than
-        four lines in all.
-
-        A PRETEND DATE RE-RUN STARTS CLEAN. Its slots from an earlier run were
-        still in `drip_sends`, so the second "test monday" found every slot
-        taken and posted nothing. Those rows — that date's only — are cleared
-        first, and the tester is told.
-
-        ONE NEWS CHECK. The live sweep follows the pretend clock, so while the
-        test day runs (and NEWS_HOLD_AFTER_TEST_SECONDS after) the live check is
-        held and the forced one is the only one.
+        NOTHING BUT THE MESSAGES. A test day posts exactly what a real day
+        posts, built by the same code, and nothing else — no clock lines, no
+        stage lines, no footer. The only visible difference is the "[TEST]" tag
+        on each message (`_tag_test`). The typing indicator stays on for the
+        whole run; that is how the tester knows it is working. A day with
+        nothing to send posts nothing, and "why was it quiet" explains it.
 
         THE KILL SWITCH IS BYPASSED, as it is for a simulation and for the same
         reason: somebody asking to watch a day happen has asked a question, and
@@ -8120,142 +8434,160 @@ class SalesBot(discord.Client):
         marker = dl.iso(today)
 
         if not drip.is_sending_day(today):
-            await self._test_say(
-                channel,
-                f"It's now {clock.describe()}.\n\n"
-                f"Nothing goes out on a {today.strftime('%A')} — I only post on "
-                "working days. Say \"next day\" to move on.",
-            )
+            log.info("[test-day] %s is a %s; nothing goes out", marker,
+                     today.strftime("%A"))
+            self._last_test_plan = {
+                "date": today, "planned": None, "rules_run": [], "sent": 0,
+                "note": f"nothing goes out on a {today.strftime('%A')} — I only "
+                        "post on working days.",
+            }
             return
 
-        with self._hold_live_news(f"test day {marker}"):
+        with self._hold_live_loop(f"test day {marker}"):
             async with self._typing(channel):
-                await self._test_day_body(message, today=today, marker=marker)
+                await self._live_test_day(channel, today=today,
+                                          by=_display(message.author))
 
-    async def _test_day_body(self, message, *, today, marker: str) -> None:
-        """The test day itself, inside the typing indicator and the news hold."""
-        channel = message.channel
-        gap = max(0, int(config.TEST_POST_GAP_SECONDS))
+    async def _live_test_day(self, channel, *, today, by: str = "",
+                             simulated: bool = False, rule: str = "",
+                             fast: bool = True) -> int:
+        """ONE pretend day, run by the real code. The number of messages sent.
+
+        THE TEST DAY AND THE SIMULATION BOTH COME HERE, so they cannot drift
+        apart: `_plan_drip` (with the database's own group history and today's
+        sent slots, so a simulated Tuesday knows what Monday said),
+        `_research_message` for every due message, `_send_drip_message` for
+        every message — leave check, convert, facts, required lines, split,
+        rule codes stripped, opener banked. A simulation differs only in WHERE
+        it writes (`self.db` is the sandbox) and in not moving the persistent
+        pretend clock; its "now" is passed down instead.
+
+        TWO STOPS, AT 10:00 AND 14:00. The real day has two: the meeting-prep
+        day-of touch is pinned to MEETING_DAYOF_TIME and everything else waits
+        for the posting window to open. Standing at one time would show a day
+        that does not happen.
+
+        ONLY THE MESSAGES PLANNED FOR TODAY GO OUT — never the rolled ones.
+
+        A PRETEND DATE RE-RUN STARTS CLEAN. That date's drip_sends and
+        news_checks are cleared first (logged, not posted), so the second
+        "test monday" does not find every slot taken.
+
+        CREDITS. Research is cached per pretend date, so a re-run of the same
+        date searches nothing; there is one forced news check, skipped if one
+        ran for that date in the last hour; compose calls are exactly as real.
+        Ends with one `[test-cost]` log line.
+        """
+        marker = dl.iso(today)
         began = _monotonic()
-        lap = [began]
-
-        def _took(stage: str) -> None:
-            now_ = _monotonic()
-            log.info("[test-day] %s: %s took %.1fs", marker, stage, now_ - lap[0])
-            lap[0] = now_
-
-        await self._test_say(
-            channel,
-            f"It's now {clock.describe()}.\n"
-            "Working through the day — sheet, rules, then the news check. "
-            "About a minute or two.",
-        )
-
-        await self._clear_stale_test_day(channel, today=today, marker=marker)
-
-        # WHICH RULES LOOKED AND WHAT THEY FOUND, read ONCE: the footer needs
-        # it, and the plan is made from the same queue.
-        queue = await self._run_next_actions(today=today)
-        rules_run = list((queue or {}).get("rules_run") or [])
-        _took("rules read")
-        if queue is None:
-            await self._test_say(channel, "Rules read — the rules engine is off, "
-                                          "so there is nothing to plan.")
-        else:
-            found = sum(1 for r in rules_run if r.get("ran") and r.get("items"))
-            await self._test_say(
-                channel, f"Rules read — {found} of {len(rules_run)} checks have "
-                         "something today.")
-
-        try:
-            already = await asyncio.to_thread(self.db.drip_sent_today, marker)
-        except Exception:
-            log.exception("[test-day] could not read today's sent slots")
-            already = []
-
-        planned = (None if queue is None else
-                   await self._plan_drip(today=today, already=already, queue=queue))
-        messages = list((planned or {}).get("messages") or [])
-        _took("plan made")
-        await self._test_say(
-            channel, f"Plan made: {len(messages)} post{'s' if len(messages) != 1 else ''}.")
-
-        morning_h, morning_m = config.test_morning_ist()
-        afternoon_h, afternoon_m = config.test_afternoon_ist()
-        cutoff = afternoon_h * 60 + afternoon_m
-        # SPLIT BY INDEX, not by `m not in morning`. Two messages in one day can
-        # be equal dicts, and identity is what this needs.
-        morning, afternoon = [], []
-        for msg in messages:
-            at = msg["send_at"].hour * 60 + msg["send_at"].minute
-            (morning if at < cutoff else afternoon).append(msg)
-
+        usage.start_tally()
         sent = 0
-        for at, batch, label in (
-            ((morning_h, morning_m), morning, "morning"),
-            ((afternoon_h, afternoon_m), afternoon, "afternoon"),
-        ):
-            # THE CLOCK MOVES WHETHER OR NOT ANYTHING IS DUE, so the pretend day
-            # is genuinely lived through to the afternoon and "next day" starts
-            # from the right place. Nothing due before the window opens is the
-            # ORDINARY shape of a day, so the stop itself is silent.
-            await asyncio.to_thread(
-                lambda hh=at[0], mm=at[1]: clock.set_time_of_day(
-                    time(hh, mm), by=_display(message.author)
-                )
-            )
-            # ONE-OFF REMINDERS COME DUE AS THE PRETEND DAY MOVES. The loop
-            # would find them within a minute anyway; firing here puts them in
-            # the transcript at the stop they belong to.
+        planned = None
+        rules_run: list = []
+        note = ""
+        try:
+            await self._clear_stale_test_day(marker=marker, sandbox=simulated)
+
+            queue = await self._run_next_actions(today=today)
+            rules_run = list((queue or {}).get("rules_run") or [])
+            if queue is None:
+                note = ("the rules engine is off (NEXT_ACTION_ENABLED) or there is "
+                        "no canonical tab to read, so there was nothing to plan.")
             try:
-                await self._fire_due_reminders(channel=channel)
+                already = await asyncio.to_thread(self.db.drip_sent_today, marker)
             except Exception:
-                log.exception("[test-day] firing due reminders failed")
-            if not batch:
-                continue
-            await self._test_say(channel, f"It's now {clock.describe()}.")
-            for i, msg in enumerate(batch):
-                if i or label == "afternoon":
-                    await asyncio.sleep(gap)
-                # THE PROPOSAL SWEEP RIDES THE FIRST SLOT, exactly as it does on
-                # a real day — it is one of the things worth testing.
-                if msg.get("slot") == 1 and self._swept_proposals_on != marker:
-                    self._swept_proposals_on = marker
-                    try:
-                        await self._sweep_proposals(today=today, channel=channel)
-                    except Exception:
-                        log.exception("[test-day] the proposal sweep failed")
+                log.exception("[test-day] could not read %s's sent slots", marker)
+                already = []
+            planned = (None if queue is None else await self._plan_drip(
+                today=today, already=already, queue=queue, only_rule=rule))
+            messages = list((planned or {}).get("messages") or [])
+            log.info("[test-day] %s: planned %d message(s) in %.1fs%s", marker,
+                     len(messages), _monotonic() - began,
+                     " (simulated)" if simulated else "")
+
+            gap = (simulation.pace_seconds(fast=fast, count=max(1, len(messages)))
+                   if simulated else max(0, int(config.TEST_POST_GAP_SECONDS)))
+            morning_h, morning_m = config.test_morning_ist()
+            afternoon_h, afternoon_m = config.test_afternoon_ist()
+            cutoff = afternoon_h * 60 + afternoon_m
+            # SPLIT BY INDEX, not by `m not in morning`. Two messages in one day
+            # can be equal dicts, and identity is what this needs.
+            morning, afternoon = [], []
+            for msg in messages:
+                at = msg["send_at"].hour * 60 + msg["send_at"].minute
+                (morning if at < cutoff else afternoon).append(msg)
+
+            stop_at = None
+            for (hh, mm), batch, label in (
+                ((morning_h, morning_m), morning, "morning"),
+                ((afternoon_h, afternoon_m), afternoon, "afternoon"),
+            ):
+                stop_at = datetime(today.year, today.month, today.day, hh, mm,
+                                   tzinfo=dl.IST)
+                # THE CLOCK MOVES WHETHER OR NOT ANYTHING IS DUE, so the pretend
+                # day is genuinely lived through to the afternoon and "next day"
+                # starts from the right place. A simulation never touches the
+                # persistent clock; its "now" is `stop_at`.
+                if not simulated:
+                    await asyncio.to_thread(
+                        lambda h=hh, m=mm: clock.set_time_of_day(time(h, m), by=by))
+                # ONE-OFF REMINDERS COME DUE AS THE PRETEND DAY MOVES. The live
+                # loop is held, so the test run fires them itself.
                 try:
-                    # RESEARCHED AT ITS SLOT, as on a real day: `_plan_drip`
-                    # hands back an un-researched plan.
-                    await self._research_message(msg, today=today)
-                    await self._send_drip_message(
-                        channel, msg, marker=marker,
-                        channel_id=getattr(channel, "id", 0),
-                    )
-                    sent += 1
+                    await self._fire_due_reminders(channel=channel, from_test=True,
+                                                   at=stop_at)
                 except Exception:
-                    log.exception("[test-day] slot %s failed to send", msg.get("slot"))
-        _took(f"sends ({sent} of {len(messages)})")
+                    log.exception("[test-day] firing due reminders failed")
+                for i, msg in enumerate(batch):
+                    if (i or label == "afternoon") and gap:
+                        await asyncio.sleep(gap)
+                    # THE PROPOSAL SWEEP RIDES THE FIRST SLOT, exactly as it
+                    # does on a real day.
+                    if msg.get("slot") == 1 and self._swept_proposals_on != marker:
+                        self._swept_proposals_on = marker
+                        try:
+                            await self._sweep_proposals(today=today, channel=channel)
+                        except Exception:
+                            log.exception("[test-day] the proposal sweep failed")
+                    try:
+                        # RESEARCHED AT ITS SLOT, as on a real day: `_plan_drip`
+                        # hands back an un-researched plan.
+                        await self._research_message(msg, today=today)
+                        await self._send_drip_message(
+                            channel, msg, marker=marker,
+                            channel_id=getattr(channel, "id", 0),
+                        )
+                        sent += 1
+                    except Exception:
+                        log.exception("[test-day] slot %s failed to send",
+                                      msg.get("slot"))
 
-        # ONE HOURLY NEWS CHECK, NOW, so the tester can see a breaking post
-        # without waiting for a slot. Exactly the live path — same prompt, same
-        # gates, same valve — recorded under the live slot key for this hour,
-        # so the live loop (held meanwhile) finds it done afterwards.
-        said = await self._test_news_check(channel, speak=False)
-        _took("news check")
-        await self._test_say(channel, "News check done — " + (said or "posted above."))
+            # ONE HOURLY NEWS CHECK, at the afternoon stop. Exactly the live
+            # path — same prompt, same gates, same valve — and silent unless it
+            # finds something major, like the real one.
+            await self._test_news_check(channel, at=stop_at)
+        finally:
+            # THE STOP WAS TEMPORARY. The clock goes back to pretend date + the
+            # real IST time the moment the run ends, however it ends.
+            if not simulated:
+                await asyncio.to_thread(
+                    lambda: clock.clear_time_override(why=f"test day {marker} ended"))
+            cost = usage.stop_tally()
+            self._last_test_plan = {
+                "date": today, "planned": planned, "rules_run": rules_run,
+                "sent": sent, "simulated": simulated, "note": note, "cost": cost,
+            }
+            log.info("[test-day] %s finished in %.1fs: %d sent%s", marker,
+                     _monotonic() - began, sent, " (simulated)" if simulated else "")
+            log.info("[test-cost] date=%s calls=%d searches=%d cache_hits=%d",
+                     marker, cost.get("calls", 0), cost.get("searches", 0),
+                     cost.get("cache_hits", 0))
+        return sent
 
-        log.info("[test-day] %s finished in %.1fs: %d sent", marker,
-                 _monotonic() - began, sent)
-        await self._test_say(
-            channel, self._test_day_footer(
-                today=today, sent=sent, planned=planned, rules_run=rules_run,
-            ),
-        )
-
-    async def _clear_stale_test_day(self, channel, *, today, marker: str) -> int:
+    async def _clear_stale_test_day(self, *, marker: str, sandbox: bool = False) -> int:
         """Clear THIS date's sends and news checks from an earlier run. The count.
+
+        LOGGED, NOT POSTED — a test run posts only messages.
 
         ONLY THIS DATE. `db.clear_test_day` deletes `WHERE on_date = ?` from
         drip_sends and news_checks and nothing else — "reset test state" is the
@@ -8264,100 +8596,59 @@ class SalesBot(discord.Client):
         NEVER THE REAL TODAY ON A LIVE DATABASE. A pretend date equal to the
         real date, on a database not named *_test.db, would be deleting the
         record of posts the team actually received today — and with it the
-        restart guard that stops them going out twice.
+        restart guard that stops them going out twice. A simulation's sandbox
+        is a throwaway copy, so there it is always safe.
         """
         try:
             stale = await asyncio.to_thread(self.db.drip_sent_today, marker)
         except Exception:
             log.exception("[test-day] could not read %s's earlier sends", marker)
             return 0
-        if not stale:
-            return 0
-        if (marker == dl.iso(dl.real_today_ist())
+        if (not sandbox and marker == dl.iso(dl.real_today_ist())
                 and not str(config.DB_PATH or "").endswith("_test.db")):
-            log.warning("[test-day] %d send(s) already recorded for %s, which is the "
-                        "REAL today on a live database — left alone", len(stale), marker)
+            if stale:
+                log.warning("[test-day] %d send(s) already recorded for %s, which is "
+                            "the REAL today on a live database — left alone",
+                            len(stale), marker)
             return 0
-        n = len(stale)
-        await self._test_say(
-            channel,
-            f"{n} post{'s were' if n != 1 else ' was'} already recorded for "
-            f"{today.strftime('%A %d %b')} from an earlier run — clearing "
-            f"{'them' if n != 1 else 'it'} so today starts clean.",
-        )
         gone = await asyncio.to_thread(lambda: self.db.clear_test_day(marker))
         if self._swept_proposals_on == marker:
             self._swept_proposals_on = ""
-        log.info("[test-day] cleared stale state for %s only: %d drip send(s), %d "
-                 "news check(s)", marker, gone["drip_sends"], gone["news_checks"])
-        return n
+        if stale or gone.get("news_checks"):
+            log.info("[test-day] cleared stale state for %s only: %d drip send(s), %d "
+                     "news check(s)%s", marker, gone["drip_sends"], gone["news_checks"],
+                     " in the sandbox" if sandbox else "")
+        return len(stale)
 
-    async def _test_news_check(self, channel, *, at=None, wrap=None,
-                               speak: bool = True) -> Optional[str]:
-        """Run one hourly news check now. Never raises.
+    async def _test_news_check(self, channel, *, at=None) -> Optional[dict]:
+        """The test run's one forced hourly news check. Never raises, never
+        speaks — a post goes out only when something is major, as live.
 
-        Returns what it did in words ("nothing important enough to interrupt
-        anybody."), or None when a post went out or nothing ran. With `speak`
-        the words are posted too; the test day says them itself, as its "news
-        check done" line.
+        ONCE AN HOUR PER PRETEND DATE. A second "test monday", or a "simulate
+        monday" straight after one, would otherwise pay for the same search
+        again; within an hour (real time) of the last forced check for that
+        date it is skipped, silently. Lean, at most
+        NEWS_CHECK_MAX_USES searches (see `_maybe_breaking_news`).
         """
+        now = at or dl.now_ist()
+        marker = dl.iso(now.date())
+        last = self._forced_news_at.get(marker)
+        if last is not None and _monotonic() - last < 3600:
+            log.info("[news-check] %s: a forced check ran %d min ago; skipped",
+                     marker, int((_monotonic() - last) // 60))
+            return None
+        self._forced_news_at[marker] = _monotonic()
         try:
-            outcome = await self._maybe_breaking_news(
-                force=True, channel=channel, at=at, wrap=wrap)
+            return await self._maybe_breaking_news(force=True, channel=channel, at=at)
         except Exception:
             log.exception("[test-day] the hourly news check failed")
-            return "it failed; see the log."
-        if outcome is None:
-            return "it did not run (web search is off)."
-        if outcome.get("posted"):
             return None
-        said = ("something important came up, but today's breaking posts are "
-                "used up, so it waits for tomorrow's main post."
-                if outcome.get("held")
-                else "nothing important enough to interrupt anybody.")
-        if not speak:
-            return said
-        say = "I ran one hourly news check just now: " + said
-        if wrap is not None:
-            await guardrails.send(channel, wrap(say), reason="simulated news check",
-                                  kind="simulation", keep_rule_ids=True)
-        else:
-            await self._test_say(channel, say)
-        return said
 
-    def _test_day_footer(self, *, today, sent: int, planned, rules_run: list) -> str:
-        """What just happened, in at most six lines, with no rule codes in it.
-
-            Monday 28 Sep — done
-            • Sent: 3
-            • Rolled to tomorrow: deliverables due or overdue (2)
-            • Looked, nothing due: people connected on LinkedIn with no DM yet
-            • Not a Monday rule: sales packages that aren't ready yet
-            Say "next day" to carry on or "back to today" to stop.
-
-        THE SKIPS ARE THE HALF THAT MATTERS — a tester who cannot tell a quiet
-        day from a broken one will report neither — but the old per-rule list
-        ran to a dozen lines with owner-and-company parentheticals nobody read.
-        The grouping is `simulation.day_points`, shared with the simulation
-        footer so the two cannot disagree.
-        """
-        points = simulation.day_points(planned=planned, rules_run=rules_run)
-        head = f"{today.strftime('%A %d %b')} — done"
-        if points.get("failed"):
-            head += " · couldn't check " + ", ".join(points["failed"][:2])
-        lines = [head] + simulation.point_lines(
-            sent=sent, points=points, weekday=today.strftime("%A"))
-        lines.append('Say "next day" to carry on or "back to today" to stop.')
-        return rules.render_for_user("\n".join(lines))
-
-    async def _test_say(self, channel, body: str) -> None:
-        """One line of test scaffolding — a time stamp, a footer — in the test
-        channel. Marked with the simulation prefix so nothing in the transcript
-        can be mistaken for something the bot said on its own."""
-        await guardrails.send(
-            channel, simulation.prefix(body),
-            reason="test day narration", kind="test-day",
-        )
+    async def _answer_why_quiet(self, message) -> None:
+        """"Why was it quiet" / "what did you skip today" — the last test run's
+        plan, in points. Deterministic, no model."""
+        await self._reply(message, simulation.why_quiet(self._last_test_plan),
+                          reason="why the test day was quiet")
 
     async def _handle_test_helper(self, message, text: str) -> bool:
         """`pretend X is on leave`, `clear leave`, `advance clock`, `reset`."""
@@ -8442,10 +8733,17 @@ class SalesBot(discord.Client):
         return f"Wiped {path} and started a fresh one."
 
     async def _run_simulation(self, message, parsed: dict) -> None:
-        """Run one simulation and post it. Changes nothing."""
+        """Run one simulation and post it: the messages, and nothing else.
+
+        THE SAME CODE AS A TEST DAY (`_live_test_day`), against a throwaway
+        copy of the database. No opening line, no header, no footer — only the
+        messages a real day would send, each tagged "[TEST]", mentions as
+        plain names unless SIMULATION_REAL_MENTIONS. "Why was it quiet"
+        explains the last simulated day afterwards.
+        """
         mode = parsed["mode"]
         if mode == simulation.MODE_WEEK:
-            days = simulation.week_of()
+            days = simulation.week_of(parsed.get("date"))
             rule = ""
         elif mode == simulation.MODE_RULE:
             when = simulation.next_date_for_rule(parsed["rule"])
@@ -8463,193 +8761,40 @@ class SalesBot(discord.Client):
 
         channel = message.channel
         fast = bool(parsed["fast"])
-
-        opening = (
-            f"{config.SIMULATION_PREFIX} Simulating "
-            + (f"the week of {days[0].strftime('%d %b')}" if len(days) > 1
-               else days[0].strftime("%a %d %b"))
-            + (f", {rule} only" if rule else "")
-            + f" · {'fast' if fast else 'compressed real'} spacing"
-            + " · nothing will be written"
-        )
-        await guardrails.send(channel, opening, reason="simulation opening",
-                              kind="simulation", keep_rule_ids=True)
+        total = {"calls": 0, "searches": 0, "cache_hits": 0}
 
         # ONE SANDBOX FOR THE WHOLE RUN, so a simulated week behaves like a
         # week: Tuesday sees what Monday did. Discarded at the end either way.
+        # The sandbox is copied from the test database, so it inherits the
+        # research cache: a simulation of a day already tested searches nothing.
+        swept_before = self._swept_proposals_on
         with simulation.SandboxDB(config.DB_PATH) as sandbox, simulation.simulating(), \
-                self._hold_live_news("simulation"):
+                self._hold_live_loop("simulation"):
             real_db = self.db
             self.db = sandbox
             try:
-                for day in days:
-                    await self._simulate_one_day(
-                        channel, day, rule=rule, fast=fast,
-                        is_week=len(days) > 1,
-                    )
+                async with self._typing(channel):
+                    for day in days:
+                        # A REAL DAY THAT IS NOT A SENDING DAY SAYS NOTHING, runs
+                        # no rules, no research and no news check — so neither
+                        # does a simulated one.
+                        if not drip.is_sending_day(day):
+                            log.info("[sim] %s is a %s; nothing goes out",
+                                     dl.iso(day), day.strftime("%A"))
+                            continue
+                        await self._live_test_day(channel, today=day, simulated=True,
+                                                  rule=rule, fast=fast)
+                        for k, v in ((self._last_test_plan or {}).get("cost")
+                                     or {}).items():
+                            total[k] = total.get(k, 0) + int(v or 0)
             finally:
                 self.db = real_db
-
-    async def _simulate_one_day(self, channel, day, *, rule: str, fast: bool,
-                                is_week: bool) -> None:
-        """One simulated day: header, the messages, the footer."""
-        import asyncio as _asyncio
-
-        if is_week:
-            await guardrails.send(
-                channel, simulation.header(day),
-                reason="simulation day header", kind="simulation", keep_rule_ids=True,
-            )
-
-        if not drip.is_sending_day(day) and day.weekday() != 6:
-            await guardrails.send(
-                channel,
-                simulation.footer({
-                    "day_label": day.strftime("%a %d %b"), "sent": 0,
-                    "note": f"{day.strftime('%A')} is silent — the drip does not "
-                            "send at the weekend.",
-                }),
-                reason="simulation footer", kind="simulation", keep_rule_ids=True,
-            )
-            return
-
-        queue = await self._run_next_actions(today=day)
-        if queue is None:
-            await guardrails.send(
-                channel,
-                simulation.footer({
-                    "day_label": day.strftime("%a %d %b"), "sent": 0,
-                    "note": "The rules engine is off (NEXT_ACTION_ENABLED) or "
-                            "there is no canonical tab to read.",
-                }),
-                reason="simulation footer", kind="simulation", keep_rule_ids=True,
-            )
-            return
-
-        actions = list(queue.get("actions") or [])
-        note = ""
-        if rule:
-            before = len(actions)
-            actions = [a for a in actions if str(a.get("rule_id", "")).upper() == rule]
-            note = (f"Only {rules.plain_description(rule) or 'one rule'}: "
-                    f"{len(actions)} of {before} item(s).")
-
-        actions.extend(await self._event_actions(today=day))
-        planned = await asyncio.to_thread(
-            lambda: drip.plan(actions, day=day, history={}, already_sent=[])
-        )
-
-        messages = planned.get("messages") or []
-        pace = simulation.pace_seconds(fast=fast, count=max(1, len(messages)))
-
-        for i, msg in enumerate(messages):
-            # R1's MAIN SWEEP RUNS EXACTLY AS LIVE, against the sandbox, so a
-            # simulated day shows the real feed rather than a placeholder.
-            if msg.get("rule_id") == "R1":
-                await self._research_message(msg, today=day)
-            body = await self._simulated_body(msg, day=day)
-            await guardrails.send(
-                channel, body,
-                reason=f"simulated slot {msg.get('slot')} for {dl.iso(day)}",
-                kind="simulation", keep_rule_ids=True,
-            )
-            # A SIMULATED SEND MARKS THE SANDBOX, so a simulated WEEK behaves
-            # like a week. Without this the events dedup — which is written
-            # only on a real send — never learns, and a conference reminded on
-            # Monday is reminded again every day to Friday. The write lands in
-            # the throwaway copy and is discarded with it, so the real
-            # `event_reminders` table is untouched.
-            for action in (msg.get("actions") or []):
-                key = action.get("event_key")
-                if not key:
-                    continue
-                await asyncio.to_thread(
-                    lambda a=action, k=key: self.db.record_event_reminder(
-                        event_key=k, event=a.get("company", ""),
-                        event_date=a.get("event_date", ""),
-                        location=a.get("location", ""), sent_on=dl.iso(day),
-                    )
-                )
-            if i < len(messages) - 1 and pace:
-                await _asyncio.sleep(pace)
-
-        # ONE HOURLY NEWS CHECK, at the main post's time on the simulated day,
-        # so a breaking post can be seen without waiting for a slot. Recorded in
-        # the sandbox under the simulated date and discarded with it.
-        hh, mm = digest.parse_time(config.NEWS_MAIN_TIME, default="14:00")
-        await self._test_news_check(
-            channel, at=datetime(day.year, day.month, day.day, hh, mm, tzinfo=dl.IST),
-            wrap=lambda b: f"{config.SIMULATION_PREFIX} {b}",
-        )
-
-        # THE SWEEP RIDES SLOT 1 IN REAL LIFE, so it does here too — and it is
-        # rendered rather than sent, like everything else.
-        sweep_line = await self._simulated_sweep(day)
-        if sweep_line:
-            await guardrails.send(channel, sweep_line,
-                                  reason="simulated approvals sweep",
-                                  kind="simulation", keep_rule_ids=True)
-
-        # THE SAME POINTS AS THE TEST DAY'S FOOTER (`simulation.day_points`):
-        # rolled counted per rule, plain names, no owner parentheticals.
-        await guardrails.send(
-            channel,
-            simulation.footer({
-                "day_label": day.strftime("%a %d %b"), "sent": len(messages),
-                "points": simulation.day_points(
-                    planned=planned, rules_run=queue.get("rules_run") or []),
-                "weekday": day.strftime("%A"), "note": note,
-            }),
-            reason="simulation footer", kind="simulation", keep_rule_ids=True,
-        )
-
-    async def _simulated_body(self, msg: dict, *, day) -> str:
-        """Compose one simulated message exactly as the real one would be.
-
-        THE MODEL COMPOSES IT. A simulation that showed the template would be
-        showing something the team will never receive — the point is to see the
-        actual wording, and the actual wording comes from the model.
-
-        A DM RUNG IS RENDERED, NOT SENT: "[DM to Vaishnavi] ...".
-        """
-        owner = str(msg.get("owner") or "")
-        address = self._drip_mention(msg)
-        fallback = drip.compose_fallback(msg, address=address)
-        body, _used = fallback, False
-        if self.llm is not None:
-            try:
-                body, _used = await self.llm.proactive_message(
-                    prompt=drip.compose_prompt(msg, address=address),
-                    fallback=fallback,
-                    recent_openers=await asyncio.to_thread(self.db.recent_openers, 5),
-                )
-            except Exception:
-                log.exception("[sim] composing failed; showing the template")
-
-        body = drip.with_sources(body, msg)
-        body = drip.with_tags(
-            body, owner_id=config.roster_id_for_name(owner), owner_name=owner,
-        )
-        if str(msg.get("destination") or "") in ("dm", "escalation"):
-            body = simulation.dm_line(owner or "the owner", body)
-        return simulation.prefix(simulation.strip_mentions(body))
-
-    async def _simulated_sweep(self, day) -> str:
-        """The pending-approvals message, rendered rather than sent."""
-        try:
-            cutoff = dl.iso(dl.subtract_working_days(
-                day, config.PROPOSAL_NUDGE_AFTER_DAYS))
-            pending = await asyncio.to_thread(
-                lambda: self.db.stale_proposals(before_iso=cutoff, nudged=False)
-            )
-        except Exception:
-            log.exception("[sim] could not read the proposal queue")
-            return ""
-        pending = [p for p in pending if p]
-        if not pending:
-            return ""
-        body = drip.with_tags(approvals.pending_text(pending))
-        return simulation.prefix(simulation.strip_mentions(body))
+                # The sandbox's slot-1 sweep must not stand in for the real one.
+                self._swept_proposals_on = swept_before
+        if len(days) > 1:
+            log.info("[test-cost] date=week-of-%s calls=%d searches=%d cache_hits=%d",
+                     dl.iso(days[0]), total["calls"], total["searches"],
+                     total["cache_hits"])
 
     async def _rule_tab_rows(self, kind: str, for_rules: str) -> list:
         """One read-only context tab's rows, or [] with a log line.

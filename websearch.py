@@ -136,10 +136,10 @@ RULE_QUERIES = {
     "news_company_screen": (
         "Find companies that have been in the AI news this week and are NOT in "
         "the list of companies we already track (below).\n\n"
-        "For each one, say in one sentence whether it is relevant to membrane "
-        "and WHY — judged against the use-case table in the sales strategy "
-        "above (use cases A-J and who buys each). Name the use case you "
-        "matched, or say plainly that it matches none.\n\n"
+        "For each one, say in one sentence what the company does and whether it "
+        "is relevant to membrane and WHY — in plain words, judged against the "
+        "offerings and Phase 1 focus in the sales strategy. Never refer to a "
+        "use case by a letter or number.\n\n"
         "Give every company its source link. DO NOT propose adding anything to "
         "the sheet — the bot asks a human before any row is added, and that is "
         "a separate step."
@@ -178,18 +178,191 @@ RULE_QUERIES = {
         "Two or three items, each with its link. Say what each one might mean "
         "for the conversation, briefly. If nothing is relevant, say so."
     ),
-    "new_pipeline_company": (
-        "Research the company below and report:\n"
-        "  - total funding raised to date, and the most recent round\n"
-        "  - headquarters location\n"
-        "  - industry, in the terms our sheet uses\n"
-        "  - two or three people worth contacting: name, designation, and a "
-        "link to a public profile or paper\n\n"
-        "EVERY FIELD CARRIES ITS SOURCE LINK. A field you could not find is "
-        "'not found' — not an estimate, not a range you inferred. Do not "
-        "construct email addresses for the people you suggest."
-    ),
 }
+# R11 IS NOT A RULE QUERY. It asks first and searches only on an approver's
+# yes, through `people_prompt` — the same search "find PoCs at X" runs.
+
+
+# -- finding people: R11's yes, and "find PoCs at X" ---------------------------
+#
+# NOTHING HERE IS TAKEN ON THE MODEL'S WORD. The model is asked for PERSON lines,
+# and each one is kept only when the page it names was actually returned by the
+# search (`parse_people`). A person whose URL the search never produced is a
+# person the model made up, and is dropped with a logged reason.
+
+PEOPLE_MAX = 5
+NOBODY_FOUND = "NOBODY FOUND"
+
+
+def people_prompt(company: str, department: str = "") -> str:
+    """The one question behind R11's yes and the find_people tool."""
+    company = " ".join(str(company or "").split())
+    dept = " ".join(str(department or "").split())
+    where = f" in the {dept}" if dept else ""
+    return "\n".join([
+        f"Find named people who work at {company}{where} and would be worth "
+        "contacting for membrane's outreach: founders and co-founders first, then "
+        "CXOs (CEO, CTO, chief scientist), then research leads and AI product owners"
+        + (f", within the {dept}" if dept else "") + ".",
+        "",
+        f"LOOK AT {company.upper()}'S OWN WEBSITE FIRST — its team, about, "
+        "leadership or research pages. Then public profile pages that search "
+        "returns (LinkedIn results, Google Scholar, personal or lab pages, "
+        "conference speaker pages).",
+        "",
+        "ONLY PEOPLE NAMED ON A PAGE YOUR SEARCH RETURNED. The title is the one "
+        "that page states. Never guess a name or a title, never build or "
+        "complete a URL, and give no email addresses at all.",
+        "",
+        "FORMAT, one per line and nothing else:",
+        "  PERSON | <full name> | <title as the page states it> | "
+        "<profile url, or -> | <url of the page that names them>",
+        f"At most {PEOPLE_MAX} PERSON lines, founders and CXOs first.",
+        f"If you found nobody you would trust, reply exactly: {NOBODY_FOUND}",
+    ])
+
+
+_PERSON_RE = re.compile(r"^\s*[-*•]?\s*PERSON\s*\|", re.IGNORECASE)
+_URL_IN_RE = re.compile(r"https?://[^\s<>|)\]]+")
+
+
+def _url_norm(url: str) -> str:
+    u = str(url or "").strip().rstrip("/.,;").lower()
+    u = re.sub(r"^https?://(www\.)?", "", u)
+    return u.split("?")[0].split("#")[0].rstrip("/")
+
+
+def evidence_urls(result: dict) -> dict:
+    """{normalised url: title} for every page the search itself returned.
+
+    The result pool first (every search hit), then any citation. Links the model
+    merely WROTE are not evidence — that is the thing being checked.
+    """
+    out: dict = {}
+    for src in list(result.get("pool") or []) + list(result.get("citations") or []):
+        url = str((src or {}).get("url") or "")
+        if url:
+            out.setdefault(_url_norm(url), str(src.get("title") or ""))
+    return out
+
+
+def _fold(text: str) -> str:
+    import unicodedata
+    raw = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in raw if not unicodedata.combining(ch)).lower()
+
+
+def _name_tokens(name: str) -> list:
+    """The parts of a name worth checking: no initials, no honorifics."""
+    skip = {"dr", "prof", "mr", "ms", "mrs"}
+    return [t for t in re.findall(r"[a-z]+", _fold(name))
+            if len(t) >= 2 and t not in skip]
+
+
+def parse_people(text: str, evidence: dict) -> tuple:
+    """(people, dropped). people = [{name, title, profile, source}].
+
+    A line is kept only when its source page — and its profile URL, when it
+    gives one — is a page the search returned. `dropped` is [(line, why)], for
+    the log. The first PEOPLE_MAX that survive are kept.
+    """
+    people: list = []
+    dropped: list = []
+    seen: set = set()
+    haystack = " ".join(f"{u} {t}" for u, t in (evidence or {}).items())
+    haystack = re.sub(r"[-_/.+%]", " ", _fold(haystack))
+    for line in str(text or "").splitlines():
+        if not _PERSON_RE.match(line):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 5:
+            dropped.append((line.strip(), "not in the PERSON format"))
+            continue
+        name, title = parts[1], parts[2]
+        profile_m = _URL_IN_RE.search(parts[3])
+        source_m = _URL_IN_RE.search(" ".join(parts[4:]))
+        profile = profile_m.group(0).rstrip(".,;") if profile_m else ""
+        source = source_m.group(0).rstrip(".,;") if source_m else ""
+        if not name or len(name.split()) < 2:
+            dropped.append((line.strip(), "no full name"))
+            continue
+        if not source and profile:
+            source = profile
+        if not source:
+            dropped.append((line.strip(), "no source page"))
+            continue
+        if not evidence:
+            dropped.append((line.strip(), "the search returned no pages to check against"))
+            continue
+        if _url_norm(source) not in evidence:
+            dropped.append((line.strip(), f"source {source} was not a search result"))
+            continue
+        # THE NAME ITSELF MUST BE IN WHAT THE SEARCH RETURNED. Page text comes
+        # back encrypted, so the check is against every result's title and url:
+        # each part of the name has to appear somewhere in them. A real page
+        # with a misread name ("Sourav Banerjee" off a Crunchbase page) fails.
+        missing = [t for t in _name_tokens(name) if not re.search(
+            rf"(?<![a-z]){re.escape(t)}(?![a-z])", haystack)]
+        if missing:
+            dropped.append((line.strip(), "the name is not in any result title or "
+                                          f"url (missing: {', '.join(missing)})"))
+            continue
+        if profile and _url_norm(profile) not in evidence:
+            # The person is found; only the profile link is unverified, so the
+            # link goes and the person stays.
+            dropped.append((line.strip(), f"profile {profile} was not a search "
+                                          "result — kept the person, dropped the link"))
+            profile = ""
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        people.append({"name": name, "title": title if title not in ("-", "") else "",
+                       "profile": profile, "source": source})
+        if len(people) >= PEOPLE_MAX:
+            break
+    return people, dropped
+
+
+def _is_own_site(url: str, company: str) -> bool:
+    words = str(company or "").lower().split()
+    token = re.sub(r"[^a-z0-9]", "", words[0]) if words else ""
+    host = _url_norm(url).split("/")[0].replace("-", "").replace(".", "")
+    return bool(token) and token in host
+
+
+def render_people(company: str, people: list, *, department: str = "",
+                  titles: Optional[dict] = None) -> str:
+    """The reply. The company's own pages lead the "Found on" line.
+
+        Shunya Labs — people worth a look:
+        • Ritu Mehrotra — Co-founder [linkedin.com](<https://linkedin.com/in/...>)
+        Found on: [About Shunya Labs](<https://shunyalabs.ai/about>) · …
+
+    Every link is masked (`links.link`): a profile by its site name, a "Found
+    on" page by its search-result title (`titles`, from `evidence_urls`).
+    """
+    import links
+
+    titles = titles or {}
+    label = company + (f" ({department})" if department else "")
+    if not people:
+        return (f"I couldn't find named people for {label} — the site lists none "
+                "and search turned up nothing I'd trust.")
+    lines = [f"{label} — people worth a look:"]
+    for p in people[:PEOPLE_MAX]:
+        bit = f"• {p['name']}" + (f" — {p['title']}" if p.get("title") else "")
+        if p.get("profile"):
+            bit += " " + links.link("", p["profile"])
+        lines.append(bit)
+    pages: list = []
+    for p in people:
+        if p["source"] not in pages:
+            pages.append(p["source"])
+    pages.sort(key=lambda u: 0 if _is_own_site(u, company) else 1)
+    lines.append("Found on: " + " · ".join(
+        links.link(titles.get(_url_norm(u), ""), u) for u in pages[:4]))
+    return "\n".join(lines)
 
 
 def enabled() -> bool:
@@ -380,6 +553,11 @@ def parse_results(response) -> dict:
     #      not — nine per search on a live call, so it is a fallback for "we
     #      have nothing better", never the first choice. Capped, because a
     #      two-line nudge does not want eighteen links under it.
+    # THE EVIDENCE IS KEPT TOO: `pool` is every page the search returned and
+    # `citations` every cited page, so a caller can check a URL the model
+    # wrote against what the search actually produced (`parse_people`).
+    out["citations"] = list(out["sources"])
+    out["pool"] = list(out.get("_pool") or [])
     if not out["sources"]:
         out["sources"] = links_in_text(out["text"])
     if not out["sources"]:
@@ -413,10 +591,11 @@ def format_sources(sources: list, *, limit: int = 6) -> str:
     message cannot accidentally go out without them. Capped, because twelve
     links under a three-line nudge is a bibliography.
     """
+    import links
+
     rows = []
     for source in (sources or [])[:max(1, int(limit))]:
-        title = source.get("title") or source.get("url")
-        rows.append(f"<{source['url']}>" if not title else f"{title} — <{source['url']}>")
+        rows.append(links.link(source.get("title") or "", source["url"]))
     extra = max(0, len(sources or []) - len(rows))
     if extra:
         rows.append(f"…and {extra} more source(s)")
@@ -579,12 +758,44 @@ def _self_test() -> int:
     check("one per web-dependent rule",
           sorted(RULE_QUERIES),
           ["closure_support", "events", "li_no_dm", "meeting_prep",
-           "new_pipeline_company", "news_company_screen"])
+           "news_company_screen"])
     check("R1 is not a generic query any more (news.sweep_prompt owns it)",
           "ai_news" in RULE_QUERIES, False)
     check("the lean line names the company", "membrane.social" in LEAN_LINE, True)
-    check("R2 judges against the use-case table",
-          "use-case table" in RULE_QUERIES["news_company_screen"], True)
+    check("R2 judges in words, never by letter",
+          "Never refer to a use case by a letter" in RULE_QUERIES["news_company_screen"],
+          True)
+
+    print("\nfinding people")
+    ev = {_url_norm("https://shunya.ai/team"): "Team", _url_norm(
+        "https://www.linkedin.com/in/ritu-m"): "Ritu Mehrotra - Co-founder"}
+    got, why = parse_people(
+        "PERSON | Ritu Mehrotra | Co-founder | https://www.linkedin.com/in/ritu-m | "
+        "https://shunya.ai/team\n"
+        "PERSON | Made Up | CTO | https://www.linkedin.com/in/made-up | "
+        "https://shunya.ai/team\n", ev)
+    check("a person the search returned is kept", [p["name"] for p in got],
+          ["Ritu Mehrotra"])
+    check("an invented person is dropped", len(why), 1)
+    got2, why2 = parse_people(
+        "PERSON | Ritu Mehrotra | Co-founder | https://www.linkedin.com/in/other | "
+        "https://shunya.ai/team\n", ev)
+    check("an unverified profile loses its link, not the person",
+          [(p["name"], p["profile"]) for p in got2], [("Ritu Mehrotra", "")])
+    got3, _ = parse_people(
+        "PERSON | Sourav Banerjee | Founder | - | https://shunya.ai/team\n", ev)
+    check("a real page with a misread name is dropped", got3, [])
+    check("nothing to check against keeps nobody",
+          parse_people("PERSON | A B | CEO | - | https://x.com/team", {})[0], [])
+    body = render_people("Shunya Labs", got)
+    check("the reply names the person with a masked link",
+          "• Ritu Mehrotra — Co-founder [linkedin.com](<https://www.linkedin.com/in/ritu-m>)"
+          in body, True)
+    check("the company's own page leads Found on",
+          body.splitlines()[-1].startswith("Found on: [shunya.ai](<https://shunya.ai/team>)"),
+          True)
+    check("nobody found says so honestly",
+          render_people("X", []).startswith("I couldn't find named people for X"), True)
     check("R6 forbids a constructed address",
           "construct an address" in RULE_QUERIES["li_no_dm"], True)
     check("R6 mandates the honest not-found",
@@ -600,8 +811,8 @@ def _self_test() -> int:
     print("\nformatting sources")
     line = format_sources([{"url": "https://a.com/x", "title": "A"},
                            {"url": "https://b.com/y", "title": ""}])
-    check("titles link", "A — <https://a.com/x>" in line, True)
-    check("untitled still links", "<https://b.com/y>" in line, True)
+    check("titles link, masked", "[A](<https://a.com/x>)" in line, True)
+    check("untitled links by site name", "[b.com](<https://b.com/y>)" in line, True)
     many = format_sources([{"url": f"https://{i}.com", "title": ""} for i in range(9)],
                           limit=3)
     check("capped, and says how many more", "…and 6 more source(s)" in many, True)

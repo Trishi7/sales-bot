@@ -186,6 +186,13 @@ _HUMOUR_TEXT = {
 # THE HUMAN TOUCHES, requested as behaviour rather than as adjectives. These are
 # constant across tone settings — they are what makes a message read as written
 # by a person, and none of them is a matter of taste.
+# PLAIN WORDS, in the tone block AND the proactive voice, word for word.
+PLAIN_WORDS_RULE = (
+    "Plain words only. No idioms, no metaphors, no figures of speech. Short "
+    "sentences. If a sentence could confuse someone reading English as a second "
+    "language, rewrite it."
+)
+
 HUMAN_TOUCHES = """HUMAN TOUCHES (these apply at every tone setting):
 
 - USE FIRST NAMES. "Vaishnavi — ..." not "Hi team" and not "@Vaishnavi, please".
@@ -215,6 +222,8 @@ def prompt_block(*, recent_openers: Optional[list] = None) -> str:
         _HUMOUR_TEXT[s["humour"]],
         "",
         HUMAN_TOUCHES,
+        "",
+        "PLAIN WORDS: " + PLAIN_WORDS_RULE,
         "",
         "STRUCTURE: " + STRUCTURE_RULE,
     ]

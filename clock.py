@@ -14,14 +14,20 @@ restarts the bot has not changed their mind about what day it is — a pretend
 clock that quietly evaporated on a restart would be worse than none, because
 the bot would carry on behaving as if it were still Monday's tester.
 
-    pretend now = pretend start + (real now - real start)
+    pretend now = the pretend DATE + the REAL IST time of day
 
-so time still MOVES. An hour of testing is an hour on the pretend clock, which
-is what makes a gap between two posts mean something. What it will not do is
-roll into the next day on its own: the date is held at the pretend day (the
-last second of it, if a tester really does sit there past midnight) because
-"make it Monday" is an instruction about the day, and a day that changed itself
-while somebody was mid-test would invalidate the test without telling them.
+THE PRETEND CLOCK OWNS THE DATE ONLY. Testers move the day; the wall clock is
+always IST. "make it Monday" at 13:17 is Monday 28 Sep, 1:17 PM (test time),
+and a reminder asked for at 1:19 PM fires at 1:19 PM real time. (It used to be
+pretend start + elapsed, which left the clock standing at a test day's 14:00
+stop for the rest of the afternoon — a tester at 13:17 was told 1:17 PM "has
+already passed".)
+
+THE ONE EXCEPTION IS TEMPORARY. A test day has to live through its 10:00 and
+14:00 stops, so `set_time_of_day` sets an IN-MEMORY override (moving with real
+time from the stop) that `_run_test_day` clears in a `finally`. It is never
+stored: a restart, or the end of the run, puts the clock back to pretend date +
+real IST time.
 
 THIS IS NOT THE SIMULATION SANDBOX and the two must not be confused.
 `simulation.py` previews a day against a THROWAWAY COPY of the database and
@@ -61,8 +67,11 @@ CREATE TABLE IF NOT EXISTS test_clock (
 
 _lock = threading.RLock()
 # {"pretend_start": datetime, "real_start": datetime, "set_by": str} or {}.
+# ONLY THE DATE of pretend_start is used; the time of day is always real.
 _state: dict = {}
 _loaded = False
+# THE TEST-DAY STOP: {"at": time, "real_start": datetime} or {}. In memory only.
+_override: dict = {}
 
 # WHERE A PRETEND DAY STARTS when nobody said a time. Early enough that the
 # whole posting window is still ahead of the tester.
@@ -195,6 +204,7 @@ def forget() -> None:
     global _loaded
     with _lock:
         _state.clear()
+        _override.clear()
         _loaded = False
 
 
@@ -206,23 +216,26 @@ def pretending() -> bool:
 
 
 def now_ist() -> datetime:
-    """What time the bot thinks it is. The pretend clock, or the real one.
+    """What time the bot thinks it is: the pretend DATE + the real IST time.
 
-    THE DATE IS HELD. Elapsed real time is added so the clock moves, but never
-    past the end of the pretend day — see the module docstring.
+    No pretend date -> the real IST clock. During a test day's stop (the
+    temporary override) the stop's time, moving with real time, never past the
+    end of the pretend day.
     """
     state = _load()
+    real = real_now_ist()
     if not state:
-        return real_now_ist()
-    elapsed = real_now_ist() - state["real_start"]
-    if elapsed < timedelta(0):          # the machine's clock went backwards
-        elapsed = timedelta(0)
-    out = state["pretend_start"] + elapsed
-    if out.date() != state["pretend_start"].date():
-        return datetime.combine(
-            state["pretend_start"].date(), time(23, 59, 59), tzinfo=IST
-        )
-    return out
+        return real
+    day = state["pretend_start"].date()
+    with _lock:
+        ov = dict(_override)
+    if ov:
+        moved = max(timedelta(0), real - ov["real_start"])
+        out = datetime.combine(day, ov["at"], tzinfo=IST) + moved
+        if out.date() != day:
+            return datetime.combine(day, time(23, 59, 59), tzinfo=IST)
+        return out
+    return datetime.combine(day, real.time(), tzinfo=IST)
 
 
 def today_ist() -> date:
@@ -243,21 +256,37 @@ def format_moment(when: Optional[datetime] = None) -> str:
 
 
 def describe(when: Optional[datetime] = None) -> str:
-    """The moment, marked as test time when the clock is pretending."""
+    """The moment, marked "(test time)" while a pretend date is set, "(IST)"
+    otherwise. EVERY reply that quotes the time uses this, never a
+    hand-formatted datetime."""
     line = format_moment(when)
-    return f"{line} (test time)" if pretending() else line
+    return f"{line} (test time)" if pretending() else f"{line} (IST)"
 
 
 def status() -> dict:
-    """{pretending, now, real_now, set_by} — for the boot log and `test help`."""
+    """{pretending, now, real_now, set_by, pretend_date, override} — for the
+    boot log and `test help`."""
     state = _load()
+    with _lock:
+        ov = dict(_override)
     return {
         "pretending": bool(state),
         "now": now_ist(),
         "real_now": real_now_ist(),
+        "pretend_date": state["pretend_start"].date() if state else None,
+        "override": ov.get("at"),
         "set_by": str(state.get("set_by") or ""),
         "db_path": _db_path(),
     }
+
+
+def process_timezone() -> str:
+    """The zone the PROCESS runs in (TZ env, time.tzname) — for the boot log,
+    so a server on UTC is visible at a glance. The bot never depends on it."""
+    import time as _time
+    return (f"TZ={os.environ.get('TZ') or '(unset)'}, "
+            f"tzname={'/'.join(_time.tzname)}, "
+            f"local offset={datetime.now().astimezone().strftime('%z')}")
 
 
 # -- moving it ----------------------------------------------------------------
@@ -271,10 +300,15 @@ def _refuse() -> tuple:
 
 
 def set_day(day: date, *, at: Optional[time] = None, by: str = "") -> tuple:
-    """(ok, message). Make it `day`, starting at `at` (default 9:00 IST)."""
+    """(ok, message). Make it `day`. The time of day stays the real IST time.
+
+    `at` is accepted for old callers and ignored: the pretend clock owns the
+    date only.
+    """
     if not config.SALES_TEST_MODE:
         return _refuse()
-    start = datetime.combine(day, at or DEFAULT_START, tzinfo=IST)
+    start = datetime.combine(day, DEFAULT_START, tzinfo=IST)
+    clear_time_override(why="the day was changed")
     _save(start, by=by)
     log.warning("[clock] the pretend clock is now %s (set by %s)",
                 describe(), by or "somebody")
@@ -282,18 +316,32 @@ def set_day(day: date, *, at: Optional[time] = None, by: str = "") -> tuple:
 
 
 def set_time_of_day(at: time, *, by: str = "") -> tuple:
-    """Jump to a time on the SAME pretend day, keeping the clock running.
+    """A TEMPORARY stop on the same pretend day: 10:00, then 14:00.
 
-    This is what the test posting run uses to stand at 10:00 and then at 14:00:
-    the day must not change underneath it, and the posts have to be reckoned
-    against the hour they would really go out at.
+    What the test posting run uses so its plan is lived through at the hour the
+    posts would really go out. IN MEMORY ONLY, moving with real time from the
+    stop, and `_run_test_day` clears it in a `finally` (`clear_time_override`).
     """
     state = _load()
     if not state:
         return False, "There is no pretend day set, so there is no day to move within."
-    start = datetime.combine(state["pretend_start"].date(), at, tzinfo=IST)
-    _save(start, by=by or state.get("set_by", ""))
+    with _lock:
+        _override.clear()
+        _override.update({"at": at, "real_start": real_now_ist()})
+    log.info("[clock] test-day stop: %s (temporary; set by %s)", describe(),
+             by or state.get("set_by") or "somebody")
     return True, f"It's now {describe()}."
+
+
+def clear_time_override(*, why: str = "") -> bool:
+    """Drop the test-day stop. True when there was one. Logged."""
+    with _lock:
+        had = bool(_override)
+        _override.clear()
+    if had:
+        log.info("[clock] the test-day time stop was cleared%s; the clock is back to "
+                 "%s", f" ({why})" if why else "", describe())
+    return had
 
 
 def next_day(*, by: str = "") -> tuple:
@@ -307,6 +355,7 @@ def next_day(*, by: str = "") -> tuple:
 
 def back_to_today(*, by: str = "") -> tuple:
     """(ok, message). Drop the pretend clock; the real date comes back."""
+    clear_time_override(why="back to today")
     if not _load():
         return True, (
             f"The clock was already the real one — it's {describe()}."
@@ -345,29 +394,37 @@ def _self_test() -> int:
 
         print("\nmake it Monday")
         config.SALES_TEST_MODE = True
-        ok, line = set_day(date(2026, 9, 28), at=time(14, 0), by="tester")
+        ok, line = set_day(date(2026, 9, 28), by="tester")
+        real = real_now_ist()
         check("allowed in test mode", ok, True)
         check("the day moved", today_ist(), date(2026, 9, 28))
+        check("the time of day is the REAL IST time",
+              (now_ist().hour, now_ist().minute), (real.hour, real.minute))
         check("the opening line reads plainly",
-              "Monday 28 Sep, 2:00 PM (test time)" in line, True)
+              line, f"Right — it's now {format_moment(now_ist())} (test time).")
         check("it is marked as test time", "(test time)" in describe(), True)
-        check("time still moves forward", now_ist() >= datetime(
-            2026, 9, 28, 14, 0, tzinfo=IST), True)
 
         print("\nit survives a restart")
         forget()
         check("re-read from SQLite", today_ist(), date(2026, 9, 28))
         check("...still pretending", pretending(), True)
 
-        print("\nmoving within the day")
+        print("\nthe test-day stop is temporary")
         set_time_of_day(time(10, 0), by="tester")
         check("the hour moved", now_ist().hour, 10)
         check("the day did not", today_ist(), date(2026, 9, 28))
+        forget()
+        check("a restart drops the stop", now_ist().hour, real_now_ist().hour)
+        set_time_of_day(time(14, 0), by="tester")
+        check("the afternoon stop", now_ist().hour, 14)
+        check("clearing it says so", clear_time_override(why="run ended"), True)
+        check("back to the real time of day", now_ist().hour, real_now_ist().hour)
+        check("...on the pretend date", today_ist(), date(2026, 9, 28))
 
         print("\nnext day")
         next_day(by="tester")
         check("tomorrow", today_ist(), date(2026, 9, 29))
-        check("...starts at the default hour", now_ist().hour, DEFAULT_START.hour)
+        check("...at the real time of day", now_ist().hour, real_now_ist().hour)
 
         print("\nback to today")
         ok, line = back_to_today(by="tester")
@@ -375,14 +432,17 @@ def _self_test() -> int:
         check("the real date is back", today_ist(), real_today_ist())
         check("no longer pretending", pretending(), False)
         check("saying it twice is harmless", back_to_today()[0], True)
+        check("the real clock says (IST)", describe().endswith("(IST)"), True)
 
-        print("\nthe date is held, not rolled")
-        set_day(date(2026, 9, 28), at=time(23, 0), by="tester")
+        print("\na stop never rolls into the next day")
+        set_day(date(2026, 9, 28), by="tester")
+        set_time_of_day(time(23, 0), by="tester")
         with _lock:
-            _state["real_start"] = real_now_ist() - timedelta(hours=5)
+            _override["real_start"] = real_now_ist() - timedelta(hours=5)
         check("five hours later it is still Monday", today_ist(), date(2026, 9, 28))
         check("...held at the last second", now_ist().hour, 23)
         back_to_today()
+        check("back to today clears the stop too", status()["override"], None)
     finally:
         config.SALES_TEST_MODE = False
         forget()

@@ -208,8 +208,8 @@ async def main():
     print("   " + "\n   ".join(body.splitlines()))
     lines = [l for l in body.splitlines() if l.startswith("• ")]
     check("5 lines", len(lines), 5)
-    check("each with a topic tag", all(re.match(r"^• \[[^\]]+\] ", l) for l in lines))
-    check("each with a link", all("<https://" in l for l in lines))
+    check("no topic tag", any(re.match(r"^• \[[^\]]+\] ", l) for l in lines), False)
+    check("each with a masked link", all("](<https://" in l for l in lines))
     rows = bot.db.news_stories_on(dl.iso(TUE))
     keys = [news.headline_key(r["headline"]) for r in rows]
     check("no two share a headline_key", len(keys), len(set(keys)))
@@ -280,9 +280,11 @@ async def main():
     out = await bot._maybe_breaking_news()
     new = channel.sent[before_msgs:]
     check("ONE message went out", len(new), 1)
-    check("...carrying both important stories", new[0].count("• ["), 2 if new else 0)
-    check("...opening with 'Worth knowing now:'",
-          new[0].splitlines()[0] if new else "", "Worth knowing now:")
+    check("...carrying both important stories", new[0].count("• ") if new else 0, 2)
+    # SALES_TEST_MODE: a breaking post carries the test tag, like every test send.
+    check("...opening with '[TEST] **Breaking AI news**'",
+          new[0].splitlines()[0] if new else "",
+          f"{config.SIMULATION_PREFIX} **Breaking AI news**")
     check("the importance-3 story stayed quiet", "leaderboard" in (new[0] if new else ""),
           False)
     check("it is NOT in drip_sends", bot.db.drip_sent_today(dl.iso(TUE)), [])

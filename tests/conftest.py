@@ -49,6 +49,7 @@ def pocs_tab():
     """A parsed Outreach PoCs tab with three contacts at one company."""
     import time
 
+    import deadlines as dl
     import gtm_sheet
 
     values = [POCS_HEADERS] + [
@@ -59,7 +60,7 @@ def pocs_tab():
         ["3", "Wispr Flow", "AI Voice Agents", "Ariya Rastrow", "Chief Scientist",
          "", "SF", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
     ]
-    return gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=time.time())
+    return gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=dl.real_epoch())
 
 
 @pytest.fixture
@@ -67,13 +68,14 @@ def pipeline_tab():
     """A parsed Master Pipeline tab with two companies on it."""
     import time
 
+    import deadlines as dl
     import gtm_sheet
 
     values = [PIPELINE_HEADERS] + [
         ["1", "Wispr Flow", "AI Voice Agents", "US", "$56M", "…", ""],
         ["2", "PolyAI", "AI Voice Agents", "UK", "$50M", "…", ""],
     ]
-    return gtm_sheet.SHEETS._parse_values("Master Pipeline", values, read_at=time.time())
+    return gtm_sheet.SHEETS._parse_values("Master Pipeline", values, read_at=dl.real_epoch())
 
 
 @pytest.fixture

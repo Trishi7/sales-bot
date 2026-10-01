@@ -62,6 +62,7 @@ import threading
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
+import deadlines as dl
 
 log = logging.getLogger(__name__)
 
@@ -140,7 +141,9 @@ _HEAD_CHARS = 1200
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    # THE REAL CLOCK, IN IST: sync timing and scan stamps are about the
+    # machine. The "last N days" window below uses the bot's date instead.
+    return dl.real_now_ist()
 
 
 # -- text extraction (format-tolerant, stdlib only) --------------------------
@@ -450,7 +453,9 @@ def list_notes(
     all_notes, loaded_notes = _scan(notes_dir)
     considered = all_notes if include_excluded else loaded_notes
 
-    cutoff = (_utcnow() - timedelta(days=max(0, int(days)))).date()
+    # A DATE DECISION: "the last N days" as the bot reckons today (IST,
+    # pretend date included).
+    cutoff = dl.today_ist() - timedelta(days=max(0, int(days)))
     out: list[dict] = []
     for meta in considered:
         try:
@@ -594,7 +599,7 @@ def freshness(*, notes_dir: Optional[str] = None) -> tuple[Optional[str], Option
     try:
         mtimes = [os.path.getmtime(p) for p, _ in _candidate_files(notes_dir)]
         if mtimes:
-            newest_mtime = datetime.fromtimestamp(max(mtimes), tz=timezone.utc).isoformat()
+            newest_mtime = datetime.fromtimestamp(max(mtimes), tz=dl.IST).isoformat()
     except OSError:
         log.debug("[notes] mtime scan failed", exc_info=True)
     return (latest_date, newest_mtime)

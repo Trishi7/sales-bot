@@ -12,8 +12,9 @@ channel records what it was sent and when.
 
   (i)   "remind me tomorrow at 2pm about the pulse doc" — the confirmation
         names the date AND the time; a time already past is refused;
-  (ii)  advance the test clock — the reminder posts within 60 s, tagging the
-        asker, in the same channel;
+  (ii)  advance the test clock — the LIVE loop stays held (the test run owns
+        the day); the test run's own firing posts it, "[TEST]"-tagged, tagging
+        the asker, in the same channel;
   (iii) a Saturday reminder fires on Saturday (a day the drip is silent);
   (iv)  the row is closed and does not fire twice;
   (v)   a reminder WITH a company still appears in the drip preview, and is
@@ -161,20 +162,25 @@ async def main():
     pretend(WED, 14)
     moved_at = _time.monotonic() - T0[0]
     print(f"   {moved_at:5.1f}s  clock moved to {clock.describe()}")
-    while not channel.sent and _time.monotonic() - T0[0] < 75:
+    # THE LIVE LOOP STANDS DOWN WHILE THE PRETEND CLOCK IS SET — the test run
+    # owns the day and fires the reminder itself at its stop.
+    while not channel.sent and _time.monotonic() - T0[0] < moved_at + 65:
         await asyncio.sleep(0.5)
     loop_task.cancel()
+    check("the live loop, held by the pretend clock, posted nothing", channel.sent, [])
+    fired = await bot._fire_due_reminders(from_test=True)
+    tag = config.SIMULATION_PREFIX
     if channel.sent:
         t, at, body = channel.sent[0]
-        print(f"   {t:5.1f}s  posted at {at} (test time): {body!r}")
-        check("posted within 60 s of the clock moving", t - moved_at <= 60.5)
-        check("it tags the asker",
-              body.startswith(f"<@{VAISHNAVI}> — you asked me to remind you: "))
+        print(f"   {t:5.1f}s  the test run fired it at {at} (test time): {body!r}")
+        check("it tags the asker, under [TEST] and its heading",
+              body.startswith(f"{tag} **Reminder**\n<@{VAISHNAVI}> — you asked me to "
+                              "remind you: "))
         check("...with what they asked for",
-              body, f"<@{VAISHNAVI}> — you asked me to remind you: the pulse product "
-                    "overview doc")
+              body, f"{tag} **Reminder**\n<@{VAISHNAVI}> — you asked me to remind you: "
+                    "the pulse product overview doc")
     else:
-        check("posted within 60 s of the clock moving", False)
+        check("the test run fired it", fired, [r1["id"]])
     check("in the same channel it was asked in", len(channel.sent), 1)
     check("not a drip message", bot.db.drip_sent_today("2026-09-30"), [])
 
@@ -186,10 +192,10 @@ async def main():
     print(f"   confirm={r3.get('confirm')!r}  is_weekend={r3.get('is_weekend')}")
     pretend(SAT, 9, 59)
     before = len(channel.sent)
-    fired = await bot._fire_due_reminders()
+    fired = await bot._fire_due_reminders(from_test=True)
     check("not a minute early", fired, [])
     pretend(SAT, 10, 0)
-    fired = await bot._fire_due_reminders()
+    fired = await bot._fire_due_reminders(from_test=True)
     print(f"   Sat 10:00 tick fired {fired}: {channel.sent[-1][2]!r}")
     check("it fired on Saturday", fired, [r3["id"]])
     check("...on a day the drip does not send", drip.is_sending_day(SAT), False)
@@ -197,8 +203,8 @@ async def main():
     # ------------------------------------------------------------------ (iv)
     say("(iv) CLOSED, AND NEVER TWICE")
     pretend(SAT, 10, 5)
-    again = await bot._fire_due_reminders()
-    again2 = await bot._fire_due_reminders()
+    again = await bot._fire_due_reminders(from_test=True)
+    again2 = await bot._fire_due_reminders(from_test=True)
     check("two more ticks fire nothing", (again, again2), ([], []))
     check("exactly one post for it", len(channel.sent) - before, 1)
     for rid in (r1["id"], r3["id"]):
@@ -232,7 +238,7 @@ async def main():
     check("...with its text (not 'the reminder you asked for')",
           any("send Acme the pricing deck" in i["text"] for i in items))
     pretend(THU, 15)
-    fired = await bot._fire_due_reminders()
+    fired = await bot._fire_due_reminders(from_test=True)
     print(f"   Thu 15:00 tick fired {fired}: {channel.sent[-1][2]!r}")
     check("it fired at the exact time", fired, [r5["id"]])
     check("...naming the company", channel.sent[-1][2].endswith("(Acme AI)"))

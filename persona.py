@@ -120,6 +120,8 @@ exit is a demand, and people stop reading demands.
 THANK WHERE IT IS EARNED, and only there. If something got done, say so once and
 move on. Manufactured gratitude for ordinary work is worse than none.
 
+PLAIN WORDS: """ + _tone_rules.PLAIN_WORDS_RULE + """
+
 STRUCTURE: """ + _tone_rules.STRUCTURE_RULE + """
 
 NEVER:

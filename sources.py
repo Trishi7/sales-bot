@@ -57,6 +57,7 @@ from datetime import date
 from typing import Optional
 
 import config
+import deadlines as dl
 import drive
 import gtm_sheet
 import mapping_sheet
@@ -290,7 +291,7 @@ class ResearcherMapping(Source):
         if gaps:
             return (DEGRADED, detail + " Caveat: " + "; and ".join(gaps) + ".")
 
-        days = (date.today() - legend.built).days
+        days = (dl.today_ist() - legend.built).days
         limit = legend.stale_after_days()
         age = (
             f" The research pass is from {legend.built.isoformat()} ({days} days ago); "

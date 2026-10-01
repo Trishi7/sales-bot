@@ -126,6 +126,12 @@ def real_now_ist() -> datetime:
     return clock.real_now_ist()
 
 
+def real_epoch() -> float:
+    """Seconds since the epoch, from the REAL clock. For cache ages and
+    durations only — never for a date decision."""
+    return clock.real_now_ist().timestamp()
+
+
 def is_working_day(d: date) -> bool:
     """Mon–Fri. Public holidays aren't modelled: the team's holiday list isn't
     anywhere the bot can read, and treating a holiday as a working day only makes
@@ -152,6 +158,10 @@ def add_working_days(start: date, n: int) -> date:
     return d
 
 
+# SQLite's CURRENT_TIMESTAMP shape: naive, space-separated, and UTC.
+_SQLITE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$")
+
+
 def ist_date_of(value, *, default: Optional[date] = None) -> Optional[date]:
     """The IST CALENDAR DATE of a stored timestamp, whatever zone it carries.
 
@@ -173,6 +183,7 @@ def ist_date_of(value, *, default: Optional[date] = None) -> Optional[date]:
       - offset-aware ISO: "2026-09-22T00:30:00+05:30", "2026-09-21T19:00:00Z"
       - naive ISO:        "2026-09-22T00:30:00"  -> ASSUMED IST, the convention
                           every writer in this codebase follows
+      - SQLite's own:     "2026-09-21 19:00:00"  -> UTC (CURRENT_TIMESTAMP)
       - a bare date:      "2026-09-22"
 
     Returns `default` (None unless given) for anything unparseable, so a
@@ -201,10 +212,12 @@ def ist_date_of(value, *, default: Optional[date] = None) -> Optional[date]:
         except ValueError:
             return default
     if dt.tzinfo is None:
-        # NAIVE MEANS IST HERE. Every timestamp this bot writes to SQLite comes
-        # from `now_ist()`, and reading a naive one as UTC would move it 5.5
-        # hours backwards — the exact error this function exists to prevent.
-        dt = dt.replace(tzinfo=IST)
+        # TWO NAIVE SHAPES, TWO ZONES. SQLite's CURRENT_TIMESTAMP (and
+        # followups.TS_FORMAT) write "YYYY-MM-DD HH:MM:SS" — a SPACE, in UTC.
+        # Everything this bot writes itself comes from `now_ist().isoformat()`
+        # — a "T", in IST. Reading the first as IST would move it 5.5 hours
+        # the wrong way; reading the second as UTC, the same the other way.
+        dt = dt.replace(tzinfo=timezone.utc if _SQLITE_TS_RE.match(text) else IST)
     return dt.astimezone(IST).date()
 
 

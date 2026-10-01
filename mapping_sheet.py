@@ -64,6 +64,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import config
+import deadlines as dl
 from gtm_sheet import SheetAccessError, normalise_header
 
 log = logging.getLogger(__name__)
@@ -653,7 +654,7 @@ class Tab:
 
     @property
     def age_seconds(self) -> float:
-        return max(0.0, time.time() - self.read_at)
+        return max(0.0, dl.real_epoch() - self.read_at)
 
     def schema_line(self) -> str:
         mapped = ", ".join(sorted(self.role_to_col)) or "(none)"
@@ -1043,7 +1044,7 @@ class MappingSheet:
         copy is returned (check `Tab.age_seconds` and say so), and
         SheetAccessError is raised only when there is no cache to fall back on.
         """
-        now = time.time()
+        now = dl.real_epoch()
         with self._lock:
             cached = {k: v[0] for k, v in self._cache.items() if v}
             if cached and not force:
@@ -1055,7 +1056,7 @@ class MappingSheet:
             sh = self._open()
             titles = [ws.title for ws in sh.worksheets()]
             by_title = self._batch_values(sh, titles)
-            read_at = time.time()
+            read_at = dl.real_epoch()
             groups: dict[str, list[Tab]] = {}
             unrecognised: list[str] = []
             for title in titles:
@@ -1229,7 +1230,7 @@ class MappingSheet:
         own as the sheet ages past its own refresh rule.
         """
         legend = self.legend()
-        today = today or date.today()
+        today = today or dl.today_ist()
         limit = legend.stale_after_days()
 
         research_age = (today - legend.built).days if legend.built else None

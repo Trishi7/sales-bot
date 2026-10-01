@@ -62,6 +62,10 @@ import rules
 
 log = logging.getLogger(__name__)
 
+# THE ONE LINK HELPER: `[short name](<url>)`. Lives in links.py so guardrails
+# can use it too; this is the name every renderer calls.
+from links import link, doc_label  # noqa: E402,F401
+
 # Stages a message can be at for its group. See `db.drip_group_history`.
 STAGE_NUDGE = "nudge"
 STAGE_REASK = "reask"
@@ -684,65 +688,67 @@ def plan(
 # fallback that reads like a template is what people will actually receive on
 # the day the API is down.
 _ASK = {
-    nextaction.R_AI_NEWS: (
-        "{who}here is what moved in AI in the last 24 hours on our topic list. Skim "
-        "it when you have a minute."
-    ),
+    # R1 IS POSTED AS ITS STORIES (see VERBATIM_TYPES); this is only the
+    # never-expected case of a news message with no stories on it.
+    nextaction.R_AI_NEWS: "{who}Nothing new on the news today.",
     nextaction.R_NEWS_SCREEN: (
-        "{who}a few companies in the news this week are not in the Master Pipeline. "
-        "Here is why each one is or is not worth adding — tell me which, if any, and "
-        "I will put them in."
+        "{who}some companies in the news this week are not in the Master Pipeline. "
+        "Below is why each one fits us or not. Tell me which ones to add, if any, "
+        "and I will add them."
     ),
     nextaction.R_EVENTS: (
-        "{who}{companies} is coming up and we are not registered. Worth a look before "
-        "registration closes — tell me if it is not for us and I will leave it."
+        "{who}{companies} is coming up and we have not registered. Please look at it "
+        "before registration closes. If it is not for us, tell me and I will stop "
+        "asking."
     ),
     # R4 IS ALWAYS POINTS (see `points_of`); this sentence is only the
     # never-expected case of a deliverables message with no items on it.
     nextaction.R_DELIVERABLES: (
-        "{who}here is the deliverables list for this week. Shout if any of these "
-        "have moved and I'll update my list."
+        "{who}here is the deliverables list for this week. " + "{close}"
     ),
     nextaction.R_PROSPECTS: (
-        "{who}{companies} — nobody has made first contact with these yet. Worth a "
-        "look when you get a window; tell me when they are done and I will move on."
+        "{who}nobody has contacted {companies} yet. Can you contact them when you "
+        "have time? Tell me when it is done and I will move to the next ones."
     ),
     nextaction.R_LI_NO_DM: (
-        "{who}{companies} connected a few days back and I have no DM against them. "
-        "If it has gone, tell me and I will note it; if not, now is while it is warm."
+        "{who}{companies} accepted the LinkedIn connection a few days ago and there "
+        "is no DM yet. Do you want to send one? If you already did, tell me and I "
+        "will note it."
     ),
     nextaction.R_DM_NO_MEETING: (
-        "{who}the DM to {companies} has been sitting a while with no meeting behind "
-        "it. Worth a look at where it got to when you have a minute."
+        "{who}the DM to {companies} went out {days} days ago and no meeting is "
+        "booked yet. Do you want to follow up? Tell me if they replied."
     ),
     nextaction.R_MEETING_PREP: (
-        "{who}the {companies} meeting is coming up. Deck, package and demo all in "
-        "hand? If it is all set just say, and I will leave it alone — I only did "
-        "not want it to arrive as a surprise."
+        "{who}the {companies} meeting is coming up. Are the deck, the package and "
+        "the demo ready? If everything is ready, tell me and I will not ask again."
     ),
     nextaction.R_MEETING_FOLLOWUP: (
-        "{who}the {companies} meeting is down as done and there are no next steps "
-        "against it. What came out of it, which package came up, and roughly what "
-        "size? Tell me and I will stop asking."
+        "{who}the {companies} meeting is marked as done, but there are no next steps "
+        "on the sheet. What was agreed, which package did you discuss, and about how "
+        "big is the deal? Tell me and I will stop asking."
     ),
     # THE SUPPORTIVE VERSION, from the call. Two or more deals go as points
     # with the same offer as the close (see `points_of`).
     nextaction.R_CLOSURE_SUPPORT: (
-        "{who}{companies} is in the closure stage — anything I can pull together to "
-        "help it along: the PoC's background, the company, a package summary? Say "
-        "the word."
+        "{who}{companies} is in the closure stage. Can I help? I can prepare the "
+        "PoC's background, a note on the company, or a package summary. Tell me "
+        "which one you need."
     ),
+    # R11 IS ALWAYS POINTS (see `points_of`); this is the never-expected case
+    # of a new-company message with no company on it.
     nextaction.R_NEW_COMPANY: (
-        "{who}{companies} is new in the Master Pipeline. I can fill in the funding, "
-        "location and industry and suggest a few PoCs — say the word and I will."
+        "{who}a new company landed in the pipeline. Want me to look for relevant "
+        "PoCs for outreach? Say yes and I'll dig in."
     ),
     nextaction.R_PACKAGES: (
-        "{who}{companies} is still not marked ready. What is left on it, and roughly "
-        "when? No rush, I just do not want to offer it before it is there."
+        "{who}{companies} is still not marked ready. What is still missing, and when "
+        "do you expect it to be ready? There is no rush. I only want to be sure "
+        "before we offer it."
     ),
     nextaction.SCHEDULED_REMINDER: (
-        "{who}you asked me to flag {companies} today. Here it is — tell me when it is "
-        "done, or tell me to move it."
+        "{who}you asked me to remind you about {companies} today. Tell me when it is "
+        "done, or tell me a new date."
     ),
 }
 
@@ -750,9 +756,81 @@ _ASK = {
 # that it is the last time — which is what makes it land as a courtesy rather
 # than as a second demand.
 _REASK = (
-    "{who}circling back on {companies} — no pressure at all, and I will leave it "
-    "after this. If it is handled or not worth it, just say and I will drop it."
+    "{who}this is my last reminder about {companies}. If it is done or no longer "
+    "needed, tell me and I will stop asking."
 )
+
+
+# -- the heading: one bold first line per message type ------------------------
+#
+# DETERMINISTIC, NEVER WRITTEN BY THE MODEL. `_send_drip_message` puts it above
+# the tags line, after composition, so a composer that ignored it or a template
+# that forgot it cannot produce a message without one. {day} is the send day,
+# {week} that week's Monday, {company} the first company on the message.
+HEADINGS = {
+    "R1": "AI news — {day}",
+    "R1_breaking": "Breaking AI news",
+    "R2": "Companies in the news",
+    "R3": "AI events & summits",
+    "R4": "Deliverables — week of {week}",
+    "R5": "PoCs to contact",
+    "R6": "LinkedIn connected, no DM yet",
+    "R7": "DM sent, no meeting yet",
+    "R8": "Meeting prep — {company}",
+    "R9": "Meeting follow-up — {company}",
+    "R10": "Closure support",
+    "R11": "New companies in the pipeline",
+    "R12": "Sales packages",
+    "reminder": "Reminder",
+    "approvals": "Waiting for your yes",
+}
+_HEADING_BY_TYPE = {
+    nextaction.R_AI_NEWS: "R1", nextaction.R_NEWS_SCREEN: "R2",
+    nextaction.R_EVENTS: "R3", nextaction.R_DELIVERABLES: "R4",
+    nextaction.R_PROSPECTS: "R5", nextaction.R_LI_NO_DM: "R6",
+    nextaction.R_DM_NO_MEETING: "R7", nextaction.R_MEETING_PREP: "R8",
+    nextaction.R_MEETING_FOLLOWUP: "R9", nextaction.R_CLOSURE_SUPPORT: "R10",
+    nextaction.R_NEW_COMPANY: "R11", nextaction.R_PACKAGES: "R12",
+    nextaction.SCHEDULED_REMINDER: "reminder",
+}
+
+
+def _day_label(day: date) -> str:
+    return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
+
+
+def heading(key: str, *, day: Optional[date] = None, company: str = "") -> str:
+    """`**AI news — Tue 29 Sep**` for a HEADINGS key. "" for an unknown key."""
+    pattern = HEADINGS.get(str(key or ""))
+    if not pattern:
+        return ""
+    day = day or dl.today_ist()
+    monday = day - timedelta(days=day.weekday())
+    text = pattern.format(day=_day_label(day), week=f"{monday.day} {monday.strftime('%b')}",
+                          company=str(company or "").strip() or "the meeting")
+    return f"**{text}**"
+
+
+def heading_for(message: dict, *, day: Optional[date] = None) -> str:
+    """The heading for one drip message, by its type (or its rule id)."""
+    key = _HEADING_BY_TYPE.get(message.get("type")) or str(message.get("rule_id") or "")
+    companies = [c for c in (message.get("companies") or []) if str(c).strip()]
+    return heading(key, day=day, company=companies[0] if companies else "")
+
+
+def with_heading(body: str, head: str) -> str:
+    """`head` on its own first line above `body` (tags line included)."""
+    body = str(body or "").strip()
+    if not head:
+        return body
+    return f"{head}\n{body}" if body else head
+
+
+# TYPES POSTED EXACTLY AS RENDERED, never composed by the model: the news
+# (one story per bullet, nothing else) and the deliverables (the three-line
+# layout). A composer asked to keep a multi-line list intact is a composer
+# that will sometimes not.
+VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -899,10 +977,29 @@ def with_sources(body: str, message: dict) -> str:
 # a one-line close around them, and `llm._proactive_problem` rejects any
 # composition that lost or reworded a line (logged as `structure`).
 
-DELIVERABLES_CLOSE = "Shout if any of these have moved and I'll update my list."
-CLOSURE_CLOSE = ("Anything I can pull together to help them along — the PoC's "
-                 "background, the company, a package summary? Say the word.")
-GENERIC_CLOSE = "Tell me when they are done and I will move on."
+DELIVERABLES_CLOSE = "Tell me if any of these have moved and I will update my list."
+CLOSURE_CLOSE = ("Can I help with any of these? I can prepare the PoC's background, "
+                 "a note on the company, or a package summary. Tell me which one.")
+GENERIC_CLOSE = "Tell me when they are done and I will move to the next ones."
+NEW_COMPANY_CLOSE = ("Want me to look for relevant PoCs for outreach? Say yes and "
+                     "I'll dig in.")
+_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five"}
+
+
+def render_new_companies(companies: list) -> tuple:
+    """R11's (opener, lines). One company per line, no links, nothing else.
+
+        Hey team — two new companies landed in the pipeline:
+        • Shunya Labs
+        • Synthflow AI
+    """
+    names = [str(c).strip() for c in (companies or []) if str(c).strip()]
+    if len(names) == 1:
+        opener = "Hey team — a new company landed in the pipeline:"
+    else:
+        count = _COUNT_WORDS.get(len(names), str(len(names)))
+        opener = f"Hey team — {count} new companies landed in the pipeline:"
+    return opener, [f"• {n}" for n in names]
 
 
 def _plural(n: int, word: str) -> str:
@@ -911,15 +1008,20 @@ def _plural(n: int, word: str) -> str:
 
 def render_deliverables(items: list, *, today: Optional[date] = None,
                         limit: int = 20) -> list:
-    """R4's lines: the header, then one numbered line per deliverable.
+    """R4's lines: a count, then each deliverable as its own numbered point.
 
-        Deliverables for the week of Mon 28 Sep — 6 open:
-        1. Pulse overview doc — Sales, due Thu 1 Oct, overdue by 3 days — waiting on pricing
+        6 open:
+        1. Pulse Product Overview Document
+           Team: Sales | Due: Thu 2 Oct | Overdue: 3 days
+           [Doc](<https://docs.google.com/...>)
+           waiting on pricing
 
-    P1 FIRST, THEN BY DEADLINE — priority is the order, not a filter. The link
-    is appended only when the row has one; remarks only when there are any.
-    Past `limit` the rest are counted in one closing line, never dropped
-    silently.
+    "Overdue" only when past due; "Due" always; the link line only when the row
+    has one; remarks, when present, as the last short line. The week is in the
+    heading (`HEADINGS["R4"]`), not here.
+
+    P1 FIRST, THEN BY DEADLINE — priority is the order, not a filter. Past
+    `limit` the rest are counted in one closing line, never dropped silently.
     """
     today = today or dl.today_ist()
     rows = sorted(
@@ -928,25 +1030,24 @@ def render_deliverables(items: list, *, today: Optional[date] = None,
                        str(a.get("deadline") or "9999"),
                        str(a.get("item") or a.get("deliverable") or "").lower()),
     )
-    week = dl.parse_date(str((rows[0].get("week_of") if rows else "") or "")) or (
-        today - timedelta(days=today.weekday()))
-    header = (f"Deliverables for the week of {week.strftime('%a')} {week.day} "
-              f"{week.strftime('%b')} — {len(rows)} open:")
-    lines = [header]
+    lines = [f"{len(rows)} open:"]
+    pad = "   "
     for i, a in enumerate(rows[:max(1, int(limit))], 1):
         name = str(a.get("item") or a.get("deliverable")).strip()
-        team = str(a.get("team") or config.DELIVERABLE_DEFAULT_OWNER).strip()
-        line = f"{i}. {name} — {team}, due {a.get('deadline_pretty') or a.get('deadline')}"
+        team = str(a.get("team") or "").strip() or config.DELIVERABLE_DEFAULT_OWNER
+        meta = [f"Team: {team}",
+                f"Due: {a.get('deadline_pretty') or a.get('deadline') or 'not set'}"]
         days = a.get("days_left")
         if isinstance(days, int) and days < 0:
-            line += f", overdue by {_plural(-days, 'day')}"
+            meta.append(f"Overdue: {_plural(-days, 'day')}")
+        lines.append(f"{i}. {name}")
+        lines.append(pad + " | ".join(meta))
+        url = str(a.get("link") or "").strip()
+        if url.startswith("http"):
+            lines.append(pad + link(doc_label(url), url))
         remarks = " ".join(str(a.get("remarks") or "").split())
         if remarks:
-            line += f" — {remarks}"
-        link = str(a.get("link") or "").strip()
-        if link.startswith("http"):
-            line += f" <{link}>"
-        lines.append(line)
+            lines.append(pad + remarks)
     if len(rows) > limit:
         lines.append(f"(+{len(rows) - limit} more due this week — ask and I'll list them)")
     return lines
@@ -984,11 +1085,19 @@ def points_of(message: dict) -> Optional[dict]:
         rendered = render_deliverables(actions, limit=cap)
         if len(rendered) < 2:
             return None
-        body = rendered[1:]
-        numbered = [l for l in body if l[:1].isdigit()]
-        extra = [l for l in body if not l[:1].isdigit()]
-        return {"header": rendered[0], "lines": numbered, "extra": extra,
+        # THE LAYOUT IS MULTI-LINE, so every line is kept, in order. R4 is
+        # posted verbatim (VERBATIM_TYPES) and never recomposed.
+        return {"header": rendered[0], "lines": rendered[1:], "extra": [],
                 "close": DELIVERABLES_CLOSE}
+    if kind == nextaction.R_NEW_COMPANY:
+        companies = [c for c in (message.get("companies") or []) if str(c).strip()]
+        if not companies:
+            return None
+        opener, lines = render_new_companies(companies[:cap])
+        # THE OPENER IS PART OF THE BLOCK: the message is exactly this shape,
+        # and the composer writes nothing before it (`compose_prompt`).
+        return {"header": opener, "lines": lines, "extra": [],
+                "close": NEW_COMPANY_CLOSE, "opener_in_block": True}
     if kind == nextaction.R_CLOSURE_SUPPORT:
         lines = render_closure(actions)
         if len(lines) < 2:
@@ -1026,7 +1135,11 @@ def fact_count(message: dict) -> int:
 def required_lines(message: dict) -> list:
     """The point lines a composed message must carry unchanged."""
     points = points_of(message)
-    return list(points["lines"]) if points else []
+    if not points:
+        return []
+    # WHERE THE OPENER IS PART OF THE BLOCK (R11), it is a fact line too.
+    head = [points["header"]] if points.get("opener_in_block") else []
+    return head + list(points["lines"])
 
 
 def split_on_lines(body: str, *, limit: int = 1900) -> list:
@@ -1074,9 +1187,12 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
 
     # POINTS: the deterministic list, with its opener and its close. Research
     # (R10's news) rides underneath rather than replacing the list.
+    if message.get("type") in VERBATIM_TYPES:
+        who = ""
     points = points_of(message)
     if points:
-        body = (who + points_block(points) + "\n" + points["close"]).strip()
+        lead = "" if points.get("opener_in_block") else who
+        body = (lead + points_block(points) + "\n" + points["close"]).strip()
         if research:
             body += "\n\n" + research
         note = note_of(message)
@@ -1086,11 +1202,20 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
         note = note_of(message)
         return (who + research + (f"\n({note})" if note else "")).strip()
 
+    # NEWS THAT COULD NOT BE CHECKED IS NOT "NOTHING NEW". A search that did
+    # not run says so, rather than claiming a quiet day.
+    if message.get("type") == nextaction.R_AI_NEWS and note_of(message):
+        return f"I couldn't check the news today — {note_of(message)}."
+
     template = (
         _REASK if message.get("stage") == STAGE_REASK
         else _ASK.get(message.get("type"), _ASK[nextaction.R_DM_NO_MEETING])
     )
-    body = template.format(who=who, companies=companies or "these").strip()
+    days = next((int(a["days_since_dm"]) for a in (message.get("actions") or [])
+                 if isinstance(a.get("days_since_dm"), int)),
+                int(message.get("overdue_days") or 0))
+    body = template.format(who=who, companies=companies or "these", days=days,
+                           close=DELIVERABLES_CLOSE).strip()
     note = note_of(message)
     return f"{body} ({note})" if note else body
 
@@ -1107,11 +1232,27 @@ def compose_prompt(message: dict, *, address: str = "") -> str:
         "Write ONE short proactive message for the sales channel.",
         "",
         f"Who it is for: {message.get('owner') or 'nobody in particular (the team)'}",
-        f"Address them as EXACTLY this, once, at the start: "
-        f"{address or message.get('owner') or '(do not address anyone by name)'}",
+        (f"Address them as EXACTLY this, once, at the start: "
+         f"{address or message.get('owner') or '(do not address anyone by name)'}"
+         if not (points and points.get("opener_in_block"))
+         else "Address nobody by name — the block below already opens the message."),
         f"What it is about: {message.get('type_label')}",
     ]
-    if points:
+    if points and points.get("opener_in_block"):
+        # THE BLOCK ALREADY OPENS THE MESSAGE (R11). The model may only reword
+        # the close; the opener and the company lines arrive unchanged.
+        lines += [
+            "",
+            "THIS MESSAGE IS A SHORT LIST THAT ALREADY HAS ITS OPENER. Write NOTHING "
+            "before it and address nobody. Reproduce the block below EXACTLY — every "
+            "line, character for character, in this order, no links added — then ONE "
+            f"closing line in your voice that asks this: \"{points['close']}\"",
+            "Do not add the <<< >>> markers:",
+            "<<<",
+            points_block(points),
+            ">>>",
+        ]
+    elif points:
         # THE MODEL WRITES TWO LINES. The list is rendered in code and must
         # arrive unchanged; a composition missing any of its lines is thrown
         # away for the template (`llm._proactive_problem`, logged `structure`).
@@ -1412,7 +1553,7 @@ def _self_test() -> int:
                               ("no rush", "tell me", "just say", "your call")), True)
     msg["stage"] = STAGE_REASK
     check("the re-ask says it is the last one",
-          "leave it after this" in compose_fallback(msg), True)
+          "my last reminder" in compose_fallback(msg), True)
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

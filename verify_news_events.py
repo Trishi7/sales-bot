@@ -161,8 +161,9 @@ async def scenario_main(bot, today):
                 "| https://reuters.com/chips | 3\n"
             )
         if rule == "R2":
-            return ("SCREEN | Nebius | fits use case C, inference infrastructure, "
-                    "buys eval data | https://reuters.com/nebius\n")
+            return ("SCREEN | Nebius | builds inference infrastructure | fits evals: "
+                    "buys eval data for its hosted models | https://reuters.com/nebius\n"
+                    "SKIP | EU AI Act phase two | regulation, not a specific company\n")
         return ""
 
     install_fakes(bot, reply_for=reply)
@@ -184,8 +185,9 @@ async def scenario_main(bot, today):
     check("the item is no longer waiting on research", r1["web_pending"], False,
           live_optional=True)
     bullets = [l for l in r1["text"].splitlines() if l.startswith("• ")]
-    check("every story carries a topic tag and a link",
-          bool(bullets) and all(l.startswith("• [") and "<http" in l for l in bullets),
+    check("every story is a bullet with a masked link and no topic tag",
+          bool(bullets) and all("](<http" in l and not l.startswith("• [")
+                                for l in bullets),
           live_optional=True)
     check("three stories", len(bullets), 3, live_optional=True)
     check("the sources are attached for the send path",
@@ -196,17 +198,19 @@ async def scenario_main(bot, today):
     r2 = items[1]
     check("the screen ran", r2["web_pending"], False)
     check("it names the company", "Nebius" in r2["text"], live_optional=True)
-    check("with a reason judged against the use cases",
-          "use case C" in r2["text"], live_optional=True)
+    check("with what they do and why, in words",
+          "fits evals" in r2["text"] and "builds inference" in r2["text"],
+          live_optional=True)
+    check("the regulation story is not screened", "EU AI Act" in r2["text"], False)
     check("and its link", "<https://reuters.com/nebius>" in r2["text"],
           live_optional=True)
     check("it asks before adding anything", "without a yes" in r2["text"])
     r2_calls = [c for c in CALLS if c["rule"] == "R2"]
     check("R2 read today's posted stories", bool(r2_calls) and
           "Nebius raises $700m" in r2_calls[0]["prompt"], live_optional=True)
-    check("...on the lean prompt, with the use-case table in the question",
+    check("...on the lean prompt, with what we sell in the question",
           bool(r2_calls) and r2_calls[0]["lean"]
-          and "MEMBRANE'S USE CASES" in r2_calls[0]["prompt"])
+          and "WHAT MEMBRANE SELLS" in r2_calls[0]["prompt"])
     if LIVE and r2.get("text"):
         bullets = [l for l in r2["text"].splitlines() if l.strip().startswith("•")]
         check("live: every screened company carries a link",

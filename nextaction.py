@@ -49,8 +49,9 @@ deduplicates across every rule by contact, keeping the item from the
 earliest-listed rule in the file, and says in the result which rules lost. A
 person hearing about themselves twice in one afternoon is how a bot gets muted.
 
-WEB-DEPENDENT RULES STILL PRODUCE THEIR ITEMS. R1, R2, R3, R6, R8, R10 and R11
-need research this bot cannot do yet. Each produces its item carrying
+WEB-DEPENDENT RULES STILL PRODUCE THEIR ITEMS. R1, R2, R3, R6, R8 and R10
+need research this bot cannot do yet (R11 asks first and searches only on a
+yes, so it is not one of them). Each produces its item carrying
 `web_pending=True` and the placeholder text, so the schedule is real and visible
 before the research layer lands. Nothing is silently skipped waiting for it.
 
@@ -1101,8 +1102,11 @@ def _r_new_pipeline_company(rule, ctx) -> list:
     was down for a week) would dump every company added in that gap into one
     post.
 
-    Fills in funding, location and industry and suggests PoCs — WEB-DEPENDENT.
-    Permission is asked before anything is added to Outreach PoCs.
+    ASKS FIRST, SEARCHES ON A YES. The item names the company and nothing
+    else; the drip posts "want me to look for relevant PoCs?" and opens a
+    `poc_lookup` proposal against that message. Only an approver's yes runs a
+    search (bot._apply_poc_lookup). Nothing is ever added to Outreach PoCs
+    without a separate yes.
     """
     today = ctx["today"]
     wait = max(0, int(config.NEW_COMPANY_AFTER_WORKING_DAYS))
@@ -1122,10 +1126,9 @@ def _r_new_pipeline_company(rule, ctx) -> list:
             rule=rule, trigger=R_NEW_COMPANY, today=today, due=due,
             why=(f"R11: {name} first appeared in the Master Pipeline on "
                  f"{dl.format_date(first_seen)}, {wait} working day(s) ago"),
-            text=(f"{name} is new in the Master Pipeline. I can fill in funding, location "
-                  "and industry and suggest PoCs with designation, LinkedIn URL and paper "
-                  "link — shall I?"),
-            company=name, web_pending=True,
+            text=(f"{name} is new in the Master Pipeline. Want me to look for "
+                  "relevant PoCs for outreach?"),
+            company=name, web_pending=False,
             extra={"first_seen": dl.iso(first_seen)},
         ))
     return out

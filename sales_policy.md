@@ -48,8 +48,8 @@ naming the row and the cells you read.
 > **Moved to the strategy doc.** These used to be principles here and are now
 > governed there. Do not apply an older version of them from memory:
 >
-> - **ICP and who to target** → strategy §2 (the use-case matrix A–J and who
->   buys each) and §5 (role priority, company order, pace). Quote the matrix,
+> - **ICP and who to target** → strategy §2 (the use cases and who buys
+>   each, in words) and §5 (role priority, company order, pace). Quote the matrix,
 >   don't paraphrase it. When effort is going into a company that matches no row
 >   in it, say so and name the mismatch — off-ICP work isn't forbidden, it's
 >   just never allowed to be invisible.
@@ -151,16 +151,17 @@ are not.
 
 **R1 — AI news**
 
-> Vaishnavi, three things moved overnight: Wispr Flow closed a
-> $56M Series B, ElevenLabs is hiring an evals lead, and Ariya published on
-> streaming ASR. Links below — skim when you get a minute, nothing needs you
-> today.
+> • Wispr Flow raises a $56M Series B — to build voice dictation for teams. [techcrunch.com](<https://techcrunch.com/...>)
+> • ElevenLabs is hiring an evals lead — a new role in its research team. [elevenlabs.io](<https://elevenlabs.io/...>)
+>
+> (News is posted as its stories, one per bullet, with no closing line. News
+> never asks anyone to do anything.)
 
 **R2 — News-company screen**
 
 > Sid, four companies in the news this week are not in the
-> Master Pipeline. Two look like use case H and one is a competitor; the fourth
-> I would leave. Tell me which to add and I will put them in.
+> Master Pipeline. Two build agents and could use our task-training data,
+> one is a competitor, and the fourth I would leave. Tell me which to add and I will put them in.
 
 **R3 — AI events and summits**
 
@@ -211,9 +212,9 @@ are not.
 
 **R11 — New company in the Master Pipeline**
 
-> Sid, Nova Labs turned up in the Master Pipeline yesterday.
-> I can fill in the funding, location and industry and suggest a few PoCs — say
-> the word and I will.
+> Hey team — a new company landed in the pipeline:
+> • Nova Labs
+> Want me to look for relevant PoCs for outreach? Say yes and I'll dig in.
 
 **R12 — Sales packages**
 

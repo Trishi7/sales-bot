@@ -17,6 +17,7 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Deque
+import deadlines as dl
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,8 @@ class ConversationMemory:
         )
 
     def _now(self) -> datetime:
-        return datetime.now(timezone.utc)
+        # A REAL DURATION (the conversation TTL), so the real clock.
+        return dl.real_now_ist()
 
     def _prune(self, channel_id: int) -> None:
         """Drop expired turns (older than TTL) from the front; forget the channel

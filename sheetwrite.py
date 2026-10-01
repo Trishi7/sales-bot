@@ -609,7 +609,12 @@ def parse_reminder_time(raw: str) -> str:
     24-hour IST. "" means it could not be read — the caller says so rather than
     guessing, because a reminder at a minute nobody asked for is a wrong one.
     """
-    text = " ".join(str(raw or "").lower().replace(".", "").split())
+    # TOLERANT OF HOW PEOPLE TYPE A TIME: "1: 17 pm", "1.17pm", "13:17",
+    # "1:17 p.m.". A dot or colon between digits is the minute separator (with
+    # any spaces round it); any other dot goes ("p.m." -> "pm").
+    text = str(raw or "").lower()
+    text = re.sub(r"(\d)\s*[.:]\s*(\d)", r"\1:\2", text)
+    text = " ".join(text.replace(".", "").split())
     if not text:
         return ""
     if text in _TIME_WORDS:
@@ -788,7 +793,7 @@ def _self_test() -> int:
                "TRUE", "LinkedIn", "01-09-2026", "TRUE", "05-09-2026", "", "",
                "", "Booked",
                "", "", "", "", "", ""]]
-    tab = gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=_time.time())
+    tab = gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=dl.real_epoch())
     trow = tab.rows[0]
 
     def plan(fields, trigger=TRIGGER_REPLY, text=""):

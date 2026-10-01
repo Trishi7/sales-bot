@@ -21,6 +21,7 @@ deliverables tab and a throwaway *_test.db.
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -131,19 +132,29 @@ async def main():
     print("   the template (DRIP_LLM_COMPOSE off, or the model's version rejected):")
     for line in body.splitlines():
         print("     | " + line)
-    numbered = [l for l in body.splitlines() if l[:2].rstrip(".").isdigit()]
+    numbered = [l for l in body.splitlines() if re.match(r"^\d+\. ", l)]
     check("6 numbered lines", len(numbered), 6)
+    # THE THREE-LINE LAYOUT: each point is its numbered line plus the indented
+    # lines under it (team | due | overdue, the link, the remarks).
+    blocks, cur = [], None
+    for l in body.splitlines():
+        if re.match(r"^\d+\. ", l):
+            cur = [l]
+            blocks.append(cur)
+        elif cur is not None and l.startswith("   "):
+            cur.append(l)
+    blocks = ["\n".join(b) for b in blocks]
     check("P1 first (MSA, DPA, API rate limits), then by deadline",
           [l.split(". ", 1)[1].split(" — ")[0] for l in numbered],
           ["MSA template", "DPA review", "API rate limits", "Case study: Hinglish STT",
            "Pulse product overview doc", "Dashboard SSO"])
-    check("team and date on every line",
-          all(" — " in l and ", due " in l for l in numbered))
+    check("team and due on every point",
+          all("Team: " in b and "Due: " in b for b in blocks))
     check("remarks where present",
-          sum(("pricing table" in l) or ("load test" in l) for l in numbered), 2)
-    check("the overdue one says so", "overdue by 5 days" in numbered[0])
-    check("the link only where there is one",
-          sum("<https://" in l for l in numbered), 1)
+          sum(("pricing table" in b) or ("load test" in b) for b in blocks), 2)
+    check("the overdue one says so", "Overdue: 5 days" in blocks[0])
+    check("the link only where there is one, masked",
+          sum("](<https://" in b for b in blocks), 1)
     check("done / next week / undated rows are left out",
           any(x in body for x in ("NDA", "Q1 plan", "Some idea")), False)
     check("addressed to the checklist's owner", msg["owner"], "Vaishnavi")
@@ -166,9 +177,9 @@ async def main():
 
     # ------------------------------------------------------------------ (ii)
     print("\n(ii) A BLANK TEAM")
-    dpa = next(l for l in numbered if "DPA review" in l)
+    dpa = next(b for b in blocks if "DPA review" in b)
     print(f"   {dpa}")
-    check("shows the default owner", " — Vaishnavi, due " in dpa)
+    check("shows the default owner", "Team: Vaishnavi |" in dpa)
 
     # ------------------------------------------------------------------ (iii)
     print("\n(iii) THE MODEL DROPS A BULLET")
@@ -264,7 +275,7 @@ async def main():
     check("each under Discord's 2000", all(n <= 2000 for n in lens))
     joined = "\n".join(sent)
     check("no numbered line was split", sum(
-        1 for l in joined.splitlines() if l[:3].rstrip(". ").isdigit()), 20)
+        1 for l in joined.splitlines() if re.match(r"^(\[TEST\] )?\d+\. ", l)), 20)
     check("ONE drip slot recorded", len(bot.db.drip_sent_today(dl.iso(MON))), 1)
 
 

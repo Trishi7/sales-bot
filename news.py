@@ -204,33 +204,54 @@ def sweep_prompt(topics: list, *, today: date, since_hours: int, mode: str,
     return "\n".join(lines)
 
 
+# THE OFFERINGS R2 MAPS A COMPANY ONTO, in the words the team uses. Named in the
+# prompt so "why it fits" is an offering, never a letter from a table.
+SCREEN_OFFERINGS = (
+    "evals", "post-training preference data", "red-teaming",
+    "voice & multilingual speech", "agent trajectories", "Gen-Z research",
+)
+
+
 def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "") -> str:
     """R2 — which of today's news companies are NOT in the pipeline.
 
     READS THE STORIES R1 ALREADY POSTED. The question is about a result set we
     are holding, and searching again to answer it would spend the budget twice.
 
-    THE USE-CASE TABLE RIDES IN HERE, in the user prompt, because the lean
-    system prompt no longer carries the strategy doc. Only that section, capped.
+    JUDGED IN WORDS. The strategy's "What we sell" section (offerings, use
+    cases, Phase 1 focus) rides in the user prompt, because the lean system
+    prompt no longer carries the strategy doc. Only that section, capped.
+
+    ONLY STORIES ABOUT ONE SPECIFIC COMPANY. Regulation, a city, a government
+    or an industry-wide trend is not a company to screen; each such story comes
+    back as a SKIP line with its reason, which the caller logs.
     """
     lines = [
         "Below are news stories posted today, and the list of companies the team "
         "already tracks in its Master Pipeline.",
         "",
-        "Name the companies that appear in the STORIES but are NOT in the TRACKED "
-        "list. For each one, ONE line saying whether it is relevant to membrane and "
-        "why, judged against the use-case table (A-J and who buys each) below. "
-        "Name the use case you matched, or say plainly that it matches none.",
+        "Name the companies that a story is SPECIFICALLY ABOUT and that are NOT in "
+        "the TRACKED list. For each one say, in plain words: what the company does "
+        "(one clause), which membrane offering it maps to — "
+        + ", ".join(SCREEN_OFFERINGS) + " — and why, or why it does not fit. Judge "
+        "against the offerings and the Phase 1 focus in the strategy text below. "
+        "Never refer to a use case by a letter or a number.",
+        "",
+        "SKIP any story that is not about one specific company — regulation, a "
+        "city or government, or an industry-wide trend — with one SKIP line "
+        "saying why.",
         "",
         "FORMAT, one per line and nothing else:",
-        "  SCREEN | <company> | <fit or no fit, and which use case> | <url>",
+        "  SCREEN | <company> | <what they do, one clause> | "
+        "<why it fits or doesn't> | <url>",
+        "  SKIP | <story headline> | <why it is not about a specific company>",
         "",
         "DO NOT propose adding anything to any sheet. A human is asked before any "
         "row is added and that is a separate step you are not part of.",
         "If every company in the news is already tracked, reply: NOTHING NEW",
     ]
     if use_cases.strip():
-        lines += ["", "MEMBRANE'S USE CASES (from the sales strategy):", use_cases.strip()]
+        lines += ["", "WHAT MEMBRANE SELLS (from the sales strategy):", use_cases.strip()]
     lines += ["", "TODAY'S STORIES:"]
     for s in stories[:20]:
         head = s.get("headline") or s.get("title") or s.get("about") or "?"
@@ -375,7 +396,11 @@ def parse_stories(text: str, *, topics: Optional[list] = None) -> list:
 
 
 def parse_screen(text: str) -> list:
-    """The SCREEN lines, as [{company, verdict, url}]."""
+    """The SCREEN lines, as [{company, what, why, verdict, url}].
+
+    Five fields (company | what | why | url). An older four-field line
+    (company | verdict | url) still reads, with the verdict as `why`.
+    """
     out: list = []
     for line in str(text or "").splitlines():
         if not _SCREEN_RE.match(line):
@@ -383,14 +408,35 @@ def parse_screen(text: str) -> list:
         parts = [p.strip() for p in line.split("|")]
         if len(parts) < 3:
             continue
-        company = parts[1]
-        verdict = parts[2]
-        tail = " ".join(parts[3:]) if len(parts) > 3 else ""
-        found = _URL_RE.search(tail) or _URL_RE.search(line)
+        found = _URL_RE.search(line)
         url = found.group(0).rstrip(".,;)") if found else ""
-        verdict = _URL_RE.sub("", verdict).strip(" -–—|")
-        if company and verdict:
-            out.append({"company": company, "verdict": verdict, "url": url})
+        fields = [_URL_RE.sub("", p).strip(" -–—|<>") for p in parts[1:]]
+        fields = [f for f in fields if f]
+        if not fields:
+            continue
+        company = fields[0]
+        if len(fields) >= 3:
+            what, why = fields[1], fields[2]
+        else:
+            what, why = "", (fields[1] if len(fields) > 1 else "")
+        if company and (what or why):
+            out.append({"company": company, "what": what, "why": why,
+                        "verdict": why, "url": url})
+    return out
+
+
+_SKIP_RE = re.compile(r"^\s*SKIP\s*\|", re.IGNORECASE)
+
+
+def parse_screen_skips(text: str) -> list:
+    """The SKIP lines, as [{story, why}] — stories not about one company."""
+    out: list = []
+    for line in str(text or "").splitlines():
+        if not _SKIP_RE.match(line):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        out.append({"story": parts[1] if len(parts) > 1 else "",
+                    "why": " ".join(parts[2:]).strip() if len(parts) > 2 else ""})
     return out
 
 
@@ -515,24 +561,34 @@ def _topic_label(topic: str) -> str:
     return "Other" if (topic or TOPIC_OTHER) == TOPIC_OTHER else topic
 
 
-def render(stories: list, *, mode: str = MODE_MAIN) -> str:
-    """One line per story: `• [Topic] Headline — what happened <url>`.
+# What a quiet main sweep posts under its heading. A quiet hourly check posts
+# nothing at all.
+QUIET_MAIN = "Nothing new on the news today."
+BREAKING_HEADING = "**Breaking AI news**"
 
-    `mode="breaking"` opens with "Worth knowing now:" and carries every story
-    it is given, in ONE message. No attribution block, no fallback
-    announcement: the feed is the feed.
+
+def render(stories: list, *, mode: str = MODE_MAIN) -> str:
+    """One bullet per story: `• Headline — what happened. [site](<url>)`.
+
+    NO TOPIC TAG AND NO CLOSING LINE — news never needs an action, so nothing
+    after the bullets asks for one. The main post's heading ("AI news — Tue 29
+    Sep") is added by the drip sender; a breaking post carries its own heading
+    here, because it is sent outside the drip, and every story it is given, in
+    ONE message.
     """
+    import links
+
     picked = [s for s in (stories or []) if s.get("url")]
     if not picked:
         return ""
     lines: list = []
     if mode == MODE_BREAKING:
-        lines.append("Worth knowing now:")
+        lines.append(BREAKING_HEADING)
     for s in picked:
-        head = _no_pings(s.get("headline") or "")
-        what = _no_pings(s.get("what") or "")
-        body = f"{head} — {what}" if what else head
-        lines.append(f"• [{_topic_label(s.get('topic'))}] {body} <{s['url']}>")
+        head = _no_pings(s.get("headline") or "").strip()
+        what = _no_pings(s.get("what") or "").strip().rstrip(".")
+        body = f"{head} — {what}." if what else head
+        lines.append(f"• {body} {links.link('', s['url'])}")
     return "\n".join(lines)
 
 
@@ -541,12 +597,19 @@ def render_screen(rows: list, *, limit: int = 5) -> str:
     picked = [r for r in rows if r.get("company")][:max(1, int(limit))]
     if not picked:
         return ""
+    import links
+
     lines = ["In the news today and not in the Master Pipeline:"]
     for r in picked:
-        link = f" <{r['url']}>" if r.get("url") else ""
-        lines.append(f"• {_no_pings(r['company'])} — {_no_pings(r['verdict'])}{link}")
-    lines.append("Say the word and I'll add any of these — I won't add anything "
-                 "without a yes.")
+        # ONE COMPANY PER BULLET, TWO SHORT LINES: what they do, then why it
+        # fits (or doesn't). The link rides on the first line, masked.
+        link = f" {links.link('', r['url'])}" if r.get("url") else ""
+        what = _no_pings(r.get("what") or "")
+        why = _no_pings(r.get("why") or r.get("verdict") or "")
+        lines.append(f"• {_no_pings(r['company'])}" + (f" — {what}" if what else "") + link)
+        if why:
+            lines.append(f"  {why}")
+    lines.append("Tell me which ones to add. I will not add anything without a yes.")
     return "\n".join(lines)
 
 
@@ -770,13 +833,17 @@ def _self_test() -> int:
 
     print("\nrendering")
     body = render([S("evals", "Lab ships", 4), S(TOPIC_OTHER, "Thing <@123> @everyone")])
-    check("topic tag and link on every line", body.count("• ["), 2)
-    check("the tag is the topic", body.startswith("• [evals] Lab ships — w <https://"), True)
-    check("OTHER reads as Other", "[Other]" in body, True)
+    first = body.splitlines()[0]
+    check("one bullet per story", body.count("• "), 2)
+    check("no topic tag", "[evals]" in body or "[Other]" in body, False)
+    check("headline — what. [site](<url>)",
+          first.startswith("• Lab ships — w. [") and first.endswith(">)"), True)
+    check("no bare url", "<http" in body.replace("(<http", ""), False)
     check("no pings survive", "<@123>" in body or "@everyone" in body, False)
+    check("no closing line", body.splitlines()[-1].startswith("• "), True)
     b = render([S("evals", "A", 5), S("RLHF", "B", 4)], mode=MODE_BREAKING)
-    check("breaking opens with the line", b.splitlines()[0], "Worth knowing now:")
-    check("...and carries every story", b.count("• ["), 2)
+    check("breaking opens with its heading", b.splitlines()[0], "**Breaking AI news**")
+    check("...and carries every story as a bullet", b.count("• "), 2)
     check("no stories, no text", render([]), "")
 
     print("\nthe check clock")
@@ -800,15 +867,31 @@ def _self_test() -> int:
     check("it is capped", len(extract_section(doc, "What we sell", cap=10)), 10)
 
     print("\nthe screen")
-    rows = parse_screen(
-        "SCREEN | Nebius | fits use case C, inference infra | https://n.com/1\n"
-        "SCREEN | Priority Tech | no fit, payments | https://p.com/2\n"
+    text = (
+        "SCREEN | Shunya Labs | builds Indic speech models | fits voice & multilingual "
+        "speech: they need Hinglish preference data | https://n.com/1\n"
+        "SCREEN | Priority Tech | payments software | no fit, nothing AI-training | "
+        "https://p.com/2\n"
+        "SKIP | EU AI Act enters phase two | regulation, not a specific company\n"
     )
+    rows = parse_screen(text)
     check("both screens read", len(rows), 2)
-    check("the screen prompt carries the use cases",
-          "MEMBRANE'S USE CASES" in screen_prompt([S("evals", "x")], ["Acme"],
-                                                   use_cases="| A | x |"), True)
-    check("it asks before adding", "without a yes" in render_screen(rows), True)
+    check("what they do is read", rows[0]["what"], "builds Indic speech models")
+    check("the url is read", rows[0]["url"], "https://n.com/1")
+    check("the skip is read", parse_screen_skips(text)[0]["why"],
+          "regulation, not a specific company")
+    prompt = screen_prompt([S("evals", "x")], ["Acme"], use_cases="Offerings: Pulse")
+    check("the screen prompt carries the strategy text",
+          "WHAT MEMBRANE SELLS" in prompt, True)
+    check("it names the offerings in words", "agent trajectories" in prompt, True)
+    check("it forbids letters", "Never refer to a use case by a letter" in prompt, True)
+    check("it asks for skips", "SKIP |" in prompt, True)
+    body = render_screen(rows)
+    check("one bullet, two lines",
+          body.splitlines()[1:3],
+          ["• Shunya Labs — builds Indic speech models [n.com](<https://n.com/1>)",
+           "  fits voice & multilingual speech: they need Hinglish preference data"])
+    check("it asks before adding", "without a yes" in body, True)
 
     print("\nfound-nothing")
     check("an honest empty", found_nothing("NOTHING FOUND"), True)
