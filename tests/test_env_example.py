@@ -56,7 +56,7 @@ NOT_SETTINGS = {"PYTHONPATH", "PYTEST_CURRENT_TEST", "TZ"}
 # RETIRED, BUT STILL READ ON ONE PATH. Web search moved out of the model
 # (search_backend.py), and these ten shape Anthropic's server-side tool, which
 # is now reached only under SEARCH_BACKEND=anthropic — kept for comparison.
-# Under the default backend they do nothing, so they belong in the RETIRED
+# Under every other backend they do nothing, so they belong in the RETIRED
 # block; the code still reads them, so they are the one exception to "a
 # retired name is read nowhere". The set is closed: adding to it needs the
 # same justification, written in the RETIRED block itself.

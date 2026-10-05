@@ -868,3 +868,103 @@ async def search_channel_history(
         total, len(channels_searched), len(matches),
     )
     return out
+
+
+# -- the team's own messages, for the voice profile (read-only) ----------------
+
+# How many messages one channel is walked through, at most, looking for the
+# team's. A ceiling on API cost, well above what 60 days of a sales channel holds.
+VOICE_SCAN_CAP_PER_CHANNEL = 5000
+
+
+async def team_messages_for_voice(
+    client: discord.Client,
+    *,
+    author_ids,
+    days: int,
+    max_messages: int,
+    usable=None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """The team's own recent messages in the REAL sales channels, newest first.
+
+    THE CHANNELS ARE NOT A PARAMETER. They come from
+    `guardrails.voice_channel_ids()` — SALES_DIGEST_CHANNEL_ID and
+    WEEKLY_DIGEST_CHANNEL_ID, never the test channel, never the leave channel,
+    never a DM — so no caller can point the voice profile at anything else.
+
+    ONLY `author_ids`. A message from anybody not on that list is not returned,
+    and neither is a bot's, an empty one, or one addressed to a bot (somebody
+    typing a command at Saley is not how the team writes to each other).
+    `usable`, when given, is the caller's own test of the text (too short,
+    link-only, mention-only); it is applied BEFORE the cap, so the cap counts
+    messages worth learning from.
+
+    `now` is the REAL clock by default, not the pretend one: what the team
+    wrote in the last 60 days does not move because a tester said "make it
+    Monday".
+
+    Returns {"channels": [ids read], "scanned": n, "messages": [{"author_id",
+    "text", "timestamp"}]} with at most `max_messages`, the newest kept. The
+    TEXT IS RAW — the caller filters and scrubs it before anything is stored.
+    Never raises; an unreadable channel is logged and skipped.
+    """
+    wanted = {int(u) for u in (author_ids or ())}
+    channel_ids = guardrails.voice_channel_ids()
+    out = {"channels": [], "scanned": 0, "messages": []}
+    if not wanted or not channel_ids:
+        log.info("[query.voice] nothing to read: %d author id(s), %d channel(s)",
+                 len(wanted), len(channel_ids))
+        return out
+
+    if now is None:
+        import deadlines as dl
+        now = dl.real_now_ist()
+    cutoff = now.astimezone(timezone.utc) - timedelta(days=max(1, int(days)))
+    collected: list = []
+    for cid in channel_ids:
+        channel = client.get_channel(cid)
+        if channel is None:
+            # No gateway cache (a REST-only login, or a cold start): ask for it.
+            try:
+                channel = await client.fetch_channel(cid)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
+                log.warning("[query.voice] channel %s is not reachable (%s); skip",
+                            cid, type(e).__name__)
+                continue
+        if getattr(channel, "guild", None) is None:
+            log.warning("[query.voice] channel %s is not a guild channel; skip", cid)
+            continue
+        scanned = kept = 0
+        try:
+            async for msg in channel.history(
+                after=cutoff, limit=VOICE_SCAN_CAP_PER_CHANNEL, oldest_first=False
+            ):
+                scanned += 1
+                author = msg.author
+                if author is None or getattr(author, "bot", False):
+                    continue
+                if getattr(author, "id", None) not in wanted:
+                    continue
+                text = (msg.content or "").strip()
+                if not text:
+                    continue
+                if any(getattr(u, "bot", False) for u in (msg.mentions or [])):
+                    continue
+                if usable is not None and not usable(text):
+                    continue
+                kept += 1
+                collected.append({"author_id": int(author.id), "text": text,
+                                  "timestamp": msg.created_at})
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning("[query.voice] cannot read channel %s (%s); skip",
+                        cid, type(e).__name__)
+            continue
+        out["channels"].append(cid)
+        out["scanned"] += scanned
+        log.info("[query.voice] #%s: scanned %d, %d from the team",
+                 getattr(channel, "name", cid), scanned, kept)
+
+    collected.sort(key=lambda r: r["timestamp"], reverse=True)
+    out["messages"] = collected[:max(1, int(max_messages))]
+    return out

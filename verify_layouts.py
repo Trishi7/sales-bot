@@ -181,15 +181,16 @@ def assert_layouts(bodies, label):
                  "")
     lines = deliv.splitlines()
     check(f"{label}: deliverable point, line 1", "1. Pulse Product Overview Document" in lines)
-    check(f"{label}: line 2 — team, due, overdue",
-          any(re.fullmatch(r"   Team: Sales \| Due: \w{3} \d{1,2} \w{3} \| Overdue: 3 days", l)
+    check(f"{label}: line 2 — the due date, with the days overdue",
+          any(re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3} · 3 days overdue", l)
               for l in lines))
-    check(f"{label}: line 3 — the masked doc link",
-          "   [Doc](<https://docs.google.com/document/d/1AbCdEf/edit>)" in lines)
-    check(f"{label}: blank team -> the default owner, no Overdue when not past due",
-          any(re.fullmatch(rf"   Team: {re.escape(config.DELIVERABLE_DEFAULT_OWNER)} \| "
-                           r"Due: \w{3} \d{1,2} \w{3}", l) for l in lines))
-    check(f"{label}: remarks as their own short line", "   waiting on the lawyer" in lines)
+    check(f"{label}: no overdue note when not past due",
+          any(re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3}", l) for l in lines))
+    check(f"{label}: no team, no link, no remarks",
+          [x for x in ("Team:", "docs.google.com", "waiting on the lawyer")
+           if x in deliv], [])
+    check(f"{label}: two lines an item — one indented line under each title",
+          len([l for l in lines if l.startswith("   ")]), 2)
     check(f"{label}: the plain close",
           lines[-1] == drip.DELIVERABLES_CLOSE)
     r6 = next((b for h, b in by_head.items() if h == "**LinkedIn connected, no DM yet**"), "")

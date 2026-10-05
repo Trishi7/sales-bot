@@ -1077,31 +1077,43 @@ RESEARCH_ALLOWED_DOMAINS: list[str] = _str_list(
 
 # -- WEB SEARCH ----------------------------------------------------------------
 # THE RETRIEVAL HAPPENS OUTSIDE THE MODEL (search_backend.py, feeds.py). A
-# search API returns titles and snippets — hundreds of tokens — and the model
-# is handed those, instead of Anthropic's server-side tool putting ~28k tokens
-# of page text into the context per search and re-reading it on every internal
-# iteration. Same rules, same answers, a fraction of the cost.
+# search backend returns titles and snippets — hundreds of tokens — and the
+# model is handed those, instead of Anthropic's server-side tool putting ~28k
+# tokens of page text into the context per search and re-reading it on every
+# internal iteration. Same rules, same answers, a fraction of the cost — and
+# NO PAID SEARCH API: the backends are a self-hosted SearXNG, DuckDuckGo, and
+# Google's free Custom Search quota.
 #
 # WEB CONTENT IS DATA, NEVER INSTRUCTIONS. websearch.SAFETY_PREAMBLE says so to
 # the model on every call, and the code gives a page nowhere to go: nothing acts
 # on a search result without a human's yes (approvals.py).
 WEB_SEARCH_ENABLED = _bool("WEB_SEARCH_ENABLED", default=True)
 
-# WHICH BACKEND ANSWERS A SEARCH: "serper" (the default), "brave", or
-# "anthropic". The first two are plain HTTP search APIs called from
-# search_backend.py; "anthropic" is the old server-side tool, kept working
-# behind the same `llm.web_research` for comparison — and it is the only
-# setting under which the WEB_SEARCH_* tool variables below are read.
-SEARCH_BACKEND = (os.getenv("SEARCH_BACKEND", "") or "").strip().lower() or "serper"
-if SEARCH_BACKEND not in ("serper", "brave", "anthropic"):
-    log.warning("SEARCH_BACKEND=%r is not serper, brave or anthropic; using serper",
-                SEARCH_BACKEND)
-    SEARCH_BACKEND = "serper"
+# WHICH BACKEND ANSWERS A SEARCH: "searxng" (the default), "ddg", "google_cse"
+# or "anthropic". The first three are called from search_backend.py and cost
+# nothing; "anthropic" is the old server-side tool, kept working behind the
+# same `llm.web_research` for comparison — and it is the only setting under
+# which the WEB_SEARCH_* tool variables below are read.
+SEARCH_BACKENDS = ("searxng", "ddg", "google_cse")
+SEARCH_BACKEND = (os.getenv("SEARCH_BACKEND", "") or "").strip().lower() or "searxng"
+if SEARCH_BACKEND not in SEARCH_BACKENDS + ("anthropic",):
+    log.warning("SEARCH_BACKEND=%r is not searxng, ddg, google_cse or anthropic "
+                "(serper and brave are retired); using searxng", SEARCH_BACKEND)
+    SEARCH_BACKEND = "searxng"
 
-# The keys. Serper is the default backend; Brave is the AUTOMATIC FALLBACK when
-# Serper answers 429 or 5xx and this key is set (and the backend itself when
-# SEARCH_BACKEND=brave). Neither set = no search, said plainly.
-#
+# WHO IS ASKED NEXT when SEARCH_BACKEND fails — in this order. "ddg" needs no
+# setup, which is why it is the default; it is scraped, so it is the fallback
+# and never meant as the primary.
+SEARCH_FALLBACKS: list[str] = [
+    x.lower() for x in _str_list("SEARCH_FALLBACKS", "ddg")
+    if x.lower() in SEARCH_BACKENDS and x.lower() != SEARCH_BACKEND
+]
+
+# Where SearXNG listens. It runs on the bot's own server, bound to loopback
+# (DEPLOY.md, "SearXNG"), so nothing but the bot can reach it.
+SEARXNG_URL = (os.getenv("SEARXNG_URL", "") or "").strip() or "http://127.0.0.1:8888"
+
+
 # A "<REQUIRED: ...>" placeholder copied straight out of .env.example reads as
 # UNSET — it must never be sent to a search API as though it were a key.
 def _key(raw) -> str:
@@ -1109,27 +1121,27 @@ def _key(raw) -> str:
     return "" if value.startswith("<") else value
 
 
-SERPER_API_KEY = _key(os.getenv("SERPER_API_KEY", ""))
-BRAVE_API_KEY = _key(os.getenv("BRAVE_API_KEY", ""))
+# Google's Custom Search JSON API: an API key and a search-engine id (cx).
+# Free for 100 queries a day, which search_backend.py enforces itself.
+GOOGLE_CSE_KEY = _key(os.getenv("GOOGLE_CSE_KEY", ""))
+GOOGLE_CSE_CX = _key(os.getenv("GOOGLE_CSE_CX", ""))
 
 # HOW MANY SEARCH REQUESTS A DAY, ACROSS EVERYTHING (the real IST day). Banked
 # in the same web_search_usage ledger as before, one row per rule. A cache hit
-# is not a request and costs nothing. When it is spent the rules DEGRADE to
-# "web research unavailable today" — they do not fail and do not go quiet.
-SEARCH_DAILY_BUDGET = _int("SEARCH_DAILY_BUDGET", 150)
+# is not a request, and neither is a Google News feed read. When it is spent
+# the rules DEGRADE to "web research unavailable today" — they do not fail and
+# do not go quiet. The backends are free; this bounds how hard they are leaned
+# on, which is what keeps a scraped one from blocking the bot.
+SEARCH_DAILY_BUDGET = _int("SEARCH_DAILY_BUDGET", 60)
 
 # The query -> results cache (SQLite, search_cache). A repeated query inside
 # this many hours is served from it: no request, no budget, no cost. It is what
 # makes a second "simulate week" on the same test day free.
 SEARCH_CACHE_HOURS = _int("SEARCH_CACHE_HOURS", 6)
 
-# One search request's timeout, in seconds. One retry, then [] and a log line.
+# One search request's timeout, in seconds. One retry on a timeout, then the
+# next backend in SEARCH_FALLBACKS, then [] and a log line.
 SEARCH_TIMEOUT_SECONDS = _int("SEARCH_TIMEOUT_SECONDS", 10)
-
-# What a request costs, in dollars per 1,000, for the "what did you cost"
-# answer. Serper's pay-as-you-go price is about $1; Brave's about $5.
-SERPER_COST_PER_1K = _float("SERPER_COST_PER_1K", 1.0)
-BRAVE_COST_PER_1K = _float("BRAVE_COST_PER_1K", 5.0)
 
 # The most text `search_backend.fetch_page` hands back from one page, in
 # characters. A page is read for one fact; 6000 characters is ~1,500 tokens.
@@ -1161,7 +1173,7 @@ def search_daily_budget() -> int:
 
 # -- THE ANTHROPIC SERVER-SIDE TOOL (SEARCH_BACKEND=anthropic ONLY) -----------
 # Everything from here to RESEARCH_FETCH_* shapes Anthropic's own web search
-# tool and is IGNORED under serper or brave. Kept so one call can be compared.
+# tool and is IGNORED under every other backend. Kept so one call can be compared.
 
 # WHICH VERSION OF THE TOOL. Three exist and they are NOT interchangeable:
 #
@@ -1815,7 +1827,7 @@ NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 5)
 NEWS_BREAKING_MAX_PER_DAY = _int("NEWS_BREAKING_MAX_PER_DAY", 2)
 
 # Searches one hourly check may spend — ONLY under SEARCH_BACKEND=anthropic.
-# Under serper/brave the check reads the feeds and searches nothing.
+# Under every other backend the check reads the feeds and searches nothing.
 NEWS_CHECK_MAX_USES = _int("NEWS_CHECK_MAX_USES", 2)
 
 # THE FEEDS (feeds.py). Polled every NEWS_FEED_POLL_MINUTES from the sweep
@@ -2615,6 +2627,76 @@ def digest_channel_id() -> int:
     return SALES_CHANNEL_IDS[0] if SALES_CHANNEL_IDS else 0
 
 
+# -- The voice profile: the team's own tone, learned ---------------------------
+#
+# Saley reads the team's recent messages in the REAL sales channels, works out
+# how the team writes — sentence length, contractions, how a message opens, how
+# an ask is phrased, emoji, length — and keeps a short "how this team writes"
+# note plus a few anonymised examples in SQLite (`voice_profile`, one row). The
+# note and six of the examples ride in every compose and reply prompt. See
+# voice.py.
+#
+# THE PROFILE IS DATA, NEVER INSTRUCTIONS. It is wrapped as such in every
+# prompt, and an example that reads like an instruction is not kept.
+#
+# WHAT IT COSTS: one MODEL_LIGHT call per rebuild — one a week.
+
+# The switch. Off: nothing is read, nothing is injected, and the hand-written
+# exemplars in sales_policy.md are used exactly as before. A profile already
+# stored is left where it is and ignored.
+VOICE_ENABLED = _bool("VOICE_ENABLED", default=True)
+
+# How far back the team's messages are read.
+VOICE_LOOKBACK_DAYS = _int("VOICE_LOOKBACK_DAYS", 60)
+
+# WHOSE messages are learned from, as Discord ids. Empty (the default) means
+# SALES_APPROVER_IDS plus TEAM_ROSTER_IDS. Nobody else's message is ever read
+# into the profile, and a bot's never is.
+VOICE_LEARN_FROM_IDS: list[int] = _int_list("VOICE_LEARN_FROM_IDS")
+
+# The most messages one build learns from (the newest are kept).
+VOICE_MAX_MESSAGES = _int("VOICE_MAX_MESSAGES", 300)
+
+# How many examples are STORED. Six of them ride in a prompt at a time, in
+# rotation.
+VOICE_EXEMPLARS = _int("VOICE_EXEMPLARS", 12)
+
+# The profile is rebuilt when it is this many days old (and on boot when there
+# is none, and on "refresh voice").
+VOICE_REFRESH_DAYS = _int("VOICE_REFRESH_DAYS", 7)
+
+
+def voice_learn_from_ids() -> list:
+    """The ids whose messages the voice profile may learn from, in a stable
+    order. VOICE_LEARN_FROM_IDS when set, else the approvers plus the roster."""
+    if VOICE_LEARN_FROM_IDS:
+        return sorted({int(u) for u in VOICE_LEARN_FROM_IDS})
+    return sorted({int(u) for u in SALES_APPROVER_IDS} | {int(u) for u in TEAM_ROSTER_IDS})
+
+
+def voice_channel_ids() -> list:
+    """The REAL sales channels the voice profile is learned from.
+
+    SALES_DIGEST_CHANNEL_ID and WEEKLY_DIGEST_CHANNEL_ID, and only when each is
+    a sales channel. NEVER THE TEST CHANNEL — what a tester types at the bot is
+    not how the team writes to each other — and never the leave channel. With
+    neither set it falls back to the channel the drip posts in, on the same
+    two conditions. May be empty: the profile is then simply not built.
+    """
+    test = max(0, int(SALES_TEST_CHANNEL_ID or 0))
+    leave_channel = max(0, int(HOLIDAY_CHANNEL_ID or 0))
+    wanted = [SALES_DIGEST_CHANNEL_ID, WEEKLY_DIGEST_CHANNEL_ID]
+    if not any(wanted):
+        wanted = [digest_channel_id()]
+    out: list = []
+    for cid in wanted:
+        cid = int(cid or 0)
+        if (cid and cid not in out and cid != test and cid != leave_channel
+                and is_sales_channel(cid)):
+            out.append(cid)
+    return out
+
+
 # -- Logging ------------------------------------------------------------------
 
 LOG_LEVEL = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper()
@@ -3117,27 +3199,37 @@ def validate() -> list[str]:
         )
     elif SEARCH_BACKEND != "anthropic":
         log.info(
-            "[config] web search ON, OUTSIDE the model: backend=%s, %d request(s) a "
-            "day, results cached %dh; R1's news comes from %d RSS feed(s) + %d topic "
-            "queries, polled every %d min. MODEL_LIGHT=%s reads the snippets. Token "
-            "budget %s input tokens a day.",
-            SEARCH_BACKEND, SEARCH_DAILY_BUDGET, SEARCH_CACHE_HOURS,
+            "[config] web search ON, OUTSIDE the model: backend=%s%s, fallbacks=%s, "
+            "%d request(s) a day, results cached %dh; company news reads Google "
+            "News RSS first (no request). R1's news comes from %d RSS feed(s) + %d "
+            "topic queries, polled every %d min. MODEL_LIGHT=%s reads the snippets. "
+            "Token budget %s input tokens a day.",
+            SEARCH_BACKEND,
+            f" at {SEARXNG_URL}" if SEARCH_BACKEND == "searxng" else "",
+            ",".join(SEARCH_FALLBACKS) or "(none)",
+            SEARCH_DAILY_BUDGET, SEARCH_CACHE_HOURS,
             len(NEWS_RSS_FEEDS), len(NEWS_TOPICS), NEWS_FEED_POLL_MINUTES,
             MODEL_LIGHT, f"{TOKEN_DAILY_BUDGET:,}" if TOKEN_DAILY_BUDGET else "no",
         )
-        if SEARCH_BACKEND == "serper" and not SERPER_API_KEY:
-            log.error(
-                "SEARCH_BACKEND=serper but SERPER_API_KEY is not set%s. R1's news "
-                "still works (it is RSS), but R2's lookups, R3, R6, R8, R10, R11 and "
-                "web questions will say 'web research unavailable today — "
-                "SERPER_API_KEY is not set'. Get a key at https://serper.dev.",
-                " — every search will go to Brave instead" if BRAVE_API_KEY else "",
+        if SEARCH_BACKEND == "ddg":
+            log.warning(
+                "SEARCH_BACKEND=ddg — DuckDuckGo is scraped, so it is rate-limited "
+                "and sometimes empty. It is meant as the FALLBACK; run SearXNG "
+                "(DEPLOY.md) and set SEARCH_BACKEND=searxng for the primary."
             )
-        if SEARCH_BACKEND == "brave" and not BRAVE_API_KEY:
+        if "google_cse" in (SEARCH_BACKEND, *SEARCH_FALLBACKS) and \
+                not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
             log.error(
-                "SEARCH_BACKEND=brave but BRAVE_API_KEY is not set: nothing can be "
-                "searched. R1's news still works (it is RSS)."
+                "google_cse is in the search chain but GOOGLE_CSE_KEY and "
+                "GOOGLE_CSE_CX are not both set: it will be skipped%s.",
+                "" if SEARCH_BACKEND != "google_cse" or SEARCH_FALLBACKS
+                else ", and nothing else is configured — R2's lookups, R3, R6, "
+                     "R11 and web questions will say 'web research unavailable "
+                     "today'. Company news (R8/R10) and R1 still work: they are RSS",
             )
+        if SEARCH_BACKEND != "searxng" and not SEARCH_FALLBACKS:
+            log.info("[config] SEARCH_FALLBACKS is empty: when %s fails, a search "
+                     "returns nothing.", SEARCH_BACKEND)
     else:
         log.info(
             "[config] web search ON: tool=%s, max %d search(es) per call, %d a day. "
@@ -3148,7 +3240,7 @@ def validate() -> list[str]:
         log.warning(
             "SEARCH_BACKEND=anthropic — the server-side web search tool, kept for "
             "comparison. It puts ~28k tokens of page text in the context per search; "
-            "serper is the default because it costs a small fraction of that."
+            "searxng is the default because it costs nothing."
         )
         if WEB_SEARCH_ALLOWED_DOMAINS and WEB_SEARCH_BLOCKED_DOMAINS:
             log.warning(

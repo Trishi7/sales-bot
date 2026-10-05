@@ -94,6 +94,7 @@ import sources
 import state
 import usage
 import tone
+import voice
 import toolsets
 import strategy
 import todos
@@ -177,6 +178,21 @@ _WEB_HINT_RE = re.compile(
     r"google|search|look\s+(it\s+)?up|what'?s\s+new|in\s+the\s+news)\b",
     re.IGNORECASE,
 )
+
+# THE VOICE PROFILE'S THREE COMMANDS — matched as plain text, answered without
+# the model router. "refresh voice" re-reads the sales channel now (an approver
+# only: it costs one light-model call); "how do you sound" prints the style
+# note and three of the examples; "forget my messages" drops the asker's
+# examples and rebuilds without them.
+_VOICE_REFRESH_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:refresh|rebuild|relearn|update)\s+(?:your\s+|the\s+)?"
+    r"voice(?:\s+profile)?\s*[.!]?\s*$", re.IGNORECASE)
+_VOICE_SHOW_RE = re.compile(
+    r"^\s*(?:how\s+do\s+you\s+sound|what(?:'?s|\s+is)\s+your\s+voice"
+    r"(?:\s+profile)?|show\s+(?:me\s+)?(?:your|the)\s+voice(?:\s+profile)?)"
+    r"\s*[?.!]?\s*$", re.IGNORECASE)
+_VOICE_FORGET_RE = re.compile(
+    r"^\s*(?:please\s+)?forget\s+my\s+messages\s*[.!]?\s*$", re.IGNORECASE)
 
 _CAPABILITY_RE = re.compile(
     r"(what\s+(can|do)\s+you\s+(do|see|have|know)|what\s+are\s+you\s+for|"
@@ -280,6 +296,15 @@ class SalesBot(discord.Client):
         # THE SEARCH CACHE, THE REQUEST LEDGER AND THE FEED STORE live there too.
         search_backend.bind(self._ledger)
         feeds.bind(self._ledger)
+        # THE VOICE PROFILE is read from whatever `self.db` is NOW — so a
+        # simulation, which swaps in a copy of this database, reads the row
+        # the copy inherited. One row, every path.
+        voice.bind(lambda: self.db)
+        # The rebuild in flight, if any, and when (real monotonic) one was
+        # last attempted — a failed build is retried hours later, not on
+        # every sweep tick.
+        self._voice_task: Optional[asyncio.Task] = None
+        self._voice_tried_at: float = 0.0
         # When (real monotonic) the feeds were last polled.
         self._feeds_polled_at: float = 0.0
 
@@ -441,6 +466,13 @@ class SalesBot(discord.Client):
             "[bot] policy %s (%s, %d chars) — re-read on every question",
             "loaded" if pol["loaded"] else "MISSING", pol["path"], pol["chars"],
         )
+
+        # THE VOICE PROFILE: whether one exists and how old it is, on every
+        # boot — and a build in the background when there is none (or it is
+        # past VOICE_REFRESH_DAYS). It reads the real sales channel and posts
+        # nothing; boot does not wait for it.
+        log.info("[boot] %s", await asyncio.to_thread(voice.status_line, self.db))
+        self._maybe_refresh_voice(reason="boot")
 
         # THE SHEET-WORLD REPORT, at boot. It reads the CANONICAL "Outreach
         # PoCs" tab and LOGS the four things that fail silently: which tab was
@@ -1173,6 +1205,12 @@ class SalesBot(discord.Client):
             await self._send_cost_report(message)
             return True
 
+        # THE VOICE PROFILE'S COMMANDS — fixed phrases, deterministic answers.
+        if await self._handle_voice_command(message, text):
+            log.info("[query] msg=%s → a voice-profile command (matched directly)",
+                     message.id)
+            return True
+
         if _TIME_RE.match(text):
             log.info("[query] msg=%s → the clock (matched directly)", message.id)
             self._mark_route(message, "capability")
@@ -1348,10 +1386,16 @@ class SalesBot(discord.Client):
                                  "reached. Answer from the snippets you already "
                                  "have, and say what you could not check."}
             out["asked"] += 1
-            detail = await asyncio.to_thread(
-                lambda: search_backend.search_detail(
-                    query, n=8, news=bool((inp or {}).get("news")),
-                    days=(inp or {}).get("days") or None, rule="question"))
+            days = (inp or {}).get("days") or None
+            if (inp or {}).get("news"):
+                # Recent news: Google News RSS first, a request only if empty.
+                detail = await asyncio.to_thread(
+                    lambda: search_backend.news_detail(
+                        query, days=days or 7, n=8, rule="question"))
+            else:
+                detail = await asyncio.to_thread(
+                    lambda: search_backend.search_detail(
+                        query, n=8, days=days, rule="question"))
             out["searches"] += 1
             if detail["error"] and not detail["results"]:
                 return {"error": f"The search did not run: {detail['error']}. Say "
@@ -1693,7 +1737,8 @@ class SalesBot(discord.Client):
         Model spend is priced from the token log (`usage.dollars`: Sonnet
         $3/$15 per million in/out, cache write $3.75, read $0.30; Haiku $1/$5,
         $1.25, $0.10). Search spend is the request ledger times the backend's
-        price (SERPER_COST_PER_1K; Anthropic's own tool is $10 per thousand).
+        price: searxng, ddg and google_cse are free; Anthropic's own tool is
+        $10 per thousand.
         """
         ledger = self._ledger()
         lines: list = []
@@ -5318,7 +5363,159 @@ class SalesBot(discord.Client):
             await self._maybe_breaking_news()
         except Exception:
             log.exception("[news-check] tick raised; continuing")
+        # THE WEEKLY VOICE REBUILD. A date comparison on every tick; a channel
+        # read and one light-model call when the profile is VOICE_REFRESH_DAYS
+        # old. Posts nothing.
+        try:
+            self._maybe_refresh_voice(reason="weekly refresh")
+        except Exception:
+            log.exception("[voice] tick raised; continuing")
         self._maybe_write_daily_summary()
+
+    # -- the voice profile ---------------------------------------------------
+
+    def _maybe_refresh_voice(self, *, reason: str) -> bool:
+        """Start a background rebuild if the profile is missing or stale. True
+        when one was started.
+
+        NEVER DURING A SIMULATION — `self.db` is a throwaway copy then, and a
+        profile written into it would be discarded with it. At most one build
+        at a time, and a build that failed is not retried for six hours: a
+        channel the bot cannot read does not become readable by asking every
+        fifteen minutes.
+        """
+        if not config.VOICE_ENABLED or simulation.in_simulation():
+            return False
+        if self._voice_task is not None and not self._voice_task.done():
+            return False
+        due, why = voice.needs_rebuild(self.db)
+        if not due:
+            return False
+        if self._voice_tried_at and _monotonic() - self._voice_tried_at < 6 * 3600:
+            return False
+        self._voice_tried_at = _monotonic()
+        log.info("[voice] rebuilding (%s): %s", reason, why)
+        self._voice_task = asyncio.create_task(self._refresh_voice(reason=reason))
+        return True
+
+    async def _voice_names(self) -> tuple:
+        """(companies, people) to keep OUT of the voice profile: every company
+        on the Outreach PoCs and Master Pipeline tabs, and every PoC's name.
+        Empty lists when the sheet cannot be read — `voice.build_profile` adds
+        the companies the database has seen, and the scrubber's last rule
+        (an unknown capitalised word is a name) covers the rest."""
+        companies: list = []
+        people: list = []
+        try:
+            companies = list(await self._known_companies())
+        except Exception:
+            log.exception("[voice] could not read the company names from the sheet")
+        try:
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POCS)
+            for r in (tab.rows if tab else []):
+                name = gtm_sheet.clean_cell(r.get("name"))
+                if name:
+                    people.append(name)
+        except Exception:
+            log.exception("[voice] could not read the PoC names from the sheet")
+        return companies, people
+
+    async def _refresh_voice(self, *, reason: str) -> dict:
+        """Build the voice profile now, into the DURABLE database. Never raises."""
+        try:
+            companies, people = await self._voice_names()
+            result = await voice.build_profile(
+                self, db=self._ledger(), llm=self.llm, companies=companies,
+                people=people, reason=reason)
+        except Exception as e:
+            log.exception("[voice] the rebuild failed")
+            result = {"ok": False, "reason": f"it failed ({type(e).__name__})",
+                      "messages": 0}
+        state.audit(
+            "voice_profile_built" if result.get("ok") else "voice_profile_not_built",
+            reason=reason, messages=result.get("messages", 0),
+            note_source=result.get("note_source") or None,
+            why=result.get("reason") or None,
+        )
+        return result
+
+    async def _handle_voice_command(self, message, text: str) -> bool:
+        """"refresh voice", "how do you sound", "forget my messages". True when
+        one was handled. Deterministic replies; the only model call is the one
+        light note call inside a rebuild."""
+        uid = getattr(message.author, "id", 0)
+        if _VOICE_SHOW_RE.match(text):
+            self._mark_route(message, "capability")
+            await self._reply(message, await asyncio.to_thread(voice.describe, self.db),
+                              reason="showed the voice profile")
+            return True
+
+        if _VOICE_REFRESH_RE.match(text):
+            self._mark_route(message, "capability")
+            if not config.is_approver(uid):
+                await self._reply(
+                    message, "Only Sid or Vaishnavi can ask me to re-learn the "
+                    "team's tone. I refresh it myself every "
+                    f"{max(1, int(config.VOICE_REFRESH_DAYS))} days anyway.",
+                    reason="refresh voice refused: not an approver")
+                return True
+            if not config.VOICE_ENABLED:
+                await self._reply(message, "Voice learning is switched off "
+                                  "(VOICE_ENABLED), so there's nothing to refresh.",
+                                  reason="refresh voice: disabled")
+                return True
+            if simulation.in_simulation() or (
+                    self._voice_task is not None and not self._voice_task.done()):
+                await self._reply(message, "I'm already in the middle of something "
+                                  "— ask me again in a minute.",
+                                  reason="refresh voice: busy")
+                return True
+            self._voice_tried_at = _monotonic()
+            self._voice_task = asyncio.create_task(self._refresh_voice(
+                reason=f"refresh voice, asked by {_display(message.author)}"))
+            result = await self._voice_task
+            if result.get("ok"):
+                body = ("Done — I re-read the sales channel and refreshed how I "
+                        f"sound, from {result.get('messages', 0)} of the team's "
+                        "messages. Say \"how do you sound\" to see it.")
+            else:
+                body = ("I couldn't refresh it: " + str(result.get("reason") or
+                        "something went wrong") + ". What I had before is unchanged.")
+            await self._reply(message, body, reason="refreshed the voice profile")
+            return True
+
+        if _VOICE_FORGET_RE.match(text):
+            self._mark_route(message, "capability")
+            if uid not in set(config.voice_learn_from_ids()):
+                await self._reply(
+                    message, "I don't learn from your messages — only from the "
+                    "sales team's — so there's nothing of yours to forget.",
+                    reason="forget my messages: not a learned-from member")
+                return True
+            gone = await asyncio.to_thread(lambda: voice.forget(uid, db=self._ledger()))
+            state.audit("voice_forget", reason="a team member asked to be forgotten",
+                        user_id=str(uid), exemplars_dropped=gone)
+            result = {"ok": False, "reason": "voice learning is off"}
+            if config.VOICE_ENABLED and not simulation.in_simulation():
+                result = await self._refresh_voice(
+                    reason=f"forget my messages, asked by {_display(message.author)}")
+            if result.get("ok"):
+                tail = " and rebuilt how I sound without them."
+            else:
+                # THE REBUILD DID NOT HAPPEN, so the numbers and the note still
+                # carry this person's share. Clear them rather than keep them:
+                # "forget" must not depend on a rebuild succeeding.
+                await asyncio.to_thread(self._ledger().clear_voice_profile)
+                voice.invalidate()
+                tail = (". I couldn't rebuild just now (" + str(result.get("reason") or
+                        "it failed") + "), so I've cleared what I'd learned and will "
+                        "learn again without yours.")
+            await self._reply(
+                message, f"Done — I've dropped your messages ({gone} stored "
+                f"example{'' if gone == 1 else 's'}) and won't learn from them again"
+                + tail, reason="forgot a team member's messages")
+            return True
+        return False
 
     # ======================================================================
     # WRITING TO THE SHEET
@@ -6962,6 +7159,12 @@ class SalesBot(discord.Client):
                         recent_openers=openers,
                         facts=drip.fact_count(message),
                         required_lines=drip.required_lines(message),
+                        # WHICH SIX EXAMPLES of the team's own writing ride in
+                        # this compose: rotated by the send day and the slot, so
+                        # consecutive messages see different ones and the same
+                        # (day, slot) sees the same ones on a real day, a test
+                        # day and a simulation.
+                        voice_seed=self._voice_seed(marker, message),
                     )
                     how = getattr(self.llm, "last_proactive", None) or {}
                     compose_retries = int(how.get("retries") or 0)
@@ -7156,6 +7359,20 @@ class SalesBot(discord.Client):
             f", {compose_retries} retry" if compose_retries else "",
             f": {fallback_reason}" if fallback_reason else "",
         )
+
+    @staticmethod
+    def _voice_seed(marker: str, message: dict) -> int:
+        """The rotation seed for the voice examples: the send day's ordinal
+        plus the slot. A function of the plan alone, never of the clock or of
+        which path is sending."""
+        try:
+            day = date.fromisoformat(str(marker)).toordinal()
+        except ValueError:
+            day = 0
+        try:
+            return day + int(message.get("slot") or 0)
+        except (TypeError, ValueError):
+            return day
 
     def _drip_mention(self, message: dict) -> str:
         """How a drip message addresses its owner.
@@ -8048,14 +8265,23 @@ class SalesBot(discord.Client):
                  len(keep))
         return outcome
 
-    async def _search_available(self) -> tuple:
+    async def _search_available(self, *, feed_first: bool = False) -> tuple:
         """(ok, why). The reasons research cannot happen, said plainly: search
-        switched off, no key for the backend, the day's request budget spent,
-        or the day's token budget spent."""
+        switched off, no backend configured, the day's request budget spent,
+        or the day's token budget spent.
+
+        `feed_first` is for research whose only query is company news (R8,
+        R10): that reads Google News RSS, which needs no backend and spends no
+        request, so neither of those two is a reason to skip it.
+        """
         import websearch
 
         if not websearch.enabled():
             return False, websearch.unavailable_note("WEB_SEARCH_ENABLED is off")
+        if feed_first and not websearch.server_side():
+            if await asyncio.to_thread(usage.over_budget):
+                return False, usage.budget_note()
+            return True, ""
         if not websearch.server_side():
             ok, why = search_backend.available()
             if not ok:
@@ -8634,7 +8860,9 @@ class SalesBot(discord.Client):
 
         R6   '"<name>" "<company>" email contact', eight results — a published
              address shows up in a staff page's or a paper's snippet.
-        R8 / R10   the company, in the NEWS index, last 7 days, eight results.
+        R8 / R10   the company's news, last 7 days, eight results. A `news`
+             query is read from Google News RSS first (`search_backend.news`)
+             and costs a search request only when that feed is empty.
         """
         rule = item.get("rule") or ""
         company = " ".join(str(item.get("company") or "").split())
@@ -8704,7 +8932,9 @@ class SalesBot(discord.Client):
         marker = dl.iso(today)
         server = websearch.server_side()
         for item in pending:
-            ok, why = await self._search_available()
+            asks = self._row_queries(item)
+            ok, why = await self._search_available(
+                feed_first=bool(asks) and all(q.get("news") for q in asks))
             if not ok:
                 item["research_note"] = why
                 continue
@@ -8722,7 +8952,7 @@ class SalesBot(discord.Client):
                 rule=rule_id,
                 prompt=query + "\n\n" + await self._research_context(item),
                 max_uses=(min(int(config.WEB_SEARCH_MAX_USES), left) if server else 1),
-                lean=True, queries=self._row_queries(item),
+                lean=True, queries=asks,
             )
             await self._bank(result, rule_id=rule_id)
             if result.get("ok"):

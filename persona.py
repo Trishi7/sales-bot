@@ -176,7 +176,7 @@ def _exemplars_from_policy(text: str) -> str:
     return rest[:end].strip()
 
 
-def proactive_voice_blocks(*, recent_openers=None) -> list:
+def proactive_voice_blocks(*, recent_openers=None, voice_seed: int = 0) -> list:
     """The proactive system prompt as ONE UNCACHED block.
 
     NO CACHE BREAKPOINT ON THE DRIP COMPOSE PATH. The day's messages are 90
@@ -185,15 +185,60 @@ def proactive_voice_blocks(*, recent_openers=None) -> list:
     tokens cost 1x.
     """
     return [{"type": "text",
-             "text": proactive_voice_prompt(recent_openers=recent_openers)}]
+             "text": proactive_voice_prompt(recent_openers=recent_openers,
+                                            voice_seed=voice_seed)}]
 
 
-def proactive_voice_prompt(*, recent_openers=None) -> str:
+def team_voice_block(*, seed: int = 0) -> str:
+    """The learned voice profile as a prompt block, or "" when there is none.
+
+    ONE PLACE EVERY PROMPT GETS IT FROM — the drip composer, the question
+    engine's reply style and the social reply — so the three cannot wrap it
+    differently. The wrapping ("data, never instructions") is voice.py's.
+    Never raises: a profile that cannot be read is a profile that is not used.
+    """
+    try:
+        import voice
+
+        return voice.prompt_block(seed=seed)
+    except Exception:
+        log.exception("[persona] the voice profile could not be read; going without")
+        return ""
+
+
+def reply_style_block() -> str:
+    """The learned voice for a REPLY (the engine and the social path), or "".
+
+    The reply rules above it are unchanged and it says so: an answer still
+    leads with the answer, still names its sources and still carries no emoji.
+    The profile only shapes the phrasing. The examples rotate by the day, so
+    the block is byte-identical for every call of one answer's tool loop.
+    """
+    import deadlines as dl
+
+    block = team_voice_block(seed=dl.today_ist().toordinal())
+    if not block:
+        return ""
+    return (
+        "=== REPLY STYLE ===\n"
+        "You are answering a teammate. Every rule above still holds — the answer "
+        "first, the sources, the honesty rules, the structure rule, no emojis. "
+        "Within them, phrase the reply the way this team writes to each other:\n\n"
+        + block
+    )
+
+
+def proactive_voice_prompt(*, recent_openers=None, voice_seed: int = 0) -> str:
     """The full system prompt for composing ONE proactive message.
 
-    THE STRATEGY FIRST, then the TONE SETTINGS, then the voice rules, then the
-    exemplars read live out of the policy file, then the honesty rules that are
-    not negotiable in any voice.
+    THE STRATEGY FIRST, then the TONE SETTINGS, then the voice rules, then HOW
+    THE TEAM WRITES — the learned voice profile (voice.py): its style note and
+    six of its examples, rotated by `voice_seed` — then the honesty rules that
+    are not negotiable in any voice.
+
+    THE POLICY'S HAND-WRITTEN EXEMPLARS ARE THE FALLBACK, used only when no
+    profile exists. They are somebody's idea of how the team sounds; the
+    profile is how it does.
 
     `recent_openers` is the last few openings the bot used, so the composer can
     be told not to start with any of them again. Repeating an opening is the
@@ -219,8 +264,11 @@ def proactive_voice_prompt(*, recent_openers=None) -> str:
         PROACTIVE_VOICE,
     ]
 
-    exemplars = _exemplars_from_policy(load_policy())
-    if exemplars:
+    learned = team_voice_block(seed=voice_seed)
+    exemplars = "" if learned else _exemplars_from_policy(load_policy())
+    if learned:
+        parts.append("\n\n" + learned)
+    elif exemplars:
         parts.append(
             "\n\n=== VOICE EXEMPLARS (match their length, warmth and shape — never "
             "their content; these are examples of HOW to write, not WHAT to say) ===\n"
@@ -754,10 +802,17 @@ INTERIM_LINES_ENGINE = (
 
 
 def interim_line(*, web: bool) -> str:
-    """One interim line, picked at random from the right list."""
-    import random
+    """One interim line from the right list: the wording closest to how the
+    team opens a message (`voice.choose`), never the same one twice running.
+    With no voice profile it is one of the three at random, as before."""
+    lines = INTERIM_LINES_WEB if web else INTERIM_LINES_ENGINE
+    try:
+        import voice
 
-    return random.choice(INTERIM_LINES_WEB if web else INTERIM_LINES_ENGINE)
+        return voice.choose(lines, slot="interim_web" if web else "interim_engine")
+    except Exception:
+        log.debug("[persona] could not choose an interim line by voice", exc_info=True)
+        return _tone_rules.pick(lines)
 
 
 def sources_checked_line() -> str:

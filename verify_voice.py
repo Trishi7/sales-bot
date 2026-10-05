@@ -447,6 +447,25 @@ async def main():
 
         composed = await run_days(bot)
 
+        # THE COMPOSED MESSAGES NEXT TO THE TEAM'S OWN. The test day reads the
+        # same voice_profile row a real day does (this database is a copy of
+        # the test database, so it inherits it).
+        import voice
+
+        print("\n(i-b) " + voice.status_line(bot.db))
+        prof = voice.profile(bot.db)
+        if prof is not None:
+            print(f"   the {len(composed)} model-composed message(s) of the test day(s):")
+            for body in composed:
+                for sub in body.splitlines():
+                    print("   S| " + sub)
+                print("   S|")
+            print("   three of the team's own messages (names stripped), from the profile:")
+            for text in voice.exemplars_for(0, count=3, prof=prof):
+                print("   T| " + text.replace("\n", " / "))
+            check("every composed message was written with the profile in its prompt",
+                  voice.WRAPPER in __import__("persona").proactive_voice_prompt())
+
         print(f"\n(ii) the {len(composed)} model-composed message(s) and the banned phrases")
         hits = [(p, b[:60]) for b in composed for p in BANNED if p in b.lower()]
         check("no composed message contains a banned phrase", hits, [])

@@ -455,8 +455,14 @@ class LLM:
         try:
             # The preamble probes the sources live (Sheets among them): built
             # on a thread so it cannot freeze the event loop.
-            blocks = await asyncio.to_thread(
-                lambda: persona.system_blocks(tail=SOCIAL_REPLY_PROMPT))
+            # THE TEAM'S OWN TONE rides behind the social rules (data, never
+            # instructions — `persona.reply_style_block`); "" with no profile.
+            def _blocks():
+                style = persona.reply_style_block()
+                return persona.system_blocks(
+                    tail=SOCIAL_REPLY_PROMPT + (("\n\n" + style) if style else ""))
+
+            blocks = await asyncio.to_thread(_blocks)
             resp = await self._create(
                 system=blocks,
                 prompt=prompt,
@@ -484,7 +490,8 @@ class LLM:
 
     async def proactive_message(self, *, prompt: str, fallback: str,
                                 recent_openers=None, facts: int = 0,
-                                required_lines=()) -> tuple[str, bool]:
+                                required_lines=(),
+                                voice_seed: int = 0) -> tuple[str, bool]:
         """Compose ONE proactive message in the warm-sales-head voice.
 
         Returns (text, used_model). `fallback` is a complete, sendable sentence
@@ -493,9 +500,10 @@ class LLM:
         message: a nudge that did not go out because an API was slow is a nudge
         nobody knows was missed.
 
-        The system prompt is `persona.proactive_voice_prompt()`, which reads the
-        voice exemplars live out of sales_policy.md — so rewriting the bot's
-        proactive voice is a markdown edit, not a deploy.
+        The system prompt is `persona.proactive_voice_prompt()`, which carries
+        the learned voice profile (voice.py) — the style note and six of the
+        team's own examples, rotated by `voice_seed` — and, only when there is
+        no profile, the hand-written exemplars out of sales_policy.md.
 
         The reply is checked before it is trusted (`proactive_verdict`), and
         the check has TWO OUTCOMES:
@@ -527,7 +535,8 @@ class LLM:
                 # TONE IS READ HERE, AT COMPOSE TIME, not at import. A change to
                 # SALEY_WARMTH is in force on the very next message with no
                 # restart — which is the point of the setting existing.
-                system=persona.proactive_voice_blocks(recent_openers=recent_openers),
+                system=persona.proactive_voice_blocks(
+                    recent_openers=recent_openers, voice_seed=voice_seed),
                 prompt=ask,
                 max_tokens=320,
                 site=site,
@@ -592,6 +601,26 @@ class LLM:
         )
         self.last_proactive["reason"] = second["reason"]
         return fallback, False
+
+    async def voice_note(self, *, prompt: str) -> str:
+        """THE "HOW THIS TEAM WRITES" NOTE, from the voice profile's numbers and
+        examples (`voice.note_request`). ONE call, on MODEL_LIGHT, once a week.
+
+        It carries no strategy and no persona: it describes a style, it does
+        not speak as the bot. Returns the raw text — `voice.clean_note` holds
+        it to its contract — or "" on any failure, which the caller treats as
+        "write the note by rule".
+        """
+        import voice
+
+        try:
+            resp = await self._create(system=voice.NOTE_PROMPT, prompt=prompt,
+                                      max_tokens=500, site="voice_note",
+                                      include_strategy=False, light=True)
+        except Exception:
+            log.exception("[llm.voice] the note call raised; no note from the model")
+            return ""
+        return _text_of(resp)
 
     async def classify_leave(self, *, prompt: str) -> str:
         """WHO IS AWAY TODAY, from the leave channel's recent posts.
@@ -709,12 +738,15 @@ class LLM:
         THE INSIDES DEPEND ON SEARCH_BACKEND, and nothing else about the call
         does:
 
-          serper / brave (the default)   THE SEARCH RUNS OUTSIDE THE MODEL.
+          searxng / ddg / google_cse (the default)   THE SEARCH RUNS OUTSIDE
+              THE MODEL.
               `queries` — at most two, each a string or a dict of
               `search_backend.search` kwargs ({"q", "n", "news", "site",
               "days"}) — are run through `search_backend`, `pages` (urls) are
               read with `fetch_page`, and any `snippets` the caller already
-              holds (feed items, posted stories) are added. The results become
+              holds (feed items, posted stories) are added. A query marked
+              `news` goes to `search_backend.news` — Google News RSS first, a
+              search request only when that feed is empty. The results become
               one SNIPPETS block — at most 10 items of at most 300 characters —
               and MODEL_LIGHT answers the caller's prompt from that block
               alone. `sources` are the snippets it actually cited. `max_uses`
@@ -778,8 +810,16 @@ class LLM:
         for q in asked[:cap]:
             kw = dict(q) if isinstance(q, dict) else {"q": str(q)}
             text = str(kw.pop("q", "") or "")
-            detail = await asyncio.to_thread(
-                lambda t=text, k=kw: search_backend.search_detail(t, rule=rule, **k))
+            if kw.pop("news", False) and not kw.get("site"):
+                # RECENT NEWS ABOUT X: the Google News feed first, which is not
+                # a search request at all.
+                detail = await asyncio.to_thread(
+                    lambda t=text, k=kw: search_backend.news_detail(
+                        t, days=k.get("days") or 1, n=k.get("n") or 10, rule=rule))
+            else:
+                detail = await asyncio.to_thread(
+                    lambda t=text, k=kw: search_backend.search_detail(
+                        t, rule=rule, **k))
             out["searches"] += int(detail.get("requests") or 0)
             out["cached"] += 1 if detail.get("cached") else 0
             if detail.get("error"):

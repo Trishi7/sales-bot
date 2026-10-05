@@ -116,7 +116,7 @@ PLAIN_BY_TRIGGER = {
     "ai_news": "today's AI news worth reading",
     "news_company_screen": "companies in the news that aren't in the pipeline yet",
     "events": "AI events and summits coming up",
-    "deliverables": "deliverables due or overdue",
+    "deliverables": "P1 deliverables due this week — title and due date only",
     "prospects": "people we haven't made first contact with",
     "li_no_dm": "people connected on LinkedIn with no DM yet",
     "dm_no_meeting": "people we DM'd who haven't booked a meeting",
@@ -162,19 +162,26 @@ class Rule:
     rule cannot mean one thing to the preview and another to the queue.
     """
 
-    __slots__ = ("id", "name", "plain", "weekdays", "trigger",
+    __slots__ = ("id", "name", "plain", "description", "sheet_wording",
+                 "weekdays", "trigger",
                  "max_items_per_post", "destination", "counts_toward_cap",
                  "enabled", "_order")
 
     def __init__(self, *, id: str, name: str, weekdays: tuple, trigger: str,
                  max_items_per_post: int, destination: str,
                  counts_toward_cap: bool, enabled: bool, order: int = 0,
-                 plain: str = ""):
+                 plain: str = "", description: str = "", sheet_wording: str = ""):
         self.id = id
         self.name = name
         # What this rule is, in words somebody outside the team would follow.
         # See PLAIN_BY_TRIGGER for why it exists and why it is not `name`.
         self.plain = plain or PLAIN_BY_TRIGGER.get(trigger, "") or name
+        # OPTIONAL. `description` is the rule in one line, as the file states
+        # it; `sheet_wording` is the text for the Bot Rules tab's "What the Bot
+        # Shares / Checks" cell, kept beside the rule so the sheet and the
+        # file are edited from one place (`sheet_wording_for`).
+        self.description = description or self.plain
+        self.sheet_wording = sheet_wording
         self.weekdays = weekdays            # tuple of 0..6, Monday = 0
         self.trigger = trigger
         self.max_items_per_post = max_items_per_post
@@ -223,6 +230,7 @@ class Rule:
     def as_dict(self) -> dict:
         return {
             "id": self.id, "name": self.name, "plain": self.plain,
+            "description": self.description,
             "trigger": self.trigger,
             "weekdays": self.weekday_label(),
             "max_items_per_post": self.max_items_per_post,
@@ -234,7 +242,8 @@ class Rule:
 
 
 _lock = threading.RLock()
-_cache: dict = {"loaded": False, "rules": [], "source": {}, "error": "", "remedy": ""}
+_cache: dict = {"loaded": False, "rules": [], "source": {}, "error": "", "remedy": "",
+                "global_rules": {}}
 
 
 def _fail(message: str, remedy: str) -> None:
@@ -298,6 +307,8 @@ def _parse_rule(raw: dict, *, order: int) -> Rule:
         id=rule_id,
         name=name,
         plain=" ".join(str(raw.get("plain") or "").split()).strip(),
+        description=" ".join(str(raw.get("description") or "").split()).strip(),
+        sheet_wording=" ".join(str(raw.get("sheet_wording") or "").split()).strip(),
         weekdays=_parse_weekdays(raw.get("weekdays"), rule_id),
         trigger=trigger,
         max_items_per_post=max_items,
@@ -367,11 +378,18 @@ def load(path: Optional[str] = None, *, force: bool = False) -> list:
         rules.append(rule)
 
     source = data.get("source") if isinstance(data.get("source"), dict) else {}
+    # THE GLOBAL RULES TAB'S ROWS THIS FILE CARRIES (today: "voice"). Optional;
+    # a file without the block loads exactly as before.
+    raw_global = data.get("global_rules")
+    global_rules = {
+        str(k).strip().lower(): " ".join(str(v or "").split())
+        for k, v in (raw_global.items() if isinstance(raw_global, dict) else ())
+    }
 
     with _lock:
         _cache.update({
             "loaded": True, "rules": list(rules), "source": dict(source),
-            "error": "", "remedy": "",
+            "error": "", "remedy": "", "global_rules": global_rules,
         })
     return list(rules)
 
@@ -390,7 +408,7 @@ def safe_load(path: Optional[str] = None, *, force: bool = False) -> list:
         with _lock:
             _cache.update({
                 "loaded": True, "rules": [], "source": {},
-                "error": str(e), "remedy": e.remedy,
+                "error": str(e), "remedy": e.remedy, "global_rules": {},
             })
         log.error(
             "[rules] NO RULES LOADED: %s. %s The bot will not say anything on "
@@ -419,6 +437,25 @@ def status() -> dict:
         "remedy": remedy,
         "source": source,
     }
+
+
+def global_rule(key: str) -> str:
+    """One row of the Global Rules tab as this file carries it ("voice"), or ""."""
+    safe_load()
+    with _lock:
+        return str((_cache.get("global_rules") or {}).get(str(key or "").strip().lower())
+                   or "")
+
+
+def sheet_wording_for(rule_id: str) -> str:
+    """The text for a rule's "What the Bot Shares / Checks" cell on the Bot
+    Rules tab — the rule's own `sheet_wording`, else its description. "" when
+    the rule is unknown. Printed by verify_parity.py so the sheet can be made
+    to say what the file says."""
+    rule = by_id(str(rule_id or "").strip().upper())
+    if rule is None:
+        return ""
+    return rule.sheet_wording or rule.description
 
 
 def plain_description(rule_id: str) -> str:
@@ -478,6 +515,14 @@ def render_for_user(text: str) -> str:
     body = _RULE_ID_RE.sub(
         lambda m: getattr(known.get("R" + m.group(1)), "plain", ""), body
     )
+    # NOTHING REPLACED, NOTHING TIDIED. `_tidy` closes the gaps a removed id
+    # leaves, and it does that by trimming every line's edges — which also
+    # flattens the indented second line of an R4 item ("   Due: Thu 2 Oct").
+    # It used to run on any text with a capital R in it, so a deliverable
+    # called "RBA review" lost the whole list's layout and one called "MSA"
+    # did not.
+    if body == str(text or ""):
+        return body
     return _tidy(body)
 
 

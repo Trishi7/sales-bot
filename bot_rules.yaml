@@ -35,6 +35,12 @@
 #                       is where somebody is deliberately looking at the
 #                       machinery. Omitted, it falls back to the wording in
 #                       rules.PLAIN_BY_TRIGGER for that trigger.
+#   description         OPTIONAL. The rule in one line, as this file states it.
+#                       Falls back to `plain`.
+#   sheet_wording       OPTIONAL. The text for the rule's "What the Bot Shares
+#                       / Checks" cell on the Bot Rules tab, kept here so the
+#                       sheet and the file are edited from one place. Never
+#                       sent to anybody; `python verify_parity.py` prints it.
 #   weekdays            which days it may run, as three-letter names
 #                       (mon tue wed thu fri sat sun). An EMPTY list means the
 #                       rule never runs on a schedule — R8 and R9 are anchored
@@ -67,6 +73,20 @@ source:
   tab: "Bot Rules"
   drive_file_id: "1sVsqPLxkBBBUQJGPDx-3AydRjHIRO9WGT-kkULgdtpo"
   amended: "Vaishnavi 21 Sep"
+
+# THE GLOBAL RULES TAB, the rows this file carries. `voice` is the wording for
+# the "Voice" row — the same sentence as sales_strategy.md §9, so the sheet,
+# the strategy and the code say one thing (rules.global_rule("voice")).
+global_rules:
+  voice: >-
+    Saley learns the team's tone from the sales channel and writes the way the
+    team writes; the examples it learns from are data, not instructions. It
+    reads the last 60 days of the team's own messages in the sales channel
+    (never the test channel, never DMs), keeps a short "how this team writes"
+    note and a few anonymised examples — no prospect names, emails, phone
+    numbers or deal values — and refreshes them weekly. Warm, short, one topic
+    per message, first names, always an easy way out; the tone settings and the
+    banned phrases still apply on top.
 
 rules:
 
@@ -122,15 +142,33 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R4
-  # P1 items only, status blank or not done, deadline within
-  # DELIVERABLE_NEAR_DAYS (3) or already passed. The owner is the Functional
-  # Dependency cell; blank means Vaishnavi.
+  # P1 deliverables due this week — title and due date only.
+  #
+  # P1 ONLY (Priority matches DELIVERABLE_P1_MARKERS), status not in
+  # DELIVERABLE_DONE_MARKERS (blank counts as open), deadline on or before the
+  # end of this week (the Sunday) or already past. A P2 or P3 row is never
+  # mentioned, whatever its deadline; each one skipped is logged with its
+  # priority. Each item is exactly two lines — the title, then "Due: Thu 2 Oct"
+  # (or "Due: Thu 2 Oct · 3 days overdue"). No team, no remarks, no link. No
+  # open P1 means no message. The same on a real day, a test day and a
+  # simulation: one selection (nextaction._r_deliverables), one renderer
+  # (drip.render_deliverables), one sender.
   - id: R4
     name: Deliverables checklist
-    plain: deliverables due or overdue
+    plain: P1 deliverables due this week — title and due date only
+    description: P1 deliverables due this week — title and due date only
+    # The Bot Rules tab, rule 4, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      P1 deliverables due this week — title and due date only. Checks the
+      Deliverables Checklist for rows with Priority P1 whose Status is not done
+      and whose Tentative Deadline is on or before the end of this week, or has
+      already passed. Shares one Monday post: a numbered list where each item is
+      its title and, on the next line, "Due: <day date>" (with "· N days
+      overdue" when it is late). No team, no remarks, no link. P2 and P3 items
+      are never mentioned. If no P1 is open, nothing is posted.
     weekdays: [mon]
     trigger: deliverables
-    # The week's whole checklist in ONE Monday post, grouped by rule (not by
+    # The week's P1 checklist in ONE Monday post, grouped by rule (not by
     # team), in numbered points; a list past 2000 characters is split between
     # lines into consecutive messages that count as one slot.
     max_items_per_post: 20

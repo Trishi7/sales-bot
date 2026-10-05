@@ -230,6 +230,190 @@ def sanitize(text: str) -> str:
     return cleaned
 
 
+# -- what the voice profile may read, and what it may keep ----------------------
+
+
+def voice_channel_ids() -> list[int]:
+    """The channels the VOICE PROFILE is learned from. Narrower than
+    `readable_channel_ids()` on purpose: the real sales channels only
+    (`config.voice_channel_ids`) — never the test channel, never the leave
+    channel, and a DM has no id here at all. The reader iterates THIS and takes
+    no channel list from its caller."""
+    return [cid for cid in config.voice_channel_ids()
+            if config.is_sales_channel(cid) and not is_leave_channel(cid)]
+
+
+# WHAT A LEARNED EXAMPLE MUST NOT CARRY. The profile stores a few of the team's
+# own messages as examples of tone, and tone needs none of these.
+_ANY_MENTION_RE = re.compile(r"<@[!&]?(\d+)>")
+_CHANNEL_REF_RE = re.compile(r"<#\d+>")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_PHONE_RE = re.compile(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)")
+_AMOUNT_RE = re.compile(
+    r"(?:[$₹€£]|\b(?:usd|inr|rs\.?|eur|gbp)\s?)\s?\d[\d,]*(?:\.\d+)?"
+    r"\s?(?:k|m|mn|bn|b|cr|crores?|lakhs?|lacs?|l)?\b"
+    r"|\b\d[\d,]*(?:\.\d+)?\s?(?:k|m|mn|bn|cr|crores?|lakhs?|lacs?|usd|inr|"
+    r"dollars?|rupees?)\b"
+    r"|\b\d[\d,]*(?:\.\d+)?\s?%",
+    re.IGNORECASE,
+)
+# An amount of MONEY: a currency sign or word in front, or a money word behind.
+_MONEY_RE = re.compile(
+    r"(?:[$₹€£]|\b(?:usd|inr|rs\.?|eur|gbp)\s?)\s?\d[\d,]*(?:\.\d+)?"
+    r"\s?(?:k|m|mn|bn|b|cr|crores?|lakhs?|lacs?|l)?\b"
+    r"|\b\d[\d,]*(?:\.\d+)?\s?(?:cr|crores?|lakhs?|lacs?|usd|inr|dollars?|rupees?)\b",
+    re.IGNORECASE,
+)
+# Any number long enough to be an id, a phone fragment or a figure.
+_LONG_NUMBER_RE = re.compile(r"\b\d{1,3}(?:,\d{2,3})+\b|\b\d{4,}\b")
+_CAP_TOKEN_RE = re.compile(r"(?<![<\w])[A-Z][A-Za-z0-9&'’-]*")
+_SCRUB_SPACE_RE = re.compile(r"[ \t]{2,}")
+_SCRUB_PUNCT_RE = re.compile(r"\s+([,.;:!?])")
+_REPEAT_PLACEHOLDER_RE = re.compile(r"(<company>|<name>)(?:[ ,&]+(?:and )?\1)+")
+
+COMPANY_PLACEHOLDER = "<company>"
+NAME_PLACEHOLDER = "<name>"
+
+# Words that end a company's name without being the company ("Sarvam AI" is
+# "Sarvam" in a chat message).
+_GENERIC_NAME_WORDS = frozenset((
+    "ai", "labs", "lab", "inc", "llc", "ltd", "pvt", "limited", "technologies",
+    "technology", "tech", "systems", "solutions", "group", "global", "the", "of",
+    "and", "university", "institute", "research", "data", "software", "studio",
+    "studios", "co", "corp", "company", "india", "open", "new",
+))
+
+
+def has_private_details(text: str) -> bool:
+    """True when `text` carries something `scrub_for_learning` would remove
+    outright — an email, a link, a phone number, an amount, a long number."""
+    body = str(text or "")
+    return any(p.search(body) for p in (_EMAIL_RE, _URL_RE, _PHONE_RE, _AMOUNT_RE,
+                                        _LONG_NUMBER_RE))
+
+
+def _name_variants(name: str, *, person: bool) -> list:
+    """The ways a name turns up in a chat message: in full, without its
+    trailing generic words, and by its first word."""
+    full = " ".join(str(name or "").split())
+    if len(full) < 3:
+        return []
+    out = [full]
+    words = full.split()
+    if person:
+        if len(words[0]) >= 3:
+            out.append(words[0])
+        return out
+    stem = list(words)
+    while len(stem) > 1 and stem[-1].lower().strip(".,") in _GENERIC_NAME_WORDS:
+        stem.pop()
+    if stem != words:
+        out.append(" ".join(stem))
+    first = words[0].strip(".,")
+    if len(first) >= 4 and first.lower() not in _GENERIC_NAME_WORDS:
+        out.append(first)
+    # "Acme.ai" is "Acme" in a chat message.
+    bare = first.split(".")[0]
+    if bare != first and len(bare) >= 4 and bare.lower() not in _GENERIC_NAME_WORDS:
+        out.append(bare)
+    return out
+
+
+def scrub_for_learning(text: str, *, companies=(), people=(), keep_words=(),
+                       ordinary_words=(), guess_names: bool = True,
+                       match_case: bool = False, keep_figures: bool = False) -> str:
+    """A team message as the VOICE PROFILE may store it: tone, and nothing a
+    prospect would recognise.
+
+    `sanitize()` first — the same mention gate as every outbound message — and
+    then everything that is not tone comes out:
+
+      MENTIONS    a roster member's tag becomes their first name, anybody
+                  else's becomes "<name>". No `<@id>` token survives, so an
+                  example can never teach the composer to write one.
+      EMAILS, LINKS, PHONE NUMBERS, AMOUNTS, LONG NUMBERS   removed.
+      COMPANIES   every name in `companies` (in full, without its "AI"/"Labs"
+                  tail, and by its first word) becomes "<company>".
+      PEOPLE      every name in `people` (in full, and by first name) becomes
+                  "<name>".
+      ANYTHING ELSE CAPITALISED that is not in `keep_words` (the roster's first
+                  names, weekdays, months, the product's own words) and is not
+                  a word the team also types in lowercase (`ordinary_words`)
+                  becomes "<company>". A name the sheet has never heard of is
+                  still a name.
+
+    THE LAST RULE ERRS TOWARDS REMOVING. It will sometimes blank an innocent
+    word; an example with a hole in it is worth less, an example with a
+    prospect's name in it must not exist. Short all-capitals words (API, DM,
+    NDA) are left: in this channel they are jargon far more often than names.
+
+    `guess_names=False` switches that last rule off, for text the bot's own
+    model wrote (the style note), where a capital letter starts a sentence and
+    nothing else. `match_case=True` goes with it: a known name is then replaced
+    only as it is written — a team's message says "wispr", but a note that says
+    "speak" means the verb, not the company called Speak. `keep_figures=True`
+    leaves percentages and plain numbers in — the note quotes the profile's
+    own figures ("75% of messages skip the greeting") — but money still goes.
+
+    NOT `sanitize()` ITSELF, deliberately. That function is on the path of
+    every message the bot sends, and a nudge with its amounts and its email
+    address taken out would be a worse nudge.
+    """
+    body = sanitize(str(text or ""))
+
+    def _mention(m: re.Match) -> str:
+        known = str(config.ROSTER_DISPLAY_NAMES.get(str(m.group(1))) or "").strip()
+        return known.split()[0] if known else NAME_PLACEHOLDER
+
+    body = _ANY_MENTION_RE.sub(_mention, body)
+    body = _CHANNEL_REF_RE.sub("", body)
+    body = _EMAIL_RE.sub("", body)
+    body = _URL_RE.sub("", body)
+    body = _PHONE_RE.sub("", body)
+    # MONEY ALWAYS GOES. `keep_figures` spares only percentages and plain
+    # numbers — a deal value is never a matter of style.
+    body = _MONEY_RE.sub("", body)
+    if not keep_figures:
+        body = _AMOUNT_RE.sub("", body)
+        body = _LONG_NUMBER_RE.sub("", body)
+
+    keep = {str(w).lower() for w in (keep_words or ()) if str(w).strip()}
+    swaps: list = []
+    for name in people or ():
+        swaps += [(v, NAME_PLACEHOLDER) for v in _name_variants(name, person=True)
+                  if v.lower() not in keep]
+    for name in companies or ():
+        swaps += [(v, COMPANY_PLACEHOLDER) for v in _name_variants(name, person=False)
+                  if v.lower() not in keep]
+    # Longest first, so "Wispr Flow" goes before "Wispr".
+    # LETTERS AND DIGITS ARE THE BOUNDARY, not \w: an underscore or a hyphen
+    # does not hide a name ("pulse_wispr" still carries the company).
+    flags = 0 if match_case else re.IGNORECASE
+    for variant, placeholder in sorted(swaps, key=lambda s: -len(s[0])):
+        body = re.sub(r"(?<![A-Za-z0-9<])" + re.escape(variant)
+                      + r"(?:['’]s)?(?![A-Za-z0-9>])", placeholder, body, flags=flags)
+
+    ordinary = {str(w).lower() for w in (ordinary_words or ())}
+
+    def _unknown(m: re.Match) -> str:
+        token = m.group(0)
+        low = token.lower().replace("’", "'")
+        base = low.split("'")[0]
+        if base == "i" or low in keep or base in keep or low in ordinary or base in ordinary:
+            return token
+        letters = re.sub(r"[^A-Za-z]", "", token)
+        if letters.isupper() and len(letters) <= 5:
+            return token
+        return COMPANY_PLACEHOLDER
+
+    if guess_names:
+        body = _CAP_TOKEN_RE.sub(_unknown, body)
+    body = _REPEAT_PLACEHOLDER_RE.sub(lambda m: m.group(1), body)
+    body = _SCRUB_PUNCT_RE.sub(lambda m: m.group(1), _SCRUB_SPACE_RE.sub(" ", body))
+    return "\n".join(line.strip() for line in body.splitlines()).strip()
+
+
 # -- send side ----------------------------------------------------------------
 
 

@@ -223,6 +223,145 @@ the bot states plainly when asked. That is a supported state, not a broken one.
 
 ---
 
+## 4b. SearXNG (the search backend)
+
+The bot searches the web through **SearXNG**, a metasearch engine you run on the
+same server. It is free, needs no API key and has no daily quota. The bot calls
+it over loopback and reads its JSON; nothing else can reach it.
+
+**Without it the bot still searches** — `SEARCH_FALLBACKS=ddg` answers through
+DuckDuckGo — but that path is scraped, rate-limited and sometimes empty. It is
+the fallback, not the plan. R1's news and company news (R8/R10) need neither:
+they are RSS.
+
+### Install Docker (once)
+
+```bash
+sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2
+sudo usermod -aG docker "$USER"     # then log out and back in
+```
+
+### Two files
+
+```bash
+sudo mkdir -p /opt/searxng/config && sudo chown -R "$USER" /opt/searxng
+cd /opt/searxng
+```
+
+`/opt/searxng/docker-compose.yml`:
+
+```yaml
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"        # loopback ONLY — never "8888:8080"
+    volumes:
+      - ./config:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "1"
+```
+
+`/opt/searxng/config/settings.yml`:
+
+```yaml
+use_default_settings: true
+
+server:
+  secret_key: "REPLACE_WITH_openssl_rand_hex_32"
+  limiter: false          # the limiter exists to block bots, and the bot is one
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json                # REQUIRED — without it format=json answers 403
+```
+
+Three lines there matter:
+
+- **`formats: [html, json]`.** A stock SearXNG serves only HTML and answers the
+  bot's `format=json` with **403**. This is the step people miss.
+- **`limiter: false`.** The limiter rejects clients that do not look like a
+  browser. It is safe to turn off *because* of the next point.
+- **`127.0.0.1:8888:8080`** in the compose file. Docker publishes ports past
+  `ufw`, so `"8888:8080"` would put an open, unlimited search proxy on the
+  public internet. Bound to loopback, only this machine can call it.
+
+Fill in the secret and start it:
+
+```bash
+sed -i "s/REPLACE_WITH_openssl_rand_hex_32/$(openssl rand -hex 32)/" config/settings.yml
+docker compose up -d
+```
+
+### Check it, then point the bot at it
+
+```bash
+curl -s 'http://127.0.0.1:8888/search?q=searxng&format=json' | head -c 300
+# healthy: {"query": "searxng", "number_of_results": …, "results": [{"url": …
+# 403:     json is not in search.formats — fix settings.yml, `docker compose restart`
+# refused: the container is not up — `docker compose ps`, `docker compose logs`
+```
+
+In the bot's `.env`:
+
+```
+SEARCH_BACKEND=searxng
+SEARXNG_URL=http://127.0.0.1:8888
+SEARCH_FALLBACKS=ddg
+```
+
+Then, from `/opt/sales-bot`, the live check — real searches, no model call,
+nothing posted:
+
+```bash
+./venv/bin/python verify_search_backend.py --only a
+```
+
+It should end `ALL PASSED` with `backend=searxng` on the search lines. If they
+say `backend=ddg`, SearXNG did not answer and the line above them says why.
+
+In the bot's log a healthy search is one line, and a fallback is two:
+
+```
+[search] query='"Meera Iyer" "IIT Madras" email contact' backend=searxng n=8 cached=no
+[search] searxng failed (ConnectionError); falling back to ddg
+```
+
+After a connection failure the bot leaves SearXNG alone for five minutes and
+uses the fallback, so a stopped container costs one timeout rather than one per
+search. `pm2 restart sales-bot` clears that wait.
+
+### Keeping it running
+
+| Action | Command (in `/opt/searxng`) |
+|---|---|
+| Status | `docker compose ps` |
+| Logs | `docker compose logs --tail 50` |
+| Restart (after editing `settings.yml`) | `docker compose restart` |
+| Update | `docker compose pull && docker compose up -d` |
+
+`restart: unless-stopped` brings it back after a reboot. Results that turn up
+empty while the container is healthy usually mean the upstream engines have
+rate-limited the server's IP; the bot treats "every engine unresponsive" as a
+failure and falls back, and `docker compose logs` names the engines.
+
+**Google Custom Search** is the third option (`SEARCH_BACKEND=google_cse`, or add
+it to `SEARCH_FALLBACKS`): set `GOOGLE_CSE_KEY` and `GOOGLE_CSE_CX`. It is free
+for 100 queries a day and the bot stops itself at 100, counted on Google's
+(Pacific) day, so it is never billed.
+
+---
+
 ## 5. Start it under PM2
 
 ```bash
@@ -351,6 +490,8 @@ question. `git pull` alone is enough for a policy change.
 ## Notes
 
 - **Outbound only.** No inbound ports, no reverse proxy, no firewall rules.
+  SearXNG (section 4b) listens on `127.0.0.1:8888` only — if `ss -ltn` ever
+  shows `0.0.0.0:8888`, the compose file's port line is wrong.
 - **Logs** go to `./logs` via PM2 (gitignored). Rotation:
   `pm2 install pm2-logrotate`.
 - **Verbosity**: `LOG_LEVEL` in `.env` (`DEBUG` | `INFO` | `WARNING` | `ERROR`).

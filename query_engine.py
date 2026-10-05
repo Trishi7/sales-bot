@@ -62,7 +62,16 @@ def _system_prompt(*, requester_name: str, today: str, tool_names: list[str]) ->
     """The whole system prompt as ONE string — what `_system_blocks` sends,
     joined. Kept for the verify scripts and for anything that reads it."""
     return persona.system_preamble() + _engine_text(
-        requester_name=requester_name, today=today, tool_names=tool_names)
+        requester_name=requester_name, today=today, tool_names=tool_names
+    ) + _reply_style()
+
+
+def _reply_style() -> str:
+    """THE ENGINE'S REPLY STYLE: the learned voice profile, as data, behind the
+    OUTPUT rules — "" when there is no profile. The examples rotate by the day,
+    so every call of one answer's loop sends the same bytes."""
+    style = persona.reply_style_block()
+    return ("\n\n" + style) if style else ""
 
 
 def _system_blocks(*, requester_name: str, today: str, tool_names: list[str],
@@ -81,7 +90,8 @@ def _system_blocks(*, requester_name: str, today: str, tool_names: list[str],
     return persona.system_blocks(
         include_sources=True, front=front,
         tail=_engine_text(requester_name=requester_name, today=today,
-                          tool_names=tool_names) + (("\n\n" + tail) if tail else ""))
+                          tool_names=tool_names) + _reply_style()
+        + (("\n\n" + tail) if tail else ""))
 
 
 def _engine_text(*, requester_name: str, today: str, tool_names: list[str]) -> str:

@@ -31,6 +31,7 @@ unprompted one a day. Five tables:
 All timestamps are UTC 'YYYY-MM-DD HH:MM:SS' strings — the same shape SQLite's
 CURRENT_TIMESTAMP writes — so they sort and compare correctly as plain strings.
 """
+import json
 import logging
 import re
 import sqlite3
@@ -884,6 +885,21 @@ CREATE TABLE IF NOT EXISTS search_cache (
     fetched_at   TEXT NOT NULL              -- ISO datetime, UTC
 );
 
+-- A BACKEND'S OWN DAILY QUOTA (search_backend.py). Google's Custom Search API
+-- is free for 100 queries a day and billed past it, so every call to it is
+-- counted here and the 101st is refused before it leaves. `on_date` is the
+-- day the PROVIDER counts in (Pacific time for Google), not the IST day the
+-- request budget uses.
+--
+-- KEPT BY "reset test state": the calls were made whatever a test wipes.
+CREATE TABLE IF NOT EXISTS search_quota_usage (
+    on_date    TEXT NOT NULL,
+    backend    TEXT NOT NULL,
+    requests   INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (on_date, backend)
+);
+
 -- R1: WHAT THE FEEDS HAVE CARRIED (feeds.py). One row per story.
 --
 -- A poll reads RSS and stores what is new here; no model and no search API is
@@ -909,14 +925,46 @@ CREATE TABLE IF NOT EXISTS news_feed_items (
 );
 CREATE INDEX IF NOT EXISTS ix_news_feed_published ON news_feed_items(published_at);
 CREATE INDEX IF NOT EXISTS ix_news_feed_headline ON news_feed_items(headline_key);
+
+-- THE VOICE PROFILE: how the team writes, learned from its own messages in the
+-- real sales channels (voice.py). ONE ROW, id 1, replaced on every rebuild.
+--
+-- WHAT IS IN IT: numbers (`stats`), a short style note, and a few example
+-- messages with every company and prospect name replaced by a placeholder and
+-- every email, phone number and amount removed. NO PROSPECT'S NAME, NO EMAIL,
+-- NO NUMBER AND NO DEAL VALUE IS STORED HERE. An example carries its author's
+-- Discord id — a team member's, never shown — so "forget my messages" can
+-- drop that person's examples.
+--
+-- `excluded_ids` is the list of team members who said "forget my messages".
+-- It survives every rebuild and outlives the profile itself: the row is kept,
+-- emptied, when a profile is cleared.
+--
+-- A simulation runs on a COPY of this database, so it reads the same row the
+-- real day and the test day read.
+CREATE TABLE IF NOT EXISTS voice_profile (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    built_at      TEXT NOT NULL DEFAULT '',     -- ISO datetime, REAL UTC; '' = none
+    lookback_days INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    author_count  INTEGER NOT NULL DEFAULT 0,
+    channels      TEXT NOT NULL DEFAULT '[]',   -- JSON: the channel ids read
+    stats         TEXT NOT NULL DEFAULT '{}',   -- JSON: the computed numbers
+    exemplars     TEXT NOT NULL DEFAULT '[]',   -- JSON: [{"text", "author_id"}]
+    note          TEXT NOT NULL DEFAULT '',     -- "How this team writes"
+    note_source   TEXT NOT NULL DEFAULT '',     -- model | rules
+    excluded_ids  TEXT NOT NULL DEFAULT '[]'    -- JSON: ids who opted out
+);
 """
 
 # WHAT "reset test state" / "start over" KEEP. Everything else is operational
-# state and is wiped. These four are caches and ledgers of things that were
-# PAID FOR (or fetched): deleting them would make the next test run pay again,
-# and would make "what did you cost" forget what testing cost.
+# state and is wiped. These are caches and ledgers of things that were PAID FOR
+# (or fetched): deleting them would make the next test run pay again, and would
+# make "what did you cost" forget what testing cost. The voice profile is kept
+# for both reasons — it cost a model call, and it holds the "forget my
+# messages" list, which a test reset must never undo.
 KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls",
-                 "web_search_usage")
+                 "web_search_usage", "search_quota_usage", "voice_profile")
 
 
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` won't
@@ -942,9 +990,9 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # the asker in plain text.
     ("scheduled_reminders", "channel_id", "TEXT NOT NULL DEFAULT ''"),
     ("scheduled_reminders", "asker_id", "TEXT NOT NULL DEFAULT ''"),
-    # WHICH BACKEND A DAY'S SEARCHES RAN ON (serper | brave | anthropic), so
-    # "what did you cost" can price a request. '' on rows from before this is
-    # read as anthropic, which is what they were.
+    # WHICH BACKEND A DAY'S SEARCHES RAN ON (searxng | ddg | google_cse |
+    # anthropic), so "what did you cost" can price a request. '' on rows from
+    # before this is read as anthropic, which is what they were.
     ("web_search_usage", "backend", "TEXT NOT NULL DEFAULT ''"),
 ]
 
@@ -2692,8 +2740,8 @@ class DB:
             return _config.search_daily_budget()
 
     def web_search_budget_left(self, on_date: str) -> int:
-        """Requests left today — SEARCH_DAILY_BUDGET under serper/brave,
-        WEB_SEARCH_DAILY_BUDGET under the anthropic backend."""
+        """Requests left today — SEARCH_DAILY_BUDGET for the backends that
+        search outside the model, WEB_SEARCH_DAILY_BUDGET under anthropic."""
         import config as _config
         budget = _config.search_daily_budget()
         return max(0, budget - self.web_searches_today(on_date))
@@ -2707,8 +2755,8 @@ class DB:
         Reserving before the call would spend a budget on searches that never
         happened.
 
-        `backend` (serper | brave | anthropic) is stored beside the count so
-        "what did you cost" can price each request.
+        `backend` (searxng | ddg | google_cse | anthropic) is stored beside
+        the count so "what did you cost" can price each request.
         """
         try:
             with self.conn() as c:
@@ -2758,6 +2806,41 @@ class DB:
         except Exception:
             log.exception("[websearch] the ledger range could not be read")
             return []
+
+    # -- a backend's own daily quota (search_backend.py) --------------------
+
+    def search_quota_used(self, on_date: str, backend: str) -> int:
+        """Calls made to `backend` on `on_date` (the provider's day).
+
+        FAILS CLOSED, like the request budget: an unreadable count returns a
+        number no free quota exceeds, so the backend is skipped rather than
+        billed. The next backend in SEARCH_FALLBACKS still answers.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT requests FROM search_quota_usage "
+                    "WHERE on_date = ? AND backend = ?",
+                    (str(on_date), str(backend)),
+                ).fetchone()
+            return int((row["requests"] if row else 0) or 0)
+        except Exception:
+            log.exception("[search] the %s quota could not be read; treating it "
+                          "as SPENT", backend)
+            return 10 ** 9
+
+    def search_quota_add(self, on_date: str, backend: str, n: int = 1) -> None:
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO search_quota_usage (on_date, backend, requests) "
+                    "VALUES (?,?,?) ON CONFLICT(on_date, backend) DO UPDATE SET "
+                    "requests = requests + excluded.requests, "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    (str(on_date), str(backend), max(0, int(n or 0))),
+                )
+        except Exception:
+            log.exception("[search] could not count a %s request", backend)
 
     # -- the token log ------------------------------------------------------
 
@@ -3559,6 +3642,115 @@ class DB:
         with self.conn() as c:
             c.execute("DELETE FROM event_deadline_checks WHERE event_key = ?",
                       (str(event_key),))
+
+    # -- the voice profile (one row) ---------------------------------------
+
+    @staticmethod
+    def _json_or(raw, default):
+        try:
+            value = json.loads(raw or "")
+        except (TypeError, ValueError):
+            return default
+        return value if isinstance(value, type(default)) else default
+
+    def voice_row(self) -> dict:
+        """The voice_profile row as a dict, JSON decoded. ALWAYS a dict: with no
+        row every field is empty, and `built_at` == "" means "no profile".
+
+        FAILS OPEN, at the empty profile. An unreadable row costs the learned
+        tone for one message (the policy's hand-written exemplars are used
+        instead), never the message.
+        """
+        empty = {"built_at": "", "lookback_days": 0, "message_count": 0,
+                 "author_count": 0, "channels": [], "stats": {}, "exemplars": [],
+                 "note": "", "note_source": "", "excluded_ids": []}
+        try:
+            with self.conn() as c:
+                row = c.execute("SELECT * FROM voice_profile WHERE id = 1").fetchone()
+        except Exception:
+            log.exception("[voice] the voice_profile row could not be read")
+            return empty
+        if row is None:
+            return empty
+        return {
+            "built_at": row["built_at"] or "",
+            "lookback_days": int(row["lookback_days"] or 0),
+            "message_count": int(row["message_count"] or 0),
+            "author_count": int(row["author_count"] or 0),
+            "channels": self._json_or(row["channels"], []),
+            "stats": self._json_or(row["stats"], {}),
+            "exemplars": self._json_or(row["exemplars"], []),
+            "note": row["note"] or "",
+            "note_source": row["note_source"] or "",
+            "excluded_ids": [int(u) for u in self._json_or(row["excluded_ids"], [])
+                             if str(u).lstrip("-").isdigit()],
+        }
+
+    def save_voice_profile(self, *, built_at: str, lookback_days: int,
+                           message_count: int, author_count: int, channels: list,
+                           stats: dict, exemplars: list, note: str,
+                           note_source: str) -> None:
+        """Replace the profile. `excluded_ids` is NOT touched — the opt-outs
+        outlive every rebuild."""
+        with self.conn() as c:
+            c.execute(
+                """
+                INSERT INTO voice_profile
+                    (id, built_at, lookback_days, message_count, author_count,
+                     channels, stats, exemplars, note, note_source)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    built_at = excluded.built_at,
+                    lookback_days = excluded.lookback_days,
+                    message_count = excluded.message_count,
+                    author_count = excluded.author_count,
+                    channels = excluded.channels, stats = excluded.stats,
+                    exemplars = excluded.exemplars, note = excluded.note,
+                    note_source = excluded.note_source
+                """,
+                (str(built_at), int(lookback_days), int(message_count),
+                 int(author_count), json.dumps(list(channels or [])),
+                 json.dumps(stats or {}, ensure_ascii=False),
+                 json.dumps(list(exemplars or []), ensure_ascii=False),
+                 str(note or ""), str(note_source or "")),
+            )
+
+    def clear_voice_profile(self) -> None:
+        """Forget what was learned; keep who opted out."""
+        with self.conn() as c:
+            c.execute(
+                "UPDATE voice_profile SET built_at = '', lookback_days = 0, "
+                "message_count = 0, author_count = 0, channels = '[]', "
+                "stats = '{}', exemplars = '[]', note = '', note_source = '' "
+                "WHERE id = 1")
+
+    def voice_exclude(self, user_id: int) -> int:
+        """"Forget my messages": add `user_id` to the opt-outs and drop their
+        stored examples NOW. How many examples went. The numbers and the note
+        still reflect them until the rebuild the caller runs next."""
+        uid = int(user_id)
+        row = self.voice_row()
+        excluded = sorted(set(row["excluded_ids"]) | {uid})
+        kept = [e for e in row["exemplars"]
+                if int((e or {}).get("author_id") or 0) != uid]
+        with self.conn() as c:
+            c.execute("INSERT OR IGNORE INTO voice_profile (id) VALUES (1)")
+            c.execute(
+                "UPDATE voice_profile SET excluded_ids = ?, exemplars = ? WHERE id = 1",
+                (json.dumps(excluded), json.dumps(kept, ensure_ascii=False)),
+            )
+        return len(row["exemplars"]) - len(kept)
+
+    def company_names(self) -> list:
+        """Every company the pipeline snapshot has ever seen (pipeline_companies)
+        — names to keep OUT of the voice profile. [] when unreadable."""
+        try:
+            with self.conn() as c:
+                rows = c.execute("SELECT company FROM pipeline_companies").fetchall()
+            return [r["company"] for r in rows if r["company"]]
+        except Exception:
+            log.exception("[voice] the pipeline companies could not be read")
+            return []
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.conn() as c:

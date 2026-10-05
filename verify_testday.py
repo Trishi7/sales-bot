@@ -185,7 +185,7 @@ async def main():
     check("it says what is not today's rule",
           "• Not a Monday rule: sales packages that aren't ready yet" in text)
     check("...including a rule that ran and found nothing",
-          "• Looked, nothing due: deliverables due or overdue" in text)
+          "• Looked, nothing due: P1 deliverables due this week — title and due date only" in text)
 
     import re
     codes = re.findall(r"\bR\d{1,2}\b", text)

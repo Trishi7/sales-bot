@@ -1,24 +1,32 @@
-"""SEARCH OUTSIDE THE MODEL — the nine checks, with real output and the token log.
+"""SEARCH OUTSIDE THE MODEL — the checks, with real output and the token log.
 
     python verify_search_backend.py              every check
+    python verify_search_backend.py --only a     the retrieval layer alone: free
     python verify_search_backend.py --only i,ii  some of them
     python verify_search_backend.py --no-week    skip (vii), the simulated week
     python verify_search_backend.py --no-compare skip (ix), the Anthropic call
+    python verify_search_backend.py --stub       canned search results
 
-WHAT IS REAL. The feeds (plain HTTP), the model calls (your ANTHROPIC_API_KEY —
-this spends a few cents), the bot's own code paths (`_news_run`,
+WHAT IS REAL. The searches (SEARCH_BACKEND and SEARCH_FALLBACKS from your .env
+— SearXNG if it is running, DuckDuckGo if it is not; both free), the feeds
+(plain HTTP), the model calls (your ANTHROPIC_API_KEY — this spends a few
+cents; (a) makes none), the bot's own code paths (`_news_run`,
 `_maybe_breaking_news`, `_research_items`, `_find_people`, `_answer_with_engine`,
 `_handle_simulation`, `_send_cost_report`) and, for (vii), the real sheet.
 Discord is a recording channel; the database is a throwaway *_test.db, so no
 ledger or cache of yours is touched.
 
-SERPER IS REAL WHEN IT HAS A KEY. Without SERPER_API_KEY (and BRAVE_API_KEY)
-the search HTTP boundary — `search_backend._http`, the one function — is
-replaced by canned Serper responses, and every check that used it is labelled
-"SERPER STUBBED". The request counting, the cache, the budget, the snippet
-block and the model's token use are still the real ones; only the search
-results are not.
+--stub REPLACES THE SEARCH RESULTS, AND ONLY THEM. The search HTTP boundary —
+`search_backend._http`, the one function — answers with canned SearXNG
+responses, the fallbacks are switched off, and every check that used it is
+labelled "SEARCH STUBBED". The request counting, the cache, the budget, the
+snippet block and the model's token use are still the real ones. Company news
+still reads the real Google News feed: that is not a search.
 
+  (a)    the retrieval layer, live, with no model call: a search (and which
+         backend answered), the same search again from the cache, news() from
+         Google News RSS at zero requests, news() falling back to search()
+         for a company the feed has nothing on, fetch_page, the LinkedIn refusal
   (i)    feeds.poll() stores items; a second poll stores 0 new
   (ii)   the 14:00 news post from the feeds — bullets with links; llm_calls
          shows ONE MODEL_LIGHT call under 5k input tokens and no Sonnet call
@@ -34,6 +42,8 @@ results are not.
          are cache hits
   (viii) "what did you cost today" in dollars
   (ix)   SEARCH_BACKEND=anthropic still works for one call, for comparison
+  (x)    R10's company news comes from Google News RSS: zero search requests,
+         one MODEL_LIGHT call
 """
 import asyncio
 import logging
@@ -65,7 +75,9 @@ config.ROSTER_DISPLAY_NAMES = {str(SID): "Sid"}
 config.SIMULATION_FAST_GAP_SECONDS = 0
 config.TEST_POST_GAP_SECONDS = 0
 config.WEB_SEARCH_ENABLED = True
-config.SEARCH_BACKEND = "serper"
+if config.SEARCH_BACKEND == "anthropic":        # (ix) is where that one is checked
+    config.SEARCH_BACKEND, config.SEARCH_FALLBACKS = "searxng", ["ddg"]
+BACKEND = config.SEARCH_BACKEND
 config.INTERIM_ENABLED = False
 config.digest_enabled = lambda: True
 
@@ -167,62 +179,66 @@ class FakeMessage:
         return SimpleNamespace(id=len(POSTED), jump_url="https://discord/x")
 
 
-# -- the canned Serper, used ONLY when there is no key -------------------------
+# -- the canned SearXNG, used ONLY under --stub --------------------------------
 
-STUBBED = not (config.SERPER_API_KEY or config.BRAVE_API_KEY)
+STUBBED = "--stub" in sys.argv[1:]
 
 
 def canned_http(method, url, *, headers, params=None, body=None):
-    q = str((body or {}).get("q") or (params or {}).get("q") or "").lower()
-    if url.endswith("/news") and "sarvam" in q:
-        return 200, {"news": [
+    q = str((params or {}).get("q") or "").lower()
+    in_news = (params or {}).get("categories") == "news"
+    if in_news and "sarvam" in q:
+        return 200, {"results": [
             {"title": "Sarvam AI opens its Indic speech models to enterprises",
-             "link": "https://example-news.test/sarvam-speech", "date": "2 days ago",
-             "snippet": "The Bengaluru lab said its speech-to-text models for ten "
-                        "Indian languages are now available through an API.",
-             "source": "Example News"},
+             "url": "https://example-news.test/sarvam-speech",
+             "publishedDate": "2026-09-29T08:00:00",
+             "content": "The Bengaluru lab said its speech-to-text models for ten "
+                        "Indian languages are now available through an API."},
             {"title": "Sarvam AI hiring evaluation engineers",
-             "link": "https://example-news.test/sarvam-hiring", "date": "4 days ago",
-             "snippet": "Job posts show the company building an internal "
-                        "evaluation team for its voice agents.",
-             "source": "Example Wire"}]}
+             "url": "https://example-news.test/sarvam-hiring",
+             "publishedDate": "2026-09-27T08:00:00",
+             "content": "Job posts show the company building an internal "
+                        "evaluation team for its voice agents."}]}
     if "site:linkedin.com/in" in q:
-        return 200, {"organic": [
+        return 200, {"results": [
             {"title": "Asha Rao - Co-founder & CEO - Shunya Labs | LinkedIn",
-             "link": "https://www.linkedin.com/in/asha-rao-stub",
-             "snippet": "Co-founder and CEO at Shunya Labs. Bengaluru."},
+             "url": "https://www.linkedin.com/in/asha-rao-stub",
+             "content": "Co-founder and CEO at Shunya Labs. Bengaluru."},
             {"title": "Vikram Nair - Head of Research - Shunya Labs | LinkedIn",
-             "link": "https://www.linkedin.com/in/vikram-nair-stub",
-             "snippet": "Head of Research at Shunya Labs. Speech and "
+             "url": "https://www.linkedin.com/in/vikram-nair-stub",
+             "content": "Head of Research at Shunya Labs. Speech and "
                         "multilingual models."},
             {"title": "Priya Menon - Recruiter - Other Company | LinkedIn",
-             "link": "https://www.linkedin.com/in/priya-menon-stub",
-             "snippet": "Recruiter at Other Company. Previously worked with "
+             "url": "https://www.linkedin.com/in/priya-menon-stub",
+             "content": "Recruiter at Other Company. Previously worked with "
                         "Shunya Labs alumni."}]}
     if "email contact" in q:
-        return 200, {"organic": [
+        return 200, {"results": [
             {"title": "Faculty — Department of Computer Science",
-             "link": "https://cs.example-university.test/people/meera-iyer",
-             "snippet": "Meera Iyer, Associate Professor. Research: speech and "
+             "url": "https://cs.example-university.test/people/meera-iyer",
+             "content": "Meera Iyer, Associate Professor. Research: speech and "
                         "evaluation. Email: meera.iyer@example-university.test"},
             {"title": "Meera Iyer - Google Scholar",
-             "link": "https://scholar.example.test/citations?user=abc",
-             "snippet": "Verified email at example-university.test. Cited by 2,100."}]}
-    key = "news" if url.endswith("/news") else "organic"
-    return 200, {key: [
+             "url": "https://scholar.example.test/citations?user=abc",
+             "content": "Verified email at example-university.test. Cited by 2,100."}]}
+    return 200, {"results": [
         {"title": "AI funding this week: three rounds worth knowing",
-         "link": "https://example-news.test/ai-funding-week",
-         "snippet": "Lumen Robotics raised $40m Series B; Vaani Voice closed a "
-                    "$12m Series A; EvalWorks raised $6m seed.", "date": "1 day ago"},
+         "url": "https://example-news.test/ai-funding-week",
+         "content": "Lumen Robotics raised $40m Series B; Vaani Voice closed a "
+                    "$12m Series A; EvalWorks raised $6m seed.",
+         "publishedDate": "2026-09-30T08:00:00"},
         {"title": "Vaani Voice raises $12m to build voice agents for Indian banks",
-         "link": "https://example-wire.test/vaani-series-a",
-         "snippet": "The round was led by Example Capital.", "date": "2 days ago"}]}
+         "url": "https://example-wire.test/vaani-series-a",
+         "content": "The round was led by Example Capital.",
+         "publishedDate": "2026-09-29T08:00:00"}]}
 
 
 if STUBBED:
     search_backend._http = canned_http
-    config.SERPER_API_KEY = "stub-key-no-request-leaves-this-machine"
-SERPER = "SERPER STUBBED (no SERPER_API_KEY)" if STUBBED else "serper, live"
+    config.SEARCH_BACKEND, config.SEARCH_FALLBACKS = "searxng", []
+    BACKEND = "searxng"
+SERPER = ("SEARCH STUBBED (--stub)" if STUBBED else
+          f"{BACKEND}, live; fallbacks {','.join(config.SEARCH_FALLBACKS) or 'none'}")
 
 
 # -- reading the token log -----------------------------------------------------
@@ -305,6 +321,81 @@ async def main() -> int:
           f"{config.SEARCH_CACHE_HOURS}h")
     print(f"  TOKEN_DAILY_BUDGET    {config.TOKEN_DAILY_BUDGET:,}")
     print(f"  database              {config.DB_PATH} (throwaway)")
+
+    # ---------------------------------------------------------------- (a)
+    if want("a"):
+        print(f"\n(a) the retrieval layer — no model call  [{SERPER}]")
+        t0, mark = now_ts(), len(LINES)
+        note(f"chain: {' -> '.join(search_backend.chain())}"
+             + (f"   SEARXNG_URL={config.SEARXNG_URL}" if BACKEND == "searxng" else ""))
+
+        def show_rows(results, limit=4):
+            for r in results[:limit]:
+                note(f"  {r['date'][:10] or '-':10} | {r['source'][:20]:20} | "
+                     f"{r['title'][:70]}")
+                note(f"  {'':10}   {r['url'][:110]}")
+
+        query = 'site:linkedin.com/in "Sarvam AI"'
+        before = requests_used(bot)
+        first = await asyncio.to_thread(
+            lambda: search_backend.search_detail(query, n=5, rule="verify"))
+        note(f"search({query!r}, n=5): backend={first['backend']} "
+             f"results={len(first['results'])} requests={first['requests']} "
+             f"error={first['error']!r}")
+        show_rows(first["results"])
+        check("the search returned results", len(first["results"]) >= 1)
+        check("...in the one shape", all(
+            sorted(r) == ["date", "snippet", "source", "title", "url"]
+            for r in first["results"]) and bool(first["results"]))
+        check("...from a backend in the chain",
+              first["backend"] in search_backend.chain())
+        check("one request was banked", requests_used(bot) - before, 1)
+
+        again = await asyncio.to_thread(
+            lambda: search_backend.search_detail(query, n=5, rule="verify"))
+        check("the same search again is a cache hit, with no request",
+              (again["cached"], again["requests"], requests_used(bot) - before),
+              (True, 0, 1))
+
+        before = requests_used(bot)
+        got = await asyncio.to_thread(
+            lambda: search_backend.news_detail("Sarvam AI", days=7, n=8, rule="verify"))
+        note(f"news('Sarvam AI', days=7): backend={got['backend']} "
+             f"results={len(got['results'])} requests={got['requests']}")
+        show_rows(got["results"])
+        check("news() answered from Google News RSS", got["backend"], "google_news")
+        check("...with stories", len(got["results"]) >= 1)
+        check("...and ZERO search requests",
+              (got["requests"], requests_used(bot) - before), (0, 0))
+        check("news() returns the same list",
+              await asyncio.to_thread(
+                  lambda: search_backend.news("Sarvam AI", days=7, n=8)),
+              got["results"])
+
+        nobody = "Zxqvlorp Kwyjibo Systems"
+        got = await asyncio.to_thread(
+            lambda: search_backend.news_detail(nobody, days=1, n=5, rule="verify"))
+        note(f"news({nobody!r}, days=1): backend={got['backend']} "
+             f"results={len(got['results'])} requests={got['requests']} "
+             f"error={got['error']!r}")
+        check("an empty feed fell back to search()", got["backend"] != "google_news")
+
+        page = await asyncio.to_thread(
+            lambda: search_backend.fetch_page("https://example.com/"))
+        note(f"fetch_page(example.com): ok={page['ok']} title={page['title']!r} "
+             f"chars={len(page['text'])} error={page['error']!r}")
+        check("fetch_page read a page", (page["ok"], bool(page["text"])), (True, True))
+        refused = await asyncio.to_thread(
+            lambda: search_backend.fetch_page("https://www.linkedin.com/in/someone"))
+        check("LinkedIn is never fetched", refused["error"],
+              "linkedin.com is never fetched")
+
+        state_now = search_backend.budget()
+        note(f"budget: {state_now['used']} of {state_now['budget']} requests used")
+        for line in LINES[mark:]:
+            if line.startswith("[search]"):
+                note("log: " + line[:200])
+        check("no model call was made", len(calls_since(bot, t0)), 0)
 
     # ---------------------------------------------------------------- (i)
     if want("i"):
@@ -457,8 +548,12 @@ async def main() -> int:
                       if "fetch_page url=" in l and "linkedin." in l.lower()]
         people = [l for l in body.splitlines() if l.startswith("• ")]
         check("it named people", len(people) >= 1)
-        check("...each with a linkedin.com/in url from the result titles",
-              bool(people) and all("linkedin.com/in/" in l for l in people))
+        # A person comes from a LinkedIn result title (and carries that url) or
+        # from the company's own team page, which the reply names once.
+        check("...with linkedin.com/in urls from the result titles",
+              any("linkedin.com/in/" in l for l in people))
+        check("...and anyone without one is from the company's own page, named",
+              all("linkedin.com/in/" in l for l in people) or "Found on:" in body)
         check("NO LinkedIn fetch in the log", fetched_li, [])
         check("the linkedin search was a site: query",
               any("site:linkedin.com/in" in l for l in searched))
@@ -590,7 +685,7 @@ async def main() -> int:
         note(f"snippet path [{SERPER}]: ok={snip['ok']} "
              f"requests={snip['searches']} sources={len(snip['sources'])}")
         cost_s = show_calls(rows_s) + (requests_used(bot) - before) * \
-            search_backend.cost_per_request("serper")
+            search_backend.cost_per_request(BACKEND)
 
         config.SEARCH_BACKEND = "anthropic"
         try:
@@ -600,7 +695,7 @@ async def main() -> int:
             await bot._bank(server, rule_id="R10")
             rows_a = calls_since(bot, t0)
         finally:
-            config.SEARCH_BACKEND = "serper"
+            config.SEARCH_BACKEND = BACKEND
         note(f"anthropic path: ok={server['ok']} searches billed="
              f"{server['searches']} sources={len(server['sources'])}")
         cost_a = show_calls(rows_a) + int(server["searches"] or 0) * \
@@ -620,11 +715,35 @@ async def main() -> int:
     elif want("ix"):
         skipped.append("(ix) the anthropic comparison — --no-compare")
 
+    # ---------------------------------------------------------------- (x)
+    if want("x"):
+        print("\n(x) R10 company news — Google News RSS, not a search request")
+        company = "Sarvam AI"
+        item = {"rule": "closure_support", "rule_id": "R10", "key": f"R10:{company}",
+                "row_key": f"{company.lower()}|", "company": company, "poc": "",
+                "poc_designation": "", "web_pending": True,
+                "text": f"{company} closure support [web research pending]"}
+        t0, before, mark = now_ts(), requests_used(bot), len(LINES)
+        await bot._research_items([item], today=today)
+        rows = calls_since(bot, t0)
+        show("R10's research", item.get("research") or item.get("research_note") or "")
+        note(f"sources: {[s['url'][:70] for s in item.get('sources') or []]}")
+        for line in LINES[mark:]:
+            if line.startswith(("[search]", "[websearch]")):
+                note("log: " + line[:200])
+        show_calls(rows)
+        check("the news came from the Google News feed", any(
+            "backend=google_news" in l and "cached=" in l for l in LINES[mark:]))
+        check("ZERO search requests", requests_used(bot) - before, 0)
+        check("one model call, on MODEL_LIGHT",
+              (len(rows), all(is_light(r) for r in rows)), (1, True))
+        check("it produced research or an honest empty",
+              bool(item.get("research") or item.get("research_note")))
+
     print()
     if STUBBED:
-        print("NOTE: no SERPER_API_KEY — the search RESULTS in (iv)-(vii) and (ix) "
-              "were canned.\n      Set it in .env and run this again for live "
-              "Serper results.")
+        print("NOTE: --stub — the search RESULTS in (a) and (iv)-(vii) were "
+              "canned.\n      Run it without --stub for live results.")
     for s in skipped:
         print(f"SKIPPED: {s}")
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")

@@ -840,9 +840,13 @@ REMINDER_LINES = (
 
 
 def reminder_line(who: str, what: str, company: str = "") -> str:
-    """One of REMINDER_LINES, at random, with the company in brackets if any."""
-    body = tone.pick(REMINDER_LINES).format(who=str(who or "").strip(),
-                                            what=str(what or "").strip())
+    """One of REMINDER_LINES — the wording closest to how the team opens a
+    message (`voice.choose`; at random when there is no voice profile) — with
+    the company in brackets if any."""
+    import voice
+
+    body = voice.choose(REMINDER_LINES, slot="reminder").format(
+        who=str(who or "").strip(), what=str(what or "").strip())
     company = str(company or "").strip()
     return f"{body} ({company})" if company else body
 
@@ -958,8 +962,8 @@ def with_heading(body: str, head: str) -> str:
 
 
 # TYPES POSTED EXACTLY AS RENDERED, never composed by the model: the news
-# (one story per bullet, nothing else) and the deliverables (the three-line
-# layout). A composer asked to keep a multi-line list intact is a composer
+# (one story per bullet, nothing else) and the deliverables (title and due
+# date, two lines an item). A composer asked to keep a multi-line list intact is a composer
 # that will sometimes not.
 VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES})
 
@@ -1190,46 +1194,45 @@ def _plural(n: int, word: str) -> str:
 
 def render_deliverables(items: list, *, today: Optional[date] = None,
                         limit: int = 20, opener: str = "") -> list:
-    """R4's lines: a count, then each deliverable as its own numbered point.
+    """R4's lines: a count, then each P1 deliverable as EXACTLY TWO LINES.
 
-        6 open:
+        2 open:
         1. Pulse Product Overview Document
-           Team: Sales | Due: Thu 2 Oct | Overdue: 3 days
-           [Doc](<https://docs.google.com/...>)
-           waiting on pricing
+           Due: Thu 2 Oct · 3 days overdue
+        2. MSA template
+           Due: Wed 7 Oct
 
-    "Overdue" only when past due; "Due" always; the link line only when the row
-    has one; remarks, when present, as the last short line. The week is in the
-    heading (`HEADINGS["R4"]`), not here.
+    THE TITLE AND THE DUE DATE, AND NOTHING ELSE. No team, no remarks, no
+    link — whatever the item dict carries. "· N days overdue" only when past
+    due. The week is in the heading (`HEADINGS["R4"]`), not here.
 
-    P1 FIRST, THEN BY DEADLINE — priority is the order, not a filter. Past
-    `limit` the rest are counted in one closing line, never dropped silently.
+    P1 ONLY. The selection is `nextaction._r_deliverables`; an item that says
+    it is not P1 (`is_p1` False) is dropped here as well, so no caller can put
+    a P2 into the post by building the list by hand. Sorted by deadline, then
+    title. Past `limit` the rest are counted in one closing line, never
+    dropped silently.
+
+    THE ONE RENDERER. The real drip, a test day and a simulation all reach it
+    through `points_of` -> `compose_fallback` in `_send_drip_message`; R4 is
+    posted verbatim (VERBATIM_TYPES), so what this returns is what is sent.
     """
     today = today or dl.today_ist()
     rows = sorted(
-        (a for a in (items or []) if a.get("item") or a.get("deliverable")),
-        key=lambda a: (0 if a.get("is_p1") else 1,
-                       str(a.get("deadline") or "9999"),
+        (a for a in (items or [])
+         if (a.get("item") or a.get("deliverable")) and a.get("is_p1") is not False),
+        key=lambda a: (str(a.get("deadline") or "9999"),
                        str(a.get("item") or a.get("deliverable") or "").lower()),
     )
     lines = [(opener or DELIVERABLES_OPENERS[0]).format(n=len(rows))]
     pad = "   "
     for i, a in enumerate(rows[:max(1, int(limit))], 1):
-        name = str(a.get("item") or a.get("deliverable")).strip()
-        team = str(a.get("team") or "").strip() or config.DELIVERABLE_DEFAULT_OWNER
-        meta = [f"Team: {team}",
-                f"Due: {a.get('deadline_pretty') or a.get('deadline') or 'not set'}"]
+        name = " ".join(str(a.get("item") or a.get("deliverable")).split())
+        due = f"Due: {a.get('deadline_pretty') or a.get('deadline') or 'not set'}"
         days = a.get("days_left")
         if isinstance(days, int) and days < 0:
-            meta.append(f"Overdue: {_plural(-days, 'day')}")
+            due += f" · {_plural(-days, 'day')} overdue"
         lines.append(f"{i}. {name}")
-        lines.append(pad + " | ".join(meta))
-        url = str(a.get("link") or "").strip()
-        if url.startswith("http"):
-            lines.append(pad + link(doc_label(url), url))
-        remarks = " ".join(str(a.get("remarks") or "").split())
-        if remarks:
-            lines.append(pad + remarks)
+        lines.append(pad + due)
     if len(rows) > limit:
         lines.append(f"(+{len(rows) - limit} more due this week — ask and I'll list them)")
     return lines
@@ -1267,10 +1270,11 @@ def points_of(message: dict) -> Optional[dict]:
         rendered = render_deliverables(
             actions, limit=cap,
             opener=_voice(message, "r4_opener", DELIVERABLES_OPENERS))
+        # NO OPEN P1, NO MESSAGE: only the count line came back.
         if len(rendered) < 2:
             return None
-        # THE LAYOUT IS MULTI-LINE, so every line is kept, in order. R4 is
-        # posted verbatim (VERBATIM_TYPES) and never recomposed.
+        # TWO LINES AN ITEM, so every line is kept, in order. R4 is posted
+        # verbatim (VERBATIM_TYPES) and never recomposed.
         return {"header": rendered[0], "lines": rendered[1:], "extra": [],
                 "close": _voice(message, "r4_close", DELIVERABLES_CLOSES)}
     if kind == nextaction.R_NEW_COMPANY:

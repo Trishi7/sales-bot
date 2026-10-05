@@ -20,7 +20,7 @@ THE TWELVE, with the trigger name the file uses:
      R1  ai_news                weekdays            the news sweep
      R2  news_company_screen    Tue, Fri            news companies vs the pipeline
      R3  events                 alt. Wed            register / attend, until it passes
-     R4  deliverables           Mon                 P1, due within 3 days or passed
+     R4  deliverables           Mon                 P1 only, due this week or passed
      R5  prospects              Tue, Thu            first contact FALSE or blank
      R6  li_no_dm               Tue, Fri            connected > 3d, no DM
      R7  dm_no_meeting          Mon                 DM > 7d, no meeting
@@ -576,23 +576,30 @@ def _r_events(rule, ctx) -> list:
 
 
 def _r_deliverables(rule, ctx) -> list:
-    """R4 — every open deliverable due by the END OF THIS WEEK, or already past.
+    """R4 — every open P1 deliverable due by the END OF THIS WEEK, or already past.
 
     ONE MONDAY POST, THE WHOLE WEEK. The window runs to the Sunday of the week
     it runs in, so Monday's message is the week's checklist rather than a drip
     of whatever falls inside DELIVERABLE_NEAR_DAYS. Anything already past its
     deadline is in too, however old.
 
-    PRIORITY IS ORDER, NOT A FILTER. It used to drop everything that was not
-    P1; now every open row is listed and P1s lead (`drip.render_deliverables`
-    sorts P1 first, then by deadline). The one place the old P1 + NEAR_DAYS
-    test survives is a SUNDAY run — the exception is "a P1 due on Monday", and
-    widening a Sunday post to the whole week would spend the weekend's one
-    message on things with four working days left.
+    P1 ONLY. PRIORITY IS THE FILTER. A row whose Priority does not match
+    DELIVERABLE_P1_MARKERS is never mentioned, whatever its deadline — a P2 due
+    tomorrow is still not in the post. Each open row skipped for its priority
+    is logged with that priority, so "why is X not in Monday's list" has an
+    answer in the log. A SUNDAY run keeps the narrower window (P1 and within
+    DELIVERABLE_NEAR_DAYS): the exception is "a P1 due on Monday", and widening
+    a Sunday post to the whole week would spend the weekend's one message on
+    things with four working days left.
+
+    THIS IS THE ONE SELECTION. A real day, a test day and a simulation all
+    reach it through `run()` with the day they are living, so none of them has
+    a filter of its own.
 
     THE TEAM IS THE Functional Dependency CELL (Engineering, Sales, Legal …),
-    and blank means DELIVERABLE_DEFAULT_OWNER. Blank is common and it is not
-    the same as unowned.
+    and blank means DELIVERABLE_DEFAULT_OWNER. It decides who the item belongs
+    to; the post itself shows the title and the due date only
+    (`drip.render_deliverables`).
 
     STATUS BLANK OR NOT DONE. Only DELIVERABLE_DONE_MARKERS count as finished;
     everything else, blank included, is open — chasing a finished item costs
@@ -618,7 +625,14 @@ def _r_deliverables(rule, ctx) -> list:
         if _matches_any(row.get("status"), config.DELIVERABLE_DONE_MARKERS):
             continue
         is_p1 = bool(_matches_any(row.get("priority"), config.DELIVERABLE_P1_MARKERS))
-        if sunday and not is_p1:
+        if not is_p1:
+            log.info(
+                "[R4] skipped %r (row %s): priority %r is not P1 "
+                "(DELIVERABLE_P1_MARKERS), deadline %r",
+                item_name, row.get("_row") or "?",
+                _text(row, "priority") or "(blank)",
+                _text(row, "deadline") or "(blank)",
+            )
             continue
         raw = row.get("deadline")
         due = _deliverable_due(raw, today=today)
@@ -632,18 +646,22 @@ def _r_deliverables(rule, ctx) -> list:
                 else "due today" if days == 0 else "due in %d day(s)" % days)
         out.append(_item(
             rule=rule, trigger=R_DELIVERABLES, today=today, due=due,
-            why=(f"R4 ({'Sunday: P1 due soon' if sunday else 'Mondays: due this week'})"
-                 f": {priority or 'no priority'}, status {status}, {when}"),
-            text=f"{item_name} — {team}, {when}",
+            why=(f"R4 ({'Sunday: P1 due soon' if sunday else 'Mondays: P1 due this week'})"
+                 f": {priority}, status {status}, {when}"),
+            text=f"{item_name} — {when}",
             owner=team, company=item_name, sheet_row=row.get("_row"),
+            # WHAT THE POST NEEDS AND NOTHING ELSE: the title and the deadline.
+            # The remarks and the link are no longer carried — the post shows
+            # neither, and a field nothing renders is a field somebody will
+            # one day render by accident. `team` stays because it is the
+            # item's owner, not because it is shown.
             extra={
                 "deliverable": item_name, "item": item_name, "team": team,
                 "deadline": dl.iso(due), "deadline_pretty": _short_date(due),
-                "status": status, "remarks": _text(row, "remarks"),
-                "link": _text(row, "link"),
+                "status": status,
                 # NOT `priority`: that key is the item's numeric band, which
                 # every sort in this module reads.
-                "sheet_priority": priority, "is_p1": is_p1,
+                "sheet_priority": priority, "is_p1": True,
                 "days_left": days, "week_of": dl.iso(monday),
                 "dependency": _text(row, "dependency"),
             },
@@ -1727,7 +1745,7 @@ def _self_test() -> int:
     check("blank and No are selected, Yes is not",
           sorted(a["company"] for a in got), ["Hinglish STT", "Image A/B"])
 
-    print("\nR4 deliverables — open, due by Sunday or already past, any priority")
+    print("\nR4 deliverables — P1 only, open, due by Sunday or already past")
     # MON is Mon 21 Sep 2026, so the week ends Sun 27 Sep.
     dl_rows = [
         {"_row": 2, "_extra": {}, "action_item": "MSA", "priority": "P1",
@@ -1742,27 +1760,36 @@ def _self_test() -> int:
          "status": "In progress", "deadline": "10-Sep", "dependency": "Sales"},
         {"_row": 7, "_extra": {}, "action_item": "Next week", "priority": "P1",
          "status": "", "deadline": "28-Sep", "dependency": ""},
+        {"_row": 8, "_extra": {}, "action_item": "Overview doc", "priority": "P1",
+         "status": "In progress", "deadline": "10-Sep", "dependency": "",
+         "remarks": "copy", "link": "https://docs.google.com/document/d/x"},
     ]
     got = run(today=MON, rows=[], deliverables=dl_rows,
               day_rules=[rules_mod.by_id("R4")])["actions"]
-    check("every open row due by Sunday or past, P2/P3 included",
-          sorted(a["deliverable"] for a in got), ["MSA", "Pitch deck", "Website"])
+    check("P1 only: open, due by Sunday or past — the P2 and the P3 are not there",
+          sorted(a["deliverable"] for a in got), ["MSA", "Overview doc"])
+    check("a P2 due THIS WEEK is skipped, whatever its deadline",
+          "Website" in [a["deliverable"] for a in got], False)
+    check("an overdue P3 is skipped too",
+          "Pitch deck" in [a["deliverable"] for a in got], False)
     check("a deadline 11 days ago is read as overdue, not as next year",
-          next(a["days_left"] for a in got if a["deliverable"] == "Pitch deck"), -11)
+          next(a["days_left"] for a in got if a["deliverable"] == "Overview doc"), -11)
     check("the team comes from Functional Dependency",
           next(a["team"] for a in got if a["deliverable"] == "MSA"), "Sid")
     check("blank team -> the default owner",
-          next(a["team"] for a in got if a["deliverable"] == "Website"),
+          next(a["team"] for a in got if a["deliverable"] == "Overview doc"),
           config.DELIVERABLE_DEFAULT_OWNER)
-    check("extra carries remarks, priority and the pretty date",
-          next((a["remarks"], a["sheet_priority"], a["deadline_pretty"])
-               for a in got if a["deliverable"] == "Website"),
-          ("copy", "P2", "Sun 27 Sep"))
+    check("extra carries the priority and the pretty date",
+          next((a["sheet_priority"], a["deadline_pretty"], a["is_p1"])
+               for a in got if a["deliverable"] == "Overview doc"),
+          ("P1", "Thu 10 Sep", True))
+    check("...and neither the remarks nor the link",
+          [k for a in got for k in ("remarks", "link") if k in a], [])
     sun = MON + timedelta(days=6)
     got = run(today=sun, rows=[], deliverables=dl_rows,
               day_rules=[rules_mod.by_id("R4")])["actions"]
     check("a Sunday run (if R4 ran on Sundays) keeps P1 + DELIVERABLE_NEAR_DAYS",
-          sorted(a["deliverable"] for a in got), ["MSA", "Next week"])
+          sorted(a["deliverable"] for a in got), ["MSA", "Next week", "Overview doc"])
 
     print("\nDEDUP — one contact, one mention, per day")
     dup = row(li_connected_date="15-09-2026")      # R5 eligible AND R6 due

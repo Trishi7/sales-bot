@@ -623,7 +623,7 @@ def day_points(*, planned: Optional[dict], rules_run: Optional[list]) -> dict:
     "failed": [names]} — plain rule names, no rule codes, no owners.
 
     ROLLED IS COUNTED IN ITEMS PER RULE: two owner groups of the same rule are
-    one line to a tester ("deliverables due or overdue (5)"), which is what the
+    one line to a tester ("P1 deliverables due this week — title and due date only (5)"), which is what the
     old per-group list with its owner-and-company parentheticals got wrong.
 
     A HELD GROUP ("asked recently") counts as LOOKED, NOTHING DUE: the rule
@@ -942,7 +942,7 @@ def _self_test() -> int:
     check("same points as day_points", len(pts["rolled"]), 1)
     print("   " + text.replace("\n", "\n   "))
     check("reports the count", "• Sent: 3" in text, True)
-    check("rolled is counted per rule", "deliverables due or overdue (3)" in text, True)
+    check("rolled is counted per rule", "P1 deliverables due this week — title and due date only (3)" in text, True)
     check("reports what looked and found nothing",
           "Looked, nothing due: people connected on LinkedIn" in text, True)
     check("reports what is not today's", "Not a Monday rule: sales packages" in text, True)

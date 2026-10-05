@@ -9,9 +9,10 @@ path (`_send_drip_message`, into a recording channel) run against a test
 deliverables tab and a throwaway *_test.db.
 
   (i)   a Monday preview from a test sheet with 6 open rows across 3 teams and
-        mixed priorities — ONE message, 6 numbered lines, P1 first, team and
-        date on every line, remarks where present;
-  (ii)  a row with a blank team shows the default owner;
+        mixed priorities — ONE message, the 3 P1s only, two lines an item
+        (title, then "Due: ..."), no team, no remarks, no link;
+  (ii)  the P2 and P3 rows due this week are skipped, and each is logged with
+        its priority; no open P1 means no message;
   (iii) a composed message missing a bullet falls back to the template and
         logs `structure` (and so does prose with 3+ facts and no points);
   (iv)  an R10 message renders as points with the supportive close;
@@ -54,6 +55,7 @@ tone.pin(0)
 
 failures = 0
 LOG: list = []
+INFO: list = []          # nextaction's INFO lines (the R4 skips)
 
 
 def check(name, got, want=True):
@@ -70,6 +72,16 @@ class Capture(logging.Handler):
 
 logging.basicConfig(level=logging.WARNING, format="      log  %(name)s: %(message)s")
 logging.getLogger().addHandler(Capture())
+
+
+class CaptureInfo(logging.Handler):
+    def emit(self, record):
+        INFO.append(record.getMessage())
+
+
+logging.getLogger("nextaction").setLevel(logging.INFO)
+logging.getLogger("nextaction").addHandler(CaptureInfo())
+logging.getLogger("nextaction").propagate = False
 
 MON = date(2026, 10, 5)                   # a Monday; the week ends Sun 11 Oct
 
@@ -137,9 +149,9 @@ async def main():
     for line in body.splitlines():
         print("     | " + line)
     numbered = [l for l in body.splitlines() if re.match(r"^\d+\. ", l)]
-    check("6 numbered lines", len(numbered), 6)
-    # THE THREE-LINE LAYOUT: each point is its numbered line plus the indented
-    # lines under it (team | due | overdue, the link, the remarks).
+    check("3 numbered lines — the P1s, and only the P1s", len(numbered), 3)
+    # THE TWO-LINE LAYOUT: each point is its numbered line plus ONE indented
+    # line under it ("Due: ...", with the days overdue when it is late).
     blocks, cur = [], None
     for l in body.splitlines():
         if re.match(r"^\d+\. ", l):
@@ -148,17 +160,20 @@ async def main():
         elif cur is not None and l.startswith("   "):
             cur.append(l)
     blocks = ["\n".join(b) for b in blocks]
-    check("P1 first (MSA, DPA, API rate limits), then by deadline",
-          [l.split(". ", 1)[1].split(" — ")[0] for l in numbered],
-          ["MSA template", "DPA review", "API rate limits", "Case study: Hinglish STT",
-           "Pulse product overview doc", "Dashboard SSO"])
-    check("team and due on every point",
-          all("Team: " in b and "Due: " in b for b in blocks))
-    check("remarks where present",
-          sum(("pricing table" in b) or ("load test" in b) for b in blocks), 2)
-    check("the overdue one says so", "Overdue: 5 days" in blocks[0])
-    check("the link only where there is one, masked",
-          sum("](<https://" in b for b in blocks), 1)
+    check("by deadline: MSA, DPA, API rate limits",
+          [l.split(". ", 1)[1] for l in numbered],
+          ["MSA template", "DPA review", "API rate limits"])
+    check("each item is exactly two lines", [len(b.splitlines()) for b in blocks],
+          [2, 2, 2])
+    check("line 2 is the due date and nothing else",
+          [b.splitlines()[1] for b in blocks],
+          ["   Due: Wed 30 Sep · 5 days overdue", "   Due: Wed 7 Oct",
+           "   Due: Thu 8 Oct"])
+    check("no team, no remarks, no link anywhere",
+          [x for x in ("Team:", "Legal", "Engineering", "load test", "pricing table",
+                       "http", "](<") if x in body], [])
+    check("the body is the opener, 3 x 2 lines and the close",
+          len(body.splitlines()), 1 + 6 + 1)
     check("done / next week / undated rows are left out",
           any(x in body for x in ("NDA", "Q1 plan", "Some idea")), False)
     check("addressed to the checklist's owner", msg["owner"], "Vaishnavi")
@@ -180,10 +195,22 @@ async def main():
           all(l in prompt for l in points["lines"]))
 
     # ------------------------------------------------------------------ (ii)
-    print("\n(ii) A BLANK TEAM")
-    dpa = next(b for b in blocks if "DPA review" in b)
-    print(f"   {dpa}")
-    check("shows the default owner", "Team: Vaishnavi |" in dpa)
+    print("\n(ii) P2 / P3 ROWS DUE THIS WEEK ARE SKIPPED, AND LOGGED")
+    skipped = [l for l in INFO if l.startswith("[R4] skipped")]
+    for l in skipped:
+        print("   log: " + l)
+    check("the P2s and the P3 are not in the post",
+          [x for x in ("Pulse product overview doc", "Dashboard SSO",
+                       "Case study: Hinglish STT") if x in body], [])
+    check("each skipped row is logged with its priority",
+          sorted((l.split("'")[1], l.split("priority '")[1].split("'")[0])
+                 for l in skipped),
+          [("Case study: Hinglish STT", "P2"), ("Dashboard SSO", "P3"),
+           ("Pulse product overview doc", "P2"), ("Some idea", "P2")])
+    none_open = [dict(r, priority="P2") for r in SHEET]
+    _o2, plan2 = r4_message(none_open)
+    check("no open P1 -> no message at all",
+          [m for m in plan2["messages"] if m["type"] == nextaction.R_DELIVERABLES], [])
 
     # ------------------------------------------------------------------ (iii)
     print("\n(iii) THE MODEL DROPS A BULLET")
@@ -244,10 +271,12 @@ async def main():
 
     # ------------------------------------------------------------------ split
     print("\n(+) TWENTY ITEMS, ONE SLOT")
-    big = [dict(SHEET[1], _row=100 + i, action_item=f"Deliverable number {i + 1}",
+    big = [dict(SHEET[1], _row=100 + i,
+                action_item=(f"Deliverable number {i + 1} with a title long enough to "
+                             "push the whole list past Discord's two thousand "
+                             "character ceiling"),
                 deadline="9-Oct", dependency=["Sales", "Legal", "Engineering"][i % 3],
-                remarks="a remark long enough to push the whole list past Discord's "
-                        "two thousand character ceiling", priority=f"P{1 + i % 3}")
+                priority="P1")
            for i in range(20)]
     _o, bigplan = r4_message(big)
     bigmsg = bigplan["messages"][0]

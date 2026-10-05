@@ -606,9 +606,22 @@ BREAKING_HEADING = "**Breaking AI news**"
 
 def quiet_line(day: date) -> str:
     """The quiet-day line for `day` — one of QUIET_LINES, rotating by working
-    day, so Friday and the Monday after it differ too (`tone.rotate`)."""
+    day, so Friday and the Monday after it differ too (`tone.rotate`).
+
+    THE VOICE PROFILE SETS THE ORDER, the rotation stays: the wording closest
+    to how the team opens a message leads (`voice.order`), and three quiet days
+    in a row are still three different lines. With no profile the order is the
+    one written above.
+    """
     import tone
-    return tone.rotate(QUIET_LINES, day)
+    lines = QUIET_LINES
+    try:
+        import voice
+
+        lines = voice.order(QUIET_LINES)
+    except Exception:
+        log.debug("[news] could not order the quiet lines by voice", exc_info=True)
+    return tone.rotate(lines, day)
 
 
 def render(stories: list, *, mode: str = MODE_MAIN) -> str:

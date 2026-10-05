@@ -131,6 +131,11 @@ close by asking whether that was helpful.
 
 ### Voice exemplars
 
+> **These are the fallback.** Saley learns the team's tone from the sales
+> channel (the voice profile, `voice.py`) and is given the team's own messages
+> as its examples. This section is used only when no profile exists yet, or
+> when `VOICE_ENABLED` is off.
+
 These are the reference for every proactive message.
 **Match their length, their warmth and their shape — never their content.**
 
@@ -153,12 +158,14 @@ ones further down show the shape for each rule in the same voice.
 > Sid, two names from today's AI news aren't in our pipeline: one builds voice
 > agents, the other does evals. Want me to add either? Say skip if not.
 
-**Deliverables** (the week's list; the lines themselves are added in code)
+**Deliverables** (the week's P1 list — title and due date only; the lines
+themselves are added in code and posted exactly as rendered)
 
-> Vaishnavi, here's what's still open this week:
+> Here's what's open — 2:
 > 1. NDA
-> 2. Hinglish STT package
-> 3. Pulse overview doc
+>    Due: Fri 18 Sep · 10 days overdue
+> 2. Pulse overview doc
+>    Due: Wed 30 Sep
 > If any of these have moved, just tell me and I'll update my list.
 
 **A reminder** (somebody asked to be reminded)
