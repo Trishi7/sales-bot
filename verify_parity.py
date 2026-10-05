@@ -14,7 +14,10 @@ same database:
              copy of that database).
 
 and the bodies are compared. They must be IDENTICAL apart from the "[TEST]"
-prefix and how a mention is written (a simulation shows "@Name").
+prefix and how a mention is written (a simulation shows "@Name") — the same
+messages, in the same order — and the three must have made THE SAME CAP
+DECISIONS: who goes, which of them count against DAILY_MESSAGE_CAP, who rolls
+to tomorrow and who is held.
 
 NOTHING REACHES DISCORD. The bot is never logged in; every send lands in a
 recording channel. The sheet is read and never written (SHEET_WRITES_ENABLED is
@@ -30,12 +33,19 @@ rotated examples, the recent openers) and the compose prompt. Two paths
 produce the same composed body only if they handed the composer the same
 bytes, which is the property being checked. It costs nothing.
 
-  (ii)  R4 through all three paths: identical bodies, P1 only, two lines an item;
+  (ii)  R4 through all three paths: identical bodies, P1 only, each item its
+        title, team, due date and link;
   (iii) a P2 row with a deadline this week is skipped, and logged, on every path;
   (vi)  one composed message through all three paths: identical bodies — and
         every other drip message of the day too;
-  (vii) the Bot Rules tab wording for rule 4 and for the Global Rules row "Voice",
-        printed from the rules the bot loads.
+  (vii) the Bot Rules tab wording for rule 4 and for the Global Rules rows
+        "Voice" and "Daily cap", printed from the rules the bot loads;
+  (viii) the cap, three ways: the same plan, the same counted posts, the same
+        rolled and held groups — and `counted_today` agreeing with what the
+        live day wrote to drip_sends.
+
+`python verify_s1.py` is the companion: the same three paths on a fixture
+Monday built to hit the cap (six countable groups, an R8 and an R9).
 """
 import asyncio
 import hashlib
@@ -320,10 +330,26 @@ def begin(label: str):
     print(f"\n   ---- {label} ----")
 
 
-def collect() -> dict:
+def decisions(planned) -> dict:
+    """What a plan decided about the cap: who goes (and whether each counts),
+    who rolls and why, who is held. Compared across the three paths."""
+    planned = planned or {}
+    return {
+        "go": [(m["type"], bool(m.get("counts_toward_cap", True)),
+                bool(m.get("pinned")), m.get("send_at_hhmm"))
+               for m in planned.get("messages") or []],
+        "rolled": sorted((g["type"], g.get("rolled_why", ""))
+                         for g in planned.get("rolled") or []),
+        "held": sorted(g["type"] for g in planned.get("held") or []),
+        "counted": planned.get("counted"), "cap": planned.get("cap"),
+    }
+
+
+def collect(planned=None) -> dict:
     return {"sent": [(slot, kind, [strip(p) for p in posts]) for slot, kind, posts in SENT],
             "raw": [(slot, kind, list(posts)) for slot, kind, posts in SENT],
-            "skips": sorted(set(SKIPS)), "prompts": list(PROMPTS)}
+            "skips": sorted(set(SKIPS)), "prompts": list(PROMPTS),
+            "decisions": decisions(planned)}
 
 
 async def real_path(day: date) -> dict:
@@ -353,7 +379,9 @@ async def real_path(day: date) -> dict:
     clock.clear_time_override(why="verify_parity")
     print(f"   {len(SENT)} drip message(s) into channel {channel_id} (recording); "
           f"tagged [TEST]: {sum(1 for p in POSTED if p.startswith('[TEST]'))}")
-    return collect()
+    got = collect(planned)
+    got["rows"] = bot.db.drip_sent_today(dl.iso(day))
+    return got
 
 
 async def test_path(day: date, command: str) -> dict:
@@ -365,7 +393,7 @@ async def test_path(day: date, command: str) -> dict:
     await bot._handle_test_command(FakeMessage(), command)
     print(f"   resolved to {dl.iso(dl.today_ist())}; {len(SENT)} drip message(s); "
           f"tagged [TEST]: {sum(1 for _s, _k, ps in SENT for p in ps if p.startswith('[TEST]'))}")
-    got = collect()
+    got = collect((bot._last_test_plan or {}).get("planned"))
     got["day"] = dl.today_ist()
     return got
 
@@ -380,7 +408,7 @@ async def sim_path(day: date, command: str) -> dict:
     plan = (bot._last_test_plan or {})
     print(f"   resolved to {dl.iso(plan.get('date')) if plan.get('date') else '?'}; "
           f"{len(SENT)} drip message(s); the sandbox was a copy of {os.path.basename(path)}")
-    got = collect()
+    got = collect(plan.get("planned"))
     got["day"] = plan.get("date")
     return got
 
@@ -427,13 +455,17 @@ async def three_ways(day: date, label: str) -> None:
         lines = body.splitlines()
         items = [i for i, l in enumerate(lines) if re.match(r"^\d+\. ", l)]
         check("R4: one R4 post", len(r4["real"]), 1)
-        check("R4: every item is exactly two lines — the title, then \"Due: ...\"",
-              all(i + 1 < len(lines) and re.fullmatch(
-                  r"   Due: \w{3} \d{1,2} \w{3}(?: · \d+ days? overdue)?", lines[i + 1])
-                  and (i + 2 >= len(lines) or not lines[i + 2].startswith("   "))
+        check("R4: every item is its title, then \"Team: ...\", then \"Due: ...\"",
+              all(i + 2 < len(lines) and lines[i + 1].startswith("   Team: ")
+                  and re.fullmatch(
+                      r"   Due: \w{3} \d{1,2} \w{3}(?: · \d+ days? overdue)?",
+                      lines[i + 2])
                   for i in items))
-        check("R4: no team, no remarks, no link",
-              [x for x in ("Team:", "http", "](<", "waiting on") if x in body], [])
+        check("R4: a link is a [Doc](<…>) line of its own, and no remarks are shown",
+              ([l for l in lines if "http" in l and not l.startswith("   [Doc](<")],
+               "waiting on" in body), ([], False))
+        urls = re.findall(r"\(<(https?://[^>]+)>\)", body)
+        check("R4: no link appears twice", len(urls), len(set(urls)))
         head = [l for l in lines if l.startswith("**")]
         check("R4: the heading, the opener and the close are there",
               (head[:1], bool(re.search(r"^\d+ (still )?open:|what's open", body, re.M)),
@@ -486,6 +518,38 @@ async def three_ways(day: date, label: str) -> None:
     if not (real["sent"] == test["sent"] == sim["sent"]):
         for name, run in (("real", real), ("test", test), ("sim", sim)):
             print(f"   {name}: " + ", ".join(f"slot {s} {k}" for s, k, _p in run["sent"]))
+    # ---- (viii) the cap ----------------------------------------------------
+    print("\n(viii) THE CAP, THREE WAYS")
+    d = real["decisions"]
+    print(f"   cap {d['cap']} counted post(s); the real day planned {len(d['go'])} "
+          f"message(s), {sum(1 for g in d['go'] if g[1])} counted, "
+          f"{sum(1 for g in d['go'] if not g[1])} outside the cap; "
+          f"{len(d['rolled'])} rolled, {len(d['held'])} held")
+    for kind, counted, pinned, hhmm in d["go"]:
+        print(f"     {hhmm}  {kind:<22} {'counted' if counted else 'outside the cap'}"
+              f"{', fixed time' if pinned else ''}")
+    for kind, why in d["rolled"]:
+        print(f"     rolls  {kind} ({why})")
+    check("the same cap decisions on all three: who goes, who counts, who rolls, "
+          "who is held", real["decisions"] == test["decisions"] == sim["decisions"])
+    if not (real["decisions"] == test["decisions"] == sim["decisions"]):
+        for name, run in (("real", real), ("test", test), ("sim", sim)):
+            print(f"   {name}: {run['decisions']}")
+    check("the same messages in the same order (by type)",
+          [k for _s, k, _p in real["sent"]] == [k for _s, k, _p in test["sent"]]
+          == [k for _s, k, _p in sim["sent"]])
+    check("the order sent is the order planned",
+          [k for _s, k, _p in real["sent"]], [g[0] for g in d["go"]])
+    rows = real.get("rows") or []
+    check("every row the real day wrote carries counts_toward_cap",
+          [r["action_type"] for r in rows if r.get("counts_toward_cap") is None], [])
+    check("counted_today(drip_sends) is what the plan counted, and within the cap",
+          (drip.counted_today(rows), drip.counted_today(rows) <= int(d["cap"] or 0)),
+          (d["counted"], True))
+    check("no meeting-prep or meeting-follow-up row was counted",
+          [r["action_type"] for r in rows
+           if r["action_type"] in drip.NEVER_COUNTED and r.get("counts_toward_cap")], [])
+
     check("the real run carries no [TEST] tag; the other two tag every message",
           (any(p.startswith("[TEST]") for _s, _k, ps in real["raw"] for p in ps),
            all(p.startswith("[TEST]") for _s, _k, ps in test["raw"] for p in ps),
@@ -528,12 +592,18 @@ def bot_rules_wording() -> None:
     print("\n(vii) THE WORDING FOR THE SHEET — printed from the rules the bot loads")
     rules_mod.reload()
     r4 = rules_mod.by_id("R4")
-    want = "P1 deliverables due this week — title and due date only"
+    want = "P1 deliverables due this week — title, team, due date and link"
     print("\n   Bot Rules tab — rule 4, column \"What the Bot Shares / Checks\":")
     print("     " + rules_mod.sheet_wording_for("R4"))
     print("\n   Global Rules tab — row \"Voice\":")
     print("     " + rules_mod.global_rule("voice"))
+    print("\n   Global Rules tab — row \"Daily cap\":")
+    print("     " + rules_mod.global_rule("daily_cap"))
     print()
+    check("the Daily cap row is the agreed sentence",
+          rules_mod.global_rule("daily_cap"),
+          "Max 5 posts a day; meeting prep, meeting follow-ups, reminders, urgent "
+          "news and answers to questions don't count.")
     check("bot_rules.yaml R4 plain", r4.plain, want)
     check("bot_rules.yaml R4 description", r4.description, want)
     strategy = persona.load_strategy()

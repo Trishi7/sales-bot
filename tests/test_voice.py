@@ -134,24 +134,51 @@ class TestR4IsP1OnlyTitleAndDue:
         assert any("'Case study'" in s and "'P2'" in s for s in skips)
         assert any("'Dashboard SSO'" in s and "'P3'" in s for s in skips)
 
-    def test_each_item_is_exactly_two_lines_title_then_due(self):
+    def test_each_item_is_title_team_due_and_its_link(self):
+        """S3: the team and the link came back. The team is the Functional
+        Dependency, or the default owner when that cell is blank; the link
+        line is there only when the row has a link."""
+        import config
         import drip
 
         lines = drip.render_deliverables(self._actions())
         assert lines == [
             "2 open:",
-            "1. MSA template", "   Due: Wed 30 Sep · 5 days overdue",
-            "2. DPA review", "   Due: Wed 7 Oct",
+            "1. MSA template", "   Team: Legal",
+            "   Due: Wed 30 Sep · 5 days overdue",
+            "   [Doc](<https://docs.google.com/document/d/x>)",
+            "2. DPA review", f"   Team: {config.DELIVERABLE_DEFAULT_OWNER}",
+            "   Due: Wed 7 Oct",
         ]
 
-    def test_no_team_no_remarks_no_link_even_when_the_item_carries_them(self):
+    def test_no_remarks_even_when_the_item_carries_them(self):
         import drip
 
         lines = drip.render_deliverables([{
             "item": "MSA", "team": "Legal", "remarks": "with the lawyer",
             "link": "https://docs.google.com/document/d/x", "deadline": "2026-10-06",
             "deadline_pretty": "Tue 6 Oct", "days_left": 1, "is_p1": True}])
-        assert lines == ["1 open:", "1. MSA", "   Due: Tue 6 Oct"]
+        assert lines == ["1 open:", "1. MSA", "   Team: Legal", "   Due: Tue 6 Oct",
+                         "   [Doc](<https://docs.google.com/document/d/x>)"]
+        assert not any("lawyer" in l for l in lines)
+
+    def test_an_action_item_and_a_link_each_appear_once(self):
+        """The checklist sometimes carries one deliverable on two rows, and
+        several items often point at one tracker."""
+        import drip
+
+        def item(name, link, deadline="2026-10-06"):
+            return {"item": name, "team": "Sales", "link": link, "deadline": deadline,
+                    "deadline_pretty": "Tue 6 Oct", "days_left": 1, "is_p1": True}
+
+        lines = drip.render_deliverables([
+            item("Overview doc", "https://x.test/tracker"),
+            item("overview doc", "https://x.test/other", "2026-10-07"),
+            item("Pricing page", "https://x.test/tracker", "2026-10-08")])
+        assert [l for l in lines if l[:3] in ("1. ", "2. ", "3. ")] == [
+            "1. Overview doc", "2. Pricing page"]
+        assert sum("x.test/tracker" in l for l in lines) == 1
+        assert lines[0] == "2 open:"
 
     def test_the_renderer_drops_an_item_that_says_it_is_not_p1(self):
         import drip
@@ -171,7 +198,7 @@ class TestR4IsP1OnlyTitleAndDue:
         import rules
 
         rules.reload()
-        want = "P1 deliverables due this week — title and due date only"
+        want = "P1 deliverables due this week — title, team, due date and link"
         r4 = rules.by_id("R4")
         assert r4.plain == want and r4.description == want
         assert rules.sheet_wording_for("R4").startswith(want)

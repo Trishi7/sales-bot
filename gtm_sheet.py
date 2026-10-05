@@ -145,8 +145,8 @@ RESEARCHER_LINES = "researcher_lines"
 # "Master Pipeline" is what the live sheet calls the researcher-lines tab, and
 # GTM_PIPELINE_TAB_TITLES is what finds it. Same kind, the sheet's own name.
 MASTER_PIPELINE = RESEARCHER_LINES
-# THE EVENTS & SUMMITS TAB. Conferences, summits and the like, each earning one
-# reminder at T-EVENT_LEAD_DAYS and never another.
+# THE EVENTS & SUMMITS TAB. Conferences, summits and the like; R3 reads it
+# every Wednesday (nextaction._r_events).
 EVENTS = "events_summits"
 
 # -- THE READ-ONLY CONTEXT TABS ----------------------------------------------
@@ -566,9 +566,9 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "dates": ("dates", "date"),
     },
     # THE AI EVENTS & SUMMITS TAB, found by name (GTM_EVENTS_TAB_TITLES).
-    # Read for its DATES: each event earns ONE reminder at T-EVENT_LEAD_DAYS and
-    # never another. Everything else on the row rides into that reminder so it
-    # says something useful rather than "there is an event".
+    # Read for its DATES, its registration deadline and whether we are
+    # registered: R3 gives each event close enough to matter one line on
+    # Wednesday.
     #
     # ITS DATES ARE FREE TEXT and always have been — "15-10-2026" on one row,
     # "October 20-21, 2026" on the next, "not available" on a third. They go
@@ -3085,6 +3085,135 @@ class GTMSheets:
         out["ok"] = bool(out["written"])
         return out
 
+    # -- THE ONE EXCEPTION TO THE RESTRICTED BANDS: the email cell ------------
+
+    EMAIL_ROLE = "email"
+
+    def write_email(self, *, row: int, email: str, expect_company: str,
+                    expect_name: str = "", reason: str = "",
+                    restore_from: str = "") -> dict:
+        """Write ONE email address into ONE row's Email cell — if it is blank.
+
+        THE SINGLE EXCEPTION TO "THE BOT NEVER WRITES A:I". The Email column
+        sits in the restricted identity band, and `write_cells` refuses it, as
+        it refuses every column there. This method is the only way past, and it
+        is deliberately narrow — each of these is checked here, in the write
+        path, and any one of them failing means nothing is written:
+
+          1. EMAIL_WRITE_ALLOWED is true (off by default);
+          2. the role is `email` and nothing else — it is not a parameter;
+          3. the value is one plain address (no spaces, one "@", a dotted host);
+          4. the sheet is RE-READ FRESH, the row still names `expect_company`
+             (and `expect_name`, when given) — the same interlock every write
+             has, against a re-sorted sheet;
+          5. THE CELL IS STILL BLANK in that fresh read. Somebody may have
+             typed the address in since the post; theirs wins, always;
+          6. not in a simulation, not with SHEET_WRITES_ENABLED off, not on a
+             read-only sheet — the same gates as every other write.
+
+        Returns {"ok", "written": [{role, column, cell, header, old, new}],
+        "skipped": str, "error": str}. `skipped` is set, with ok False and no
+        error, when the cell already holds something — that is not a failure.
+
+        `restore_from` IS THE UNDO, and it is as narrow: it empties the cell
+        again ONLY while the cell still holds exactly the address this bot
+        wrote (`restore_from`). An address somebody corrected by hand since is
+        not ours to remove.
+        """
+        out = {"ok": False, "written": [], "skipped": "", "error": ""}
+        undo = bool(restore_from)
+        value = "" if undo else " ".join(str(email or "").split())
+        try:
+            import simulation as _sim
+            if _sim.in_simulation():
+                log.info("[gtm] simulation: refusing to write an email to row %s", row)
+                out.update(simulated=True, error="",
+                           remedy="a simulation never writes to the sheet")
+                return out
+        except Exception:
+            pass
+        if not config.EMAIL_WRITE_ALLOWED:
+            out["error"] = ("writing an email to the sheet is off "
+                            "(EMAIL_WRITE_ALLOWED=false); the Email column is in the "
+                            "restricted band and I leave it alone")
+            return out
+        if not config.SHEET_WRITES_ENABLED:
+            out["error"] = "sheet writing is off (SHEET_WRITES_ENABLED=false)"
+            return out
+        if not undo and not re.fullmatch(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+", value):
+            out["error"] = f"{value!r} is not a plain email address; nothing written"
+            return out
+        refusal = self._refuse_if_read_only()
+        if refusal:
+            log.error("[gtm] %s", refusal)
+            out["error"] = refusal
+            return out
+        try:
+            tabs = self.read(force=True)             # FRESH: the blank check is on it
+        except SheetAccessError as e:
+            out["error"] = f"cannot reach the playbook: {e}. {e.remedy}".strip()
+            return out
+        tab = tabs.get(POCS)
+        if tab is None:
+            out["error"] = "there is no Outreach PoCs tab to write to"
+            return out
+        mismatch = self._row_mismatch(row=int(row), expect_company=expect_company)
+        if mismatch:
+            log.error("[gtm] %s", mismatch)
+            out["error"] = mismatch
+            return out
+        current = next((r for r in tab.rows if r.get("_row") == int(row)), None) or {}
+        if expect_name and normalise_header(clean_cell(current.get("name"))) != \
+                normalise_header(expect_name):
+            out["error"] = (f"row {row} is {clean_cell(current.get('name'))!r}, not "
+                            f"{expect_name!r} — the sheet has changed under me; "
+                            "refusing to write")
+            return out
+        idx = tab.role_to_col.get(self.EMAIL_ROLE)
+        if idx is None:
+            out["error"] = "the Outreach PoCs tab has no Email column mapped"
+            return out
+        have = clean_cell(current.get(self.EMAIL_ROLE))
+        if undo:
+            if have.lower() != str(restore_from).strip().lower():
+                out["skipped"] = (f"the Email cell now holds {have or 'nothing'!r}, not "
+                                  f"the {restore_from!r} I wrote — left as it is")
+                return out
+        elif have:
+            out["skipped"] = f"the Email cell already holds {have}"
+            return out
+        entry = {
+            "role": self.EMAIL_ROLE, "column": _col_letter(idx),
+            "cell": f"{_col_letter(idx)}{int(row)}",
+            "header": tab.headers[idx] if idx < len(tab.headers) else "Email",
+            "old": have, "new": value,
+        }
+        log.warning("[gtm] RESTRICTED-BAND EXCEPTION: %s %s (%s) — the email role, "
+                    "the one column in %s the bot may write, and only %s%s",
+                    "clearing" if undo else "writing", entry["cell"], entry["header"],
+                    config.restricted_band_label(idx) or "the writable window",
+                    "back to blank" if undo else "into a blank cell",
+                    f" — {reason}" if reason else "")
+        try:
+            ws = self._open().worksheet(tab.title)
+            ws.update(values=[[value]], range_name=entry["cell"],
+                      value_input_option="RAW")
+        except SheetAccessError as e:
+            out["error"] = f"{e}. {e.remedy}".strip()
+            return out
+        except Exception as e:
+            err = self._translate(e, ORIGINAL, self.sheet_id(), writing=True)
+            out["error"] = f"{err}. {err.remedy}".strip()
+            log.error("[gtm] email write failed: %s", err)
+            return out
+        self._patch_cached_cell(row=int(row), role=self.EMAIL_ROLE, value=value)
+        log.info("[gtm] WROTE %s (%s) %r -> %r%s", entry["cell"], entry["header"],
+                 entry["old"], entry["new"], f" — {reason}" if reason else "")
+        out["written"].append(entry)
+        out["ok"] = True
+        return out
+
     def write_cells_on(self, tab: "Tab", *, row: int, values: dict,
                        reason: str = "") -> dict:
         """Write cells on a row of a NON-canonical tab. Returns the same shape
@@ -3227,6 +3356,13 @@ class GTMSheets:
         an old value into whatever now sits in that row would be a second, worse
         mistake dressed as a correction.
         """
+        # AN EMAIL THE BOT WROTE is undone by the same narrow path that wrote it
+        # (`write_email`): the cell is emptied only while it still holds that
+        # exact address. Through `write_cells` the band check would refuse it.
+        if cells and all(c.get("role") == self.EMAIL_ROLE for c in cells):
+            return self.write_email(
+                row=int(row), email="", expect_company=expect_company,
+                reason="undo", restore_from=str(cells[0].get("new") or ""))
         values = {c["role"]: c.get("old", "") for c in (cells or []) if c.get("role")}
         result = self.write_cells(
             row=int(row), values=values, expect_company=expect_company,

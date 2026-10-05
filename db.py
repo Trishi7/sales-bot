@@ -34,6 +34,7 @@ CURRENT_TIMESTAMP writes — so they sort and compare correctly as plain strings
 import json
 import logging
 import re
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -380,7 +381,7 @@ CREATE INDEX IF NOT EXISTS ix_sched_row ON scheduled_reminders(row_key, status);
 CREATE TABLE IF NOT EXISTS drip_sends (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     on_date      TEXT NOT NULL,      -- YYYY-MM-DD IST
-    slot         INTEGER NOT NULL,   -- 1..DAILY_MESSAGE_CAP, the day's send slot
+    slot         INTEGER NOT NULL,   -- 1..n, the order the day's posts went out
     group_key    TEXT NOT NULL,      -- "<type>|<owner key>"
     action_type  TEXT NOT NULL,
     owner_key    TEXT NOT NULL DEFAULT '',
@@ -726,13 +727,22 @@ CREATE TABLE IF NOT EXISTS meeting_followups (
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- R1: THE OLD NEWS ROTATION — RETIRED, NOT DROPPED.
+-- R1: WHOSE TURN IT IS — the PoC news rotation (S2).
 --
--- R1 used to search for our PoCs, researchers and pipeline companies by name,
--- in turn, and this table kept whose turn it was. Since the 24/29 Sep decision
--- R1 is an AI industry feed on a topic list and searches for nobody by name, so
--- nothing reads or writes this table any more. It is left in place rather than
--- dropped: a DROP on startup is irreversible, and the rows cost nothing.
+-- One row per name the bot looks up news about: a person on an active Outreach
+-- PoCs row (kind 'poc'), or a company on Master Pipeline or Outreach PoCs
+-- (kind 'company'). `source` is the tab — or tabs — the name is on, in the
+-- sheet's own words; it is what a posted story says in brackets.
+--
+-- NEWS_POC_TARGETS_PER_DAY names are looked up a day, least recently checked
+-- first. `last_searched` is the REAL IST date a name was last in the day's
+-- set, '' = never; the day's set is every row stamped with today's date, so
+-- every poll of a day asks about the same names and a restart does not move
+-- the rotation on.
+--
+-- (This table was the rotation for the retired people search, which made a
+-- billed web search per name. It is reused as it stood: a Google News RSS
+-- query per name is free.)
 CREATE TABLE IF NOT EXISTS news_targets (
     target_key    TEXT PRIMARY KEY,   -- normalised name + kind
     kind          TEXT NOT NULL,      -- poc | researcher | company
@@ -917,6 +927,8 @@ CREATE TABLE IF NOT EXISTS news_feed_items (
     source       TEXT NOT NULL DEFAULT '',
     published_at TEXT NOT NULL DEFAULT '',   -- ISO datetime, UTC
     topic_hint   TEXT NOT NULL DEFAULT '',   -- the NEWS_TOPICS query it came from
+    -- `kind` (industry | poc) and `sheet_ref` ("Synthflow AI — on Master
+    -- Pipeline") were added with PoC news — see _MIGRATIONS.
     seen_at      TEXT NOT NULL DEFAULT '',   -- ISO datetime, UTC
     importance   INTEGER NOT NULL DEFAULT 0, -- 1-5 once scored
     topic        TEXT NOT NULL DEFAULT '',
@@ -964,7 +976,8 @@ CREATE TABLE IF NOT EXISTS voice_profile (
 # for both reasons — it cost a model call, and it holds the "forget my
 # messages" list, which a test reset must never undo.
 KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls",
-                 "web_search_usage", "search_quota_usage", "voice_profile")
+                 "web_search_usage", "search_quota_usage", "voice_profile",
+                 "news_targets")
 
 
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` won't
@@ -976,6 +989,16 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # drip row — so a reply of "yes" has something concrete to apply. Added
     # after drip_sends first shipped, hence the migration.
     ("drip_sends", "offer", "TEXT NOT NULL DEFAULT ''"),
+    # DOES THIS POST TAKE ONE OF THE DAY'S COUNTED POSTS? Written on send, read
+    # by `drip.counted_today` — the one counter. Without it the planner asked
+    # each sent row whether it counted, got no answer, and counted them all, so
+    # a meeting-prep post that had gone out took a slot from a chase after all.
+    # NULL on rows from before this: `drip.counts` asks the row's rule instead.
+    ("drip_sends", "counts_toward_cap", "INTEGER"),
+    # WAS IT A FIXED-TIME POST (R1 at NEWS_MAIN_TIME, R8's day-of touch)? Those
+    # take no place in the spaced window, so the planner must not count them
+    # when it works out which window time the next post gets. NULL on older rows.
+    ("drip_sends", "pinned", "INTEGER"),
     # THE TOPIC FEED. R1 became an AI industry feed on a topic list (24/29 Sep),
     # and a posted story now carries its topic (for the spread rules), its
     # headline key (for the no-repeats check across outlets), the importance
@@ -985,6 +1008,15 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("news_stories", "headline_key", "TEXT NOT NULL DEFAULT ''"),
     ("news_stories", "importance", "INTEGER NOT NULL DEFAULT 3"),
     ("news_stories", "kind", "TEXT NOT NULL DEFAULT 'main'"),
+    # TWO KINDS OF NEWS (S2). A feed item, and a posted story, is `industry` or
+    # `poc`; a PoC one carries the sheet row it is about, in the words the post
+    # shows in brackets. On news_stories the column is `news_kind` because
+    # `kind` there already says which POST carried it (main | breaking |
+    # overflow).
+    ("news_feed_items", "kind", "TEXT NOT NULL DEFAULT 'industry'"),
+    ("news_feed_items", "sheet_ref", "TEXT NOT NULL DEFAULT ''"),
+    ("news_stories", "news_kind", "TEXT NOT NULL DEFAULT 'industry'"),
+    ("news_stories", "sheet_ref", "TEXT NOT NULL DEFAULT ''"),
     # ONE-OFF REMINDERS FIRE WHERE THEY WERE ASKED, TAGGING WHO ASKED. Rows from
     # before this carry '' for both: they fire in the posting channel and name
     # the asker in plain text.
@@ -1892,16 +1924,24 @@ class DB:
             rows = c.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
-    def scheduled_reminders_due_on(self, on_date: str) -> list[dict]:
-        """OPEN reminders dated `on_date`, for the exact-time loop. FAILS QUIET:
-        an unreadable table means no reminder fires this minute, and the next
-        tick tries again."""
+    def scheduled_reminders_due_by(self, on_date: str) -> list[dict]:
+        """OPEN reminders dated `on_date` OR EARLIER, for the exact-time loop —
+        the only thing that sends a reminder.
+
+        "OR EARLIER" IS THE CATCH-UP. A reminder whose date passed while the bot
+        was down, or that was written with yesterday's date, used to be left to
+        the drip's second lane, which never closed it. The loop now takes it on
+        its next tick, says when it was due, and closes it.
+
+        FAILS QUIET: an unreadable table means no reminder fires this minute,
+        and the next tick tries again."""
         try:
             with self.conn() as c:
                 rows = c.execute(
                     "SELECT id, row_key, company, poc, due_date, due_time, what, "
                     "requested_by, channel_id, asker_id FROM scheduled_reminders "
-                    "WHERE status = 'open' AND due_date = ? ORDER BY id",
+                    "WHERE status = 'open' AND due_date <= ? "
+                    "ORDER BY due_date, id",
                     (str(on_date),),
                 ).fetchall()
             return [dict(r) for r in rows]
@@ -1950,8 +1990,8 @@ class DB:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT slot, group_key, action_type, owner_key, owner_label, "
-                "companies, stage, planned_at, sent_at FROM drip_sends "
-                "WHERE on_date = ? ORDER BY slot ASC",
+                "companies, stage, planned_at, sent_at, counts_toward_cap, pinned "
+                "FROM drip_sends WHERE on_date = ? ORDER BY slot ASC",
                 (str(on_date),),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1960,10 +2000,16 @@ class DB:
         self, *, on_date: str, slot: int, group_key: str, action_type: str,
         owner_key: str = "", owner_label: str = "", companies: str = "",
         stage: str = "nudge", planned_at: str = "", channel_id=None,
-        message_id=None, sent_at: str = "",
+        message_id=None, sent_at: str = "", counts_toward_cap: bool = True,
+        pinned: bool = False,
     ) -> bool:
         """Record that one drip message went out. False when that slot was
         already taken.
+
+        `counts_toward_cap` and `pinned` are the post's own answers to "did this
+        take one of the day's counted posts" and "was it a fixed-time post".
+        They are stored, not re-derived, so a later change to bot_rules.yaml
+        cannot rewrite what an earlier post cost the day.
 
         The UNIQUE (on_date, slot) constraint is doing real work: two sweep
         ticks racing on the same slot both try to insert, one wins, and the
@@ -1974,12 +2020,14 @@ class DB:
                 c.execute(
                     "INSERT INTO drip_sends (on_date, slot, group_key, action_type, "
                     "owner_key, owner_label, companies, stage, planned_at, channel_id, "
-                    "message_id, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "message_id, sent_at, counts_toward_cap, pinned) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (str(on_date), int(slot), str(group_key), str(action_type),
                      str(owner_key or ""), str(owner_label or ""), str(companies or ""),
                      str(stage or "nudge"), str(planned_at or ""),
                      str(channel_id) if channel_id else None,
-                     str(message_id) if message_id else None, str(sent_at or "")),
+                     str(message_id) if message_id else None, str(sent_at or ""),
+                     1 if counts_toward_cap else 0, 1 if pinned else 0),
                 )
         except sqlite3.IntegrityError:
             log.warning(
@@ -2494,6 +2542,22 @@ class DB:
             ).fetchone()
         return self.proposal(row["proposal_key"]) if row else None
 
+    def open_proposals_for_message(self, message_id: str) -> list[dict]:
+        """EVERY open proposal keyed to one message, oldest first.
+
+        One post can ask more than one thing — R3 may offer to add events it
+        found, to fill in deadlines, and to remind the team again — and each is
+        its own proposal. The caller picks which one a reply answers.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT proposal_key FROM write_proposals "
+                "WHERE message_id = ? AND status = 'open' ORDER BY created_at, rowid",
+                (str(message_id or ""),),
+            ).fetchall()
+        out = [self.proposal(r["proposal_key"]) for r in rows]
+        return [p for p in out if p]
+
     def latest_open_proposal(self, *, company: str = "") -> Optional[dict]:
         """The newest open proposal, optionally for one company.
 
@@ -2960,6 +3024,13 @@ class DB:
         NEW MEANS NEITHER KEY IS KNOWN: the same link (url_key) or the same
         headline from another outlet (headline_key) is the same story and is
         not stored twice.
+
+        A STORY ALREADY STORED AS INDUSTRY NEWS THAT A PoC QUERY ALSO RETURNS
+        BECOMES A PoC STORY. The outlets' feeds are read first, so a funding
+        round at a pipeline company usually arrives from TechCrunch before the
+        company's own query finds it; without this it would stay "industry" and
+        lose both its sheet row and its place in the PoC slots. Its score is
+        kept — it is the same story.
         """
         added = 0
         with self.conn() as c:
@@ -2968,31 +3039,46 @@ class DB:
                 hkey = str(it.get("headline_key") or "").strip()
                 if not ukey:
                     continue
+                kind = "poc" if str(it.get("kind") or "") == "poc" else "industry"
+                ref = str(it.get("sheet_ref") or "")[:200]
                 seen = c.execute(
-                    "SELECT 1 FROM news_feed_items WHERE url_key = ? "
+                    "SELECT url_key, kind FROM news_feed_items WHERE url_key = ? "
                     "OR (? <> '' AND headline_key = ?) LIMIT 1", (ukey, hkey, hkey),
                 ).fetchone()
                 if seen is not None:
+                    if kind == "poc" and str(seen["kind"] or "") != "poc":
+                        c.execute(
+                            "UPDATE news_feed_items SET kind = 'poc', sheet_ref = ? "
+                            "WHERE url_key = ?", (ref, seen["url_key"]))
                     continue
                 c.execute(
                     "INSERT INTO news_feed_items (url_key, headline_key, url, title, "
-                    "summary, source, published_at, topic_hint, seen_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "summary, source, published_at, topic_hint, seen_at, kind, "
+                    "sheet_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (ukey, hkey, str(it.get("url") or ""), str(it.get("title") or "")[:300],
                      str(it.get("summary") or "")[:300], str(it.get("source") or "")[:120],
                      str(it.get("published_at") or ""), str(it.get("topic_hint") or ""),
-                     str(it.get("seen_at") or "")),
+                     str(it.get("seen_at") or ""), kind, ref),
                 )
                 added += 1
         return added
 
     def news_feed_between(self, since_utc: str, until_utc: str) -> list[dict]:
-        """Every stored item published in [since, until], newest first."""
+        """Every stored item that belongs to [since, until], newest first.
+
+        PUBLISHED in the window — or, for a PoC item, FIRST SEEN in it. A name
+        is looked up every few weeks and its query reaches back
+        NEWS_POC_LOOKBACK_DAYS, so a PoC story is often a few days old on the
+        day the bot first learns of it; by its publication date alone it would
+        belong to a window that closed before anybody had looked.
+        """
         with self.conn() as c:
             rows = c.execute(
-                "SELECT * FROM news_feed_items WHERE published_at >= ? "
-                "AND published_at <= ? ORDER BY published_at DESC",
-                (str(since_utc), str(until_utc)),
+                "SELECT * FROM news_feed_items WHERE "
+                "(published_at >= ? AND published_at <= ?) "
+                "OR (kind = 'poc' AND seen_at >= ? AND seen_at <= ?) "
+                "ORDER BY published_at DESC",
+                (str(since_utc), str(until_utc), str(since_utc), str(until_utc)),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -3181,6 +3267,21 @@ class DB:
             return True
         return bool(row)
 
+    def event_keys_recorded(self, prefix: str = "") -> set:
+        """Every key in `event_reminders` starting with `prefix`. FAILS CLOSED:
+        unreadable means "nothing has been listed", which for R3's once-only
+        "date unclear" line costs one repeat rather than hiding a row for ever.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT event_key FROM event_reminders WHERE event_key LIKE ?",
+                    (str(prefix) + "%",)).fetchall()
+            return {str(r["event_key"]) for r in rows}
+        except Exception:
+            log.exception("[db] could not read the event log; treating it as empty")
+            return set()
+
     def record_event_reminder(
         self, *, event_key: str, event: str, event_date: str,
         location: str = "", sent_on: str = "",
@@ -3256,8 +3357,99 @@ class DB:
 
     # -- R1: stories already posted ----------------------------------------
     #
-    # `news_targets` and its four methods are RETIRED with the people rotation;
-    # the table is left in place (see SCHEMA) and nothing touches it.
+    # `news_targets` is the PoC news rotation (S2): who is looked up, and
+    # whose turn it is. Three methods; `feeds.poll` and the bot's sync use them.
+
+    def news_targets_sync(self, targets: list) -> dict:
+        """Make the rotation match the sheet. {"total", "added", "removed"}.
+
+        `targets` is [{"key", "kind", "name", "company", "source", "sheet_row"}]
+        — every name that may be looked up TODAY. A name no longer on the sheet
+        (the row went inactive, the person is on the departures list now) is
+        DELETED, not left to take a turn: the rule is "never anyone on the
+        departures list", and a stale row would break it quietly. A name that
+        is still there keeps its `last_searched`, so a sync never restarts the
+        rotation.
+        """
+        wanted = {str(t.get("key") or "").strip(): t for t in (targets or [])
+                  if str(t.get("key") or "").strip()}
+        with self.conn() as c:
+            have = {r["target_key"] for r in
+                    c.execute("SELECT target_key FROM news_targets").fetchall()}
+            gone = [k for k in have if k not in wanted]
+            c.executemany("DELETE FROM news_targets WHERE target_key = ?",
+                          [(k,) for k in gone])
+            for key, t in wanted.items():
+                c.execute(
+                    "INSERT INTO news_targets (target_key, kind, name, company, "
+                    "source, sheet_row) VALUES (?,?,?,?,?,?) "
+                    "ON CONFLICT(target_key) DO UPDATE SET kind = excluded.kind, "
+                    "  name = excluded.name, company = excluded.company, "
+                    "  source = excluded.source, sheet_row = excluded.sheet_row",
+                    (key, str(t.get("kind") or "company"), str(t.get("name") or ""),
+                     str(t.get("company") or ""), str(t.get("source") or ""),
+                     t.get("sheet_row")),
+                )
+        return {"total": len(wanted), "added": len([k for k in wanted if k not in have]),
+                "removed": len(gone)}
+
+    def news_targets_for_day(self, on_date: str, limit: int) -> list[dict]:
+        """THE DAY'S NAMES: at most `limit`, least recently checked first.
+
+        THE SAME SET ALL DAY. A name already stamped with `on_date` is in
+        today's set; only the remainder up to `limit` is drawn — never-checked
+        names first ('' sorts before every date), then the oldest — and stamped.
+        So the first poll of a day chooses, every later poll and every restart
+        reads the same choice, and tomorrow moves on. [] when `limit` is 0.
+
+        AMONG NAMES CHECKED EQUALLY LONG AGO THE ORDER IS A FIXED SHUFFLE (a
+        hash of the key), not the alphabet: drawn alphabetically, the first
+        fortnight was every company from A to F and not one person, because
+        "company" sorts before "poc".
+        """
+        limit = max(0, int(limit))
+        if not limit:
+            return []
+        cols = ("target_key, kind, name, company, source, sheet_row, last_searched, "
+                "searches, hits")
+        try:
+            with self.conn() as c:
+                today = c.execute(
+                    f"SELECT {cols} FROM news_targets WHERE last_searched = ? "
+                    "ORDER BY target_key LIMIT ?", (str(on_date), limit)).fetchall()
+                room = limit - len(today)
+                fresh = []
+                if room > 0:
+                    waiting = c.execute(
+                        f"SELECT {cols} FROM news_targets WHERE last_searched < ?",
+                        (str(on_date),)).fetchall()
+                    fresh = sorted(waiting, key=lambda r: (
+                        str(r["last_searched"] or ""),
+                        hashlib.sha1(str(r["target_key"]).encode("utf-8")).hexdigest(),
+                    ))[:room]
+                    c.executemany(
+                        "UPDATE news_targets SET last_searched = ?, "
+                        "searches = searches + 1 WHERE target_key = ?",
+                        [(str(on_date), r["target_key"]) for r in fresh])
+            return [dict(r) for r in list(today) + list(fresh)]
+        except Exception:
+            log.exception("[news] the PoC rotation could not be read; no PoC names "
+                          "are looked up this poll")
+            return []
+
+    def news_target_hits(self, keys: list) -> None:
+        """Count one run that found something, for each name in `keys`."""
+        rows = [(str(k),) for k in (keys or []) if str(k or "").strip()]
+        if not rows:
+            return
+        with self.conn() as c:
+            c.executemany("UPDATE news_targets SET hits = hits + 1 "
+                          "WHERE target_key = ?", rows)
+
+    def news_targets_count(self) -> int:
+        with self.conn() as c:
+            return int(c.execute(
+                "SELECT COUNT(*) AS n FROM news_targets").fetchone()["n"] or 0)
 
     def news_story_seen(self, url_key: str, headline_key: str = "", *,
                         since_iso: str) -> Optional[dict]:
@@ -3302,7 +3494,9 @@ class DB:
              str(s.get("headline") or s.get("title") or "")[:300],
              str(s.get("what") or s.get("about") or "")[:300], str(rule_id),
              str(kind), str(on_date), str(s.get("topic") or ""),
-             str(s.get("headline_key") or ""), int(s.get("importance") or 3), str(kind))
+             str(s.get("headline_key") or ""), int(s.get("importance") or 3), str(kind),
+             "poc" if str(s.get("kind") or "") == "poc" else "industry",
+             str(s.get("sheet_ref") or "")[:200])
             for s in (stories or []) if str(s.get("url_key") or "").strip()
         ]
         if not rows:
@@ -3311,13 +3505,15 @@ class DB:
             c.executemany(
                 "INSERT INTO news_stories "
                 "(url_key, url, title, about, rule_id, mode, posted_on, topic, "
-                " headline_key, importance, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                " headline_key, importance, kind, news_kind, sheet_ref) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(url_key) DO UPDATE SET "
                 "  url = excluded.url, title = excluded.title, about = excluded.about, "
                 "  rule_id = excluded.rule_id, mode = excluded.mode, "
                 "  posted_on = excluded.posted_on, topic = excluded.topic, "
                 "  headline_key = excluded.headline_key, "
-                "  importance = excluded.importance, kind = excluded.kind",
+                "  importance = excluded.importance, kind = excluded.kind, "
+                "  news_kind = excluded.news_kind, sheet_ref = excluded.sheet_ref",
                 rows,
             )
         return len(rows)
@@ -3339,7 +3535,8 @@ class DB:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT url, title AS headline, about AS what, topic, importance, "
-                "  kind, url_key FROM news_stories WHERE posted_on = ? "
+                "  kind, url_key, news_kind, sheet_ref FROM news_stories "
+                "WHERE posted_on = ? "
                 "ORDER BY created_at ASC, rowid ASC", (str(on_date),),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -3355,11 +3552,19 @@ class DB:
         return [str(r["title"]) for r in rows]
 
     def news_topic_count_today(self, topic: str, on_date: str) -> int:
-        """How many stories on `topic` went out on `on_date`, main and breaking."""
+        """How many INDUSTRY stories on `topic` went out on `on_date`, in the
+        main post or a breaking one.
+
+        NOT THE OVERFLOW POST AND NOT PoC NEWS. The per-topic limit shapes the
+        main post; "More AI news today" is where the stories it kept out go, so
+        counting them would have the limit feed itself — and news about our own
+        people is exempt from the limit, so it does not use it up either.
+        """
         with self.conn() as c:
             row = c.execute(
                 "SELECT COUNT(*) AS n FROM news_stories WHERE posted_on = ? "
-                "AND lower(topic) = lower(?)", (str(on_date), str(topic or "")),
+                "AND lower(topic) = lower(?) AND kind <> 'overflow' "
+                "AND news_kind <> 'poc'", (str(on_date), str(topic or "")),
             ).fetchone()
         return int(row["n"] or 0)
 
@@ -3375,7 +3580,8 @@ class DB:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT DISTINCT topic FROM news_stories WHERE posted_on BETWEEN ? AND ? "
-                "AND topic <> ''", (monday.isoformat(), sunday.isoformat()),
+                "AND topic <> '' AND kind <> 'overflow' AND news_kind <> 'poc'",
+                (monday.isoformat(), sunday.isoformat()),
             ).fetchall()
         return [str(r["topic"]) for r in rows]
 

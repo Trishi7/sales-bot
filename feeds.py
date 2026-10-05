@@ -6,7 +6,21 @@ need searching for — the outlets publish it as RSS, free, and Google News turn
 any topic into a feed. So:
 
     poll()   reads NEWS_RSS_FEEDS, plus one Google News RSS query per entry in
-             NEWS_TOPICS, and stores what is NEW in `news_feed_items`.
+             NEWS_TOPICS, plus one per PoC name whose turn it is today, and
+             stores what is NEW in `news_feed_items`.
+
+TWO KINDS OF NEWS (S2). An item is `industry` (the first two) or `poc`: it came
+from the query for a person on an active Outreach PoCs row or a company on
+Master Pipeline / Outreach PoCs, AND IT NAMES THEM IN ITS TITLE OR SUMMARY.
+That last part is a check made here, in code: Google News matches a quoted name
+anywhere in an article, and an item that merely mentions "Pulse" somewhere is
+not news about the company called Pulse. A PoC item carries `sheet_ref` — "who
+it is about and where they are on the sheet" — which the post shows in brackets.
+
+The names take turns (`news_targets`, NEWS_POC_TARGETS_PER_DAY a day, least
+recently checked first). This module reads the day's names from the database;
+the bot keeps that table in step with the sheet and leaves out anybody on the
+mapping's departures list.
 
 A POLL MAKES ZERO API CALLS. It is plain HTTP GETs, run every
 NEWS_FEED_POLL_MINUTES from the sweep loop. What the light model later sees is
@@ -74,6 +88,88 @@ def google_news_url(topic: str) -> str:
     topic = " ".join(str(topic or "").split())
     q = f'"{topic}"' if " " in topic else topic
     return GOOGLE_NEWS.format(q=quote_plus(f"{q} {GOOGLE_NEWS_WINDOW}"))
+
+
+# -- our PoCs -----------------------------------------------------------------
+
+KIND_INDUSTRY = "industry"
+KIND_POC = "poc"
+
+# A name shorter than this is not looked up: "AI", "Go" and "X" are words, and a
+# query for one returns the whole day's news tagged as ours.
+POC_NAME_MIN_CHARS = 3
+
+# The most items ONE name's query may add to the store in one poll — the
+# newest. The first live poll looked up 15 names and came back with 236 items
+# "naming" them: a big company is in the news forty times a week, and a
+# company called "Andi" shares its name with a footballer and a reality-TV
+# contestant. The scorer throws the strangers out, but it has to be shown
+# them first, and 236 of them left no room in the call for the industry.
+POC_ITEMS_PER_NAME = 5
+
+
+def poc_query(target: dict) -> str:
+    """The Google News query for one name: `"<company>"`, or `"<person>"
+    "<company>"` for a person — both quoted, so each is matched as a phrase."""
+    name = " ".join(str(target.get("name") or "").split()).replace('"', "")
+    company = " ".join(str(target.get("company") or "").split()).replace('"', "")
+    if str(target.get("kind") or "") == "company" or not company:
+        return f'"{name}"'
+    return f'"{name}" "{company}"'
+
+
+def poc_url(target: dict) -> str:
+    days = max(1, int(config.NEWS_POC_LOOKBACK_DAYS))
+    return GOOGLE_NEWS.format(q=quote_plus(f"{poc_query(target)} when:{days}d"))
+
+
+def sheet_ref(target: dict) -> str:
+    """What a PoC story says in brackets: who it is about and where they are on
+    the sheet. "Synthflow AI — on Master Pipeline"; for a person, "Jane Doe,
+    Synthflow AI — on Outreach PoCs"."""
+    name = " ".join(str(target.get("name") or "").split())
+    company = " ".join(str(target.get("company") or "").split())
+    who = name if (str(target.get("kind") or "") == "company" or not company
+                   or company.lower() == name.lower()) else f"{name}, {company}"
+    source = " ".join(str(target.get("source") or "").split())
+    return f"{who} — on {source}" if source else who
+
+
+def names_it(item: dict, target: dict) -> bool:
+    """Does this item NAME the target in its title or summary?
+
+    A whole-phrase match, case-insensitive, on word boundaries — the company's
+    name for a company, the person's full name for a person. An item about the
+    company that does not name the person is not news about the person (the
+    company has its own turn in the rotation).
+    """
+    name = " ".join(str(target.get("name") or "").split())
+    if len(name) < POC_NAME_MIN_CHARS:
+        return False
+    text = f"{item.get('title') or ''} \n {item.get('summary') or ''}"
+    return re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.I) is not None
+
+
+def poc_targets(now: Optional[datetime] = None) -> list:
+    """Today's names, from the rotation. [] when PoC news is off, there is no
+    database, or nothing has been synced from the sheet yet.
+
+    "TODAY" IS THE REAL IST DATE: the rotation moves once a real day, whatever
+    date a tester is standing on.
+    """
+    limit = max(0, int(config.NEWS_POC_TARGETS_PER_DAY))
+    db = _db()
+    if not limit or db is None:
+        return []
+    now = now or datetime.now(timezone.utc)
+    today = (now.astimezone(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+    try:
+        rows = db.news_targets_for_day(today.isoformat(), limit)
+    except Exception:
+        log.exception("[feeds] could not read today's PoC names")
+        return []
+    return [t for t in rows
+            if len(" ".join(str(t.get("name") or "").split())) >= POC_NAME_MIN_CHARS]
 
 
 def sources() -> list:
@@ -144,9 +240,15 @@ def _published(entry, now: datetime) -> datetime:
     return now
 
 
-def parse(content, *, topic_hint: str = "", now: Optional[datetime] = None) -> list:
+def parse(content, *, topic_hint: str = "", now: Optional[datetime] = None,
+          target: Optional[dict] = None) -> list:
     """One feed's bytes -> [{url, url_key, headline_key, title, summary, source,
-    published_at, topic_hint, seen_at}]. Never raises; [] for nonsense.
+    published_at, topic_hint, seen_at, kind, sheet_ref}]. Never raises; [] for
+    nonsense.
+
+    `target` is the PoC name this feed was the query for. Its items are kept
+    only when they NAME it (`names_it`), and are tagged kind=poc with its
+    `sheet_ref`; every other feed's items are kind=industry.
 
     A link-less or title-less entry is dropped, and so is a digest link. For a
     Google News entry the " - Outlet" tail comes off the title (it is the
@@ -182,7 +284,7 @@ def parse(content, *, topic_hint: str = "", now: Optional[datetime] = None) -> l
         summary = _plain(entry.get("summary") or entry.get("description") or "")
         if summary.lower().startswith(title.lower()[:60]):
             summary = ""
-        out.append({
+        item = {
             "url": url, "url_key": news.url_key(url),
             "headline_key": news.headline_key(title),
             "title": _clip(title, 300),
@@ -191,7 +293,14 @@ def parse(content, *, topic_hint: str = "", now: Optional[datetime] = None) -> l
             "published_at": utc_iso(_published(entry, now)),
             "topic_hint": topic_hint,
             "seen_at": utc_iso(now),
-        })
+            "kind": KIND_INDUSTRY, "sheet_ref": "",
+        }
+        if target is not None:
+            if not names_it(item, target):
+                continue
+            item["kind"] = KIND_POC
+            item["sheet_ref"] = sheet_ref(target)
+        out.append(item)
     return out
 
 
@@ -201,13 +310,19 @@ def parse(content, *, topic_hint: str = "", now: Optional[datetime] = None) -> l
 def poll(*, now: Optional[datetime] = None) -> dict:
     """Read every feed and store what is new. Zero API calls.
 
-    Returns {"feeds", "ok", "fetched", "new", "errors"}. `fetched` is every
-    item the feeds carried inside the keep window; `new` is how many of them
-    the store had not seen — so a second poll straight after the first reports
-    new=0.
+    Returns {"feeds", "ok", "fetched", "new", "errors", "poc_targets",
+    "poc_items"}. `fetched` is every item the feeds carried inside the keep
+    window; `new` is how many of them the store had not seen — so a second poll
+    straight after the first reports new=0. `poc_targets` is how many PoC names
+    were looked up and `poc_items` how many items named one of them.
+
+    THE PoC QUERIES ARE READ LAST, after the outlets and the topics, so the
+    primary report of a story is the row that is stored and the PoC query then
+    marks that row as ours (`db.news_feed_add`).
     """
     now = now or datetime.now(timezone.utc)
-    result = {"feeds": 0, "ok": 0, "fetched": 0, "new": 0, "errors": []}
+    result = {"feeds": 0, "ok": 0, "fetched": 0, "new": 0, "errors": [],
+              "poc_targets": 0, "poc_items": 0}
     try:
         import feedparser  # noqa: F401
     except ImportError:
@@ -215,32 +330,42 @@ def poll(*, now: Optional[datetime] = None) -> dict:
         log.error("[feeds] feedparser is not installed; no feed can be read")
         return result
 
-    todo = sources()
+    todo = [(url, hint, None) for url, hint in sources()]
+    names = poc_targets(now)
+    todo += [(poc_url(t), "", t) for t in names]
     result["feeds"] = len(todo)
+    result["poc_targets"] = len(names)
     if not todo:
         return result
 
-    def one(pair):
-        url, hint = pair
+    def one(job):
+        url, hint, target = job
         try:
-            return url, hint, _get(url), ""
+            return url, hint, target, _get(url), ""
         except Exception as e:
-            return url, hint, b"", f"{type(e).__name__}: {str(e)[:120]}"
+            return url, hint, target, b"", f"{type(e).__name__}: {str(e)[:120]}"
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         fetched = list(pool.map(one, todo))
 
     keep_from = utc_iso(now - timedelta(days=max(1, int(config.NEWS_FEED_KEEP_DAYS))))
     items: list = []
-    for url, hint, content, error in fetched:           # in `sources()` order
+    hit: list = []
+    for url, hint, target, content, error in fetched:   # outlets, topics, PoCs
         if error:
             result["errors"].append(f"{url} — {error}")
             log.info("[feeds] could not read %s: %s", url, error)
             continue
-        got = [i for i in parse(content, topic_hint=hint, now=now)
+        got = [i for i in parse(content, topic_hint=hint, now=now, target=target)
                if i["published_at"] >= keep_from]
+        if target is not None:
+            got = sorted(got, key=lambda i: i["published_at"],
+                         reverse=True)[:POC_ITEMS_PER_NAME]
         result["ok"] += 1
         items.extend(got)
+        if target is not None and got:
+            result["poc_items"] += len(got)
+            hit.append(target.get("target_key"))
     result["fetched"] = len(items)
 
     db = _db()
@@ -248,11 +373,17 @@ def poll(*, now: Optional[datetime] = None) -> dict:
         try:
             result["new"] = db.news_feed_add(items)
             db.news_feed_prune(keep_from)
+            if hit:
+                db.news_target_hits(hit)
         except Exception:
             log.exception("[feeds] could not store the poll")
             result["errors"].append("the feed store could not be written")
-    log.info("[feeds] poll: %d of %d feed(s) read, %d item(s), %d new%s — 0 API "
-             "calls", result["ok"], result["feeds"], result["fetched"], result["new"],
+    log.info("[feeds] poll: %d of %d feed(s) read (%d of them PoC names: %s), %d "
+             "item(s), %d naming a PoC, %d new%s — 0 API calls", result["ok"],
+             result["feeds"], len(names),
+             ", ".join(str(t.get("name")) for t in names[:6])
+             + ("…" if len(names) > 6 else "") if names else "none today",
+             result["fetched"], result["poc_items"], result["new"],
              f", {len(result['errors'])} error(s)" if result["errors"] else "")
     return result
 

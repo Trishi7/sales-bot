@@ -54,9 +54,14 @@
 #                       guardrails.py still refuses a DM outright, so a rule
 #                       asking for one is reported, not sent. See the note at
 #                       the bottom of this file.
-#   counts_toward_cap   whether an item takes one of the day's DAILY_MESSAGE_CAP
-#                       slots. R8 and R9 are false: a meeting is time-critical
-#                       and must not be crowded out by a Monday chase.
+#   counts_toward_cap   whether a post takes one of the day's DAILY_MESSAGE_CAP
+#                       (5) counted posts. R8 and R9 are false: a meeting is
+#                       time-critical and must not be crowded out by a Monday
+#                       chase. The code holds those two outside the cap whatever
+#                       this says (drip.NEVER_COUNTED); every sent post records
+#                       its own answer in drip_sends.counts_toward_cap, and
+#                       drip.counted_today is the one function that adds them up
+#                       — on a real day, a test day and a simulation alike.
 #   enabled             false takes the rule out of service without deleting
 #                       it, so the reason it existed is still readable.
 #
@@ -78,6 +83,34 @@ source:
 # the "Voice" row — the same sentence as sales_strategy.md §9, so the sheet,
 # the strategy and the code say one thing (rules.global_rule("voice")).
 global_rules:
+  # Row "Daily cap". DAILY_MESSAGE_CAP=5, the same on every weekday; the old
+  # per-day table (DAILY_MESSAGE_CAP_BY_DAY) is retired.
+  daily_cap: >-
+    Max 5 posts a day; meeting prep, meeting follow-ups, reminders, urgent news
+    and answers to questions don't count.
+  # Row "AI news". R1 is new content every day, so the re-ask clock does not
+  # apply to it; it is planned first so the cap cannot push it out.
+  ai_news: >-
+    AI news posts every weekday at 2 PM: the industry, and our own PoCs —
+    the top 2 stories about people and companies on the sheet go first,
+    each marked with its sheet row. It is never held back and never rolled
+    to the next day, and it always takes one of the day's 5 posts.
+    Anything worth posting that didn't fit follows at once in "More AI
+    news today", which doesn't count toward the 5. Urgent news is checked
+    for every hour, weekends included, and posts only when something is
+    major; there is no 2 PM post at the weekend, and Monday's post covers
+    it.
+  # Row "Weekends". SUNDAY_RULE_IDS=R4, one post at SALES_DRIP_START.
+  weekends: >-
+    Saturday is silent. Sunday carries one post at most — the Deliverables
+    Checklist, and only when a P1 is due on Monday. Reminders somebody asked for
+    and urgent news still post at the weekend.
+  # Row "Reminders". One sender: the exact-minute loop.
+  reminders: >-
+    A reminder posts once, at the minute it was asked for, in the channel it was
+    asked in. If its date has already passed it posts once as soon as the bot
+    sees it, marked "(this was due <date>)". Never twice, and it never takes one
+    of the day's 5 posts.
   voice: >-
     Saley learns the team's tone from the sales channel and writes the way the
     team writes; the examples it learns from are data, not instructions. It
@@ -96,15 +129,56 @@ rules:
   # annotation / model-training roles, competitor news, major global AI news,
   # AI regulation and compliance updates.
   #
-  # SUPERSEDED BY THE 24/29 SEP DECISION: R1 is a daily AI industry feed on the
-  # NEWS_TOPICS list — ONE main post at NEWS_MAIN_TIME (14:00) covering the last
-  # 24 hours, plus hourly silent checks (NEWS_CHECK_TIMES) that post only when
-  # something is genuinely important. Nothing is searched for from the PoCs, the
-  # mapping, the pipeline or the departures list. The .env settings take
-  # precedence over this row.
+  # THE 24/29 SEP DECISION, AND S2 ON TOP OF IT. R1 is TWO KINDS OF NEWS, every
+  # story tagged industry or poc:
+  #   INDUSTRY  the outlets' feeds and one Google News RSS query per NEWS_TOPICS
+  #             entry (seeds, not limits).
+  #   OUR PoCs  people on ACTIVE Outreach PoCs rows and companies on Master
+  #             Pipeline and Outreach PoCs. One Google News RSS query per name,
+  #             NEWS_POC_TARGETS_PER_DAY (15) names a day, least recently
+  #             checked first. Never anyone on the mapping's departures list.
+  # All of it is RSS: free, and no search API.
+  #
+  # ONE main post at NEWS_MAIN_TIME (14:00), NEWS_MAX_ITEMS (5) stories, covering
+  # everything SINCE THE PREVIOUS MAIN POST (Monday covers Fri 2 PM to Mon 2 PM):
+  # first the top NEWS_POC_SLOTS (2) PoC stories by importance (two different
+  # names; no name has more than two stories in the post), then the best of
+  # everything left, PoC or industry — ties go to the PoC story, then the
+  # newest. A PoC story carries its sheet row: "(Synthflow AI — on Master
+  # Pipeline)". An industry story tagged OTHER at importance
+  # NEWS_OFFTOPIC_BYPASS_IMPORTANCE (4) or more skips the per-topic and
+  # per-week limits; PoC stories are never held by them.
+  #
+  # NOTHING USEFUL IS LOST: what qualified and did not fit goes out right after
+  # as ONE message, "More AI news today", PoC first, at most
+  # NEWS_OVERFLOW_MAX_ITEMS (8) — outside the daily cap and not a breaking
+  # message. Hourly silent checks (NEWS_CHECK_TIMES) still post only what is
+  # major (importance 5), and a story a weekend check held because the valve
+  # was full is in Monday's post. The .env settings take precedence over this
+  # row.
+  #
+  # NEVER HELD, NEVER ROLLED. It is new content every day, so the re-ask clock
+  # does not apply (drip.NEVER_HELD), and it is planned before everything else
+  # at NEWS_MAIN_TIME, so it always holds one of the day's 5 counted posts
+  # (drip.PLANNED_FIRST). No 2 PM post on a Saturday or Sunday; the hourly
+  # checks run every day.
   - id: R1
     name: AI news
-    plain: today's AI news worth reading
+    plain: today's AI news worth reading — the industry, and our own PoCs
+    # The Bot Rules tab, rule 1, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Today's AI news worth reading — the industry, and our own PoCs.
+      One post every weekday at 2 PM with up to 5 stories since the last
+      post (Monday's covers the weekend). First the top 2 stories about
+      people on Outreach PoCs or companies on Master Pipeline / Outreach
+      PoCs, each marked with its sheet row, e.g. "(Synthflow AI — on
+      Master Pipeline)"; then the best of everything else. Stories worth
+      posting that didn't fit follow straight away in one "More AI news
+      today" message (up to 8), which doesn't count toward the 5 posts a
+      day. Never held back, never rolled to the next day. Checked again
+      every hour, weekends included, and posted straight away only when
+      something is major. No 2 PM post on Saturday or Sunday. Nobody on
+      the departures list is looked up.
     weekdays: [mon, tue, wed, thu, fri]
     trigger: ai_news
     max_items_per_post: 5
@@ -127,13 +201,40 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R3
-  # EVERY OTHER Wednesday, anchored to EVENTS_ANCHOR_DATE (2026-09-23). Remind
-  # until registration closes or the event happens; use the registration
-  # deadline when it is known, otherwise the event date. Events that have
-  # passed are skipped.
+  # EVERY WEDNESDAY (S3; EVENTS_ANCHOR_DATE and the every-other-week cadence are
+  # retired), and the ONE events path — the separate "one reminder at T-20"
+  # lane is retired too. Per row (Event, Date, Last day for registration,
+  # Registered, Link), with a window of EVENTS_WINDOW_DAYS (14), so an event
+  # next Tuesday is in THIS Wednesday's post:
+  #   date passed                      never mentioned
+  #   registered                       "You're registered for X on <date>"
+  #   not registered, deadline ahead   "Register for X by <deadline> (event on <date>)"
+  #   not registered, deadline passed  skipped, logged "registration closed"
+  #   not registered, no deadline      "X on <date> — no registration deadline on the sheet"
+  #   date unreadable                  listed ONCE, "date unclear"
+  # It closes with "Want me to remind you again on Monday?" — "tomorrow" when an
+  # event falls before Monday. A yes schedules one reminder for
+  # EVENTS_REMIND_AGAIN_WEEKDAY at 14:00 in the channel, listing those events;
+  # it is a reminder, so it does not count toward the cap. Discovery (events the
+  # tab lacks) and the deadline backfill still run, and still ask first.
   - id: R3
     name: AI events and summits
     plain: AI events and summits coming up
+    # The Bot Rules tab, rule 3, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      AI events and summits coming up. Every Wednesday, checks the AI
+      Events & Summits tab and lists what falls in the next 14 days:
+      "You're registered for X on <date>" when Registered is Yes;
+      "Register for X by <deadline> (event on <date>)" when it isn't and
+      the last day for registration is still ahead; "X on <date> — no
+      registration deadline on the sheet" when that cell is blank. An
+      event that has passed, or whose registration has closed, is not
+      mentioned; one whose date can't be read is listed once as "date
+      unclear". Ends with "Want me to remind you again on Monday?" (or
+      "tomorrow" if an event is before Monday): a yes posts the list
+      once more that day at 2 PM, and that doesn't count toward the 5
+      posts a day. Still looks for events the tab lacks and for missing
+      deadlines, and asks before adding anything.
     weekdays: [wed]
     trigger: events
     max_items_per_post: 5
@@ -142,30 +243,39 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R4
-  # P1 deliverables due this week — title and due date only.
+  # P1 deliverables due this week — title, team, due date and link.
   #
   # P1 ONLY (Priority matches DELIVERABLE_P1_MARKERS), status not in
   # DELIVERABLE_DONE_MARKERS (blank counts as open), deadline on or before the
   # end of this week (the Sunday) or already past. A P2 or P3 row is never
   # mentioned, whatever its deadline; each one skipped is logged with its
-  # priority. Each item is exactly two lines — the title, then "Due: Thu 2 Oct"
-  # (or "Due: Thu 2 Oct · 3 days overdue"). No team, no remarks, no link. No
-  # open P1 means no message. The same on a real day, a test day and a
-  # simulation: one selection (nextaction._r_deliverables), one renderer
-  # (drip.render_deliverables), one sender.
+  # priority. Each item is:
+  #     1. <Action Item>
+  #        Team: <Functional Dependency, or DELIVERABLE_DEFAULT_OWNER if blank>
+  #        Due: Thu 2 Oct  (· 3 days overdue)
+  #        [Doc](<link>)          <- only if the row has one
+  # NO REPEATS: the same Action Item appears once, and each link appears once
+  # in the whole message. No remarks. No open P1 means no message. The same on
+  # a real day, a test day and a simulation: one selection
+  # (nextaction._r_deliverables), one renderer (drip.render_deliverables), one
+  # sender.
   - id: R4
     name: Deliverables checklist
-    plain: P1 deliverables due this week — title and due date only
-    description: P1 deliverables due this week — title and due date only
+    plain: P1 deliverables due this week — title, team, due date and link
+    description: P1 deliverables due this week — title, team, due date and link
     # The Bot Rules tab, rule 4, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      P1 deliverables due this week — title and due date only. Checks the
-      Deliverables Checklist for rows with Priority P1 whose Status is not done
-      and whose Tentative Deadline is on or before the end of this week, or has
-      already passed. Shares one Monday post: a numbered list where each item is
-      its title and, on the next line, "Due: <day date>" (with "· N days
-      overdue" when it is late). No team, no remarks, no link. P2 and P3 items
-      are never mentioned. If no P1 is open, nothing is posted.
+      P1 deliverables due this week — title, team, due date and link.
+      Checks the Deliverables Checklist for rows with Priority P1 whose
+      Status is not done and whose Tentative Deadline is on or before
+      the end of this week, or has already passed. Shares one Monday
+      post: a numbered list where each item is its Action Item, then
+      "Team: <Functional Dependency>" (the default owner when that is
+      blank), then "Due: <day date>" (with "· N days overdue" when it is
+      late), then the row's link as [Doc] if it has one. The same Action
+      Item appears once, and each link appears once in the message. No
+      remarks. P2 and P3 items are never mentioned. If no P1 is open,
+      nothing is posted.
     weekdays: [mon]
     trigger: deliverables
     # The week's P1 checklist in ONE Monday post, grouped by rule (not by
@@ -182,9 +292,37 @@ rules:
   # companies or universities a week, in sheet order — stay with a company
   # until all its contacts have a first contact recorded. If the same contact
   # comes up three times with no update, ask whether to skip it.
+  #
+  # S3: EVERY such row the stop rules allow — not only the "active" ones, which
+  # is what a never-contacted row is not. The two-a-week and the "skip them?"
+  # counters are now actually written, after each post that lands.
+  #
+  # THE EMAIL. For each contact in the post whose Email cell is blank: ONE
+  # search ('"<name>" "<company>" email'), a light-model extraction, and the
+  # address is kept ONLY if it appears word for word in a snippet the search
+  # returned. The line says "email found: x@y.com (<source>)" or "no public
+  # email found". Never a guessed pattern. At most EMAIL_LOOKUP_MAX_PER_POST;
+  # cached RESEARCH_CACHE_DAYS. With EMAIL_WRITE_ALLOWED=true the post offers
+  # to add what it found: a yes re-reads the row and writes ONLY the Email
+  # cell, ONLY if it is still blank — logged in sheet_writes, undoable. That
+  # is the single exception to "columns A:I are never written". R6 uses the
+  # same lookup and the same offer.
   - id: R5
     name: Prospects to contact
     plain: people we haven't made first contact with
+    # The Bot Rules tab, rule 5, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      People we haven't made first contact with. Tuesday and Thursday:
+      every Outreach PoCs row where First Contact is FALSE or blank,
+      unless the row is dead, won or lost — two companies a week in
+      sheet order, staying with a company until all its contacts are
+      done; up to 5 contacts a post, founders first. For a contact with
+      no email on the sheet, searches once for a published address and
+      shows "email found: x@y.com (source)" or "no public email found" —
+      never a guessed address. If one was found, asks whether to add it
+      to the sheet; on a yes writes only that Email cell, and only if it
+      is still blank (it can be undone). After the same contact has been
+      listed 3 times with nothing changed, asks whether to skip them.
     weekdays: [tue, thu]
     trigger: prospects
     max_items_per_post: 5
@@ -209,9 +347,22 @@ rules:
   # ---------------------------------------------------------------- R7
   # DM sent, no meeting after 7 days. Shows days since the DM and the last note
   # logged against that contact.
+  #
+  # S3: at most DM_NO_MEETING_MAX_CONTACTS (5) CONTACTS, not companies. Longest
+  # since the DM first; ties by PROSPECT_ROLE_ORDER (founder first), then sheet
+  # order. One line each: name — company — DM sent N days ago — last note.
+  # Overflow: "+N more next Monday".
   - id: R7
     name: DM sent, no meeting
     plain: people we DM'd who haven't booked a meeting
+    # The Bot Rules tab, rule 7, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      People we DM'd who haven't booked a meeting. Mondays: Outreach
+      PoCs rows with an LI DM Date more than 7 days ago and no Meeting
+      Date. Lists up to 5 contacts — longest since the DM first,
+      founders first on a tie — one line each: name — company — DM sent
+      N days ago — last note. If there are more, the post ends "+N more
+      next Monday".
     weekdays: [mon]
     trigger: dm_no_meeting
     max_items_per_post: 5
@@ -227,7 +378,8 @@ rules:
   # 5-day one. A reschedule re-anchors every touch on the new date.
   #
   # counts_toward_cap: false — a meeting is time-critical and must not be
-  # crowded out by a Monday chase.
+  # crowded out by a Monday chase. Never held by the re-ask clock either: each
+  # touch belongs to one date, and a held touch is a lost one.
   - id: R8
     name: Meeting preparation
     plain: meetings coming up that need prep
@@ -247,9 +399,23 @@ rules:
   # destination is "channel" because that is where the FIRST touch goes; the
   # engine escalates the later ones itself and records which stage each item is
   # at. See the DM note at the bottom of this file.
+  #
+  # THE LADDER CLIMBS ONE RUNG EACH TIME A FOLLOW-UP ACTUALLY GOES OUT (the
+  # sender advances it, after the send) and STOPS after the last rung. It is
+  # cleared when Next Steps is filled or the meeting date changes, so the next
+  # stalled meeting with the same contact starts at rung 1. Outside the daily
+  # cap, and on its own clock: the re-ask clock does not apply.
   - id: R9
     name: Meeting done, no next steps
     plain: meetings that happened with no next steps recorded
+    # The Bot Rules tab, rule 9, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Meetings that happened with no next steps recorded. Checks Outreach PoCs
+      for a completed meeting whose Next Steps is blank. Asks 3 days after the
+      meeting, then every 3 days, one step at a time: a channel post, then two
+      DMs, then one escalation to Sid — and then stops. Asks for the next
+      steps, the package discussed and an estimated deal size. Filling in Next
+      Steps ends it. Doesn't count toward the 5 posts a day.
     weekdays: []
     trigger: meeting_followup
     max_items_per_post: 3
@@ -262,9 +428,24 @@ rules:
   # CLOSURE_SUPPORT_MIN (50). Exactly 50 is EXCLUDED — "above 50" is the rule
   # as written, and a boundary a bot decides for itself is a boundary nobody
   # agreed to. Asks what is needed for the next stage and shares relevant news.
+  #
+  # S3: when Prospect Status (or Closure Prob%) is blank on EVERY active row
+  # the rule cannot run, and says so in one line rather than staying silent
+  # (nextaction.CLOSURE_EMPTY_NOTICE). When the columns have values and no deal
+  # qualifies, it stays silent and the log says why.
   - id: R10
     name: Closure support
     plain: deals close enough to push over the line
+    # The Bot Rules tab, rule 10, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Deals close enough to push over the line. Mondays: rows whose
+      Prospect Status is deal / demo / quote and whose Closure Prob% is
+      above 50 (exactly 50 doesn't count); offers help and shares
+      relevant news. If Prospect Status or Closure Prob% is blank on
+      every active row, posts "No closure support this week — Prospect
+      Status and Closure Prob% are empty in the GTM sheet. Fill them in
+      and I'll pick it up next Monday." If the columns have values but
+      no deal qualifies, stays silent.
     weekdays: [mon]
     trigger: closure_support
     max_items_per_post: 5

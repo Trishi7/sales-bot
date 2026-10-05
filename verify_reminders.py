@@ -17,8 +17,9 @@ channel records what it was sent and when.
         the asker, in the same channel;
   (iii) a Saturday reminder fires on Saturday (a day the drip is silent);
   (iv)  the row is closed and does not fire twice;
-  (v)   a reminder WITH a company still appears in the drip preview, and is
-        closed after the exact-time firing;
+  (v)   a reminder WITH a company is NOT in the drip's queue (one lane: the
+        exact-minute loop is the only sender), fires once at its minute, and
+        is closed;
   plus  list_reminders / cancel_reminder, and the engine prompt's new line.
 """
 import asyncio
@@ -218,7 +219,7 @@ async def main():
         check(f"#{rid} is closed", st, "done")
 
     # ------------------------------------------------------------------ (v)
-    say("(v) A REMINDER WITH A COMPANY — drip preview Thu morning, exact firing 15:00")
+    say("(v) A REMINDER WITH A COMPANY — not in the drip, exact firing 15:00")
     pretend(TUE, 11)
     r5 = await schedule({"what": "send Acme the pricing deck", "company": "Acme AI",
                          "date": "thursday", "time": "3pm"})
@@ -226,29 +227,25 @@ async def main():
     check("matched the sheet row", r5.get("matched_sheet_row"), 12)
 
     def drip_items(day):
-        return nextaction._scheduled_reminders({
-            "today": day, "rows": [ACME_ROW], "snoozes": {},
-            "scheduled": bot.db.scheduled_reminders_by_row(),
-        })
+        # THE DRIP'S QUEUE FOR THE DAY. It used to carry the reminder too
+        # (nextaction._scheduled_reminders), which is how one was sent twice.
+        return [a for a in nextaction.run(today=day, rows=[ACME_ROW])["actions"]
+                if a["type"] == nextaction.SCHEDULED_REMINDER]
 
     pretend(THU, 9)
-    items = drip_items(THU)
-    planned = drip.plan(items, day=THU, history={}, already_sent=[], cap=5)
-    preview = drip.preview_text(planned)
-    lines = [l for l in preview.splitlines() if "Acme" in l]
-    print("   drip preview, Thu 09:00:")
-    for l in lines[:3]:
-        print("     " + l.strip())
-    check("it appears in the drip preview", bool(lines))
-    check("...with its text (not 'the reminder you asked for')",
-          any("send Acme the pricing deck" in i["text"] for i in items))
+    check("it is open, and attached to the row",
+          [r["id"] for rs in bot.db.scheduled_reminders_by_row().values() for r in rs],
+          [r5["id"]])
+    check("the drip's queue does not carry it — the loop is the only sender",
+          drip_items(THU), [])
     pretend(THU, 15)
     fired = await bot._fire_due_reminders(from_test=True)
     print(f"   Thu 15:00 tick fired {fired}: {channel.sent[-1][2]!r}")
     check("it fired at the exact time", fired, [r5["id"]])
     check("...naming the company", channel.sent[-1][2].endswith("(Acme AI)"))
     check("closed", bot.db.scheduled_reminder(r5["id"])["status"], "done")
-    check("so the drip does not repeat it", drip_items(THU), [])
+    check("and a second tick fires nothing",
+          await bot._fire_due_reminders(from_test=True), [])
 
     # ------------------------------------------------------------------ extras
     say("list_reminders / cancel_reminder")

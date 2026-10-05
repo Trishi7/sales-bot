@@ -79,7 +79,7 @@ def main() -> int:
     print("=" * 78)
     print(f"  date              {dl.iso(MONDAY)} ({MONDAY.strftime('%A')})")
     print(f"  SALES_DRIP_START  {config.SALES_DRIP_START} IST")
-    print(f"  cap for Monday    {cap}   (DAILY_MESSAGE_CAP_BY_DAY)")
+    print(f"  cap for Monday    {cap}   (DAILY_MESSAGE_CAP, every weekday)")
     print(f"  gap               {config.MESSAGE_GAP_MINUTES} "
           f"± {config.MESSAGE_JITTER_MINUTES} min")
     print(f"  items per post    {config.DRIP_MAX_ITEMS_PER_POST}")

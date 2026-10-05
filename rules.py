@@ -552,7 +552,28 @@ def for_day(day) -> list:
     evaluator decides whether anything is due, because their anchor is a
     meeting date on the sheet and not the calendar.
     """
-    return [r for r in safe_load() if r.runs_on(day)]
+    extra = sunday_exception_ids(day)
+    return [r for r in safe_load()
+            if r.runs_on(day) or (r.enabled and r.id.upper() in extra)]
+
+
+def sunday_exception_ids(day) -> set:
+    """The rule ids that get to look on a Sunday although their weekday list
+    does not name it: SUNDAY_RULE_IDS (R4), and only while the weekend is
+    otherwise silent.
+
+    R4's weekdays are [mon], so without this it was never evaluated on a
+    Sunday and the Sunday exception had nothing to send. `drip.plan` still
+    decides whether anything goes — one post, and only for an item due Monday.
+    """
+    try:
+        is_sunday = day.weekday() == 6
+    except AttributeError:
+        return set()
+    if not is_sunday or not config.DRIP_WEEKDAYS_ONLY:
+        return set()
+    return {str(r).strip().upper() for r in (config.SUNDAY_RULE_IDS or [])
+            if str(r).strip()}
 
 
 def log_startup() -> None:

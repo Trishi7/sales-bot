@@ -506,3 +506,58 @@ question. `git pull` alone is enough for a policy change.
   the sales bot ever starts answering in the PM bot's channels, the cause is
   `SALES_CHANNEL_IDS`, not the code — check it, and check the role permissions
   from step 0.
+
+---
+
+## Upgrading to the S1 build (cap, schedule, one reminder lane)
+
+Nothing to run by hand: the first boot adds two columns to `drip_sends`
+(`counts_toward_cap`, `pinned`) through the usual "columns added later" pass,
+and older rows keep NULL.
+
+In the server's `.env`:
+
+```bash
+DAILY_MESSAGE_CAP=5          # was 3 — five counted posts, every weekday
+# DAILY_MESSAGE_CAP_BY_DAY=  # delete the line: retired, no longer read
+```
+
+What changes on the first day after the restart:
+
+- up to **5** counted posts a weekday; meeting prep, meeting follow-ups,
+  reminders and urgent news are on top of that;
+- AI news posts **every** weekday at `NEWS_MAIN_TIME` (it used to skip
+  alternate days);
+- a meeting's day-of prep note goes at `MEETING_DAYOF_TIME` (10:00), not when
+  the window opens;
+- **Sunday can now post** — one Deliverables post at `SALES_DRIP_START`, only
+  when a P1 is due on the Monday. Set `SUNDAY_RULE_IDS=` (empty) to keep Sunday
+  silent;
+- any reminder whose date has already passed and is still open posts **once**
+  on the first tick, marked "(this was due <date>)". Check
+  `list_reminders` beforehand if there may be old ones;
+- R9 follow-ups now climb their ladder — the second and third go to the owner
+  (as DMs when `SALES_DMS_ENABLED=true`), the fourth to `ESCALATION_ADDRESSEE`,
+  and then they stop.
+
+`python verify_s1.py` checks all of it offline (one free DuckDuckGo request).
+
+### Upgrading to S2 and S3
+
+Nothing to run by hand; the first boot adds the new columns.
+
+- **PoC news (S2)** starts by itself: 15 names a day from the sheet are looked
+  up on Google News RSS. `NEWS_POC_TARGETS_PER_DAY=0` turns it off.
+- **R3 now posts every Wednesday** (it was alternate weeks), and the separate
+  "one reminder at T-20" events post is gone. Delete `EVENTS_ENABLED`,
+  `EVENT_LEAD_DAYS` and `EVENTS_ANCHOR_DATE` from `.env`.
+- **R5 will name more people**: it now reads every never-contacted row, not
+  only active ones, two companies a week.
+- **Email lookups** run for R5/R6 contacts with a blank Email cell (one search
+  each, at most 5 a post). They need a working search backend — until SearXNG
+  is up (section 4b) they go through the DuckDuckGo fallback.
+- **Writing a found email is OFF** until you set `EMAIL_WRITE_ALLOWED=true`.
+  It is the one exception to the restricted band: only the Email cell, only on
+  an approver's yes, only if the cell is still blank, undoable.
+
+`python verify_s2.py` and `python verify_s3.py` check both offline.

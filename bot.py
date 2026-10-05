@@ -307,6 +307,8 @@ class SalesBot(discord.Client):
         self._voice_tried_at: float = 0.0
         # When (real monotonic) the feeds were last polled.
         self._feeds_polled_at: float = 0.0
+        # When (real monotonic) the PoC news rotation was last read off the sheet.
+        self._targets_synced_at: float = 0.0
 
         self.memory = ConversationMemory(
             max_turns=config.QUERY_MEMORY_TURNS,
@@ -346,6 +348,9 @@ class SalesBot(discord.Client):
         # silence would be buried in the noise announcing it. One line per
         # skipped digest, per day.
         self._digest_suppressed_on: str = ""
+        # The day "the cap is reached" was last logged, so it is said once a
+        # day rather than on every tick after the fifth counted post.
+        self._cap_logged_on: str = ""
         # The day the proposal sweep last ran. ONE sweep per day, in the
         # first slot — a per-process marker rather than a database row,
         # because a restart re-running it once is harmless (the nudged
@@ -1335,8 +1340,145 @@ class SalesBot(discord.Client):
         simulated week must not pay to discover that."""
         return day > dl.real_today_ist()
 
+    # -- R1: whose news we look up (the PoC rotation) ------------------------
+
+    async def _news_poc_targets(self) -> Optional[list]:
+        """Every name PoC news may be looked up for, read off the sheet today.
+
+        PEOPLE on ACTIVE Outreach PoCs rows — past the activation gate and not
+        stopped (won, lost, dead, unresponsive) — and COMPANIES on Master
+        Pipeline and on those same Outreach PoCs rows. Each carries the tab it
+        is on, in the sheet's own name, which is what a posted story shows in
+        brackets; a company on both tabs says both.
+
+        NEVER ANYONE ON THE MAPPING'S DEPARTURES LIST. And when that list could
+        not be read, NO PERSON IS LOOKED UP AT ALL — only companies. "Never"
+        cannot be honoured against a list the bot does not have, and news about
+        somebody who has left, posted as news about our contact, is the mistake
+        the list exists to prevent.
+
+        None when neither tab could be read: the caller then leaves the
+        rotation as it is rather than emptying it on a bad read.
+        """
+        people: list = []
+        companies: dict = {}                 # normalised name -> target
+        read_any = False
+
+        def add_company(name: str, source: str, sheet_row) -> None:
+            name = gtm_sheet.clean_cell(name)
+            key = gtm_sheet.normalise_header(name)
+            if not name or not key:
+                return
+            have = companies.get(key)
+            if have is None:
+                companies[key] = {"key": f"company|{key}", "kind": "company",
+                                  "name": name, "company": name, "source": source,
+                                  "sheet_row": sheet_row}
+            elif source and source not in have["source"].split(" and "):
+                have["source"] = f"{have['source']} and {source}"
+
+        # MASTER PIPELINE FIRST, so a company on both tabs reads "on Master
+        # Pipeline and Outreach PoCs".
+        try:
+            pipeline = await asyncio.to_thread(
+                gtm_sheet.SHEETS.tab, gtm_sheet.RESEARCHER_LINES)
+        except Exception:
+            log.info("[news] PoC news: the pipeline tab could not be read", exc_info=True)
+            pipeline = None
+        if pipeline is not None:
+            read_any = True
+            title = str(getattr(pipeline, "title", "") or "Master Pipeline")
+            for row in pipeline.rows:
+                add_company(row.get("company"), title, row.get("_row"))
+
+        try:
+            pocs, _source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
+        except Exception:
+            log.info("[news] PoC news: the Outreach PoCs tab could not be read",
+                     exc_info=True)
+            pocs = None
+        if pocs is not None:
+            read_any = True
+            title = str(getattr(pocs, "title", "") or "Outreach PoCs")
+            active, _inactive = await asyncio.to_thread(
+                self._split_active, pocs.rows, "PoC news")
+            try:
+                departures = await asyncio.to_thread(mapping_sheet.MAPPING.departures)
+                known = bool(departures.people)
+            except Exception:
+                log.info("[news] PoC news: the departures list could not be read",
+                         exc_info=True)
+                departures, known = None, False
+            left: list = []
+            for row in active:
+                if nextaction.stop_reason(row):
+                    continue
+                company = gtm_sheet.clean_cell(row.get("company"))
+                add_company(company, title, row.get("_row"))
+                name = gtm_sheet.clean_cell(row.get("name"))
+                if not name or not company or not known:
+                    continue
+                if departures.lookup(name):
+                    left.append(name)
+                    continue
+                people.append({
+                    "key": "poc|%s|%s" % (gtm_sheet.normalise_header(name),
+                                          gtm_sheet.normalise_header(company)),
+                    "kind": "poc", "name": name, "company": company,
+                    "source": title, "sheet_row": row.get("_row"),
+                })
+            if not known:
+                log.warning(
+                    "[news] PoC news: the mapping's departures list is not loaded, so "
+                    "NO PERSON is looked up — companies only. Share the mapping sheet "
+                    "(or fix its DEPARTURES row) to turn people on.")
+            elif left:
+                log.info("[news] PoC news: %d person/people on the departures list "
+                         "left out: %s", len(left), ", ".join(left[:8]))
+        if not read_any:
+            return None
+        return list(companies.values()) + people
+
+    async def _sync_news_targets(self, *, force: bool = False) -> Optional[dict]:
+        """Keep the PoC rotation in step with the sheet. Never raises.
+
+        Every six hours at most (the sheet is cached and this is
+        cheap, but it is not free), and before the first poll after a boot. A
+        name that left the sheet — or joined the departures list — is out of
+        the rotation at the next sync.
+        """
+        if int(config.NEWS_POC_TARGETS_PER_DAY) <= 0:
+            return None
+        every = 6 * 3600
+        if not force and self._targets_synced_at and \
+                _monotonic() - self._targets_synced_at < every:
+            return None
+        self._targets_synced_at = _monotonic()
+        try:
+            targets = await self._news_poc_targets()
+            if targets is None:
+                log.info("[news] PoC news: no tab could be read; the rotation is "
+                         "left as it is")
+                return None
+            got = await asyncio.to_thread(
+                lambda: self._ledger().news_targets_sync(targets))
+            log.info("[news] PoC rotation: %d name(s) (%d compan(y/ies), %d "
+                     "person/people); %d new, %d removed; %d looked up a day",
+                     got["total"], sum(1 for t in targets if t["kind"] == "company"),
+                     sum(1 for t in targets if t["kind"] == "poc"), got["added"],
+                     got["removed"], int(config.NEWS_POC_TARGETS_PER_DAY))
+            return got
+        except Exception:
+            log.exception("[news] the PoC rotation could not be synced; continuing "
+                          "with what is stored")
+            return None
+
     async def _maybe_poll_feeds(self, *, force: bool = False) -> Optional[dict]:
         """Poll the RSS feeds every NEWS_FEED_POLL_MINUTES. Zero API calls.
+
+        The outlets' feeds, one Google News query per topic, and one per PoC
+        name whose turn it is today (`_sync_news_targets` keeps that rotation
+        in step with the sheet).
 
         Run from the sweep tick and before every news check. NOT HELD by a test
         run or the pretend clock: a poll is free, and it reads the real world's
@@ -1349,6 +1491,8 @@ class SalesBot(discord.Client):
                 _monotonic() - self._feeds_polled_at < every:
             return None
         self._feeds_polled_at = _monotonic()
+        # WHOSE NEWS TO LOOK UP, read off the sheet before the poll that asks.
+        await self._sync_news_targets()
         try:
             return await asyncio.to_thread(feeds.poll)
         except Exception:
@@ -3769,8 +3913,9 @@ class SalesBot(discord.Client):
             COMPANY IS OPTIONAL. "Remind me tomorrow at 2pm about the pulse
             product overview doc" is about no account at all, and refusing it
             for want of one was refusing the most ordinary thing a colleague is
-            asked. With a company that matches a row, the reminder ALSO surfaces
-            in the drip on its day, as before.
+            asked. With a company that matches a row it is attached to that row,
+            and that is all: it does NOT also surface in the drip. This loop is
+            the only sender, so it posts once.
 
             It FIRES at the minute (`_reminder_loop`), in THIS channel, tagging
             whoever asked. The confirmation names the date and time in words so
@@ -5254,7 +5399,16 @@ class SalesBot(discord.Client):
 
     async def _fire_due_reminders(self, *, channel=None, from_test: bool = False,
                                   at: Optional[datetime] = None) -> list:
-        """Post every open reminder dated today whose minute has come.
+        """Post every open reminder whose minute has come — and every open one
+        whose DATE has already passed, once, saying when it was due.
+
+        THE ONLY THING THAT SENDS A REMINDER. The drip used to emit them as
+        well, from the same table; it no longer does (see nextaction.py).
+
+        A REMINDER WHOSE DATE HAS PASSED — the bot was down at its minute, or
+        it was written with yesterday's date — fires on the next tick with
+        "(this was due <date>)" and closes like any other. Never twice: it is
+        claimed before it is sent, exactly as an on-time one is.
 
         "<@asker> — you asked me to remind you: {what}" (+ " ({company})"), in
         the channel it was asked in — the test channel under SALES_TEST_MODE,
@@ -5282,12 +5436,14 @@ class SalesBot(discord.Client):
             return []
         now = at or dl.now_ist()
         marker = dl.iso(now.date())
-        rows = await asyncio.to_thread(self.db.scheduled_reminders_due_on, marker)
+        rows = await asyncio.to_thread(self.db.scheduled_reminders_due_by, marker)
         default = sheetwrite.parse_reminder_time(config.REMINDER_DEFAULT_TIME) or "14:00"
         fired: list = []
         for r in rows:
             hhmm = sheetwrite.parse_reminder_time(r.get("due_time") or "") or default
-            if hhmm > now.strftime("%H:%M"):
+            # AN EARLIER DATE IS ALREADY LATE, whatever its time of day.
+            late = str(r.get("due_date") or "") < marker
+            if not late and hhmm > now.strftime("%H:%M"):
                 continue
             target = channel
             if target is None:
@@ -5304,10 +5460,15 @@ class SalesBot(discord.Client):
                 continue                 # another tick got there first
             who = guardrails.mention_for(r.get("asker_id") or 0,
                                          r.get("requested_by") or "")
-            body = drip.reminder_line(who, r["what"], r.get("company") or "")
+            was_due = dl.parse_date(r.get("due_date")) if late else None
+            body = drip.reminder_line(
+                who, r["what"], r.get("company") or "",
+                was_due=dl.format_date(was_due) if was_due else "")
             body = self._tag_test(drip.with_heading(body, drip.heading("reminder")))
             sent = await guardrails.send(
-                target, body, reason=f"one-off reminder #{r['id']} at {hhmm}",
+                target, body,
+                reason=(f"one-off reminder #{r['id']} at {hhmm}"
+                        + (f" (late: it was due {r['due_date']})" if late else "")),
                 kind="reminder", item_key=f"reminder:{r['id']}",
             )
             if sent is None:
@@ -5324,10 +5485,11 @@ class SalesBot(discord.Client):
                 continue
             self._reminder_failures.pop(r["id"], None)
             state.audit("reminder_fired", reason=r["what"], reminder_id=r["id"],
-                        due=f"{r['due_date']} {hhmm}",
+                        due=f"{r['due_date']} {hhmm}", late=late or None,
                         channel_id=str(getattr(target, "id", "")))
-            log.info("[reminders] #%s fired at %s for %s: %s", r["id"],
-                     now.strftime("%H:%M"), r.get("requested_by") or "?", r["what"])
+            log.info("[reminders] #%s fired at %s for %s%s: %s", r["id"],
+                     now.strftime("%H:%M"), r.get("requested_by") or "?",
+                     f" (late — it was due {r['due_date']})" if late else "", r["what"])
             fired.append(r["id"])
         return fired
 
@@ -5335,7 +5497,7 @@ class SalesBot(discord.Client):
         """One tick.
 
         The ONLY thing a tick can put into Discord is a DRIP MESSAGE, and at
-        most DAILY_MESSAGE_CAP of those a weekday. Every other proactive path —
+        most DAILY_MESSAGE_CAP COUNTED ones a weekday (`drip.counted_today`). Every other proactive path —
         the daily digest, the deadline reminder, the deadline chase, the promise
         nudge, the give-up flag, the row-hygiene flag, the weekly funnel post —
         was removed, not disabled behind a knob, so there is nothing here that
@@ -5697,9 +5859,12 @@ class SalesBot(discord.Client):
         proposal = None
         ref = getattr(getattr(message, "reference", None), "message_id", None)
         if ref:
-            proposal = await asyncio.to_thread(
-                self.db.open_proposal_for_message, str(ref)
+            # ONE POST CAN CARRY SEVERAL OFFERS; the reply says which, and a
+            # bare yes answers the one the post ended on (`_pick_proposal`).
+            several = await asyncio.to_thread(
+                self.db.open_proposals_for_message, str(ref)
             )
+            proposal = self._pick_proposal(several, text)
         if proposal is None:
             proposal = await asyncio.to_thread(self.db.latest_open_proposal)
         if proposal is None:
@@ -5748,9 +5913,11 @@ class SalesBot(discord.Client):
             )
         )
 
-        if decision == approvals.DECLINE and proposal.get("kind") == "poc_lookup":
-            # R11's QUESTION DECLINED: nothing happens, and nothing is said.
-            log.info("[approvals] %s DECLINED — %s; no PoC search runs",
+        if decision == approvals.DECLINE and proposal.get("kind") in (
+                "poc_lookup", "events_remind"):
+            # A QUESTION DECLINED (R11's lookup, R3's reminder): nothing
+            # happens, and nothing is said.
+            log.info("[approvals] %s DECLINED — %s; nothing runs",
                      proposal["proposal_key"], why)
             return True
 
@@ -6406,12 +6573,17 @@ class SalesBot(discord.Client):
                                     decided_by: str, why: str) -> None:
         """Apply a proposal an approver said yes to. THE ONLY WRITE PATH.
 
-        THREE KINDS, because `write_cells` is bound to the Outreach PoCs tab and
-        its restricted-band rules, and two of these are about a different tab:
+        THE KINDS, because `write_cells` is bound to the Outreach PoCs tab and
+        its restricted-band rules, and most of these are something else:
 
             cell_update     a cell on an Outreach PoCs row (the original)
             event_append    a whole new row on the Events tab, from R3 discovery
             event_deadline  one registration-deadline cell on an Events row
+            email_write     a found email into a BLANK Email cell — the one
+                            exception to the restricted band (EMAIL_WRITE_ALLOWED)
+            events_remind   R3's "remind me again": schedules a reminder,
+                            writes nothing
+            poc_lookup      R11's question: runs a search, writes nothing
 
         The branch is here rather than at three call sites so that "nothing is
         written until an approver says yes" stays a property of ONE function.
@@ -6425,6 +6597,13 @@ class SalesBot(discord.Client):
             return
         if kind == "event_deadline":
             await self._apply_event_deadline(message, proposal, decided_by=decided_by)
+            return
+        if kind == "events_remind":
+            await self._apply_events_remind(message, proposal, decided_by=decided_by)
+            return
+        if kind == "email_write":
+            await self._apply_email_write(message, proposal, decided_by=decided_by,
+                                          why=why)
             return
 
         payload = proposal.get("payload") or {}
@@ -6543,7 +6722,8 @@ class SalesBot(discord.Client):
         if not result["ok"]:
             await self._reply(
                 message,
-                f"I could not put that back: {result['error'] or 'the sheet refused it'}. "
+                f"I could not put that back: "
+                f"{result['error'] or result.get('skipped') or 'the sheet refused it'}. "
                 f"The cells are as they were after my change.",
                 reason="undo failed",
             )
@@ -6722,7 +6902,11 @@ class SalesBot(discord.Client):
         if not drip.is_sending_day(today):
             return
 
-        hour, minute = config.drip_start_ist()
+        # FROM THE EARLIEST TIME ANYTHING CAN BE DUE — the window's start, or a
+        # fixed-time post before it (R8's day-of touch at MEETING_DAYOF_TIME).
+        # `drip.plan` gives every message its own time; this only stops the
+        # sheet being read all night.
+        hour, minute = drip.earliest_send_ist()
         if not digest.is_due(now, hour=hour, minute=minute):
             return
 
@@ -6737,8 +6921,26 @@ class SalesBot(discord.Client):
                 "risking a duplicate message"
             )
             return
-        if len(already) >= max(0, config.DAILY_MESSAGE_CAP):
-            return
+        # THE CAP, COUNTED BY THE ONE COUNTER (`drip.counted_today`) — the same
+        # one `drip.plan` and the test day use. It used to be
+        # `len(already) >= DAILY_MESSAGE_CAP`: every sent post counted, so a
+        # meeting-prep post took a chase's place, and once the day was "full"
+        # this returned before R8 or R9 could be planned at all.
+        #
+        # A FULL DAY IS NOT A FINISHED DAY. Posts outside the cap — meeting prep
+        # and meeting follow-ups — may still be due, so this notes the fact once
+        # and lets `drip.plan` roll the counted groups, as it does for the test
+        # day. Nothing counted can get past it: the planner asks the same
+        # counter.
+        if drip.cap_reached(already, today):
+            if self._cap_logged_on != marker:
+                self._cap_logged_on = marker
+                log.info(
+                    "[drip] %s: the cap is reached (%d of %d counted post(s) sent). "
+                    "Only posts outside the cap — meeting prep and meeting "
+                    "follow-ups — can still go today.", marker,
+                    drip.counted_today(already), drip.cap_for(today),
+                )
 
         # THE SPACING HOLDS EVEN WHEN CATCHING UP. After a quiet morning — the
         # kill switch off until 14:00, a long outage, a clock jump — slots 1, 2
@@ -6800,7 +7002,11 @@ class SalesBot(discord.Client):
         # BEFORE the message, not after: an approval the sweep prompts is worth
         # more the earlier it lands, and the two posts arriving together reads
         # as one glance rather than two interruptions.
-        if due[0].get("slot") == 1 and self._swept_proposals_on != marker:
+        #
+        # "THE FIRST" IS THE FIRST POST OF THE DAY, WHICHEVER IT IS — nothing
+        # recorded yet — rather than "slot 1", so it is the same moment on a
+        # real day and on a test day. Never counted against the cap.
+        if not already and self._swept_proposals_on != marker:
             self._swept_proposals_on = marker
             try:
                 await self._sweep_proposals(today=today, channel=channel)
@@ -6838,6 +7044,9 @@ class SalesBot(discord.Client):
         research is worse than one with it, and better than none.
         """
         actions = list(message.get("actions") or [])
+        # WHICH CONTACTS GET AN EMAIL LOOKUP is decided now, for the ones this
+        # post will name.
+        self._request_email_lookups(message)
         if not any(a.get("web_pending") for a in actions):
             return message
         log.info(
@@ -6904,11 +7113,10 @@ class SalesBot(discord.Client):
             return None
         actions = list(queue.get("actions") or [])
 
-        # EVENTS AND THE WEEKLY LINE RIDE THE SAME QUEUE. They are appended as
-        # ordinary actions so the drip groups, ranks, spaces and caps them
-        # exactly like everything else — a feature with its own send path would
-        # be re-introducing the problem the drip exists to solve.
-        actions.extend(await self._event_actions(today=today))
+        # THE WEEKLY LINE RIDES THE SAME QUEUE, as an ordinary action, so the
+        # drip groups, ranks, spaces and caps it like everything else. (Events
+        # used to be appended here too — one reminder each at T-20 — beside R3
+        # reading the same tab. R3 is the one events path now.)
         funnel = await self._funnel_action(today=today)
         if funnel is not None:
             actions.append(funnel)
@@ -6927,33 +7135,6 @@ class SalesBot(discord.Client):
                 actions, day=today, history=history, already_sent=already
             )
         )
-
-    async def _event_actions(self, *, today) -> list:
-        """Events whose single T-minus reminder is due. [] when off or unreadable.
-
-        The dedup lookup FAILS CLOSED (see `db.event_reminder_sent`): if the
-        table cannot be read the event is treated as already reminded and stays
-        quiet. This is a once-forever message, so a duplicate is the exact thing
-        it exists to prevent and silence is the recoverable direction.
-        """
-        if not config.EVENTS_ENABLED:
-            return []
-        try:
-            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.EVENTS)
-        except Exception:
-            log.info("[events] no events tab to read", exc_info=True)
-            return []
-        if tab is None:
-            return []
-        try:
-            return await asyncio.to_thread(
-                lambda: events_mod.due_events(
-                    tab.rows, today=today, already_sent=self.db.event_reminder_sent,
-                )
-            )
-        except Exception:
-            log.exception("[events] could not compute the due events")
-            return []
 
     async def _funnel_action(self, *, today):
         """The one Friday numbers line, or None. Off by default."""
@@ -7047,6 +7228,33 @@ class SalesBot(discord.Client):
         which is the right way round: the drip speaks less on a bad day rather
         than more.
         """
+        # NOTHING TO SAY IS NOT A POST. Only R3 can get here empty: its
+        # carrier item is planned every Wednesday so the research layer can
+        # look for new events, and in a week with no event close enough to
+        # mention and nothing found there is no message. THE SLOT IS STILL
+        # RECORDED — uncounted — so the live sweep, which re-plans every tick,
+        # does not research the same empty Wednesday again fifteen minutes
+        # later.
+        if drip.nothing_to_say(message):
+            await asyncio.to_thread(
+                lambda: self.db.record_drip_send(
+                    on_date=marker, slot=int(message["slot"]),
+                    group_key=message["group_key"], action_type=message["type"],
+                    owner_key=message.get("owner_key") or "",
+                    owner_label=message.get("owner") or "", companies="",
+                    stage=message["stage"], planned_at=message["send_at_hhmm"],
+                    channel_id=channel_id, message_id=None,
+                    sent_at=dl.now_ist().isoformat(timespec="seconds"),
+                    counts_toward_cap=False, pinned=bool(message.get("pinned")),
+                )
+            )
+            log.info("[drip] slot %s for %s: %s has nothing to say today — no post, "
+                     "and the slot does not count", message["slot"], marker,
+                     message.get("rule_id") or message["type"])
+            state.audit("drip_silent", reason="the rule had nothing to say",
+                        date=marker, slot=message["slot"], action_type=message["type"])
+            return
+
         # IS THE OWNER OFF TODAY? Asked BEFORE the message is addressed, so a
         # nudge to somebody on holiday becomes a nudge to whoever is covering
         # rather than noise they come back to a week later.
@@ -7146,8 +7354,9 @@ class SalesBot(discord.Client):
             # start with. Read here rather than inside `llm` because it is a
             # database hit and that class does no I/O beyond the model call.
             openers = await asyncio.to_thread(self.db.recent_openers, 5)
-            # R1 AND R4 ARE POSTED EXACTLY AS RENDERED (drip.VERBATIM_TYPES).
-            if message.get("type") in drip.VERBATIM_TYPES:
+            # R1, R3, R4 AND A RULE'S OWN NOTICE ARE POSTED EXACTLY AS RENDERED
+            # (drip.is_verbatim).
+            if drip.is_verbatim(message):
                 fallback_reason = "posted verbatim (never composed)"
             elif self.llm is None:
                 fallback_reason = "no model configured"
@@ -7233,6 +7442,10 @@ class SalesBot(discord.Client):
                 stage=message["stage"], planned_at=message["send_at_hhmm"],
                 channel_id=channel_id, message_id=None,
                 sent_at=dl.now_ist().isoformat(timespec="seconds"),
+                # THE POST'S OWN ANSWER to "did this take one of the day's
+                # counted posts", asked of the one function that decides it.
+                counts_toward_cap=drip.counts(message),
+                pinned=bool(message.get("pinned")),
             )
         )
         if not claimed:
@@ -7310,6 +7523,29 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[approvals] could not open R11's PoC-lookup proposal; the "
                           "message went out but a yes will not find it")
+        # THE TWO OFFERS A POST CAN END ON: R3's "remind you again?", and R5's /
+        # R6's "add the email I found?". Each is a proposal keyed to this
+        # message; neither does anything until an approver says yes.
+        try:
+            await self._open_events_remind_proposal(message, sent=sent, marker=marker)
+            await self._open_email_proposal(message, sent=sent, marker=marker)
+        except Exception:
+            log.exception("[approvals] could not open this post's offer; the message "
+                          "went out but a yes will not find it")
+        # "MORE AI NEWS TODAY" FOLLOWS THE NEWS POST, at once: the stories that
+        # qualified and did not fit. Not a drip message — see the method.
+        try:
+            await self._post_news_overflow(channel, message, marker=marker)
+        except Exception:
+            log.exception("[news] the overflow post failed; the main post went out")
+        # R9 CLIMBS ONE RUNG PER FOLLOW-UP THAT ACTUALLY WENT OUT. After the
+        # send, like every other ledger here: a rung spent on a message that was
+        # refused would escalate somebody who was never asked.
+        try:
+            await self._advance_meeting_ladder(message, marker=marker)
+        except Exception:
+            log.exception("[rules] R9's ladder could not be advanced; the follow-up "
+                          "went out and will be asked again from the same rung")
         if offer_json:
             # THE PENDING OFFER, so a reply of "yes" has something concrete to
             # apply. Without it the extractor would have to invent what "yes"
@@ -7320,21 +7556,13 @@ class SalesBot(discord.Client):
                 )
             )
 
-        # AN EVENT'S ONE REMINDER IS RECORDED ONLY ONCE IT HAS ACTUALLY LANDED.
-        # Recorded before the send, a refused message would burn the event's
-        # single reminder forever — and "forever" is not a word to be careless
-        # with.
-        for action in message.get("actions") or []:
-            key = action.get("event_key")
-            if not key:
-                continue
-            await asyncio.to_thread(
-                lambda a=action, k=key: self.db.record_event_reminder(
-                    event_key=k, event=a.get("company", ""),
-                    event_date=a.get("event_date", ""),
-                    location=a.get("location", ""), sent_on=marker,
-                )
-            )
+        # WHAT A LANDED POST CHANGES: R5's weekly companies and repeat counts,
+        # R3's once-only "date unclear" lines.
+        try:
+            await self._after_send(message, sent=sent, marker=marker)
+        except Exception:
+            log.exception("[rules] the after-send bookkeeping failed; the message "
+                          "went out")
 
         state.audit(
             "drip_message",
@@ -7350,8 +7578,10 @@ class SalesBot(discord.Client):
             fallback_reason=fallback_reason or None,
         )
         log.info(
-            "[drip] SENT slot %d/%d at %s (planned %s) — %s x %s — %s [%s%s%s%s]",
-            message["slot"], config.DAILY_MESSAGE_CAP,
+            "[drip] SENT slot %d (%s) at %s (planned %s) — %s x %s — %s [%s%s%s%s]",
+            message["slot"],
+            "counted, cap %d" % drip.cap_for(send_day) if drip.counts(message)
+            else "outside the cap",
             dl.now_ist().strftime("%H:%M"), message["send_at_hhmm"],
             message["type"], message["owner"] or "(unassigned)",
             ", ".join(message["companies"]), message["stage"],
@@ -7359,6 +7589,558 @@ class SalesBot(discord.Client):
             f", {compose_retries} retry" if compose_retries else "",
             f": {fallback_reason}" if fallback_reason else "",
         )
+
+    async def _post_news_overflow(self, channel, message: dict, *, marker: str) -> int:
+        """"More AI news today" — right after the main news post. How many
+        stories it carried.
+
+        EVERY STORY THAT QUALIFIED FOR THE MAIN POST AND DID NOT FIT IT, in ONE
+        message, PoC first, at most NEWS_OVERFLOW_MAX_ITEMS (`news.choose_main`
+        decided which; they rode here on the R1 item). Before this they were
+        written to the log and to a cache row, and nowhere a person could see.
+
+        NOT A DRIP MESSAGE AND NOT A BREAKING ONE. It goes straight to the
+        channel the main post went to through `guardrails.send`: no
+        `drip_sends` row, so the daily cap cannot count it; no `news_checks`
+        row, so the breaking valve does not count it either; no @-mentions.
+        Each story is recorded in `news_stories` with kind=overflow — after the
+        send, so a refused post does not bury its stories — and is never
+        posted again.
+
+        CALLED FROM `_send_drip_message`, so a real day, a test day and a
+        simulation all do it, in the same place, with the same stories.
+        """
+        if message.get("type") != nextaction.R_AI_NEWS:
+            return 0
+        stories: list = []
+        for action in message.get("actions") or []:
+            stories.extend(action.get("news_overflow") or [])
+        if not stories:
+            return 0
+        if not config.NEWS_OVERFLOW_ENABLED:
+            log.info("[news] %s: %d story/stories did not fit the main post and "
+                     "NEWS_OVERFLOW_ENABLED is false — not posted", marker, len(stories))
+            return 0
+        try:
+            day = date.fromisoformat(marker)
+        except ValueError:
+            day = dl.today_ist()
+        cutoff = news.cutoff_iso(day)
+
+        def still_new() -> list:
+            # A breaking check may have carried one of them since the sweep. A
+            # row saying "overflow, today" is this same post from an earlier
+            # run of the same pretend day, and does not count against it.
+            out = []
+            for s in stories:
+                seen = self.db.news_story_seen(
+                    s.get("url_key") or "", s.get("headline_key") or "",
+                    since_iso=cutoff)
+                if seen and not (seen.get("kind") == news.MODE_OVERFLOW
+                                 and seen.get("posted_on") == marker):
+                    continue
+                out.append(s)
+            return out
+
+        fresh = await asyncio.to_thread(still_new)
+        body = news.render(fresh, mode=news.MODE_OVERFLOW)
+        if not body:
+            return 0
+        tagged = config.SALES_TEST_MODE or self._test_run_active()
+        room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
+        parts = drip.split_on_lines(body, limit=int(config.QUERY_REPLY_CHUNK) - room)
+        first = None
+        for i, part in enumerate(parts):
+            got = await guardrails.send(
+                channel, self._tag_test(part),
+                reason=f"more AI news for {marker}: {len(fresh)} story/stories that "
+                       "did not fit the main post"
+                       + (f" (part {i + 1}/{len(parts)})" if len(parts) > 1 else ""),
+                kind="news-overflow",
+            )
+            if i == 0:
+                first = got
+            if got is None:
+                break
+        if first is None:
+            log.warning("[news] %s: the overflow post was refused or failed; nothing "
+                        "recorded, so the stories are not marked as posted", marker)
+            return 0
+        await asyncio.to_thread(
+            lambda: self.db.record_news_stories(
+                fresh, on_date=marker, rule_id="R1", kind=news.MODE_OVERFLOW))
+        state.audit("news_overflow", reason="stories that did not fit the main post",
+                    date=marker, stories=len(fresh),
+                    poc=sum(1 for s in fresh if news.is_poc(s)),
+                    channel_id=str(getattr(channel, "id", "")))
+        log.info("[news] %s: posted \"More AI news today\" — %d story/stories (%d "
+                 "about our PoCs), outside the drip, the daily cap and the breaking "
+                 "valve", marker, len(fresh), sum(1 for s in fresh if news.is_poc(s)))
+        return len(fresh)
+
+    # -- R5 / R6: a missing email, looked up and offered -----------------------
+
+    def _request_email_lookups(self, message: dict) -> int:
+        """Mark which of this message's contacts get an email lookup. How many.
+
+        ONLY THE CONTACTS THAT MAKE THE POST, in the order the post lists them,
+        and at most EMAIL_LOOKUP_MAX_PER_POST. The rule says which contacts
+        have no email on file (`email_lookup`); this is where that becomes a
+        request, because only here is it known who the post will actually name
+        — a lookup for the ninth contact of a five-line post is a search
+        nobody reads.
+        """
+        if message.get("type") not in (nextaction.R_PROSPECTS, nextaction.R_LI_NO_DM):
+            return 0
+        shown = drip.shown_contacts(message)
+        room = max(0, int(config.EMAIL_LOOKUP_MAX_PER_POST))
+        asked = 0
+        for action in shown:
+            if asked >= room:
+                break
+            if not action.get("email_lookup") or action.get("email_checked") \
+                    or action.get("ask_to_skip"):
+                continue
+            action["web_pending"] = True
+            asked += 1
+        return asked
+
+    async def _email_lookup(self, item: dict, *, rule_id: str) -> None:
+        """Look for ONE contact's published email. Settles the item either way.
+
+        ONE SEARCH — '"<name>" "<company>" email', eight results — then ONE
+        MODEL_LIGHT call that is shown the titles and snippets and nothing
+        else, and asked to point at an address.
+
+        NEVER GUESSED, AND THAT IS CHECKED HERE, NOT ASKED FOR: the answer is
+        kept only when the address appears, character for character, in a
+        snippet the search returned (`websearch.verified_emails`). An address
+        the model assembled from a name and a domain is in no snippet, so it
+        is dropped and the line says "no public email found".
+
+        WHAT IT LEAVES ON THE ITEM: `email_checked` (a lookup ran — found or
+        not, and both are cached for RESEARCH_CACHE_DAYS), and when one was
+        found `email_found` and `email_source` (the result page it was on).
+        When the lookup could not run — search off, a budget spent — nothing
+        is claimed: the line says nothing about email and the note says why.
+        """
+        import websearch
+
+        item["web_pending"] = False
+        item["text"] = str(item.get("text") or "").replace(f" [{rules.WEB_PENDING}]", "")
+        person = " ".join(str(item.get("poc") or "").split())
+        company = " ".join(str(item.get("company") or "").split())
+        if not person or not company:
+            return
+        if self.llm is None or websearch.server_side():
+            item["research_note"] = websearch.unavailable_note(
+                "the email lookup needs SEARCH_BACKEND=searxng, ddg or google_cse "
+                "and a model")
+            return
+        ok, why = await self._search_available()
+        if not ok:
+            item["research_note"] = why
+            return
+
+        query = f'"{person}" "{company}" email'
+        results = await asyncio.to_thread(
+            lambda: search_backend.search(query, n=8, rule=rule_id))
+        answer = ""
+        if results:
+            answer = await self.llm.extract_email(
+                person=person, company=company, results=results)
+        shown = " ".join(f"{r.get('title') or ''} {r.get('snippet') or ''}"
+                         for r in results or [])
+        kept, invented = websearch.verified_emails(answer, shown)
+        if invented:
+            log.warning("[email] %s: dropped %d address(es) no snippet contains: %s",
+                        rule_id, len(invented), ", ".join(invented))
+        item["email_checked"] = True
+        offer = (" Want me to add it to the sheet? Say yes."
+                 if config.EMAIL_WRITE_ALLOWED else "")
+        if kept:
+            email = kept[0]
+            source = next(
+                (str(r.get("url") or "") for r in results
+                 if email.lower() in f"{r.get('title') or ''} {r.get('snippet') or ''}".lower()),
+                "")
+            item["email_found"], item["email_source"] = email, source
+            item["sources"] = [{"url": source, "title": ""}] if source else []
+            if item.get("rule") == nextaction.R_LI_NO_DM:
+                item["research"] = (f"Email found: {email}"
+                                    + (f" ({drip.link('', source)})" if source else "")
+                                    + "." + offer)
+        else:
+            item["email_found"], item["email_source"] = "", ""
+            if item.get("rule") == nextaction.R_LI_NO_DM:
+                item["research"] = websearch.NO_EMAIL.capitalize() + "."
+        item["research_note"] = ""
+        log.info("[email] %s %s at %s: %d result(s) for %r -> %s", rule_id, person,
+                 company, len(results or []), query,
+                 f"found {item['email_found']} on {item['email_source'] or '?'}"
+                 if kept else "no public email found")
+        state.audit(
+            "email_lookup", reason="one search, one light extraction, the address "
+                                   "kept only if a snippet shows it",
+            rule=rule_id, company=company, poc=person, results=len(results or []),
+            found=item["email_found"] or None, source=item["email_source"] or None,
+            invented=invented or None,
+        )
+
+    async def _open_email_proposal(self, message: dict, *, sent, marker: str) -> None:
+        """The post showed an email it found — record the offer to write it.
+
+        ONE PROPOSAL, KIND "email_write", KEYED TO THE MESSAGE, carrying every
+        address the post showed. Nothing is written until an approver says
+        yes, and then only by `_apply_email_write`. Not opened at all when
+        EMAIL_WRITE_ALLOWED is false: the post then makes no offer, and a
+        proposal nobody was asked about is a yes nobody can give.
+        """
+        if message.get("type") not in (nextaction.R_PROSPECTS, nextaction.R_LI_NO_DM):
+            return
+        if not config.EMAIL_WRITE_ALLOWED:
+            return
+        emails = [
+            {"sheet_row": a.get("sheet_row"), "row_key": a.get("row_key") or "",
+             "company": a.get("company") or "", "poc": a.get("poc") or "",
+             "email": a["email_found"], "source": a.get("email_source") or ""}
+            for a in drip.shown_contacts(message)
+            if a.get("email_found") and a.get("sheet_row")]
+        if not emails:
+            return
+        rule_id = str(message.get("rule_id") or "R5")
+        key = f"email_write:{marker}:{getattr(sent, 'id', 0)}"
+        await asyncio.to_thread(
+            lambda: self.db.open_proposal(
+                proposal_key=key, kind="email_write", tab=gtm_sheet.POCS, sheet_row=0,
+                row_key="", company="", poc="", payload={"emails": emails},
+                reply_text="", trigger=rule_id,
+                proposed_text="add " + ", ".join(
+                    f"{e['email']} to {e['poc']} ({e['company']})" for e in emails),
+                requested_by=rule_id,
+                channel_id=int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
+                message_id=str(getattr(sent, "id", "") or ""),
+                created_at=dl.now_ist().isoformat(timespec="seconds"),
+            )
+        )
+        state.audit(
+            "write_proposed",
+            reason="permission before every write: a found email goes into the "
+                   "sheet only on a yes",
+            proposal_key=key, kind="email_write", trigger=rule_id, count=len(emails),
+        )
+        log.info("[approvals] %s offered to write %d found email(s) (%s) — waiting "
+                 "for a yes", rule_id, len(emails), key)
+
+    async def _apply_email_write(self, message, proposal: dict, *,
+                                 decided_by: str, why: str) -> None:
+        """An approver said yes: write each found email — where the cell is
+        still blank.
+
+        EACH ROW IS RE-READ AND DECIDED ON ITS OWN (`gtm_sheet.write_email`):
+        written if the Email cell is still blank, left alone — and said so —
+        if somebody has filled it in since. Nothing else on the row is touched.
+        Every cell written is in `sheet_writes` with what was there before
+        (nothing), one batch a row, so "undo" takes them back one at a time.
+        """
+        emails = list((proposal.get("payload") or {}).get("emails") or [])
+        trigger = proposal.get("trigger") or "R5"
+        wrote: list = []
+        left: list = []
+        failed: list = []
+        written_at = dl.now_ist().isoformat(timespec="seconds")
+        for e in emails:
+            result = await asyncio.to_thread(
+                lambda e=e: gtm_sheet.SHEETS.write_email(
+                    row=int(e.get("sheet_row") or 0), email=str(e.get("email") or ""),
+                    expect_company=str(e.get("company") or ""),
+                    expect_name=str(e.get("poc") or ""),
+                    reason=f"approved by {decided_by}: email found by {trigger}",
+                )
+            )
+            if result.get("ok"):
+                batch_id = f"{message.id}:{e.get('sheet_row')}"
+                await asyncio.to_thread(
+                    lambda e=e, r=result, b=batch_id: self.db.record_sheet_write(
+                        batch_id=b, tab=proposal.get("tab") or gtm_sheet.POCS,
+                        sheet_row=int(e.get("sheet_row") or 0),
+                        row_key=e.get("row_key") or "", company=e.get("company") or "",
+                        poc=e.get("poc") or "", cells=r["written"],
+                        trigger="email_write", requested_by=decided_by,
+                        source_msg=str(message.id), written_at=written_at,
+                    )
+                )
+                state.audit(
+                    "sheet_write", reason=f"approved by {decided_by} — {why}",
+                    batch_id=batch_id, tab=proposal.get("tab") or gtm_sheet.POCS,
+                    sheet_row=int(e.get("sheet_row") or 0), company=e.get("company"),
+                    poc=e.get("poc"), trigger="email_write",
+                    proposal_key=proposal.get("proposal_key") or "",
+                    cells=[{"cell": c["cell"], "header": c["header"], "old": c["old"],
+                            "new": c["new"]} for c in result["written"]],
+                    source=e.get("source") or None, approved_by=decided_by,
+                    restricted_band_exception="email",
+                )
+                wrote.append(e)
+            elif result.get("skipped"):
+                left.append((e, result["skipped"]))
+            else:
+                failed.append((e, result.get("error") or result.get("remedy")
+                               or "the sheet refused it"))
+
+        parts: list = []
+        if wrote:
+            parts.append("Done — added " + "; ".join(
+                f"{e['email']} to {e['poc']}'s row ({e['company']})" for e in wrote)
+                + ". Only the Email cell was touched.")
+        for e, reason in left:
+            parts.append(f"Left {e['poc']}'s row alone — {reason}.")
+        for e, reason in failed:
+            parts.append(f"Couldn't write {e['poc']}'s email: {reason}. Nothing "
+                         "changed there.")
+        if not emails:
+            parts.append("There was no email left to write on that one.")
+        if wrote:
+            parts.append(f"Say undo within {config.SHEET_WRITE_UNDO_HOURS}h to take "
+                         "the last one back.")
+        await self._reply(message, " ".join(parts), reason="echoing an email write")
+        log.info("[approvals] %s approved %s — %d email cell(s) written, %d already "
+                 "filled, %d refused", decided_by, proposal.get("proposal_key"),
+                 len(wrote), len(left), len(failed))
+
+    # -- R3: "want me to remind you again?" ----------------------------------
+
+    async def _open_events_remind_proposal(self, message: dict, *, sent,
+                                           marker: str) -> None:
+        """R3 closed with "Want me to remind you again on Monday?" — record it.
+
+        KIND "events_remind", WRITES NOTHING. A yes schedules ONE one-off
+        reminder for that day at 14:00, in this channel, listing the same
+        events (`_apply_events_remind`); a no, or silence, does nothing — like
+        R11's question it expires quietly.
+        """
+        if message.get("type") != nextaction.R_EVENTS:
+            return
+        lines, _extra, offer = drip.render_events(
+            message, limit=int(message.get("max_items_per_post") or 0) or 20)
+        rows = drip.event_lines(message)
+        if not offer or not rows:
+            return
+        key = f"events_remind:{marker}:{getattr(sent, 'id', 0)}"
+        channel_id = int(getattr(getattr(sent, "channel", None), "id", 0) or 0)
+        payload = {"on": str(rows[0].get("remind_on") or ""),
+                   "word": str(rows[0].get("remind_word") or ""), "time": "14:00",
+                   "lines": [str(a.get("event_line") or "") for a in rows][:len(lines)]}
+        await asyncio.to_thread(
+            lambda: self.db.open_proposal(
+                proposal_key=key, kind="events_remind", tab=gtm_sheet.EVENTS,
+                sheet_row=0, row_key="", company="", poc="", payload=payload,
+                reply_text="", trigger="R3",
+                proposed_text=f"remind again {payload['word']} about "
+                              f"{len(payload['lines'])} event(s)",
+                requested_by="R3", channel_id=channel_id,
+                message_id=str(getattr(sent, "id", "") or ""),
+                created_at=dl.now_ist().isoformat(timespec="seconds"),
+            )
+        )
+        log.info("[approvals] R3 offered to remind again %s (%s) about %d event(s) "
+                 "(%s) — a yes schedules one reminder, nothing is written",
+                 payload["word"], payload["on"], len(payload["lines"]), key)
+
+    async def _apply_events_remind(self, message, proposal: dict, *,
+                                   decided_by: str) -> None:
+        """A yes to R3's offer: ONE reminder, that day at 14:00, in the channel.
+
+        It goes into `scheduled_reminders` like a reminder anybody asked for,
+        so the exact-minute loop posts it — once, outside the drip and the
+        daily cap — and it lists the events the post listed.
+        """
+        payload = proposal.get("payload") or {}
+        when = dl.parse_date(payload.get("on"))
+        lines = [str(x) for x in (payload.get("lines") or []) if str(x).strip()]
+        hhmm = str(payload.get("time") or "14:00")
+        today = dl.today_ist()
+        if when is None or not lines:
+            await self._reply(message, "There was nothing on that one to remind you of.",
+                              reason="events reminder had nothing on it")
+            return
+        if when <= today:
+            await self._reply(
+                message, "That day has already come — ask me for the events list any "
+                         "time and I'll post it.",
+                reason="events reminder date already passed")
+            return
+        what = "these AI events are coming up:\n" + "\n".join(f"• {x}" for x in lines)
+        channel_id = str(proposal.get("channel_id") or
+                         getattr(getattr(message, "channel", None), "id", "") or "")
+        rid = await asyncio.to_thread(
+            lambda: self.db.add_scheduled_reminder(
+                due_date=dl.iso(when), due_time=hhmm, what=what,
+                requested_by=decided_by, on_date=dl.iso(today), channel_id=channel_id,
+                asker_id=str(getattr(message.author, "id", "") or ""),
+            )
+        )
+        state.audit("events_reminder_scheduled", reason="a yes to R3's offer",
+                    reminder_id=rid, due=f"{dl.iso(when)} {hhmm}", events=len(lines),
+                    requested_by=decided_by)
+        log.info("[approvals] %s said yes to R3's offer — reminder #%s on %s at %s "
+                 "for %d event(s); it does not count toward the cap", decided_by, rid,
+                 dl.iso(when), hhmm, len(lines))
+        await self._reply(
+            message, f"Will do — I'll post these again on "
+                     f"{sheetwrite.reminder_moment_words(when, hhmm)}.",
+            reason="confirming R3's reminder")
+
+    @staticmethod
+    def _pick_proposal(proposals: list, text: str):
+        """Which of one message's open proposals does this reply answer?
+
+        ONE POST CAN ASK SEVERAL THINGS — R3 may offer to add events it found,
+        to fill in deadlines and to remind the team again. A reply that says
+        which ("yes, add them", "yes to the deadlines", "yes remind me")
+        answers that one. A bare yes answers the question the post ENDED on,
+        which is the reminder: it is the last thing the reader saw, and it is
+        the one that writes nothing.
+        """
+        proposals = [p for p in (proposals or []) if p]
+        if len(proposals) <= 1:
+            return proposals[0] if proposals else None
+        said = " ".join(str(text or "").lower().split())
+        words = (("events_remind", ("remind",)),
+                 ("event_deadline", ("deadline",)),
+                 ("event_append", ("add", "event")),
+                 ("email_write", ("email",)))
+        by_kind = {str(p.get("kind") or ""): p for p in proposals}
+        for kind, keys in words:
+            if kind in by_kind and any(k in said for k in keys):
+                return by_kind[kind]
+        return by_kind.get("events_remind") or proposals[0]
+
+    async def _after_send(self, message: dict, *, sent, marker: str) -> None:
+        """The bookkeeping that follows a post that actually landed.
+
+        R5 — `start_prospect_company` and `record_prospect_mention`, for the
+        contacts the post NAMED. Both existed with no caller, so "two companies
+        a week" restarted from the top of the sheet every run and no contact
+        ever reached the count at which the bot asks "skip them?".
+
+        R3 — an event listed as "date unclear" is recorded, which is what
+        makes that line appear once.
+
+        After the send, like every other ledger here: a post that was refused
+        must not count as a mention.
+        """
+        kind = message.get("type")
+        if kind == nextaction.R_PROSPECTS:
+            try:
+                week = "%d-W%02d" % date.fromisoformat(marker).isocalendar()[:2]
+            except ValueError:
+                week = "%d-W%02d" % dl.today_ist().isocalendar()[:2]
+            for action in drip.shown_contacts(message):
+                company = str(action.get("company") or "").strip()
+                key = str(action.get("row_key") or "").strip()
+                if company:
+                    await asyncio.to_thread(
+                        lambda c=company: self.db.start_prospect_company(
+                            c, iso_week=week, on_date=marker))
+                if key:
+                    count = await asyncio.to_thread(
+                        lambda k=key, a=action: self.db.record_prospect_mention(
+                            k, signature=str(a.get("signature") or ""), on_date=marker))
+                    log.info("[rules] R5: %s named %d time(s) unchanged (asks to skip "
+                             "at %d); %s is one of week %s's companies", key, count,
+                             int(config.PROSPECT_REPEAT_ASK_AT), company or "?", week)
+        elif kind == nextaction.R_EVENTS:
+            for action in drip.event_lines(message):
+                key = str(action.get("event_unclear_key") or "")
+                if not key:
+                    continue
+                await asyncio.to_thread(
+                    lambda a=action, k=key: self.db.record_event_reminder(
+                        event_key=k, event=a.get("company", ""), event_date="",
+                        location="", sent_on=marker))
+                log.info("[rules] R3: %r listed once as \"date unclear\"; it is not "
+                         "listed again until the sheet's date can be read",
+                         action.get("company"))
+
+    async def _advance_meeting_ladder(self, message: dict, *, marker: str) -> int:
+        """Move every meeting this R9 post asked about up one rung. How many.
+
+        `db.advance_meeting_followup` existed and nothing called it, so the
+        ladder never left rung 1: the channel post was repeated every few days
+        for ever, the DMs and the escalation never came, and "then stop" never
+        happened. Only the items the post actually carried climb — the ones
+        past the rule's `max_items_per_post` were not asked about.
+
+        THE SAME ON A REAL DAY, A TEST DAY AND A SIMULATION: this is called from
+        `_send_drip_message`, which all three send through. A simulation climbs
+        in its sandbox copy and the real ladder is untouched.
+        """
+        if message.get("type") != nextaction.R_MEETING_FOLLOWUP:
+            return 0
+        cap = int(message.get("max_items_per_post") or 0)
+        actions = list(message.get("actions") or [])
+        climbed = 0
+        for action in (actions[:cap] if cap else actions):
+            key = str(action.get("row_key") or "").strip()
+            if not key:
+                continue
+            rung = await asyncio.to_thread(
+                lambda k=key, a=action: self.db.advance_meeting_followup(
+                    k, on_date=marker, meeting_date=str(a.get("meeting_date") or "")))
+            total = int(action.get("rungs_total") or 0)
+            climbed += 1
+            log.info(
+                "[rules] R9 ladder: %s is now at rung %d of %d (%s)%s", key, rung,
+                total, action.get("rung_destination") or "channel",
+                " — that was the last one; I stop here" if total and rung >= total
+                else "",
+            )
+            state.audit(
+                "meeting_followup_rung", reason="one R9 follow-up went out",
+                date=marker, row_key=key, rung=rung, of=total or None,
+                destination=action.get("rung_destination") or "channel",
+            )
+        return climbed
+
+    async def _reset_answered_ladders(self, rows: list, ladder: dict) -> dict:
+        """Clear R9's ladder for every row whose Next Steps is now filled, or
+        whose meeting date has moved. Returns the ladder without them.
+
+        NEXT STEPS ARRIVED — the chase is over. Left alone, the row would stay
+        at the rung it reached, and the next stalled meeting with the same
+        contact would open at the escalation. A NEW MEETING DATE is a new
+        meeting and starts at rung 1 for the same reason.
+
+        IDEMPOTENT, which is why it may run wherever the queue is computed: it
+        clears state the sheet has already made stale and consumes nothing, so a
+        preview that triggers it changes nothing a real run would not.
+        """
+        if not ladder:
+            return ladder
+        out = dict(ladder)
+        for row in rows or ():
+            key = activation.row_key(row)
+            entry = out.get(key)
+            if not entry:
+                continue
+            why = ""
+            if gtm_sheet.clean_cell(row.get("next_steps")):
+                why = "Next Steps is filled"
+            else:
+                met = dl.parse_date(gtm_sheet.clean_cell(row.get("meeting_date")))
+                was = dl.parse_date(entry.get("meeting") or "")
+                if met is not None and was is not None and met != was:
+                    why = f"the meeting moved from {dl.iso(was)} to {dl.iso(met)}"
+            if not why:
+                continue
+            await asyncio.to_thread(lambda k=key: self.db.reset_meeting_followup(k))
+            out.pop(key, None)
+            log.info("[rules] R9 ladder reset for %s (it was at rung %d): %s", key,
+                     int(entry.get("sent") or 0), why)
+            state.audit("meeting_followup_reset", reason=why, row_key=key,
+                        rung=int(entry.get("sent") or 0))
+        return out
 
     @staticmethod
     def _voice_seed(marker: str, message: dict) -> int:
@@ -7403,7 +8185,8 @@ class SalesBot(discord.Client):
         report = drip.contract_report(planned)
         lines = [drip.preview_text(planned), "", "VOLUME CONTRACT (plan section 8)"]
         lines.append(
-            f"  messages {report['messages']}/{report['cap']} "
+            f"  counted {report['counted']}/{report['cap']}, "
+            f"{report['messages']} message(s) in all "
             f"({'ok' if report['within_cap'] else 'OVER CAP'}) · "
             f"gaps {report['gaps_minutes']} min, floor {report['gap_floor_minutes']} "
             f"({'ok' if report['spacing_ok'] else 'TOO CLOSE'}) · "
@@ -7618,10 +8401,13 @@ class SalesBot(discord.Client):
 
         READ-ONLY AND SEND-FREE, and that is the point of this whole layer. It
         reads the canonical tab, applies the activation gate, reads the snoozes
-        and the explicitly scheduled reminders out of SQLite, and hands all of
-        it to `nextaction.run`, which is pure. Nothing here posts, and nothing
-        here writes — so it is safe to run on every boot and on every question
-        with the digest kill switch off.
+        out of SQLite, and hands all of it to `nextaction.run`, which is pure.
+        Nothing here posts — so it is safe to run on every boot and on every
+        question with the digest kill switch off. (One-off reminders are NOT
+        read here: the exact-minute loop is their only sender.)
+
+        ITS TWO WRITES ARE BOTH IDEMPOTENT: R11's pipeline snapshot, and
+        clearing R9's ladder for a row whose Next Steps has been filled.
         """
         if not config.NEXT_ACTION_ENABLED:
             log.info(
@@ -7644,7 +8430,6 @@ class SalesBot(discord.Client):
             self._split_active, tab.rows, "the twelve rules"
         )
         snoozes = await asyncio.to_thread(self.db.snoozes)
-        scheduled = await asyncio.to_thread(self.db.scheduled_reminders_by_row)
 
         # THE OTHER FOUR TABS. Seven of the twelve rules are not about an
         # Outreach PoCs row at all — R4 reads the checklist, R12 the packages,
@@ -7688,14 +8473,28 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[rules] R9's ladder could not be read")
             meeting_followups = {}
+        # R3 lists an event whose date it cannot read ONCE; this is what it
+        # has already listed.
+        unclear_seen = await asyncio.to_thread(self.db.event_keys_recorded, "unclear|")
+        # NEXT STEPS FILLED, OR THE MEETING MOVED: that chase is over.
+        try:
+            meeting_followups = await self._reset_answered_ladders(
+                active, meeting_followups)
+        except Exception:
+            log.exception("[rules] R9's ladder could not be reset")
 
         result = await asyncio.to_thread(
             lambda: nextaction.run(
-                today=today, rows=active, snoozes=snoozes, scheduled=scheduled,
+                today=today, rows=active, snoozes=snoozes,
                 deliverables=deliverables, packages=packages, events=events,
                 pipeline_companies=pipeline_companies, new_companies=new_companies,
                 prospect_repeats=prospect_repeats, week_companies=week_companies,
                 meeting_followups=meeting_followups, inactive=len(inactive),
+                # R5 READS EVERY ROW the stop rules allow, not only the active
+                # ones: a never-contacted row is exactly what the activation
+                # gate has not let through yet.
+                prospect_rows=list(tab.rows),
+                events_unclear_seen=unclear_seen,
             )
         )
         result["tab"] = tab
@@ -7711,15 +8510,20 @@ class SalesBot(discord.Client):
     async def _news_run(self, items: list, *, today) -> list:
         """R1's MAIN sweep and R2's screen. Returns the items it filled in.
 
-        R1 IS AN AI INDUSTRY FEED ON A TOPIC LIST (the 24/29 Sep decision), and
-        IT NO LONGER SEARCHES. The feeds are polled into `news_feed_items` all
-        day (feeds.py, zero API calls); the main sweep takes the last 24 hours
-        of them that have not been posted, has MODEL_LIGHT score the ones not
-        yet scored — titles and summaries only, one call — and puts the result
-        through `news.choose` and the deterministic `news.render`. The main
-        model is not called for the news post. Nothing is read from the PoCs,
-        the mapping, the pipeline or the departures list. The item goes out in
-        R1's drip slot, pinned to NEWS_MAIN_TIME.
+        R1 IS TWO KINDS OF NEWS (S2): the AI INDUSTRY, on a topic list, and OUR
+        PoCs — the people on active Outreach PoCs rows and the companies on
+        Master Pipeline and Outreach PoCs. NEITHER IS SEARCHED FOR. The feeds
+        are polled into `news_feed_items` all day (feeds.py: outlets, topic
+        queries and a rotating set of PoC names, all plain RSS, zero API
+        calls); the main sweep takes everything since the previous main sweep
+        that has not been posted, has MODEL_LIGHT score the ones not yet scored
+        — titles and summaries only, one call — and puts the result through
+        `news.choose_main` and the deterministic `news.render`. The main model
+        is not called for the news post. The item goes out in R1's drip slot,
+        pinned to NEWS_MAIN_TIME.
+
+        WHAT DID NOT FIT RIDES ON THE ITEM (`news_overflow`) and is posted
+        right after it as "More AI news today" (`_post_news_overflow`).
 
         A DATE THAT HAS NOT HAPPENED HAS NO NEWS. For a pretend date after the
         real today the slot says so (`news.future_note`) and nothing is polled,
@@ -7765,6 +8569,7 @@ class SalesBot(discord.Client):
                 payload = cached.get("payload") or {}
                 chosen = list(payload.get("stories") or [])
                 skipped = list(payload.get("skipped") or [])
+                overflow = list(payload.get("overflow") or [])
                 usage.count("cache_hits")
                 log.info("[research-cache] hit %s for %s: %d story/stories — not "
                          "scoring again", NEWS_RUN_CACHE_KEY, marker, len(chosen))
@@ -7773,9 +8578,9 @@ class SalesBot(discord.Client):
                          NEWS_RUN_CACHE_KEY, marker)
                 ran = await self._main_sweep(news_items, today=today, marker=marker)
                 if ran is None:
-                    chosen, skipped = None, []
+                    chosen, skipped, overflow = None, [], []
                 else:
-                    chosen, skipped = ran
+                    chosen, skipped, overflow = ran
 
             for item in news_items:
                 if chosen is None:
@@ -7788,6 +8593,8 @@ class SalesBot(discord.Client):
                                        for s in chosen]
                     item["research_note"] = ""
                     item["web_pending"] = False
+                    # WHAT DID NOT FIT, for "More AI news today".
+                    item["news_overflow"] = list(overflow)
                 else:
                     # A QUIET SWEEP POSTS EXACTLY ONE LINE under its heading.
                     log.info("[news] %s: the sweep found nothing new%s", marker,
@@ -7816,6 +8623,42 @@ class SalesBot(discord.Client):
         until = min(until, dl.real_now_ist())
         return (feeds.utc_iso(until - timedelta(hours=max(1, int(hours)))),
                 feeds.utc_iso(until))
+
+    def _main_window(self, today) -> tuple:
+        """(since, until) for the MAIN sweep, as IST datetimes: everything
+        since the previous main sweep.
+
+        NOT A FIXED 24 HOURS. Monday's post covers Friday 2 PM to Monday 2 PM,
+        because nothing covered the weekend in between: a story from Saturday
+        morning was outside Monday's 24 hours and was never shown to anybody.
+        It is also what brings back a story a weekend check found and the
+        breaking valve held — held stories are not recorded as posted, so they
+        are simply still there.
+
+        "THE PREVIOUS MAIN SWEEP" IS READ OFF THE SCHEDULE — the last day
+        before `today` on which R1 runs, at NEWS_MAIN_TIME — not off a record
+        of what was sent. So it is the same on a real day, a test day and a
+        simulation, and a day the bot was down does not shorten the next one's
+        window. Never longer than the feed store keeps items.
+
+        The window ends now on the real day, and at the main time on a past
+        pretend date — a test of last Monday reads last Monday's news.
+        """
+        hh, mm = digest.parse_time(config.NEWS_MAIN_TIME, default="14:00")
+        if today >= dl.real_today_ist():
+            until = dl.real_now_ist()
+        else:
+            until = datetime(today.year, today.month, today.day, hh, mm, tzinfo=dl.IST)
+        rule = rules.by_id("R1")
+        prev = today - timedelta(days=1)
+        for back in range(1, 8):
+            day = today - timedelta(days=back)
+            if rule is None or rule.runs_on(day):
+                prev = day
+                break
+        since = datetime(prev.year, prev.month, prev.day, hh, mm, tzinfo=dl.IST)
+        floor = until - timedelta(days=max(1, int(config.NEWS_FEED_KEEP_DAYS)))
+        return max(since, floor), until
 
     async def _feed_candidates(self, *, since_utc: str, until_utc: str, today) -> list:
         """The stored feed items in a window that have NOT been posted — by
@@ -7893,32 +8736,28 @@ class SalesBot(discord.Client):
         return stories + [s for s in scored if int(s.get("importance") or 0) >= 3]
 
     async def _main_sweep(self, items: list, *, today, marker: str):
-        """Take the last 24 hours from the feed store, score, choose, record and
-        cache.
+        """Take everything since the previous main sweep from the feed store,
+        score, choose, record and cache.
 
-        Returns (chosen, skipped), or None when it could not run — every item
-        has then been told why, and NOTHING is cached, so a later attempt tries
-        again once the reason has gone.
+        Returns (chosen, skipped, overflow), or None when it could not run —
+        every item has then been told why, and NOTHING is cached, so a later
+        attempt tries again once the reason has gone. `overflow` is what
+        qualified and did not fit: "More AI news today".
         """
         import websearch
 
         if websearch.server_side():
             return await self._main_sweep_server(items, today=today, marker=marker)
-        if not websearch.enabled():
-            for item in items:
-                self._mark_unresearched(
-                    item, websearch.unavailable_note("WEB_SEARCH_ENABLED is off"))
-            return None
+        # NOT GATED ON WEB_SEARCH_ENABLED. The feed path searches nothing: it
+        # reads RSS over plain HTTP and makes one MODEL_LIGHT scoring call. With
+        # the switch off — which is how a team stops paying for web search — R1
+        # used to post "web search is off" at 14:00 instead of the news. The
+        # switch still governs the server-side path above (`_search_available`).
 
         await self._maybe_poll_feeds()
-        # THE WINDOW ENDS NOW on the real day, and at the main time on a past
-        # pretend date — a test of last Monday reads last Monday's news.
-        if today >= dl.real_today_ist():
-            until = dl.real_now_ist()
-        else:
-            hh, mm = digest.parse_time(config.NEWS_MAIN_TIME, default="14:00")
-            until = datetime(today.year, today.month, today.day, hh, mm, tzinfo=dl.IST)
-        since_utc, until_utc = self._feed_window(until, 24)
+        since, until = self._main_window(today)
+        until = min(until, dl.real_now_ist())
+        since_utc, until_utc = feeds.utc_iso(since), feeds.utc_iso(until)
         rows = await self._feed_candidates(since_utc=since_utc, until_utc=until_utc,
                                            today=today)
         stories = await self._score_feed(rows, today=today, mode=news.MODE_MAIN)
@@ -7929,25 +8768,39 @@ class SalesBot(discord.Client):
                 self._mark_unresearched(item, why)
             return None
 
-        chosen, skipped = await asyncio.to_thread(
-            lambda: news.choose(
+        picked = await asyncio.to_thread(
+            lambda: news.choose_main(
                 stories, today=today, db=self.db, cap=config.NEWS_MAX_ITEMS,
+                poc_slots=config.NEWS_POC_SLOTS,
                 per_topic=config.NEWS_PER_TOPIC_PER_DAY,
                 topics_per_week=config.NEWS_TOPICS_PER_WEEK,
                 min_importance=config.NEWS_BREAKING_MIN_IMPORTANCE,
+                offtopic_bypass=config.NEWS_OFFTOPIC_BYPASS_IMPORTANCE,
+                overflow_min=config.NEWS_OVERFLOW_MIN_IMPORTANCE,
+                overflow_max=config.NEWS_OVERFLOW_MAX_ITEMS,
             )
         )
+        chosen, skipped = picked["keep"], picked["skipped"]
+        overflow = picked["overflow"] if config.NEWS_OVERFLOW_ENABLED else []
         for line in skipped:
-            log.info("[news] main sweep skipped %s", line)
-        log.info("[news] %s main sweep: %d feed item(s) in the last 24h not yet "
-                 "posted, %d worth posting, %d kept, %d skipped", marker, len(rows),
-                 len(stories), len(chosen), len(skipped))
-        await self._store_main_sweep(chosen, skipped, marker=marker)
-        return chosen, skipped
+            log.info("[news] main sweep: %s", line)
+        log.info("[news] %s main sweep, %s to %s IST: %d feed item(s) not yet posted "
+                 "(%d about our PoCs), %d worth posting — %d in the post (%d PoC), %d "
+                 "for \"More AI news today\", %d with no room anywhere", marker,
+                 since.strftime("%a %d %b %H:%M"), until.strftime("%a %d %b %H:%M"),
+                 len(rows), sum(1 for r in rows if news.is_poc(r)), len(stories),
+                 len(chosen), sum(1 for s in chosen if news.is_poc(s)),
+                 len(picked["overflow"]), len(picked["dropped"]))
+        await self._store_main_sweep(chosen, skipped, marker=marker, overflow=overflow)
+        return chosen, skipped, overflow
 
     async def _store_main_sweep(self, chosen: list, skipped: list, *,
-                                marker: str) -> None:
+                                marker: str, overflow: Optional[list] = None) -> None:
         """Record the chosen stories and cache the day's sweep.
+
+        THE OVERFLOW IS CACHED WITH IT but NOT recorded as posted here: it is
+        recorded when "More AI news today" actually goes out
+        (`_post_news_overflow`), so a post that is refused does not bury them.
 
         RECORDED ONCE, WHEN CHOSEN — with the cache, which is what stops a
         second pass over the same day finding these in `news_stories`.
@@ -7968,7 +8821,8 @@ class SalesBot(discord.Client):
                 NEWS_RUN_CACHE_KEY, on_date=marker, rule_id="R1",
                 sources=[{"url": s.get("url", ""), "title": s.get("headline", "")}
                          for s in chosen],
-                payload={"stories": chosen, "skipped": skipped},
+                payload={"stories": chosen, "skipped": skipped,
+                         "overflow": list(overflow or [])},
             )
         )
         if stored:
@@ -8010,7 +8864,7 @@ class SalesBot(discord.Client):
         log.info("[news] %s main sweep: %d story/stories found, %d kept, %d skipped",
                  marker, len(stories), len(chosen), len(skipped))
         await self._store_main_sweep(chosen, skipped, marker=marker)
-        return chosen, skipped
+        return chosen, skipped, []
 
     @contextlib.contextmanager
     def _hold_live_loop(self, why: str):
@@ -8136,7 +8990,9 @@ class SalesBot(discord.Client):
             if not config.digest_enabled():
                 return None
             since_from = slot
-        if not websearch.enabled():
+        # WEB_SEARCH_ENABLED GOVERNS THE SEARCHING PATH ONLY. The feed path
+        # below reads RSS and searches nothing, so the switch does not stop it.
+        if websearch.server_side() and not websearch.enabled():
             return None
 
         claimed = await asyncio.to_thread(
@@ -8512,10 +9368,12 @@ class SalesBot(discord.Client):
                 item["event_proposals"] = found
                 item["deadline_proposals"] = deadlines_found
             else:
-                item["research_note"] = (
-                    "nothing new to add — every event I found is already on the tab, "
-                    "and no registration deadline was missing"
-                )
+                # NOTHING NEW IS NOT A LINE IN THE POST. It used to be said in
+                # brackets under the list; the post now ends on its offer, and
+                # in a week with nothing listed either there is no post at all.
+                item["research_note"] = ""
+                log.info("[events] %s: nothing new to add — every event found is "
+                         "already on the tab, and no deadline was missing", marker)
         return event_items
 
     async def _discover_events(self, rows: list, *, today, marker: str) -> list:
@@ -8739,12 +9597,22 @@ class SalesBot(discord.Client):
         """
         rule = str(item.get("rule_id") or item.get("rule") or "?")
         row = str(item.get("row_key") or item.get("company") or item.get("key") or "")
+        # AN EMAIL LOOKUP IS ABOUT THE PERSON, NOT THE RULE: R5 and R6 share
+        # one answer, so a contact looked up on Tuesday is not searched for
+        # again on Friday because a different rule is asking.
+        if item.get("email_lookup"):
+            return f"email|{row}"
         return f"{rule}|{row}"
 
     # The fields the research writes onto an item besides research, sources and
     # the note. A cache hit restores them too, or a hit would differ from a miss.
+    # `news_overflow` is R1's: the stories that did not fit the main post. It
+    # has to come back with the cached post, or a second pass over the same day
+    # (a restart between the sweep and the send, a test day run twice) would
+    # post the news and silently drop "More AI news today".
     _RESEARCH_PAYLOAD_FIELDS = (
         "text", "web_pending", "event_proposals", "deadline_proposals",
+        "news_overflow", "email_checked", "email_found", "email_source",
     )
 
     def _research_store(self, item: dict) -> tuple:
@@ -8762,8 +9630,9 @@ class SalesBot(discord.Client):
         """
         import websearch
 
-        per_row = (item.get("rule") or "") in websearch.RULE_QUERIES and \
-            (item.get("rule") or "") not in ("news_company_screen", "events")
+        per_row = bool(item.get("email_lookup")) or (
+            (item.get("rule") or "") in websearch.RULE_QUERIES and
+            (item.get("rule") or "") not in ("news_company_screen", "events"))
         return (self._ledger() if per_row else self.db), per_row
 
     async def _research_items(self, items: list, *, today) -> list:
@@ -8836,8 +9705,12 @@ class SalesBot(discord.Client):
             if item.get("web_pending"):
                 continue                   # no answer yet; leave it uncached
             key = self._research_key(item)
-            if not str(item.get("research") or "").strip() or \
-                    not list(item.get("sources") or []):
+            # AN EMAIL LOOKUP THAT RAN IS AN ANSWER EITHER WAY: "no public
+            # email found" is kept too, or the same contact would be searched
+            # for again at every post.
+            if not item.get("email_checked") and (
+                    not str(item.get("research") or "").strip() or
+                    not list(item.get("sources") or [])):
                 log.info("[research-cache] not storing %s — no sourced result", key)
                 continue
             store, _per_row = self._research_store(item)
@@ -8932,6 +9805,12 @@ class SalesBot(discord.Client):
         marker = dl.iso(today)
         server = websearch.server_side()
         for item in pending:
+            # R5's AND R6's EMAIL: its own path — one search, one light
+            # extraction, the address verified against the snippets.
+            if item.get("email_lookup"):
+                await self._email_lookup(
+                    item, rule_id=str(item.get("rule_id") or item.get("rule") or "?"))
+                continue
             asks = self._row_queries(item)
             ok, why = await self._search_available(
                 feed_first=bool(asks) and all(q.get("news") for q in asks))
@@ -9117,17 +9996,18 @@ class SalesBot(discord.Client):
 
         # R11's "want me to look for PoCs?" IS NEVER NUDGED. Silence means no:
         # it expires quietly at the nudge age and nothing is said.
-        for p in [p for p in pending if p.get("kind") == "poc_lookup"]:
+        quiet = ("poc_lookup", "events_remind")
+        for p in [p for p in pending if p.get("kind") in quiet]:
             await asyncio.to_thread(
                 lambda p=p: self.db.close_proposal(
                     proposal_key=p["proposal_key"], status="expired",
-                    decision="nobody asked for the PoC lookup",
+                    decision="nobody said yes to the question",
                     decided_by="", decided_at=dl.now_ist().isoformat(timespec="seconds"),
                 )
             )
-            log.info("[approvals] %s expired quietly — nobody said yes to the PoC "
-                     "lookup", p["proposal_key"])
-        pending = [p for p in pending if p.get("kind") != "poc_lookup"]
+            log.info("[approvals] %s expired quietly — nobody said yes",
+                     p["proposal_key"])
+        pending = [p for p in pending if p.get("kind") not in quiet]
 
         if not pending:
             if droppable:
@@ -9438,16 +10318,9 @@ class SalesBot(discord.Client):
         today = dl.today_ist()
         marker = dl.iso(today)
 
-        if not drip.is_sending_day(today):
-            log.info("[test-day] %s is a %s; nothing goes out", marker,
-                     today.strftime("%A"))
-            self._last_test_plan = {
-                "date": today, "planned": None, "rules_run": [], "sent": 0,
-                "note": f"nothing goes out on a {today.strftime('%A')} — I only "
-                        "post on working days.",
-            }
-            return
-
+        # A SATURDAY IS STILL LIVED THROUGH. No drip goes out, but a real
+        # Saturday still fires one-off reminders and still runs the hourly news
+        # check, so a pretend one does too (`_live_test_day` skips the plan).
         with self._hold_live_loop(f"test day {marker}"):
             async with self._typing(channel):
                 await self._live_test_day(channel, today=today,
@@ -9495,9 +10368,20 @@ class SalesBot(discord.Client):
         try:
             await self._clear_stale_test_day(marker=marker, sandbox=simulated)
 
-            queue = await self._run_next_actions(today=today)
+            # THE SAME GATE THE LIVE SWEEP ASKS FIRST. On a day the drip does not
+            # send, no queue is read and nothing is planned — exactly as live —
+            # but the day's two stops still happen, for the reminders and the
+            # hourly news check, which have no weekday rule.
+            sending = drip.is_sending_day(today)
+            queue = await self._run_next_actions(today=today) if sending else None
             rules_run = list((queue or {}).get("rules_run") or [])
-            if queue is None:
+            if not sending:
+                log.info("[test-day] %s is a %s; no drip goes out", marker,
+                         today.strftime("%A"))
+                note = (f"nothing goes out on a {today.strftime('%A')} — I only post "
+                        "on working days" + (", plus one Sunday heads-up when a "
+                        "deliverable is due Monday." if drip.sunday_rule_ids() else "."))
+            elif queue is None:
                 note = ("the rules engine is off (NEXT_ACTION_ENABLED) or there is "
                         "no canonical tab to read, so there was nothing to plan.")
             try:
@@ -9548,9 +10432,10 @@ class SalesBot(discord.Client):
                 for i, msg in enumerate(batch):
                     if (i or label == "afternoon") and gap:
                         await asyncio.sleep(gap)
-                    # THE PROPOSAL SWEEP RIDES THE FIRST SLOT, exactly as it
-                    # does on a real day.
-                    if msg.get("slot") == 1 and self._swept_proposals_on != marker:
+                    # THE PROPOSAL SWEEP RIDES THE FIRST POST OF THE DAY,
+                    # exactly as it does on a real day.
+                    if not already and not sent \
+                            and self._swept_proposals_on != marker:
                         self._swept_proposals_on = marker
                         try:
                             await self._sweep_proposals(today=today, channel=channel)
@@ -9799,13 +10684,10 @@ class SalesBot(discord.Client):
             try:
                 async with self._typing(channel):
                     for day in days:
-                        # A REAL DAY THAT IS NOT A SENDING DAY SAYS NOTHING, runs
-                        # no rules, no research and no news check — so neither
-                        # does a simulated one.
-                        if not drip.is_sending_day(day):
-                            log.info("[sim] %s is a %s; nothing goes out",
-                                     dl.iso(day), day.strftime("%A"))
-                            continue
+                        # A DAY THE DRIP DOES NOT SEND ON is still lived through:
+                        # no rules and no drip (`_live_test_day` asks the same
+                        # gate the live sweep does), but reminders and the
+                        # hourly news check run as they do on a real Saturday.
                         await self._live_test_day(channel, today=day, simulated=True,
                                                   rule=rule, fast=fast)
                         for k, v in ((self._last_test_plan or {}).get("cost")

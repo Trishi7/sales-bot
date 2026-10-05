@@ -4,7 +4,7 @@ A Discord bot that acts as a sales & marketing chief of staff for the NFThing
 team. It reads the sales channels, answers questions from what it can actually
 see, and chases the deadlines people commit to in passing.
 
-**It speaks unprompted at most three times a weekday.** Everything it has to
+**It speaks unprompted at most five times a weekday** — meeting prep, meeting follow-ups, reminders and urgent news aside. Everything it has to
 raise goes out as a [drip](#the-drip--a-few-short-messages-a-day): short,
 time-spaced messages, **one per (action type × owner)**, first at
 `SALES_DRIP_START`. Everything else it says is a reply to a person, and replies
@@ -1831,7 +1831,9 @@ Anything here already done? Say which and I'll take it off.
   the day it pretends.
 - **Sunday** keeps the narrower window — P1 and within `DELIVERABLE_NEAR_DAYS`
   — for the `SUNDAY_RULE_IDS` exception. R4 is `weekdays: [mon]` in
-  bot_rules.yaml, so that branch runs only if a Sunday is added there.
+  bot_rules.yaml; `rules.for_day` lets a `SUNDAY_RULE_IDS` rule look on a
+  Sunday anyway, and `drip.plan` posts it only when an item is due on the
+  Monday. See [Weekends](#weekends).
 
 **R10 is supportive, and in points.** Each deal's line is *"{deal} is in the
 closure stage — anything I can pull together to help it along: the PoC's
@@ -1951,7 +1953,7 @@ pass when that layer arrives.
 ### Purity, and the one write that isn't in it
 
 `nextaction.run()` reads no sheet, writes no database row and sends nothing.
-Everything it needs is passed in: the snoozes, the scheduled reminders, the four
+Everything it needs is passed in: the snoozes, the four
 context tabs' rows, the R5 repeat counts and week state, the R9 ladder, and
 R11's new companies.
 
@@ -2656,34 +2658,300 @@ Each docstring says what broke and how it was caught — a regression test named
 
 ---
 
-### Caps, per day
+### The daily cap — 5 counted posts, every weekday
 
-`DAILY_MESSAGE_CAP_BY_DAY`, default `mon:4,tue:4,wed:3,thu:3,fri:3,sun:1`. Any
-day not named falls back to `DAILY_MESSAGE_CAP`. Monday and Tuesday carry more
-rules than Wednesday, so a single scalar either throttled those two or let the
-quiet days run loose.
+`DAILY_MESSAGE_CAP`, default **5**, the same on every weekday. The per-weekday
+table (`DAILY_MESSAGE_CAP_BY_DAY`) is **retired**: it gave Monday and Tuesday
+four and the rest three, and it was one of three places that each had their own
+idea of whether the day was full.
 
-**R8 and R9 do not count against the cap at all.** That is declared per-rule in
-`bot_rules.yaml` (`counts_toward_cap: false`), not in the env — a meeting is
-happening whether or not Monday's chases fit, and letting a Monday chase crowd
-out the prep for it is the opposite of what a volume cap is for.
+**One function counts: `drip.counted_today(already)`.** The live sweep's gate,
+`drip.plan`, the test day and the simulation all ask it. Before, the live gate
+compared `len(already)` with the scalar cap (so every post counted, the
+per-day table was ignored, and once the day was "full" the sweep returned
+before meeting prep could be planned at all); `drip.plan` read a
+`counts_toward_cap` that the sent rows did not carry, got no answer, and
+counted them all; and the per-day table was a third opinion.
 
-**So a day can legitimately carry more posts than its cap.** The simulation
-below produces **six posts against a cap of four**.
+**Each sent post carries its own answer.** `drip_sends.counts_toward_cap` is
+written when the post goes out (added by the "columns added later" migration;
+rows from before it hold NULL and are counted by their rule's flag). A later
+edit to `bot_rules.yaml` cannot rewrite what an earlier post cost the day.
+
+**Never counted:**
+
+| What | How it stays outside the cap |
+|---|---|
+| R8 meeting prep, R9 meeting follow-ups | `drip.NEVER_COUNTED` — whatever `bot_rules.yaml` says |
+| reminders | posted by `bot._fire_due_reminders`, never a `drip_sends` row |
+| urgent (breaking) news | posted by `bot._maybe_breaking_news`, never a `drip_sends` row |
+| the approvals sweep | rides the first post of the day; takes no slot |
+| replies to questions, the follow-up to a "yes" | answers, sent by `_reply` |
+
+Nothing that is not a row in `drip_sends` can be counted, because that table is
+all the one counter reads. **So a day can carry more posts than its cap:**
+`python verify_s1.py --only i` shows a Monday with six countable groups, an R8
+and an R9 — five counted posts, the R8 and the R9, and one group rolled.
+
+**AI news (R1) is planned first and never held.** It is new content every day,
+so the re-ask clock does not apply to it (`drip.NEVER_HELD`) — held, it posted
+Monday, was silent Tuesday, came back Wednesday as a "re-ask" and was silent
+again on Thursday. It is decided before every other group
+(`drip.PLANNED_FIRST`), so it always holds one of the five and the cap cannot
+push it out; and it is a **fixed-time post** at `NEWS_MAIN_TIME`, outside the
+spaced window, so the window cannot roll it either. R8 and R9 are never held by
+the re-ask clock for a related reason: they run on their own clocks (R8's
+touches belong to exact dates, R9 has its ladder).
+
+**Fixed-time posts do not shift the others.** R1 and R8's day-of touch take no
+place in the spaced window (`drip_sends.pinned`), so a 14:00 news post going
+out mid-afternoon no longer pushes every later post one gap further on. The
+live sweep starts looking at the earliest time anything can be due
+(`drip.earliest_send_ist`) — it used to wait for `SALES_DRIP_START`, which with
+the window opening at 14:00 sent R8's 10:00 day-of note at 14:00.
 
 ### Weekends
 
 **Saturday is silent, full stop.** **Sunday carries one post**, at
 `SALES_DRIP_START`, and only for `SUNDAY_RULE_IDS` (default `R4`, the
-Deliverables Checklist) **whose items are due on the Monday**. A P1 due Monday
+Deliverables Checklist) **when a P1 is due on the Monday**. A P1 due Monday
 morning is the one thing that cannot wait until Monday morning to be mentioned;
 a deliverable due Thursday is not a Sunday problem and does not spend the one
 weekend message the team tolerates.
+
+**The exception is real now.** `drip.is_sending_day` used to answer False for
+every Sunday, and the live sweep, the test day and the simulation all asked it
+before planning — so the Sunday branch in `drip.plan` could never run. And R4's
+`weekdays: [mon]` meant it was never evaluated on a Sunday anyway. Now
+`is_sending_day` lets a Sunday through when `SUNDAY_RULE_IDS` is not empty,
+`rules.for_day` lets those rules look, and `drip.plan` sends one post and
+nothing more (it re-plans every tick, and what has already gone counts). The
+Sunday heads-up does not hold Monday's checklist back as "asked recently".
+
+**The hourly urgent-news checks run on Saturday and Sunday too** — they have no
+weekday gate — and so do reminders somebody asked for. There is no 2 PM news
+post at the weekend: R1's weekdays are Monday to Friday.
 
 **No public-holiday handling**, deliberately and stated rather than left as an
 absence: the bot posts on a public holiday exactly as it would on a weekday.
 `HOLIDAY_CHANNEL_ID` covers a *person* being away; a whole team being away is
 what `SALES_DIGEST_ENABLED` is for.
+
+### R1 is two kinds of news: the industry, and our own PoCs (S2)
+
+Every story is tagged **`industry`** or **`poc`**.
+
+| | Where it comes from |
+|---|---|
+| **industry** | the outlets' feeds (`NEWS_RSS_FEEDS`) and one Google News RSS query per `NEWS_TOPICS` entry — as before |
+| **poc** | one Google News RSS query per name: **people on active Outreach PoCs rows** (`"<person>" "<company>"`) and **companies on Master Pipeline and Outreach PoCs** (`"<company>"`) |
+
+**All of it is RSS — free, no search API, no model.** The PoC queries are polled
+with the other feeds (`feeds.poll`). `NEWS_POC_TARGETS_PER_DAY` (15) names are
+looked up a day, **least recently checked first**; the rotation is the
+`news_targets` table, which the retired people-search used to own and which is
+reused as it stood. The day's set is chosen by the first poll of the day and
+every later poll (and every restart) reads the same choice.
+
+**Never anyone on the mapping's departures list.** `_news_poc_targets` leaves
+them out, and a name that joins the list is deleted from the rotation at the
+next sync (six-hourly). **If the departures list cannot be read, no person is
+looked up at all — only companies**: "never" cannot be honoured against a list
+the bot does not have. The log says so in one warning.
+
+**An item is PoC news only when it names them.** Google News matches a quoted
+name anywhere in an article; `feeds.names_it` keeps an item only if the
+company's name (or the person's full name) is in its **title or summary**, as a
+whole phrase. A story an outlet's feed already delivered is not stored twice —
+the stored row is *upgraded* to `poc` and gets its sheet row.
+
+**A PoC story carries its sheet row in the post:**
+
+```
+• Synthflow raises $20M Series A — the round was led by Accel. (Synthflow AI — on Master Pipeline) [techcrunch.com](<…>)
+```
+
+**One name does not take over.** The first live poll looked up 15 names and
+came back with 236 items "naming" them — a big company on the sheet is in the
+news forty times a week, and a company called "Andi" shares its name with a
+footballer. Three limits, all constants in code: a name's query adds at most
+`feeds.POC_ITEMS_PER_NAME` (5) items a poll, the newest; the scoring call is
+shown at most `news.POC_SCORE_PER_NAME` (3) per name and gives PoC items at
+most 40% of its room, so the industry is still scored; and no name has more
+than `news.POC_PER_NAME_IN_POST` (2) stories in the main post. The scorer is
+told which items are "about our contact" and leaves out the ones that are not
+really about them.
+
+**The rotation is a fixed shuffle, not the alphabet** — among names checked
+equally long ago the order is a hash of the name, so people and companies are
+mixed from the first day instead of every company from A to F.
+
+#### The 2 PM post
+
+`news.choose_main`, `NEWS_MAX_ITEMS=5`:
+
+1. the top `NEWS_POC_SLOTS` (2) **PoC** stories by importance — fewer when
+   fewer exist — each about a **different** name;
+2. the remaining slots go to the **best of everything left**, PoC or industry,
+   by importance. **Ties: PoC first, then newest.**
+
+The spread limits (`NEWS_PER_TOPIC_PER_DAY`, `NEWS_TOPICS_PER_WEEK`) apply to
+**industry** stories in step 2 only, and three kinds of story walk past them:
+importance 5 (the big one is never hidden), **an `OTHER` story at importance
+`NEWS_OFFTOPIC_BYPASS_IMPORTANCE` (4) or more** — the topic list is seeds, not
+limits — and every PoC story. Importance 5 still interrupts as breaking.
+
+#### Nothing useful is lost: "More AI news today"
+
+Every story that qualified (importance ≥ `NEWS_OVERFLOW_MIN_IMPORTANCE`, not
+already posted) but did not fit — the post was full, or a spread limit kept it
+out — goes out **right after the main post as one message**, PoC first, at most
+`NEWS_OVERFLOW_MAX_ITEMS` (8). Before, those stories went to a log line and a
+cache row and nowhere a person could see.
+
+It is **outside the daily cap** (no `drip_sends` row), **not part of the
+breaking valve** (no `news_checks` row), carries no @-mentions, and each story
+is recorded in `news_stories` with `kind=overflow` — after the send — so it
+never repeats. Overflow stories do not use up the per-topic or per-week
+allowance. It is posted from `_send_drip_message`, so a real day, a test day
+and a simulation all do it. `NEWS_OVERFLOW_ENABLED=false` turns it off.
+
+#### The window: since the previous main post
+
+The main sweep covers **everything since the previous main post**, not a fixed
+24 hours — Monday's covers Friday 2 PM to Monday 2 PM (`_main_window`). The
+previous post is read off the schedule (the last day R1 runs, at
+`NEWS_MAIN_TIME`), so it is the same on a real day, a test day and a
+simulation. A PoC item belongs to a window by when it was **first seen**, since
+a name's query reaches back `NEWS_POC_LOOKBACK_DAYS` (7).
+
+**A story a weekend check held because the valve was full is in Monday's
+post.** A held story was never recorded as posted — but with a 24-hour window
+Saturday's story was simply out of range by Monday. Now it is inside the
+window, and at importance 5 it leads.
+
+```bash
+python verify_s2.py            # 3 PoC + 3 industry, OTHER past a full cap, Saturday-held -> Monday, llm_calls, three ways
+python verify_s2.py --live     # also: a real poll with the real sheet's PoC names and one real scoring call
+python -m news                 # choose_main, rendering and the scoring prompt, offline
+```
+
+### S3 — deliverables, R7, R10, R5's emails, R3's events
+
+**R4 — deliverables.** P1 only, and each item is now a short block:
+
+```
+1. Pulse Product Overview Document
+   Team: Sales
+   Due: Fri 18 Sep · 3 days overdue
+   [Doc](<https://docs.google.com/…>)
+```
+
+`Team` is the Functional Dependency cell, or `DELIVERABLE_DEFAULT_OWNER` when
+blank; the link line is there only when the row has one. **No repeats:** the
+same Action Item appears once (the checklist sometimes carries one on two
+rows), and each link appears once in the whole message.
+
+**R7 — DM sent, no meeting.** At most `DM_NO_MEETING_MAX_CONTACTS` (5)
+**contacts** — it used to cap by company and show neither the days nor the
+note. Longest since the DM first; ties by `PROSPECT_ROLE_ORDER` (founder
+first), then sheet order. One line each — `name — company — DM sent N days ago
+— last note` — and `(+N more next Monday)` for the rest.
+
+**R10 — closure support.** When Prospect Status (or Closure Prob%) is blank on
+*every* active row the rule cannot run, and a silent Monday read exactly like
+"no deal is close" — so that one case posts *"No closure support this week —
+Prospect Status and Closure Prob% are empty in the GTM sheet. Fill them in and
+I'll pick it up next Monday."* When the columns have values and no deal
+qualifies, it stays silent and logs why.
+
+**R5 — prospects.**
+
+- It reads **every** row whose First Contact is FALSE/blank and that no stop
+  rule blocks — not only "active" rows. The activation gate lets a row through
+  once somebody has started on it, which a never-contacted row has not; fed
+  only active rows, R5 could see almost none of the people it exists to name.
+- `db.start_prospect_company` and `db.record_prospect_mention` existed with no
+  caller, so "two companies a week" restarted from the top of the sheet every
+  run and nobody ever reached the "skip them?" count. They are now called
+  after each post that lands (`_after_send`), for the contacts it named.
+- **A missing email is looked up.** One search (`"<name>" "<company>" email`,
+  eight results, through `search_backend`), one `MODEL_LIGHT` extraction, and
+  the address is kept **only if it appears word for word in a snippet the
+  search returned** (`websearch.verified_emails`). The line says `email found:
+  x@y.com (<source>)` or `no public email found`. An address the model built
+  from a name and a domain is in no snippet, so it is dropped. At most
+  `EMAIL_LOOKUP_MAX_PER_POST`; found or not, cached `RESEARCH_CACHE_DAYS`.
+- **The one exception to "A:I is never written".** With
+  `EMAIL_WRITE_ALLOWED=true` the post ends *"Want me to add the email I found
+  to the sheet? Say yes."* and opens ONE proposal (`email_write`) keyed to the
+  message. An approver's yes calls `gtm_sheet.write_email`, which re-reads the
+  row fresh and writes **only the Email cell, only if it is still blank** —
+  logged in `sheet_writes`, undoable. `write_cells` still refuses the Email
+  column and every other column in the band; `write_email` takes no role
+  argument, so there is nothing else it can be pointed at. Off by default.
+  R6's email lookup is the same path and makes the same offer. The R5 post is
+  posted as rendered (never composed), because a "yes" answers its last line.
+
+**R3 — events, every Wednesday, one path.** `EVENTS_ANCHOR_DATE` (alternate
+weeks) is retired, and so is the second lane that ran beside R3 on the same
+tab (`_event_actions` / `events.due_events` / `EVENT_LEAD_DAYS`: one reminder
+per event at T-20, for ever). Discovery and the deadline backfill are kept.
+Per row, with a window of `EVENTS_WINDOW_DAYS` (14) — so an event next Tuesday
+is in *this* Wednesday's post:
+
+| The row | The line |
+|---|---|
+| date passed | never mentioned |
+| Registered = Yes | `You're registered for X on <date>` |
+| not registered, deadline ahead | `Register for X by <deadline> (event on <date>)` — when the deadline *or* the date is inside the window |
+| not registered, deadline passed | skipped; the log says "registration closed" |
+| not registered, no deadline | `X on <date> — no registration deadline on the sheet` |
+| date unreadable | listed **once**, `date unclear` |
+
+It ends *"Want me to remind you again on Monday?"* — or *"tomorrow"* when an
+event falls before Monday. A yes (proposal kind `events_remind`) schedules one
+reminder for `EVENTS_REMIND_AGAIN_WEEKDAY` at 14:00 in the channel, listing
+those events; the exact-minute loop posts it, so it is outside the cap. A
+Wednesday with nothing inside the window and nothing newly found posts
+nothing. Where one post carries several offers (new events, deadlines, the
+reminder), a reply that names one answers that one and a bare "yes" answers
+the reminder, the question the post ended on.
+
+```bash
+python verify_s3.py            # all five rules, three ways each, with the yes / undo / reminder flows
+```
+
+### One reminder lane, and R9's ladder
+
+**The exact-minute loop is the only thing that sends a reminder.** The drip
+used to emit them as well (`nextaction._scheduled_reminders`, "due on or before
+today"), from the same table. A reminder with a company attached therefore went
+out twice — in the drip and at its minute — and one whose date had passed was
+re-posted by the drip every day, because the drip never closed it. That lane is
+gone. `bot._fire_due_reminders` now also takes an open reminder whose **date
+has already passed**: it fires once on the next tick with *"(this was due Sat
+26 Sep 2026)"* and closes. Claimed before it is sent, so never twice.
+
+**R9 climbs one rung per follow-up that actually went out.**
+`db.advance_meeting_followup` and `db.reset_meeting_followup` existed with no
+callers, so the ladder never left rung 1: the channel post repeated for ever,
+the DMs and the escalation never came, and "then stop" never happened. The
+sender now advances the ladder after each R9 send (`_advance_meeting_ladder`,
+called from `_send_drip_message`, so a real day, a test day and a simulation
+all climb the same way — a simulation in its sandbox copy), the chase stops
+after the last rung, and the ladder is cleared when **Next Steps is filled** or
+the meeting date changes (`_reset_answered_ladders`).
+
+**R1's RSS path does not need `WEB_SEARCH_ENABLED`.** It reads feeds over plain
+HTTP and makes one light scoring call; with the switch off it used to post
+"web search is off" at 14:00 instead of the news, and the hourly check returned
+before claiming its slot. The switch still governs every path that searches.
+
+```bash
+python verify_s1.py            # all of the above, with real output (one free ddg request)
+python verify_s1.py --only i   # the Monday: 5 counted + R8 + R9, three ways
+```
 
 ### Tagging
 
@@ -2813,6 +3081,10 @@ one R4 post when a deliverable is due Monday and nothing when one is not.
 > R8 and R9 sitting outside it means a heavy meeting day can run into the
 > evening. Shorten `MESSAGE_GAP_MINUTES` or lower the per-day cap if that is not
 > wanted — the schedule is doing exactly what it was asked to.
+
+> **This transcript predates the posting window (`SALES_DRIP_END`) and the S1
+> cap.** The current Monday — five counted posts, R1 at 14:00, the R8 day-of
+> touch at 10:00 — is `python verify_s1.py --only i`.
 
 ---
 
@@ -3366,7 +3638,7 @@ the hold.
 
 | What happened | What the post says |
 |---|---|
-| `WEB_SEARCH_ENABLED=false` | "web research unavailable today — WEB_SEARCH_ENABLED is off", and the item keeps its place in the queue |
+| `WEB_SEARCH_ENABLED=false` | "web research unavailable today — WEB_SEARCH_ENABLED is off", and the item keeps its place in the queue. **Not R1:** the news reads RSS feeds and still posts |
 | The budget is spent | "the daily search budget is spent (20/20 searches used)" |
 | The call failed | the reason, and **no invented stories** |
 | It searched and found nothing | "I searched the last 24 hours and found nothing new worth posting", and the pending marker is **cleared** |
@@ -4091,7 +4363,7 @@ than a config one.
 
 **`@bot simulate monday` and the bot posts the exact messages it would send on
 the next Monday, in order, with a footer saying what rolled, what was skipped
-and why.** Twelve rules, a posting window, per-day caps, a roll-over, an
+and why.** Twelve rules, a posting window, a daily cap, a roll-over, an
 approval queue, an events dedup and a leave check interact in ways nobody can
 hold in their head. The only honest way to know what Monday looks like is to
 watch Monday happen — and waiting until Monday is a poor development loop.
@@ -4374,7 +4646,10 @@ python verify_news_feed.py                # R1's main sweep + hourly checks, val
 python verify_interim.py                  # typing indicator, interim line, latency log (real timings)
 python verify_reminders.py                # one-off reminders at an exact minute (real 60 s loop)
 python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
-python verify_parity.py                   # real day vs test day vs simulation: identical bodies, R4 and composed
+python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
+python verify_s1.py                       # cap 5 + R8/R9, R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
+python verify_s2.py                       # AI news: PoC slots, "More AI news today", OTHER bypass, the since-last-post window
+python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5 emails + the one A:I write, R3 weekly + the reminder offer
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test
 python verify_voice_profile.py --offline  # the parts that need neither Discord nor the model
 python verify_llm_audit.py                # every API call site, measured (system size, caching, tools)

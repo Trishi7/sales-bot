@@ -57,7 +57,7 @@ before the research layer lands. Nothing is silently skipped waiting for it.
 
 THIS MODULE IS PURE, AND THAT IS LOAD-BEARING. Tabs and dicts in, dicts out. It
 reads no sheet, writes no database row and sends nothing — the snoozes, the
-scheduled reminders, the new-company snapshot, the repeat counts and the R9
+new-company snapshot, the repeat counts and the R9
 ladder state are all passed IN, computed by the caller. There is no
 `guardrails.send` here and there must never be one.
 
@@ -360,29 +360,6 @@ def _int_list(values) -> list:
     return sorted(set(out), reverse=True)
 
 
-def _anchor_weeks_ok(today: date, anchor_iso: str, *, every: int = 2) -> tuple:
-    """Is `today` on the every-Nth-week cadence from the anchor? (ok, why).
-
-    R3 runs every OTHER Wednesday, anchored to EVENTS_ANCHOR_DATE. An anchor
-    date rather than "odd ISO weeks" because the team picked a date, and an
-    ISO-week parity rule silently flips its meaning in any year with 53 weeks.
-
-    A date BEFORE the anchor is not on the cadence: the rule had not started.
-    """
-    anchor = dl.parse_date(anchor_iso)
-    if anchor is None:
-        return True, f"EVENTS_ANCHOR_DATE={anchor_iso!r} is unreadable, so every run day counts"
-    if today < anchor:
-        return False, f"the rule starts on {dl.format_date(anchor)}"
-    weeks = (today - anchor).days // 7
-    if (today - anchor).days % (7 * every) < 7 and weeks % every == 0:
-        return True, f"week {weeks} from the anchor {dl.format_date(anchor)}"
-    return False, (
-        f"this is week {weeks} from the anchor {dl.format_date(anchor)}; "
-        f"the rule runs every {every} weeks"
-    )
-
-
 # -- the item -----------------------------------------------------------------
 
 
@@ -523,56 +500,153 @@ def _r_news_company_screen(rule, ctx) -> list:
     )]
 
 
+# What an R3 line is. `carrier` is not a line at all: it is the one item that
+# is there every Wednesday so the research layer (new events, missing
+# deadlines) has somewhere to put what it finds, even in a week with no event
+# close enough to mention.
+EVENT_REGISTERED = "registered"
+EVENT_REGISTER = "register"
+EVENT_NO_DEADLINE = "no_deadline"
+EVENT_UNCLEAR = "unclear"
+EVENT_CARRIER = "carrier"
+
+
+def unclear_event_key(name: str) -> str:
+    """The once-only key for an event whose date the sheet cannot read."""
+    return "unclear|" + gtm_sheet.normalise_header(name)
+
+
+def remind_again_on(today: date, soonest: Optional[date]) -> tuple:
+    """(date, word) for R3's "want me to remind you again?" offer.
+
+    The next EVENTS_REMIND_AGAIN_WEEKDAY after today — "Monday" — unless one of
+    the events listed FALLS BEFORE that day, in which case a Monday reminder
+    would arrive after the thing it is about, and the offer is "tomorrow".
+    (The event's own date, not its registration deadline: a deadline this
+    Friday is already in the line the reader has just been shown.)
+    """
+    weekday = int(config.EVENTS_REMIND_AGAIN_WEEKDAY)
+    ahead = (weekday - today.weekday() - 1) % 7 + 1
+    when = today + timedelta(days=ahead)
+    if soonest is not None and soonest < when:
+        return today + timedelta(days=1), "tomorrow"
+    return when, "on " + when.strftime("%A")
+
+
 def _r_events(rule, ctx) -> list:
-    """R3 — register for, or attend, an AI event. Every other Wednesday.
+    """R3 — the events worth a line THIS week. Every Wednesday.
 
-    Remind until registration closes or the event happens. The REGISTRATION
-    DEADLINE is used when it is known, otherwise the event date — a conference
-    in November whose registration shut in September is not a November problem.
+    ONE PATH. This used to run every other Wednesday beside a second lane
+    (`events.due_events`, one reminder per event at T-20, for ever) that read
+    the same tab and knew nothing of this one. Both are gone; this is all of
+    it. The research layer still looks for events the tab lacks and for
+    missing registration deadlines, and what it finds rides on the carrier
+    item below.
 
-    Events already past are skipped. Events whose date the sheet cannot read are
-    NOT skipped: they are carried with the reason, because "I cannot read this
-    date" is a thing somebody should fix and silence would hide it.
+    PER ROW (Event, Date, Last day for registration, Registered, Link), with
+    W = EVENTS_WINDOW_DAYS (14) — wide enough that an event next Tuesday is in
+    THIS Wednesday's post:
+
+      date passed                       never mentioned
+      registered                        "You're registered for X on <date>"
+                                        when the date is within W
+      not registered, deadline ahead    "Register for X by <deadline> (event on
+                                        <date>)" when the deadline or the date
+                                        is within W
+      not registered, deadline passed   skipped, logged "registration closed"
+      not registered, no deadline       "X on <date> — no registration deadline
+                                        on the sheet" when the date is within W
+      date unreadable                   listed ONCE, "date unclear"
+                                        (`ctx["events_unclear_seen"]` is what
+                                        makes it once; the caller records it
+                                        after the post)
+
+    THE OFFER. Every line item carries `remind_on` / `remind_word`, worked out
+    from the whole post: "Want me to remind you again on Monday?" — or
+    "tomorrow" when something listed falls before Monday.
     """
     today = ctx["today"]
-    ok, why_not = _anchor_weeks_ok(today, config.EVENTS_ANCHOR_DATE, every=2)
-    if not ok:
-        return []
-    out = []
+    window = max(1, int(config.EVENTS_WINDOW_DAYS))
+    horizon = today + timedelta(days=window)
+    seen_unclear = {str(k) for k in (ctx.get("events_unclear_seen") or ())}
+    lines: list = []
     for row in ctx.get("events") or ():
         name = _text(row, "event")
         if not name:
             continue
         when = gtm_sheet.parse_event_date(row.get("event_date"))
         closes = gtm_sheet.parse_event_date(row.get("registration_deadline"))
-        registered = gtm_sheet.parse_flag(row.get("registered"))
-        if registered is True:
-            continue
-        # The deadline that actually bites: registration if we know it, else the
-        # event itself.
-        gate = closes["start"] if closes["known"] else when["start"]
-        if gate is not None and gate < today:
-            continue
-        if when["known"] and when["start"] and when["start"] < today:
-            continue
-        where = _text(row, "location")
-        bits = [name] + ([where] if where else [])
-        if when["known"]:
-            bits.append(f"on {dl.format_date(when['start'])}"
-                        + ("" if when["start"] == when["end"]
-                           else f"-{dl.format_date(when['end'])}"))
+        registered = gtm_sheet.parse_flag(row.get("registered")) is True
+        start = when["start"] if when["known"] else None
+        deadline = closes["start"] if closes["known"] else None
+        soonest = None
+        key = ""
+
+        if start is None:
+            key = unclear_event_key(name)
+            if key in seen_unclear:
+                log.info("[R3] skipped %r (row %s): date unclear, already listed once",
+                         name, row.get("_row") or "?")
+                continue
+            raw = _text(row, "event_date")
+            kind = EVENT_UNCLEAR
+            line = f"{name} — date unclear" + (
+                f" (the sheet says \"{raw}\")" if raw else " (no date on the sheet)")
+            due = today
         else:
-            bits.append(f"(date: {when['reason']})")
-        why = f"R3 runs every other Wednesday — {why_not}"
-        if closes["known"]:
-            why += f"; registration closes {dl.format_date(closes['start'])}"
-        out.append(_item(
-            rule=rule, trigger=R_EVENTS, today=today,
-            due=gate or today, why=why,
-            text="Register or attend: " + " · ".join(bits),
-            company=name, sheet_row=row.get("_row"), web_pending=True,
+            end = when["end"] or start
+            if end < today:
+                log.info("[R3] skipped %r (row %s): it was on %s — passed",
+                         name, row.get("_row") or "?", dl.iso(start))
+                continue
+            on = _short_date(start) + ("" if end == start else f" to {_short_date(end)}")
+            within = start <= horizon
+            if registered:
+                if not within:
+                    continue
+                kind, due, soonest = EVENT_REGISTERED, start, start
+                line = f"You're registered for {name} on {on}"
+            elif deadline is not None:
+                if deadline < today:
+                    log.info("[R3] skipped %r (row %s): registration closed on %s",
+                             name, row.get("_row") or "?", dl.iso(deadline))
+                    continue
+                if not (within or deadline <= horizon):
+                    continue
+                kind, due, soonest = EVENT_REGISTER, deadline, start
+                line = f"Register for {name} by {_short_date(deadline)} (event on {on})"
+            else:
+                if not within:
+                    continue
+                kind, due, soonest = EVENT_NO_DEADLINE, start, start
+                line = f"{name} on {on} — no registration deadline on the sheet"
+        lines.append(_item(
+            rule=rule, trigger=R_EVENTS, today=today, due=due,
+            why=f"R3 (Wednesdays): {kind}, inside the {window}-day window",
+            text=line, company=name, sheet_row=row.get("_row"),
+            extra={"event_kind": kind, "event_line": line,
+                   "event_date": dl.iso(start) if start else "",
+                   "event_deadline": dl.iso(deadline) if deadline else "",
+                   "event_link": _text(row, "link"), "event_soonest": soonest,
+                   "event_unclear_key": key},
         ))
-    return out
+
+    dated = [i["event_soonest"] for i in lines if i.get("event_soonest")]
+    remind_on, remind_word = remind_again_on(today, min(dated) if dated else None)
+    for item in lines:
+        item.pop("event_soonest", None)
+        item["remind_on"] = dl.iso(remind_on)
+        item["remind_word"] = remind_word
+    # THE CARRIER: nothing to read, somewhere for the research to land.
+    carrier = _item(
+        rule=rule, trigger=R_EVENTS, today=today, due=today,
+        why="R3 (Wednesdays): looks for events the tab lacks and missing deadlines",
+        text="", web_pending=True,
+        extra={"event_kind": EVENT_CARRIER, "event_line": ""},
+    )
+    carrier["text"] = ""
+    carrier["key"] = "R3:carrier"
+    return lines + [carrier]
 
 
 def _r_deliverables(rule, ctx) -> list:
@@ -597,9 +671,10 @@ def _r_deliverables(rule, ctx) -> list:
     a filter of its own.
 
     THE TEAM IS THE Functional Dependency CELL (Engineering, Sales, Legal …),
-    and blank means DELIVERABLE_DEFAULT_OWNER. It decides who the item belongs
-    to; the post itself shows the title and the due date only
-    (`drip.render_deliverables`).
+    and blank means DELIVERABLE_DEFAULT_OWNER. The post shows it on its own
+    line under the title, then the due date, then the row's link if it has one
+    (`drip.render_deliverables`, which also keeps an Action Item and a link
+    from appearing twice).
 
     STATUS BLANK OR NOT DONE. Only DELIVERABLE_DONE_MARKERS count as finished;
     everything else, blank included, is open — chasing a finished item costs
@@ -650,13 +725,13 @@ def _r_deliverables(rule, ctx) -> list:
                  f": {priority}, status {status}, {when}"),
             text=f"{item_name} — {when}",
             owner=team, company=item_name, sheet_row=row.get("_row"),
-            # WHAT THE POST NEEDS AND NOTHING ELSE: the title and the deadline.
-            # The remarks and the link are no longer carried — the post shows
-            # neither, and a field nothing renders is a field somebody will
-            # one day render by accident. `team` stays because it is the
-            # item's owner, not because it is shown.
+            # WHAT THE POST SHOWS: the title, the team, the deadline and the
+            # row's link. The remarks are still not carried — nothing renders
+            # them, and a field nothing renders is a field somebody will one
+            # day render by accident.
             extra={
                 "deliverable": item_name, "item": item_name, "team": team,
+                "link": _text(row, "link"),
                 "deadline": dl.iso(due), "deadline_pretty": _short_date(due),
                 "status": status,
                 # NOT `priority`: that key is the item's numeric band, which
@@ -729,7 +804,12 @@ def _r_prospects(rule, ctx) -> list:
     FOUR CONSTRAINTS, and they interact:
 
       1. Eligible rows are those where First Contact is FALSE or blank AND no
-         first-contact date is recorded (`first_contact_done`).
+         first-contact date is recorded (`first_contact_done`) — EVERY such
+         row the stop rules allow, read from `ctx["prospect_rows"]`, not only
+         the "active" ones. The activation gate lets a row through once
+         somebody has started on it, which is exactly what a never-contacted
+         row has not had: fed only active rows, this rule could see almost
+         none of the people it exists to name.
       2. TWO COMPANIES A WEEK, in SHEET ORDER. The bot stays with a company
          until every contact on it has a first contact recorded, then moves on.
          Jumping around is how a company ends up half-contacted forever.
@@ -757,7 +837,8 @@ def _r_prospects(rule, ctx) -> list:
     # Group eligible rows by company, preserving SHEET ORDER for both the
     # companies and the contacts inside them.
     by_company: dict = {}
-    for row in ctx.get("rows") or ():
+    source = ctx.get("prospect_rows")
+    for row in (source if source is not None else ctx.get("rows")) or ():
         ok, _reason, _until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
         if not ok:
             continue
@@ -821,10 +902,26 @@ def _r_prospects(rule, ctx) -> list:
                 row_key=key, contact_key=key,
                 extra={"repeat_count": seen, "ask_to_skip": seen >= ask_at,
                        "role_rank": _role_rank(designation),
+                       # THE EMAIL: on file, or to be looked up at send time
+                       # for the contacts that make the post (`email_lookup`
+                       # is a request, not a promise — see bot._research_message).
+                       "email_on_file": _text(row, "email"),
+                       "email_lookup": not _text(row, "email"),
+                       # WHAT "NOTHING CHANGED" MEANS for the repeat count: the
+                       # cells somebody would touch if they had acted.
+                       "signature": prospect_signature(row),
                        "focus_note": focus_note,
                        "focus": (active_focus or {}).get("value", "")},
             ))
     return out
+
+
+def prospect_signature(row: dict) -> str:
+    """The state of a never-contacted row, as one string. When it changes,
+    R5's repeat count starts again (`db.record_prospect_mention`)."""
+    return "|".join(_text(row, role) for role in (
+        "first_contact", "first_contact_type", "first_contact_date", "sid_li_added",
+        "li_connected_date", "li_dm_date", "email", "next_steps"))
 
 
 def _r_li_no_dm(rule, ctx) -> list:
@@ -864,8 +961,10 @@ def _r_li_no_dm(rule, ctx) -> list:
             text=text, company=_text(row, "company"), poc=_text(row, "name"),
             designation=_text(row, "designation"), sheet_row=row.get("_row"),
             row_key=_contact_key(row), contact_key=_contact_key(row),
-            web_pending=not email,
-            extra={"email_on_file": email, "connected_days": elapsed},
+            # THE LOOKUP IS A REQUEST: the sender asks for it, for the contacts
+            # that make the post, up to EMAIL_LOOKUP_MAX_PER_POST.
+            extra={"email_on_file": email, "connected_days": elapsed,
+                   "email_lookup": not email},
         ))
     return out
 
@@ -904,7 +1003,8 @@ def _r_dm_no_meeting(rule, ctx) -> list:
             company=_text(row, "company"), poc=_text(row, "name"),
             designation=_text(row, "designation"), sheet_row=row.get("_row"),
             row_key=_contact_key(row), contact_key=_contact_key(row),
-            extra={"days_since_dm": elapsed, "last_note": note},
+            extra={"days_since_dm": elapsed, "last_note": note,
+                   "role_rank": _role_rank(_text(row, "designation"))},
         ))
     return out
 
@@ -1063,6 +1163,12 @@ def _r_meeting_followup(rule, ctx) -> list:
     return out
 
 
+# What R10 posts when it cannot run because the columns it reads are empty.
+CLOSURE_EMPTY_NOTICE = (
+    "No closure support this week — Prospect Status and Closure Prob% are empty "
+    "in the GTM sheet. Fill them in and I'll pick it up next Monday.")
+
+
 def _r_closure_support(rule, ctx) -> list:
     """R10 — deal / demo / quote AND closure strictly above CLOSURE_SUPPORT_MIN.
 
@@ -1072,17 +1178,29 @@ def _r_closure_support(rule, ctx) -> list:
 
     Asks what is needed for the next stage and shares relevant news — the news
     half is WEB-DEPENDENT.
+
+    AN EMPTY COLUMN IS SAID OUT LOUD; AN EMPTY RESULT IS NOT. When Prospect
+    Status — or Closure Prob% — is blank on EVERY active row, the rule cannot
+    run at all, and a silent Monday reads exactly like "no deal is close".
+    So that one case posts a line saying which columns are empty
+    (CLOSURE_EMPTY_NOTICE). When the columns have values and no deal
+    qualifies, that is an answer: nothing is posted, and the log says why.
     """
     today = ctx["today"]
     floor = int(config.CLOSURE_SUPPORT_MIN)
     out = []
+    looked = with_status = with_pct = in_stage = 0
     for row in ctx.get("rows") or ():
         ok, _reason, _until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
         if not ok:
             continue
+        looked += 1
+        with_status += 1 if _text(row, "prospect_status") else 0
+        with_pct += 1 if _text(row, "closure_prob") else 0
         stage = _matches_any(row.get("prospect_status"), config.CLOSURE_SUPPORT_STAGES)
         if not stage:
             continue
+        in_stage += 1
         pct = closure_percent(row)
         if pct is None or pct <= floor:
             continue
@@ -1102,6 +1220,25 @@ def _r_closure_support(rule, ctx) -> list:
             web_pending=True,
             extra={"closure_pct": pct, "stage": _text(row, "prospect_status")},
         ))
+    if out or not looked:
+        return out
+    if not with_status or not with_pct:
+        empty = [name for name, n in (("Prospect Status", with_status),
+                                      ("Closure Prob%", with_pct)) if not n]
+        log.info("[R10] %s blank on all %d active row(s) — posting the empty-columns "
+                 "notice instead of staying silent", " and ".join(empty), looked)
+        notice = _item(
+            rule=rule, trigger=R_CLOSURE_SUPPORT, today=today, due=today,
+            why=f"R10 (Mondays): {' and '.join(empty)} blank on every active row",
+            text=CLOSURE_EMPTY_NOTICE,
+            extra={"notice": CLOSURE_EMPTY_NOTICE, "empty_columns": empty},
+        )
+        notice["key"] = "R10:empty-columns"
+        return [notice]
+    log.info("[R10] no closure support today: %d active row(s), %d with a Prospect "
+             "Status (%d in %s), %d with a Closure Prob%% — none is in a closure "
+             "stage above %d%%. Nothing posted.", looked, with_status, in_stage,
+             "/".join(str(x) for x in config.CLOSURE_SUPPORT_STAGES), with_pct, floor)
     return out
 
 
@@ -1184,41 +1321,15 @@ def _r_sales_packages(rule, ctx) -> list:
     return out
 
 
-def _scheduled_reminders(ctx) -> list:
-    """The one lane that is NOT a rule: one-offs somebody asked for by name.
-
-    Kept out of bot_rules.yaml deliberately — it has no weekday, no cap and no
-    schedule, because it runs when a person said it should. It is also the only
-    due date in this module that is never weekend-shifted.
-    """
-    today = ctx["today"]
-    scheduled = ctx.get("scheduled") or {}
-    out = []
-    for row in ctx.get("rows") or ():
-        ok, _reason, _until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
-        if not ok:
-            continue
-        key = _contact_key(row)
-        entries = scheduled.get(key) or []
-        for entry in entries if isinstance(entries, list) else [entries]:
-            when = dl.parse_date(str((entry or {}).get("due_date") or ""))
-            if when is None or when > today:
-                continue
-            # The table calls it `what`; `about` is kept for any caller that
-            # still hands that name in. Reading only `about` meant every
-            # reminder's text came out as "the reminder you asked for".
-            about = str((entry or {}).get("what") or (entry or {}).get("about")
-                        or "").strip()
-            out.append(_item(
-                rule=None, trigger=SCHEDULED_REMINDER, today=today, due=when,
-                why=f"you asked me to come back to this on {dl.format_date(when)}",
-                text=f"{_describe(row)} — {about or 'the reminder you asked for'}",
-                company=_text(row, "company"), poc=_text(row, "name"),
-                designation=_text(row, "designation"), sheet_row=row.get("_row"),
-                row_key=key, contact_key=key,
-                destination=rules_mod.DEST_CHANNEL,
-            ))
-    return out
+# THERE IS NO REMINDER LANE HERE ANY MORE. One-off reminders used to be
+# emitted from this module too (`_scheduled_reminders`), as drip items due "on
+# or before today" — alongside the exact-minute loop in bot.py reading the same
+# table. A reminder with a company attached therefore went out twice: once in
+# the morning drip and once at its minute; and one whose date had passed was
+# re-posted by the drip every day, because the drip never closed it.
+#
+# `bot._fire_due_reminders` is the only sender now. SCHEDULED_REMINDER stays as
+# a name because drip.NEVER_COUNTED and the "reminder" heading still use it.
 
 
 # TRIGGER NAME -> EVALUATOR. `rules.py` refuses a rules file naming anything not
@@ -1266,6 +1377,7 @@ def run(
     week_companies: Optional[list] = None, meeting_followups: Optional[dict] = None,
     focus: Optional[dict] = None,
     inactive: int = 0, day_rules: Optional[list] = None,
+    prospect_rows: Optional[list] = None, events_unclear_seen=None,
 ) -> dict:
     """THE QUEUE. Everything the twelve rules make due today, deduped and ranked.
 
@@ -1287,7 +1399,7 @@ def run(
     rows = list(rows or [])
     ctx = {
         "today": today, "rows": rows,
-        "snoozes": snoozes or {}, "scheduled": scheduled or {},
+        "snoozes": snoozes or {},
         "deliverables": list(deliverables or []),
         "packages": list(packages or []),
         "events": list(events or []),
@@ -1296,6 +1408,10 @@ def run(
         "prospect_repeats": prospect_repeats or {},
         "week_companies": list(week_companies or []),
         "meeting_followups": meeting_followups or {},
+        # R5 READS EVERY ROW, not only the active ones (None = use `rows`).
+        "prospect_rows": list(prospect_rows) if prospect_rows is not None else None,
+        # Events whose unreadable date has already been listed once.
+        "events_unclear_seen": set(events_unclear_seen or ()),
         # THE LIVE FOCUS, or None. Read by R5 only — a focus is about who to
         # CONTACT NEXT, and applying it to the meeting rules would silence prep
         # for a meeting that is happening tomorrow because the company is off
@@ -1346,12 +1462,8 @@ def run(
             "items": len(items),
         })
 
-    # The explicit lane, always. It is not a rule and has no schedule.
-    explicit = _scheduled_reminders(ctx)
-    produced.extend(explicit)
-    if explicit:
-        rules_run.append({"id": "—", "name": "Reminders you asked for", "ran": True,
-                          "why": "one-offs somebody asked for by name", "items": len(explicit)})
+    # NO REMINDER LANE: `scheduled` is accepted for older callers and ignored.
+    # Reminders are sent by `bot._fire_due_reminders` alone, at their minute.
 
     # ---- DEDUP: ONE CONTACT, ONE MENTION, PER DAY --------------------------
     # Several rules can legitimately select the same person — a prospect who is
@@ -1708,21 +1820,120 @@ def _self_test() -> int:
                   day_rules=[rules_mod.by_id("R9")])["actions"]), 0)
 
     print("\nR10 closure support — exactly 50 is excluded")
+    other = row(_row=9, company="Other", name="Olu", prospect_status="Lead",
+                closure_prob="10%")
     for pct, want in (("51%", 1), ("50%", 0), ("49%", 0), ("0.6", 1), ("", 0)):
         r = row(prospect_status="Demo", closure_prob=pct)
         check(f"closure {pct!r}",
-              len(run(today=MON, rows=[r], day_rules=[rules_mod.by_id("R10")])["actions"]),
+              len(run(today=MON, rows=[r, other],
+                      day_rules=[rules_mod.by_id("R10")])["actions"]),
               want)
     check("wrong stage -> nothing",
           len(run(today=MON, rows=[row(prospect_status="Lead", closure_prob="80%")],
                   day_rules=[rules_mod.by_id("R10")])["actions"]), 0)
+    blank = [row(_row=2, company="A", name="a"), row(_row=3, company="B", name="b")]
+    got = run(today=MON, rows=blank, day_rules=[rules_mod.by_id("R10")])["actions"]
+    check("both columns blank on every active row -> the notice, once",
+          [a.get("notice") for a in got], [CLOSURE_EMPTY_NOTICE])
+    got = run(today=MON, rows=[row(_row=2, prospect_status="Demo"),
+                               row(_row=3, company="B", name="b", prospect_status="Lead")],
+              day_rules=[rules_mod.by_id("R10")])["actions"]
+    check("Closure Prob% alone blank on every row -> the notice too",
+          [a.get("empty_columns") for a in got], [["Closure Prob%"]])
+    check("...and it asks for no web research", [a["web_pending"] for a in got], [False])
+    check("no active rows at all -> silent",
+          run(today=MON, rows=[], day_rules=[rules_mod.by_id("R10")])["actions"], [])
 
-    print("\nR3 events — every other Wednesday from the anchor")
-    ok, _ = _anchor_weeks_ok(date(2026, 9, 23), "2026-09-23")
-    check("the anchor Wednesday runs", ok, True)
-    check("the next Wednesday does not", _anchor_weeks_ok(date(2026, 9, 30), "2026-09-23")[0], False)
-    check("the one after does", _anchor_weeks_ok(date(2026, 10, 7), "2026-09-23")[0], True)
-    check("before the anchor, nothing", _anchor_weeks_ok(date(2026, 9, 16), "2026-09-23")[0], False)
+    print("\nR7 — the role rank travels with the item")
+    got = run(today=MON, rows=[row(li_dm_date="10-09-2026", designation="Co-Founder")],
+              day_rules=[rules_mod.by_id("R7")])["actions"]
+    check("a founder ranks first", got[0]["role_rank"], _role_rank("Founder"))
+
+    print("\nR5 — every never-contacted row, not only the active ones")
+    never = row(_row=20, company="Zeta", name="Zed", designation="Founder")
+    got = run(today=TUE, rows=[], prospect_rows=[never],
+              day_rules=[rules_mod.by_id("R5")])["actions"]
+    check("a row that is not active is still a prospect", [a["poc"] for a in got], ["Zed"])
+    check("...and it asks for an email lookup, since none is on file",
+          (got[0]["email_lookup"], got[0]["email_on_file"]), (True, ""))
+    got = run(today=TUE, rows=[], day_rules=[rules_mod.by_id("R5")],
+              prospect_rows=[row(_row=21, company="Zeta", name="Dee", deal_status="Dead"),
+                             row(_row=22, company="Zeta", name="Em", email="em@zeta.ai")],
+              )["actions"]
+    check("a stop rule still blocks; an email on file needs no lookup",
+          [(a["poc"], a["email_lookup"]) for a in got], [("Em", False)])
+    check("the signature changes when the row does",
+          prospect_signature(never) == prospect_signature(dict(never, email="z@zeta.ai")),
+          False)
+
+    print("\nR3 events — every Wednesday, a 14-day window")
+    def ev(n, name, when, deadline="", registered="", link=""):
+        return {"_row": n, "_extra": {}, "event": name, "event_date": when,
+                "registration_deadline": deadline, "registered": registered,
+                "link": link}
+
+    def d(days):
+        return (WED + timedelta(days=days)).strftime("%d-%m-%Y")
+
+    tab = [
+        ev(2, "Registered Summit", d(10), registered="Yes"),
+        ev(3, "Next Tuesday Forum", d(6), deadline=d(4)),
+        ev(4, "Past Expo", d(-3)),
+        ev(5, "Closed Conf", d(12), deadline=d(-1)),
+        ev(6, "No Deadline Meetup", d(9)),
+        ev(7, "Far Away Con", d(40), deadline=d(30)),
+        ev(8, "Far But Closing", d(40), deadline=d(5)),
+        ev(9, "Registered Far", d(30), registered="Yes"),
+        ev(10, "Mystery Day", "sometime in spring"),
+    ]
+    r3 = rules_mod.by_id("R3")
+    got = run(today=WED, events=tab, day_rules=[r3])["actions"]
+    lines = {a["company"]: a for a in got if a.get("event_kind") != EVENT_CARRIER}
+    check("the right rows have a line", sorted(lines),
+          ["Far But Closing", "Mystery Day", "Next Tuesday Forum", "No Deadline Meetup",
+           "Registered Summit"])
+    check("registered, within the window",
+          lines["Registered Summit"]["event_line"].startswith(
+              "You're registered for Registered Summit on "), True)
+    check("not registered, deadline ahead",
+          (lines["Next Tuesday Forum"]["event_kind"],
+           lines["Next Tuesday Forum"]["event_line"].startswith(
+               "Register for Next Tuesday Forum by "),
+           "(event on " in lines["Next Tuesday Forum"]["event_line"]),
+          (EVENT_REGISTER, True, True))
+    check("a far event whose DEADLINE is inside the window is in",
+          lines["Far But Closing"]["event_kind"], EVENT_REGISTER)
+    check("no deadline on the sheet",
+          lines["No Deadline Meetup"]["event_line"].endswith(
+              "— no registration deadline on the sheet"), True)
+    check("an unreadable date is listed, as unclear",
+          "date unclear" in lines["Mystery Day"]["event_line"], True)
+    got2 = run(today=WED, events=tab, day_rules=[r3],
+               events_unclear_seen={unclear_event_key("Mystery Day")})["actions"]
+    check("...and only once", "Mystery Day" in [a["company"] for a in got2], False)
+    check("the carrier is always there, and is the only item that wants research",
+          [(a["event_kind"], a["web_pending"]) for a in got if a["web_pending"]],
+          [(EVENT_CARRIER, True)])
+    check("an empty tab still has its carrier",
+          [a["event_kind"] for a in run(today=WED, events=[], day_rules=[r3])["actions"]],
+          [EVENT_CARRIER])
+    check("it runs on the Wednesday after too (no alternate weeks)",
+          bool(run(today=WED + timedelta(days=7), events=tab, day_rules=None)
+               ["by_rule"].get("R3")), True)
+    check("nothing listed falls before Monday -> the offer is Monday, even with "
+          "a deadline this week",
+          {a["remind_word"] for a in lines.values()}, {"on Monday"})
+    soon = run(today=WED, events=tab + [ev(11, "Friday Meetup", d(2))],
+               day_rules=[r3])["actions"]
+    check("an event before Monday -> the offer is tomorrow",
+          {a["remind_word"] for a in soon if a["event_kind"] != EVENT_CARRIER},
+          {"tomorrow"})
+    later = run(today=WED, events=[ev(2, "Registered Summit", d(10), registered="Yes")],
+                day_rules=[r3])["actions"]
+    check("nothing before Monday -> the offer is Monday",
+          [(a["remind_word"], a["remind_on"]) for a in later
+           if a["event_kind"] != EVENT_CARRIER],
+          [("on Monday", dl.iso(WED + timedelta(days=5)))])
 
     print("\nR11 new company — one working day after it appeared")
     nc = [{"company": "Nova", "first_seen": "2026-09-18"}]     # a Friday
@@ -1783,8 +1994,8 @@ def _self_test() -> int:
           next((a["sheet_priority"], a["deadline_pretty"], a["is_p1"])
                for a in got if a["deliverable"] == "Overview doc"),
           ("P1", "Thu 10 Sep", True))
-    check("...and neither the remarks nor the link",
-          [k for a in got for k in ("remarks", "link") if k in a], [])
+    check("...the link travels with it; the remarks still do not",
+          sorted({k for a in got for k in ("remarks", "link") if k in a}), ["link"])
     sun = MON + timedelta(days=6)
     got = run(today=sun, rows=[], deliverables=dl_rows,
               day_rules=[rules_mod.by_id("R4")])["actions"]

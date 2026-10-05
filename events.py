@@ -1,38 +1,31 @@
-"""EVENTS & SUMMITS, and the weekly funnel line — two extra things the drip carries.
+"""THE WEEKLY FUNNEL LINE — one extra thing the drip carries.
 
-Both produce ACTIONS in the same shape `nextaction.py` emits, so the drip groups,
-ranks, spaces and caps them exactly like everything else. That is the whole point
-of putting them here rather than giving either its own send path: this bot has
-one proactive outlet and a hard cap on how often it speaks, and a feature that
-routed around either would be re-introducing the problem the drip was built to
-solve.
+It produces an ACTION in the same shape `nextaction.py` emits, so the drip
+groups, ranks, spaces and caps it exactly like everything else. That is the
+whole point of putting it here rather than giving it its own send path: this
+bot has one proactive outlet and a hard cap on how often it speaks.
 
-EVENTS — ONE REMINDER EACH, AT T-EVENT_LEAD_DAYS, FOREVER.
-
-    A conference the team has already decided about does not need reminding
-    twice, and "we mentioned it in March" is not a reason to mention it again in
-    April. The dedup is a permanent SQLite row (`event_reminders`), keyed on the
-    event's name AND its date — so an event that MOVES earns a fresh reminder,
-    because the new date is new information, while re-reading the same row
-    tomorrow does not.
-
-    T-20 is the plan's number: far enough out that a booth, a talk slot or a
-    flight is still bookable, close enough that it is not immediately forgotten
-    again.
+EVENTS ARE NO LONGER HERE. This module used to hold a second events lane as
+well — `due_events`, ONE reminder per event at T-EVENT_LEAD_DAYS (20), for
+ever — running beside R3, which read the same tab on its own schedule. Two
+paths over one tab meant an event could be announced by one, ignored by the
+other, and reminded about by neither when it mattered. R3 is the one events
+path now (`nextaction._r_events`, every Wednesday, a 14-day window), and
+EVENT_LEAD_DAYS and EVENTS_ENABLED are retired with the lane.
 
 THE WEEKLY FUNNEL LINE — OFF BY DEFAULT, AND OPT-IN.
 
     One short Friday message: leading counts, then lagging counts. Nothing else.
     A weekly number nobody asked for is the definition of a message that gets
-    skimmed, and it spends one of the day's three slots — so `WEEKLY_FUNNEL_ENABLED`
-    defaults to false and somebody has to want it.
+    skimmed, and it spends one of the day's counted posts — so
+    `WEEKLY_FUNNEL_ENABLED` defaults to false and somebody has to want it.
 
     It is deliberately COUNTS ONLY. No commentary, no trend, no "up 12% on last
     week". The bot does not have enough weeks of clean data to say anything about
     a trend, and a confident sentence about noise is worse than a number.
 
-THIS MODULE IS PURE. Rows and counts in, action dicts out. It reads no sheet
-(the caller passes the rows), writes no database row, and sends nothing.
+THIS MODULE IS PURE. Counts in, an action dict out. It reads no sheet, writes
+no database row, and sends nothing.
 """
 import logging
 from datetime import date, timedelta
@@ -45,103 +38,14 @@ import nextaction
 
 log = logging.getLogger(__name__)
 
-# The two action types this module adds to the queue. They live here rather than
-# in nextaction.py because they are not per-ROW actions — an event belongs to
-# nobody's outreach row, and the funnel line belongs to the whole sheet.
-EVENT_REMINDER = "event_reminder"
+# The action type this module adds to the queue. It lives here rather than in
+# nextaction.py because it is not a per-ROW action: the funnel line belongs to
+# the whole sheet.
 WEEKLY_FUNNEL = "weekly_funnel"
 
 TYPE_LABELS = {
-    EVENT_REMINDER: "Events coming up",
     WEEKLY_FUNNEL: "This week's numbers",
 }
-
-
-def event_key(row: dict) -> str:
-    """The permanent dedup key for one event row: name + date."""
-    name = gtm_sheet.clean_cell(row.get("event"))
-    when = gtm_sheet.sheet_date(row.get("event_date"))
-    return f"{gtm_sheet.normalise_header(name)}|{dl.iso(when) if when else ''}"
-
-
-def due_events(
-    rows: list, *, today: Optional[date] = None, already_sent=None,
-) -> list:
-    """Events whose single reminder is due today, as action dicts.
-
-    "DUE" MEANS THE LEAD WINDOW HAS OPENED AND NOT CLOSED: the event is between
-    today and T+EVENT_LEAD_DAYS. A window rather than an exact day because the
-    drip can only speak when a slot is free, and an exact-day test would drop a
-    reminder entirely on a busy Tuesday — for a once-forever message that is the
-    difference between late and never.
-
-    A PAST EVENT IS NEVER REMINDED ABOUT. Obvious, and worth stating: the sheet
-    keeps last year's conferences and a bot cheerfully flagging one would be the
-    clearest possible signal it cannot read a date.
-
-    `already_sent(key)` is `db.event_reminder_sent` — passed in so this stays
-    pure and testable.
-    """
-    today = today or dl.today_ist()
-    lead = max(1, int(config.EVENT_LEAD_DAYS))
-    horizon = today + timedelta(days=lead)
-    out: list = []
-
-    for row in rows or []:
-        name = gtm_sheet.clean_cell(row.get("event"))
-        when = gtm_sheet.sheet_date(row.get("event_date"))
-        if not name or when is None:
-            continue
-        if when < today or when > horizon:
-            continue
-        key = event_key(row)
-        if already_sent is not None and already_sent(key):
-            continue
-
-        days_away = (when - today).days
-        where = gtm_sheet.clean_cell(row.get("location"))
-        status = gtm_sheet.clean_cell(row.get("status"))
-        owner = gtm_sheet.clean_cell(row.get("owner"))
-        out.append({
-            "type": EVENT_REMINDER,
-            "label": TYPE_LABELS[EVENT_REMINDER],
-            "owner": owner,
-            "due_date": when - timedelta(days=lead),
-            "due_iso": dl.iso(when - timedelta(days=lead)),
-            "priority": nextaction.P_MEETING,
-            "priority_label": nextaction.BAND_LABELS[nextaction.P_MEETING],
-            "overdue_days": 0,
-            # The event's NAME goes in the company slot so the drip's grouping
-            # and its "companies comma-separated" sentence work unchanged — a
-            # message about three summits reads exactly like one about three
-            # accounts, which is the shape people already know how to answer.
-            "company": name,
-            "poc": "",
-            "poc_designation": "",
-            "sheet_row": row.get("_row"),
-            "row_key": key,
-            "event_key": key,
-            "event_date": dl.iso(when),
-            "location": where,
-            "anchor": dl.iso(when),
-            "anchor_label": "the event date",
-            "why": (
-                f"{name} is on {dl.format_date(when)}, {days_away}d away"
-                + (f" in {where}" if where else "")
-                + (f"; the sheet says {status!r}" if status else "")
-                + f". One reminder at T-{lead}, and never again."
-            ),
-            "text": (
-                f"{name} is {days_away} days out"
-                + (f" ({where})" if where else "")
-                + ". Worth deciding now if we are going — no rush if it is already "
-                  "settled, just tell me and I will leave it."
-            ),
-            "key": f"event:{key}",
-        })
-
-    out.sort(key=lambda a: (a["due_date"], a["company"]))
-    return out
 
 
 def funnel_action(counts: dict, *, today: Optional[date] = None) -> Optional[dict]:
@@ -222,7 +126,7 @@ def _phrase(pairs: list) -> str:
 
 
 def _self_test() -> int:
-    """`python -m events` — the lead window, the dedup and the funnel line."""
+    """`python -m events` — the funnel line."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(name)s: %(message)s")
     today = date(2026, 9, 9)                  # a Wednesday
     failures = 0
@@ -232,41 +136,6 @@ def _self_test() -> int:
         ok = got == want
         failures += 0 if ok else 1
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: got {got!r}, want {want!r}")
-
-    def ev(name, when, **kw):
-        row = {"_row": 2, "event": name, "event_date": when, "_extra": {}}
-        row.update(kw)
-        return row
-
-    rows = [
-        ev("NeurIPS", "25-09-2026"),          # 16d away — inside T-20
-        ev("SaaStr", "09-09-2026"),           # today — inside
-        ev("Web Summit", "20-11-2026"),       # 72d away — outside
-        ev("Old Summit", "01-08-2026"),       # past
-        ev("", "25-09-2026"),                 # no name — a spacer
-    ]
-
-    print("the lead window")
-    due = due_events(rows, today=today)
-    check("only events inside T-20 and not past",
-          sorted(a["company"] for a in due), ["NeurIPS", "SaaStr"])
-    check("the reminder is dated T-minus the lead days",
-          due[0]["due_iso"] if due[0]["company"] == "SaaStr" else due[1]["due_iso"],
-          dl.iso(date(2026, 9, 9) - timedelta(days=20)))
-
-    print("\nonce, forever")
-    seen = {event_key(rows[0])}
-    due2 = due_events(rows, today=today, already_sent=lambda k: k in seen)
-    check("an already-reminded event is gone",
-          [a["company"] for a in due2], ["SaaStr"])
-    moved = ev("NeurIPS", "28-09-2026")       # same name, new date (still inside T-20)
-    check("...but a MOVED event earns a fresh one",
-          bool(due_events([moved], today=today, already_sent=lambda k: k in seen)), True)
-
-    print("\nthe message")
-    text = due[0]["text"]
-    check("no bullets or headers", any(c in text for c in ("**", "- ", "\\u2022")), False)
-    check("gives an out", "no rush" in text, True)
 
     print("\nthe weekly funnel line")
     counts = {"outreach_sent": 12, "replies": 3, "meetings_booked": 2,

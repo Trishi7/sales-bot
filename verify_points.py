@@ -9,8 +9,8 @@ path (`_send_drip_message`, into a recording channel) run against a test
 deliverables tab and a throwaway *_test.db.
 
   (i)   a Monday preview from a test sheet with 6 open rows across 3 teams and
-        mixed priorities — ONE message, the 3 P1s only, two lines an item
-        (title, then "Due: ..."), no team, no remarks, no link;
+        mixed priorities — ONE message, the 3 P1s only, each item its title,
+        "Team: ...", "Due: ..." and its link if it has one; no remarks;
   (ii)  the P2 and P3 rows due this week are skipped, and each is logged with
         its priority; no open P1 means no message;
   (iii) a composed message missing a bullet falls back to the template and
@@ -163,17 +163,19 @@ async def main():
     check("by deadline: MSA, DPA, API rate limits",
           [l.split(". ", 1)[1] for l in numbered],
           ["MSA template", "DPA review", "API rate limits"])
-    check("each item is exactly two lines", [len(b.splitlines()) for b in blocks],
-          [2, 2, 2])
-    check("line 2 is the due date and nothing else",
-          [b.splitlines()[1] for b in blocks],
+    # S3: each item is its title, a Team line, a Due line, and the row's link
+    # when it has one.
+    check("line 2 is the team", [b.splitlines()[1].startswith("   Team: ")
+                                 for b in blocks], [True, True, True])
+    check("line 3 is the due date",
+          [b.splitlines()[2] for b in blocks],
           ["   Due: Wed 30 Sep · 5 days overdue", "   Due: Wed 7 Oct",
            "   Due: Thu 8 Oct"])
-    check("no team, no remarks, no link anywhere",
-          [x for x in ("Team:", "Legal", "Engineering", "load test", "pricing table",
-                       "http", "](<") if x in body], [])
-    check("the body is the opener, 3 x 2 lines and the close",
-          len(body.splitlines()), 1 + 6 + 1)
+    check("a fourth line only for a link, written [Doc](<…>)",
+          [l for b in blocks for l in b.splitlines()[3:]
+           if not l.startswith("   [Doc](<")], [])
+    check("no remarks anywhere",
+          [x for x in ("load test", "pricing table") if x in body], [])
     check("done / next week / undated rows are left out",
           any(x in body for x in ("NDA", "Q1 plan", "Some idea")), False)
     check("addressed to the checklist's owner", msg["owner"], "Vaishnavi")

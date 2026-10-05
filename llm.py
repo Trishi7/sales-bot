@@ -1004,6 +1004,51 @@ class LLM:
             return None
         return (_text_of(resp) or "").strip()
 
+    async def extract_email(self, *, person: str, company: str,
+                            results: list) -> str:
+        """R5 / R6: pick ONE person's published email out of search results.
+
+        ONE MODEL_LIGHT call over the titles and snippets the search returned —
+        no search of its own, no page text. Returns the model's raw answer; the
+        caller keeps an address ONLY if it appears, character for character, in
+        one of those snippets (`websearch.verified_emails`), so nothing this
+        returns is trusted. "" when the call failed.
+        """
+        import websearch
+
+        if not results:
+            return ""
+        lines = [
+            f"Find the PUBLISHED email address of this person: {person} at {company}.",
+            "",
+            "Below are search results — a number, a title, a snippet. Use ONLY what "
+            "is written in them.",
+            "",
+        ]
+        for i, r in enumerate(results, 1):
+            title = " ".join(str(r.get("title") or "").split())[:140]
+            snippet = " ".join(str(r.get("snippet") or "").split())[:400]
+            lines.append(f"{i} | {title} | {snippet}")
+        lines += [
+            "",
+            "If one of the snippets shows an email address that is clearly THIS "
+            "person's own (not a generic info@/press@/support@ address, not somebody "
+            "else's), reply with exactly:",
+            "  EMAIL | <the address, copied character for character> | <result number>",
+            "Otherwise reply with exactly: NONE",
+            "NEVER build an address from a name and a domain, and never complete one "
+            "that is cut off. An address that is not written out in a snippet is NONE.",
+        ]
+        try:
+            resp = await self._create(
+                system=websearch.SAFETY_PREAMBLE + "\n\n" + websearch.LEAN_LINE,
+                prompt="\n".join(lines), max_tokens=120, site="email_lookup",
+                include_strategy=False, light=True)
+        except Exception:
+            log.exception("[email] the extraction call raised; no address is kept")
+            return ""
+        return (_text_of(resp) or "").strip()
+
     async def research_digest(self, *, person: str, org: str, pages: str) -> str:
         """The research brief's EXTRACTION step, on MODEL_LIGHT.
 

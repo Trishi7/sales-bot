@@ -5,7 +5,7 @@ it would send on the next Monday, in order — those messages and nothing else,
 built by the same code a real day uses, each tagged "[TEST]". "Why was it
 quiet" afterwards explains what was skipped (`why_quiet`).
 
-WHY THIS EXISTS. Twelve rules, a posting window, per-day caps, a roll-over, an
+WHY THIS EXISTS. Twelve rules, a posting window, a daily cap, a roll-over, an
 approval queue and a leave check interact in ways nobody can hold in their head.
 The only honest way to know what Monday looks like is to watch Monday happen —
 and waiting until Monday is a poor development loop.

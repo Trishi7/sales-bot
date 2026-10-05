@@ -60,6 +60,7 @@ log = logging.getLogger(__name__)
 MODE_MAIN = "main"
 MODE_CHECK = "check"
 MODE_BREAKING = "breaking"
+MODE_OVERFLOW = "overflow"      # "More AI news today", right after the main post
 
 # The tag for a story that is not on the topic list. Welcome — the list is
 # seeds, not limits — but named as such.
@@ -573,6 +574,191 @@ def choose(stories: list, *, today: date, db, cap: int, per_topic: int,
     return keep, skipped
 
 
+# -- the main post: our PoCs first, and nothing useful lost -------------------
+
+KIND_INDUSTRY = "industry"
+KIND_POC = "poc"
+
+# ONE NAME DOES NOT TAKE OVER THE POST. The PoC slots go to DIFFERENT names, and
+# no single name has more than this many stories in the main post — the rest
+# go to "More AI news today". Without it, the first live run's post was five
+# stories about one company on the sheet and nothing about anybody else.
+POC_PER_NAME_IN_POST = 2
+
+# ...AND DOES NOT TAKE OVER THE SCORING CALL: at most this many items per name
+# are shown to the scorer in one call, and PoC items together get at most this
+# share of it. What is not shown stays unscored and is seen by the next sweep.
+POC_SCORE_PER_NAME = 3
+POC_SCORE_SHARE = 0.4
+
+
+def is_poc(story: dict) -> bool:
+    return str((story or {}).get("kind") or "") == KIND_POC
+
+
+def _rank(stories: list) -> list:
+    """Most important first; at the same importance a PoC story leads, and
+    after that the newest. Two stable sorts, so the order is the same every
+    time the same stories are ranked."""
+    newest = sorted(stories or [], key=lambda s: str(s.get("published_at") or ""),
+                    reverse=True)
+    return sorted(newest, key=lambda s: (-int(s.get("importance") or 3),
+                                         0 if is_poc(s) else 1))
+
+
+def choose_main(stories: list, *, today: date, db, cap: int, poc_slots: int,
+                per_topic: int, topics_per_week: int, min_importance: int,
+                offtopic_bypass: int, overflow_min: int, overflow_max: int) -> dict:
+    """THE 2 PM POST, and what did not fit it.
+
+    Returns {"keep": [...], "overflow": [...], "skipped": [...], "dropped": [...]}.
+    `keep` is the main post in the order it is posted; `overflow` is "More AI
+    news today"; `skipped` is a sentence per story that is in neither or that
+    moved to the overflow, for the log; `dropped` is what even the overflow
+    had no room for.
+
+    WHO QUALIFIES: a story not already posted (by link or by headline, inside
+    NEWS_REPEAT_DAYS) and not a second copy of one in this batch.
+
+    HOW THE POST IS FILLED:
+      1. the top `poc_slots` PoC stories by importance — fewer when fewer exist
+         — each about a DIFFERENT name on the sheet;
+      2. the remaining slots, up to `cap`, with the best of everything left,
+         PoC or industry, by importance. Ties: PoC first, then newest.
+    No one name gets more than POC_PER_NAME_IN_POST stories in the post.
+
+    THE SPREAD LIMITS APPLY TO INDUSTRY NEWS IN STEP 2 ONLY — at most
+    `per_topic` stories on a topic a day and `topics_per_week` topics a week —
+    and three kinds of story walk past them: importance at or above
+    `min_importance` (the big one is never hidden), an OTHER story at or above
+    `offtopic_bypass` (the topic list is seeds, not limits), and every PoC
+    story.
+
+    NOTHING USEFUL IS LOST. Whatever qualified and did not get in — the post
+    was full, or a spread limit kept it out — goes to `overflow` when it is
+    worth `overflow_min` or more: PoC first, then by importance, at most
+    `overflow_max`.
+    """
+    since = cutoff_iso(today)
+    marker = dl.iso(today)
+    bar = int(min_importance)
+    cap = max(0, int(cap))
+
+    skipped: list = []
+
+    def _why(s, why):
+        skipped.append(f"{s.get('headline', '?')!r} — {why}")
+
+    # ---- who qualifies ------------------------------------------------------
+    pool: list = []
+    batch_urls: set = set()
+    batch_heads: set = set()
+    for s in _rank(stories):
+        ukey, hkey = s.get("url_key") or "", s.get("headline_key") or ""
+        if (ukey and ukey in batch_urls) or (hkey and hkey in batch_heads):
+            _why(s, "the same story is already in this batch")
+            continue
+        seen = db.news_story_seen(ukey, hkey, since_iso=since)
+        if seen:
+            how = "the same link" if seen.get("url_key") == ukey and ukey else \
+                "the same headline"
+            _why(s, f"already posted on {seen.get('posted_on', '?')} "
+                    f"({seen.get('kind') or 'main'} post) — {how}, within "
+                    f"{config.NEWS_REPEAT_DAYS} days")
+            continue
+        if ukey:
+            batch_urls.add(ukey)
+        if hkey:
+            batch_heads.add(hkey)
+        pool.append(s)
+
+    # ---- 1. our PoCs first --------------------------------------------------
+    keep: list = []
+    per_name: dict = {}                    # sheet_ref -> stories in the post
+
+    def _name(s) -> str:
+        return str(s.get("sheet_ref") or "").strip().lower()
+
+    for s in pool:
+        if len(keep) >= max(0, min(int(poc_slots), cap)):
+            break
+        if is_poc(s) and not per_name.get(_name(s)):
+            keep.append(s)
+            per_name[_name(s)] = 1
+    taken = {id(s) for s in keep}
+
+    # ---- 2. the best of everything left -------------------------------------
+    try:
+        week_topics = set(db.news_topics_this_week(iso_week(today)))
+    except Exception:
+        log.exception("[news] could not read this week's topics; treating the week "
+                      "as full so only the important breaks through")
+        week_topics = None
+    topic_counts: dict = {}
+    left_out: list = []                    # (story, why) — qualified, did not fit
+
+    def _count(topic) -> int:
+        if topic not in topic_counts:
+            try:
+                topic_counts[topic] = int(db.news_topic_count_today(topic, marker))
+            except Exception:
+                topic_counts[topic] = int(per_topic)
+        return topic_counts[topic]
+
+    for s in pool:
+        if id(s) in taken:
+            continue
+        imp = int(s.get("importance") or 3)
+        topic = s.get("topic") or TOPIC_OTHER
+        if len(keep) >= cap:
+            left_out.append((s, f"the post is full (cap {cap})"))
+            continue
+        if is_poc(s) and per_name.get(_name(s), 0) >= POC_PER_NAME_IN_POST:
+            left_out.append((s, f"the post already has {per_name[_name(s)]} stories "
+                                f"about {s.get('sheet_ref') or 'that name'}"))
+            continue
+        free = (is_poc(s) or imp >= bar
+                or (topic == TOPIC_OTHER and imp >= int(offtopic_bypass)))
+        if not free:
+            if _count(topic) >= int(per_topic):
+                left_out.append((s, f"{topic} already has {topic_counts[topic]} "
+                                    f"story/stories today "
+                                    f"(NEWS_PER_TOPIC_PER_DAY={per_topic})"))
+                continue
+            if week_topics is None or (topic not in week_topics
+                                       and len(week_topics) >= int(topics_per_week)):
+                left_out.append((s, f"{topic} would be topic number "
+                                    f"{len(week_topics or ()) + 1} this week "
+                                    f"(NEWS_TOPICS_PER_WEEK={topics_per_week})"))
+                continue
+        keep.append(s)
+        taken.add(id(s))
+        if is_poc(s):
+            per_name[_name(s)] = per_name.get(_name(s), 0) + 1
+        if not is_poc(s):
+            topic_counts[topic] = _count(topic) + 1
+            if week_topics is not None:
+                week_topics.add(topic)
+
+    # ---- what did not fit ---------------------------------------------------
+    eligible = [(s, why) for s, why in left_out
+                if int(s.get("importance") or 3) >= int(overflow_min)]
+    for s, why in left_out:
+        if int(s.get("importance") or 3) < int(overflow_min):
+            _why(s, f"{why}; importance {int(s.get('importance') or 3)} is below "
+                    f"NEWS_OVERFLOW_MIN_IMPORTANCE={overflow_min}")
+    eligible.sort(key=lambda p: 0 if is_poc(p[0]) else 1)       # stable: rank kept
+    room = max(0, int(overflow_max))
+    overflow = [s for s, _why_ in eligible[:room]]
+    dropped = [s for s, _why_ in eligible[room:]]
+    for s, why in eligible[:room]:
+        _why(s, f"{why} — goes in \"More AI news today\"")
+    for s, why in eligible[room:]:
+        _why(s, f"{why}; \"More AI news today\" is full too "
+                f"(NEWS_OVERFLOW_MAX_ITEMS={overflow_max})")
+    return {"keep": keep, "overflow": overflow, "skipped": skipped, "dropped": dropped}
+
+
 # -- what the message says ----------------------------------------------------
 
 _PING_RE = re.compile(r"<@[!&]?\d+>|@(everyone|here)\b", re.IGNORECASE)
@@ -602,6 +788,7 @@ QUIET_LINES = (
 )
 QUIET_MAIN = QUIET_LINES[0]
 BREAKING_HEADING = "**Breaking AI news**"
+OVERFLOW_HEADING = "**More AI news today**"
 
 
 def quiet_line(day: date) -> str:
@@ -627,11 +814,15 @@ def quiet_line(day: date) -> str:
 def render(stories: list, *, mode: str = MODE_MAIN) -> str:
     """One bullet per story: `• Headline — what happened. [site](<url>)`.
 
+    A PoC STORY SAYS WHOSE IT IS, in brackets before the link: `• Synthflow
+    raises $20M — … (Synthflow AI — on Master Pipeline) [site](<url>)`. That
+    is the whole reason the story is in the post, so it is in the post.
+
     NO TOPIC TAG AND NO CLOSING LINE — news never needs an action, so nothing
     after the bullets asks for one. The main post's heading ("AI news, Tue 29
-    Sep") is added by the drip sender; a breaking post carries its own heading
-    here, because it is sent outside the drip, and every story it is given, in
-    ONE message.
+    Sep") is added by the drip sender; a breaking post and the overflow post
+    ("More AI news today") carry their own heading here, because they are sent
+    outside the drip, and every story they are given, in ONE message.
     """
     import links
 
@@ -641,10 +832,15 @@ def render(stories: list, *, mode: str = MODE_MAIN) -> str:
     lines: list = []
     if mode == MODE_BREAKING:
         lines.append(BREAKING_HEADING)
+    elif mode == MODE_OVERFLOW:
+        lines.append(OVERFLOW_HEADING)
     for s in picked:
         head = _no_pings(s.get("headline") or "").strip()
         what = _no_pings(s.get("what") or "").strip().rstrip(".")
         body = f"{head} — {what}." if what else head
+        ref = _no_pings(s.get("sheet_ref") or "").strip() if is_poc(s) else ""
+        if ref:
+            body = f"{body} ({ref})"
         lines.append(f"• {body} {links.link(_link_label(s), s['url'])}")
     return "\n".join(lines)
 
@@ -687,6 +883,12 @@ def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
     The Google News queries fill the rest, at most `per_hint` per topic, so one
     busy topic ("robot") cannot spend the whole call; any room still left goes
     back to the outlets. Two rows with one headline key count once.
+
+    PoC ITEMS GO BEFORE ALL OF IT — each is the reason a whole query was made,
+    and a busy news day must not push them out of the call — BUT WITHIN LIMITS:
+    at most POC_SCORE_PER_NAME per name and POC_SCORE_SHARE of the call
+    together, so a company that is in the news forty times a week (or shares
+    its name with a footballer) cannot push the industry out instead.
     """
     cap = max(1, int(cap))
     ordered = sorted(items or [], key=lambda r: str(r.get("published_at") or ""),
@@ -703,6 +905,16 @@ def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
         out.append(row)
         return True
 
+    poc_room = max(1, int(cap * POC_SCORE_SHARE))
+    for row in ordered:
+        if not is_poc(row):
+            continue
+        name = str(row.get("sheet_ref") or "").strip().lower()
+        if per.get(("poc", name), 0) >= POC_SCORE_PER_NAME:
+            continue
+        if take(row, poc_room):
+            per[("poc", name)] = per.get(("poc", name), 0) + 1
+    ordered = [r for r in ordered if not is_poc(r)]
     outlets = [r for r in ordered if not (r.get("topic_hint") or "").strip()]
     queries = [r for r in ordered if (r.get("topic_hint") or "").strip()]
     share = cap if not queries else max(1, int(cap * 0.6))
@@ -743,6 +955,16 @@ def score_prompt(items: list, topics: list, *, today: date, mode: str) -> str:
         "  3 = useful",
         "  2-1 = filler",
     ]
+    if any(is_poc(it) for it in items):
+        lines += [
+            "",
+            "AN ITEM MARKED [ABOUT OUR CONTACT: …] came from looking up a company or "
+            "person this team is selling to. Score it for what it means to that "
+            "relationship: a funding round, a launch, an acquisition, a senior hire "
+            "or departure, layoffs or a partnership there is a 4 even if the wider "
+            "industry would not notice; a passing mention is filler. If the item is "
+            "not really about them, leave it out.",
+        ]
     if mode == MODE_CHECK:
         lines.append("BE STRICT WITH 4 AND 5: this is an hourly check for MAJOR news "
                      "only — a big launch, a large round, a regulation, a leadership "
@@ -752,7 +974,9 @@ def score_prompt(items: list, topics: list, *, today: date, mode: str) -> str:
         title = " ".join(str(it.get("title") or "").split())[:SCORE_TITLE_CHARS]
         summary = " ".join(str(it.get("summary") or "").split())[:SCORE_SUMMARY_CHARS]
         source = " ".join(str(it.get("source") or "").split())[:30]
-        lines.append(f"{i} | {source} | {title}" + (f" — {summary}" if summary else ""))
+        about = " ".join(str(it.get("sheet_ref") or "").split())[:80] if is_poc(it) else ""
+        lines.append(f"{i} | {source} | {title}" + (f" — {summary}" if summary else "")
+                     + (f" [ABOUT OUR CONTACT: {about}]" if about else ""))
     lines += [
         "",
         "FOR EACH ITEM THAT IS AI NEWS WORTH 3 OR MORE, one line in exactly this "
@@ -784,6 +1008,10 @@ def story_from_feed(row: dict, *, topics: Optional[list] = None) -> dict:
         "headline_key": str(row.get("headline_key") or ""),
         "importance": max(1, min(5, int(row.get("importance") or 3))),
         "source": str(row.get("source") or "").strip(),
+        # industry | poc, and for a PoC story the sheet row it is about.
+        "kind": KIND_POC if is_poc(row) else KIND_INDUSTRY,
+        "sheet_ref": str(row.get("sheet_ref") or "").strip() if is_poc(row) else "",
+        "published_at": str(row.get("published_at") or ""),
     }
 
 
@@ -956,6 +1184,143 @@ def _self_test() -> int:
     check("already is capped at 25",
           sweep_prompt(topics, today=today, since_hours=24, mode=MODE_MAIN,
                        already=already).count("\n  - h"), 25)
+
+    print("\nthe main post: our PoCs first, nothing useful lost (S2)")
+
+    def st(n, imp, kind="industry", topic="evals", ref="", when="2026-09-29T08:00:00+00:00"):
+        return {"headline": f"story {n}", "what": "it happened", "url": f"https://x.com/{n}",
+                "url_key": f"x.com/{n}", "headline_key": f"story {n}", "topic": topic,
+                "importance": imp, "kind": kind, "sheet_ref": ref, "source": "X",
+                "published_at": when}
+
+    class Posted:
+        def __init__(self, seen=(), week=(), today_counts=None):
+            self.seen, self.week, self.counts = set(seen), list(week), today_counts or {}
+
+        def news_story_seen(self, ukey, hkey, *, since_iso):
+            return {"url_key": ukey, "posted_on": "2026-09-28", "kind": "main"} \
+                if ukey in self.seen else None
+
+        def news_topic_count_today(self, topic, on_date):
+            return self.counts.get(topic, 0)
+
+        def news_topics_this_week(self, week):
+            return list(self.week)
+
+    def main(stories, db=None, **kw):
+        args = dict(today=today, db=db or Posted(), cap=5, poc_slots=2, per_topic=2,
+                    topics_per_week=6, min_importance=5, offtopic_bypass=4,
+                    overflow_min=3, overflow_max=8)
+        args.update(kw)
+        return choose_main(stories, **args)
+
+    def names(rows):
+        return [s["headline"] for s in rows]
+
+    six = [st("i5", 5, topic="RLHF"), st("i4", 4, topic="evals"),
+           st("i3", 3, topic="voice agent"),
+           st("p4", 4, "poc", ref="Acme — on Master Pipeline"),
+           st("p3a", 3, "poc", ref="Borealis — on Outreach PoCs"),
+           st("p3b", 3, "poc", ref="Cinder — on Master Pipeline",
+              when="2026-09-28T08:00:00+00:00")]
+    got = main(six)
+    check("3 PoC + 3 industry: the top 2 PoC lead, then the best 3 of the rest",
+          names(got["keep"]), ["story p4", "story p3a", "story i5", "story i4",
+                               "story p3b"])
+    check("...and the sixth is in the overflow", names(got["overflow"]), ["story i3"])
+    check("a tie goes to the PoC story, then to the newest",
+          names(_rank([st("a", 3), st("b", 3, "poc", when="2026-09-27T00:00:00+00:00"),
+                       st("c", 3, "poc")])), ["story c", "story b", "story a"])
+    check("fewer PoC stories than slots: the slots go to the rest",
+          names(main([st("p", 3, "poc"), st("a", 4), st("b", 4, topic="RLHF")])["keep"]),
+          ["story p", "story a", "story b"])
+    check("no PoC stories at all: an ordinary post",
+          names(main([st("a", 4), st("b", 3, topic="RLHF")])["keep"]),
+          ["story a", "story b"])
+
+    full = Posted(today_counts={"evals": 2, "OTHER": 2})
+    got = main([st("e", 4, topic="evals"), st("o4", 4, topic="OTHER"),
+                st("o3", 3, topic="OTHER"), st("p", 3, "poc", topic="evals")], db=full)
+    check("an OTHER story at importance 4 gets in past a full topic cap",
+          "story o4" in names(got["keep"]), True)
+    check("...an OTHER story at 3 does not, and neither does an on-topic 4",
+          sorted(names(got["overflow"])), ["story e", "story o3"])
+    check("...and a PoC story is never held by a topic cap",
+          "story p" in names(got["keep"]), True)
+    week = Posted(week=["a", "b", "c", "d", "e", "f"])
+    got = main([st("n", 4, topic="new topic"), st("o", 4, topic="OTHER")], db=week)
+    check("the per-week limit: OTHER at 4 walks past it, a seventh topic does not",
+          (names(got["keep"]), names(got["overflow"])), (["story o"], ["story n"]))
+    check("importance 5 walks past every spread limit",
+          names(main([st("big", 5, topic="evals")], db=full)["keep"]), ["story big"])
+
+    many = [st(f"m{i}", 3, topic=f"t{i}") for i in range(16)]
+    got = main(many, topics_per_week=99)
+    check("the overflow carries at most NEWS_OVERFLOW_MAX_ITEMS",
+          (len(got["keep"]), len(got["overflow"]), len(got["dropped"])), (5, 8, 3))
+    got = main([st("i", 4), st("j", 4, topic="RLHF"), st("k", 4, topic="a"),
+                st("l", 4, topic="b"), st("m", 4, topic="c"), st("n", 4, topic="d"),
+                st("lp", 3, "poc")], poc_slots=0)
+    check("in the overflow, PoC goes first whatever its importance",
+          names(got["overflow"]), ["story lp", "story n"])
+    check("a story already posted does not qualify for either",
+          (names(main([st("old", 5)], db=Posted(seen={"x.com/old"}))["keep"]),
+           names(main([st("old", 5)], db=Posted(seen={"x.com/old"}))["overflow"])),
+          ([], []))
+    check("below NEWS_OVERFLOW_MIN_IMPORTANCE it is not carried over",
+          names(main([st(f"q{i}", 3, topic=f"t{i}") for i in range(7)],
+                     topics_per_week=99, overflow_min=4)["overflow"]), [])
+
+    one = [st(f"a{i}", 4, "poc", ref="Anthropic — on Outreach PoCs") for i in range(6)]
+    got1 = main(one + [st("b", 3, "poc", ref="Borealis — on Master Pipeline"),
+                       st("ind", 3)])
+    check("the PoC slots go to two DIFFERENT names",
+          names(got1["keep"])[:2], ["story a0", "story b"])
+    check("...and one name has at most 2 stories in the post",
+          (sum(1 for s in got1["keep"] if s["sheet_ref"].startswith("Anthropic")),
+           "story ind" in names(got1["keep"])), (2, True))
+    check("...the rest of that name's news is in the overflow, not lost",
+          names(got1["overflow"]), ["story a2", "story a3", "story a4", "story a5"])
+
+    print("\nrendering a PoC story")
+    line = render([six[3]], mode=MODE_MAIN)
+    print("   " + line)
+    check("the sheet row is in the post, in brackets, before the link",
+          "(Acme — on Master Pipeline) [" in line, True)
+    check("an industry story has no brackets",
+          "(" in render([six[0]], mode=MODE_MAIN).split(" [")[0], False)
+    over = render(got["overflow"], mode=MODE_OVERFLOW)
+    check("the overflow post has its heading", over.splitlines()[0],
+          "**More AI news today**")
+
+    print("\nscoring: a PoC item is marked, and shown first")
+    feed = [{"title": "Robots walk", "summary": "", "source": "A", "url_key": "a",
+             "headline_key": "robots walk", "topic_hint": "", "published_at": "2",
+             "kind": "industry", "sheet_ref": ""},
+            {"title": "Acme raises $40M", "summary": "", "source": "B", "url_key": "b",
+             "headline_key": "acme raises", "topic_hint": "", "published_at": "1",
+             "kind": "poc", "sheet_ref": "Acme — on Master Pipeline"}]
+    check("a PoC item is never squeezed out of the scoring call",
+          [r["url_key"] for r in preselect(feed, cap=1)], ["b"])
+    flood = [{"title": f"Andi story {i}", "url_key": f"p{i}", "headline_key": f"andi {i}",
+              "topic_hint": "", "published_at": f"2026-09-29T{i:02d}", "kind": "poc",
+              "sheet_ref": "Andi — on Master Pipeline"} for i in range(20)] + \
+            [{"title": f"Outlet story {i}", "url_key": f"o{i}", "headline_key": f"out {i}",
+              "topic_hint": "", "published_at": f"2026-09-28T{i:02d}", "kind": "industry",
+              "sheet_ref": ""} for i in range(20)]
+    shown = preselect(flood, cap=10)
+    check("...and one name's flood does not squeeze the industry out either: "
+          "3 of its 20, then the outlets",
+          (sum(1 for r in shown if r["kind"] == "poc"),
+           sum(1 for r in shown if r["kind"] == "industry")), (3, 7))
+    sp = score_prompt(feed, topics, today=today, mode=MODE_MAIN)
+    check("the prompt says who a PoC item is about",
+          "[ABOUT OUR CONTACT: Acme — on Master Pipeline]" in sp, True)
+    check("...and how to score one", "ABOUT OUR CONTACT" in sp.split("ITEMS:")[0], True)
+    scored = parse_scores("SCORE | 2 | OTHER | 4 | Acme raised a round", feed)
+    check("a scored PoC item keeps its kind and its sheet row",
+          [(s["kind"], s["sheet_ref"]) for s in scored],
+          [("poc", "Acme — on Master Pipeline")])
 
     print("\nthe check prompt")
     c = sweep_prompt(topics, today=today, since_hours=1, mode=MODE_CHECK)

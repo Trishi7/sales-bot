@@ -1287,21 +1287,22 @@ def linkedin_ready() -> bool:
 
 
 # -- EVENTS & SUMMITS ---------------------------------------------------------
-# The playbook has an "Events & Summits" tab. Each event earns ONE reminder, at
-# T-EVENT_LEAD_DAYS, and never another.
+# The playbook has an "AI Events & Summits" tab, and R3 reads it every Wednesday.
 #
-# ONCE, FOREVER. The dedup is a permanent SQLite row, not a per-day marker: a
-# conference the team has already decided about does not need reminding twice,
-# and "we told you in March" is not a reason to tell you again in April. The
-# reminder rides the drip like everything else — it counts against
-# DAILY_MESSAGE_CAP and the kill switch applies to it.
+# EVENTS_ENABLED and EVENT_LEAD_DAYS ARE RETIRED. They belonged to a second
+# lane — one reminder per event at T-20, for ever — that ran beside R3 on the
+# same tab. There is one path now (nextaction._r_events); R3 is switched off
+# like any rule, with `enabled: false` in bot_rules.yaml.
 
-EVENTS_ENABLED = _bool("EVENTS_ENABLED", default=True)
+# HOW FAR AHEAD R3 LOOKS, in days. An event (or its registration deadline)
+# inside this window gets a line in Wednesday's post. 14, so that an event
+# next Tuesday is in THIS Wednesday's post rather than arriving the day after.
+EVENTS_WINDOW_DAYS = _int("EVENTS_WINDOW_DAYS", 14)
 
-# Days before the event that the single reminder fires. 20 is the plan's number:
-# far enough out that a booth, a talk slot or a flight is still bookable, close
-# enough that it is not forgotten again immediately.
-EVENT_LEAD_DAYS = _int("EVENT_LEAD_DAYS", 20)
+# R3 closes with "Want me to remind you again on Monday?". This is the Monday:
+# the weekday a yes schedules the one reminder for, at 14:00, in the channel.
+# When something listed falls before that day, the offer is "tomorrow" instead.
+EVENTS_REMIND_AGAIN_WEEKDAY = _weekday("EVENTS_REMIND_AGAIN_WEEKDAY", "mon")
 
 # An optional NAME hint for the events tab, comma-separated. Like the master-tab
 # hint it is only a hint; the tab is also found by its header signature.
@@ -1754,11 +1755,9 @@ NEXT_ACTION_ENABLED = _bool("NEXT_ACTION_ENABLED", default=True)
 # line explaining the first would not explain the second.
 BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 
-# R3 — EVENTS, EVERY OTHER WEDNESDAY. The anchor is the first Wednesday the rule
-# fires on; every second Wednesday after it is a run day. An anchor date rather
-# than "odd ISO weeks" because the team picked a date, and an ISO-week parity
-# rule silently flips its meaning in any year with 53 weeks.
-EVENTS_ANCHOR_DATE = (os.getenv("EVENTS_ANCHOR_DATE", "2026-09-23") or "").strip()
+# R3 — EVENTS, EVERY WEDNESDAY. EVENTS_ANCHOR_DATE is RETIRED: it picked which
+# alternate Wednesdays the rule ran on, and the rule now runs on all of them
+# (EVENTS_WINDOW_DAYS decides what is close enough to mention).
 
 # -- R1 NEWS: A DAILY AI INDUSTRY FEED ON A FIXED TOPIC LIST -----------------
 #
@@ -1811,9 +1810,51 @@ NEWS_TOPICS = (
 # The most stories the main post carries.
 NEWS_MAX_ITEMS = _int("NEWS_MAX_ITEMS", 5)
 
-# How many stories on one topic may go out in one day, and how many distinct
-# topics in one ISO week. Both are bypassed by a story at or above
-# NEWS_BREAKING_MIN_IMPORTANCE: a spread rule must never hide the big one.
+# TWO KINDS OF NEWS (S2). Every story is `industry` — the outlets' feeds and the
+# topic queries — or `poc`: news about a person on an active Outreach PoCs row,
+# or a company on Master Pipeline or Outreach PoCs.
+#
+# HOW MANY PoC NAMES ARE LOOKED UP A DAY. One Google News RSS query per name
+# ("<company>", or "<person>" "<company>"), polled with the other feeds: plain
+# HTTP, free, no search API. The names take turns, least recently checked
+# first (the `news_targets` table), so 300 names at 15 a day come round every
+# 20 days. Nobody on the mapping's departures list is ever looked up. 0 turns
+# PoC news off.
+NEWS_POC_TARGETS_PER_DAY = _int("NEWS_POC_TARGETS_PER_DAY", 15)
+
+# How far back a PoC query looks, in days. Wider than the topic queries' two
+# days because a name is only looked up every few weeks: a round announced on
+# Tuesday is still news to the team when the name's turn comes on Friday.
+NEWS_POC_LOOKBACK_DAYS = _int("NEWS_POC_LOOKBACK_DAYS", 7)
+
+# THE MAIN POST'S FIRST SLOTS GO TO OUR PoCs: the top this-many PoC stories by
+# importance lead the post (fewer when fewer exist), and the remaining slots go
+# to the best of everything left, PoC or industry. Ties: PoC first, then newest.
+NEWS_POC_SLOTS = _int("NEWS_POC_SLOTS", 2)
+
+# AN OFF-TOPIC STORY THAT MATTERS GETS IN. An industry story the scorer tagged
+# OTHER at or above this importance skips the per-topic and per-week limits
+# below — the topic list is seeds, not limits. (Importance 5 still interrupts
+# as breaking: NEWS_BREAKING_MIN_IMPORTANCE.)
+NEWS_OFFTOPIC_BYPASS_IMPORTANCE = _int("NEWS_OFFTOPIC_BYPASS_IMPORTANCE", 4)
+
+# NOTHING USEFUL IS LOST. Every story that qualified — at or above
+# NEWS_OVERFLOW_MIN_IMPORTANCE and not already posted — but did not fit the
+# main post goes out right after it as ONE message, "More AI news today", PoC
+# first, at most NEWS_OVERFLOW_MAX_ITEMS. It is outside the daily cap and is
+# not a breaking message (the valve does not count it); each story is recorded
+# in news_stories with kind=overflow so it never repeats.
+NEWS_OVERFLOW_ENABLED = _bool("NEWS_OVERFLOW_ENABLED", default=True)
+NEWS_OVERFLOW_MIN_IMPORTANCE = _int("NEWS_OVERFLOW_MIN_IMPORTANCE", 3)
+NEWS_OVERFLOW_MAX_ITEMS = _int("NEWS_OVERFLOW_MAX_ITEMS", 8)
+
+# How many INDUSTRY stories on one topic may go in the main post in one day, and
+# how many distinct topics in one ISO week. Both are bypassed by a story at or
+# above NEWS_BREAKING_MIN_IMPORTANCE (a spread rule must never hide the big
+# one), by an OTHER story at or above NEWS_OFFTOPIC_BYPASS_IMPORTANCE, and by
+# every PoC story — news about our own people is not a topic to be rationed.
+# A story these limits keep out of the main post is not lost: it goes in "More
+# AI news today".
 NEWS_PER_TOPIC_PER_DAY = _int("NEWS_PER_TOPIC_PER_DAY", 2)
 NEWS_TOPICS_PER_WEEK = _int("NEWS_TOPICS_PER_WEEK", 6)
 
@@ -1954,6 +1995,27 @@ LI_NO_DM_DAYS = _int("LI_NO_DM_DAYS", 3)
 
 # R7 — DM sent, no meeting after this many days.
 DM_NO_MEETING_DAYS = _int("DM_NO_MEETING_DAYS", 7)
+# ...and the most CONTACTS one R7 post lists (contacts, not companies): the
+# ones waiting longest, founders first on a tie. The rest are counted in one
+# closing line, "+N more next Monday".
+DM_NO_MEETING_MAX_CONTACTS = _int("DM_NO_MEETING_MAX_CONTACTS", 5)
+
+# R5 / R6 — LOOKING UP A MISSING EMAIL. For a contact in the post whose Email
+# cell is blank the bot runs ONE search ('"<name>" "<company>" email'), has
+# MODEL_LIGHT pick the address out of the result snippets, and keeps it ONLY if
+# that address appears, character for character, in a snippet the search
+# returned. Never a guessed pattern. This is the most lookups one post makes;
+# every answer, found or not, is cached for RESEARCH_CACHE_DAYS.
+EMAIL_LOOKUP_MAX_PER_POST = _int("EMAIL_LOOKUP_MAX_PER_POST", 5)
+
+# MAY THE BOT WRITE A FOUND EMAIL INTO THE SHEET? Off by default. The Email
+# column sits in the restricted identity band (RESTRICTED_COLUMN_RANGES, A:I),
+# which the bot never writes — this is the SINGLE exception, and it is narrow:
+# only the email role, only on an approver's yes to the post that showed the
+# address, only into a cell that is STILL BLANK when the row is re-read, logged
+# in sheet_writes and undoable like any other write. With this false the post
+# still shows what was found; it just does not offer to write it.
+EMAIL_WRITE_ALLOWED = _bool("EMAIL_WRITE_ALLOWED", default=False)
 
 # R8 — MEETING PREP. How many days before the meeting each touch fires, and the
 # IST time the day-of touch goes at. Touches already in the past are SKIPPED, so
@@ -2297,8 +2359,8 @@ LEAVE_FALLBACK_ORDER: list[str] = _str_list("LEAVE_FALLBACK_ORDER", "Vaishnavi,S
 # THE ONE DAILY DIGEST IS RETIRED. Its format — one long message at
 # SALES_DIGEST_TIME, grouped into HOT / DEADLINES / OVERDUE / ESCALATIONS /
 # HYGIENE / five cadence sections, with carry-forward "(3rd day)" markers — is
-# gone. What replaces it is a DRIP: at most DAILY_MESSAGE_CAP short messages a
-# weekday, time-spaced, one per (action type x owner).
+# gone. What replaces it is a DRIP: at most DAILY_MESSAGE_CAP (5) counted short
+# messages a weekday, time-spaced, one per (action type x owner).
 #
 # WHY. The digest was one message a day because six kinds of scattered message
 # got the bot muted. It solved that and created the opposite problem: a wall of
@@ -2428,65 +2490,41 @@ def drip_end_ist() -> tuple[int, int]:
 
     return _digest.parse_time(SALES_DRIP_END, default="18:30")
 
-# HOW MANY PROACTIVE MESSAGES A WEEKDAY, EVER. The volume contract, and a HARD
-# ceiling rather than a target: three short messages a day is what a busy
-# channel absorbs without learning to skim. Anything past it ROLLS TO TOMORROW
-# rather than being dropped — except that a positive reply overrides the roll,
-# because a reply that waits a day is a reply that goes cold.
-DAILY_MESSAGE_CAP = _int("DAILY_MESSAGE_CAP", 3)
-
-# ...AND THE PER-DAY SHAPE, which is what the schedule actually needs. Monday
-# and Tuesday carry more rules than Wednesday, so a single scalar either
-# throttled those two days or let the quiet ones run loose.
+# HOW MANY COUNTED POSTS A WEEKDAY, EVER — FIVE, AND THE SAME FIVE EVERY WEEKDAY.
+# The volume contract, and a HARD ceiling rather than a target. Anything past it
+# ROLLS TO TOMORROW rather than being dropped.
 #
-# "mon:4,tue:4,wed:3,thu:3,fri:3,sun:1" — any day not named here falls back to
-# DAILY_MESSAGE_CAP, and Saturday is absent on purpose: the day is silent and
-# `is_sending_day` refuses it before a cap is ever consulted.
+# WHAT IS NEVER COUNTED (drip.NEVER_COUNTED, and the Global Rules row
+# "daily_cap" in bot_rules.yaml): meeting prep (R8), meeting follow-ups (R9),
+# reminders, urgent (breaking) news, the approvals sweep, answers to questions
+# and the follow-up to a "yes". They are time-critical or they are answers, and
+# a Monday chase must never crowd one out.
 #
-# SUNDAY IS 1 AND THAT IS NOT A TYPO. Sunday sends at most one post, and only
-# for Deliverables Checklist items due on the Monday — see SUNDAY_RULE_IDS.
-DAILY_MESSAGE_CAP_BY_DAY = (
-    os.getenv("DAILY_MESSAGE_CAP_BY_DAY", "") or ""
-).strip() or "mon:4,tue:4,wed:3,thu:3,fri:3,sun:1"
+# ONE FUNCTION COUNTS: `drip.counted_today(already)`. The live sweep, the
+# planner, the test day and the simulation all ask it, so they cannot disagree
+# about whether the day is full. Each sent row carries its own
+# `counts_toward_cap` (drip_sends), written when it is sent.
+#
+# AI NEWS (R1) IS PLANNED FIRST, at NEWS_MAIN_TIME, so it always holds one of
+# the five and the cap can never push it out.
+DAILY_MESSAGE_CAP = _int("DAILY_MESSAGE_CAP", 5)
 
+# HOW MANY POSTS THE SUNDAY EXCEPTION MAY SEND. One, at SALES_DRIP_START, and
+# only for SUNDAY_RULE_IDS. Not a setting: "one weekend message" is the whole
+# agreement, and a knob here would be a way to quietly end the quiet weekend.
+SUNDAY_MAX_POSTS = 1
 
-def _parse_day_caps(spec: str) -> dict:
-    """"mon:4,tue:4" -> {0: 4, 1: 4}, keyed by Python's weekday().
-
-    An unparseable fragment is DROPPED WITH A WARNING NAMING IT rather than
-    raising: a typo here must not take the bot down, and the days that did parse
-    still mean exactly what they say. The named-but-broken day then falls back
-    to DAILY_MESSAGE_CAP, which is the safe direction — a smaller cap, not a
-    bigger one.
-    """
-    names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-    out: dict = {}
-    for part in str(spec or "").split(","):
-        frag = part.strip()
-        if not frag:
-            continue
-        day, _sep, value = frag.partition(":")
-        key = names.get(day.strip().lower()[:3])
-        try:
-            cap = int(str(value).strip())
-        except (TypeError, ValueError):
-            cap = -1
-        if key is None or cap < 0:
-            log.warning(
-                "DAILY_MESSAGE_CAP_BY_DAY: %r is not a day:cap pair like 'mon:4'; that "
-                "fragment is ignored and %s falls back to DAILY_MESSAGE_CAP=%d. The "
-                "other days still apply.", frag, day.strip() or "?", DAILY_MESSAGE_CAP,
-            )
-            continue
-        out[key] = cap
-    return out
-
-
-DAILY_MESSAGE_CAPS: dict = _parse_day_caps(DAILY_MESSAGE_CAP_BY_DAY)
+# DAILY_MESSAGE_CAP_BY_DAY IS RETIRED. It gave Monday and Tuesday four posts and
+# the rest three; the cap is now one number for every weekday, and R8/R9 sit
+# outside it instead of being squeezed into it. Like every retired name it is
+# no longer read at all: a value left in .env is inert (see the RETIRED block
+# at the bottom of .env.example).
 
 
 def message_cap_for(day) -> int:
-    """The cap for ONE day. DAILY_MESSAGE_CAP_BY_DAY first, then the scalar.
+    """The cap for ONE day: DAILY_MESSAGE_CAP on every weekday, SUNDAY_MAX_POSTS
+    on a Sunday. Saturday is refused by `drip.is_sending_day` before any cap is
+    consulted.
 
     A function rather than a lookup at import so it reflects the CURRENT value
     even if something reassigns it at runtime — a snapshot taken at import time
@@ -2496,7 +2534,9 @@ def message_cap_for(day) -> int:
         weekday = day.weekday()
     except AttributeError:
         return max(0, int(DAILY_MESSAGE_CAP))
-    return max(0, int(DAILY_MESSAGE_CAPS.get(weekday, DAILY_MESSAGE_CAP)))
+    if weekday == 6 and DRIP_WEEKDAYS_ONLY:
+        return max(0, min(int(SUNDAY_MAX_POSTS), int(DAILY_MESSAGE_CAP)))
+    return max(0, int(DAILY_MESSAGE_CAP))
 
 # MINUTES BETWEEN PROACTIVE MESSAGES. Three messages in one minute is one long
 # message with extra steps; the spacing is what makes each one land as its own
@@ -3368,23 +3408,13 @@ def validate() -> list[str]:
                 MESSAGE_GAP_MINUTES, MESSAGE_JITTER_MINUTES,
             )
         log.info(
-            "[config] per-day caps: %s (anything unnamed falls back to "
-            "DAILY_MESSAGE_CAP=%d). Saturday is silent; Sunday sends at most one post "
-            "and only for rule(s) %s.",
-            ", ".join(
-                "%s=%d" % (n, DAILY_MESSAGE_CAPS[i])
-                for i, n in enumerate(("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
-                if i in DAILY_MESSAGE_CAPS
-            ) or "(none parsed)",
-            DAILY_MESSAGE_CAP,
+            "[config] daily cap: %d counted post(s) on every weekday; meeting prep, "
+            "meeting follow-ups, reminders, urgent news and answers to questions do "
+            "not count. Saturday is silent; Sunday sends at most %d post and only for "
+            "rule(s) %s.",
+            DAILY_MESSAGE_CAP, SUNDAY_MAX_POSTS,
             ", ".join(SUNDAY_RULE_IDS) or "(none — Sunday is silent too)",
         )
-        if 5 in DAILY_MESSAGE_CAPS and DAILY_MESSAGE_CAPS[5]:
-            log.warning(
-                "DAILY_MESSAGE_CAP_BY_DAY gives Saturday a cap of %d, but Saturday is "
-                "silent and is refused before any cap is consulted. That entry does "
-                "nothing.", DAILY_MESSAGE_CAPS[5],
-            )
         if DRIP_MAX_ITEMS_PER_POST < 1:
             log.warning(
                 "DRIP_MAX_ITEMS_PER_POST=%d — no post could carry an item, so every "
@@ -3402,7 +3432,7 @@ def validate() -> list[str]:
             log.warning(
                 "DAILY_MESSAGE_CAP=%s is above 6. The whole point of the volume contract "
                 "is that a busy channel absorbs a few short messages and starts skimming "
-                "past more. The agreed number is 3.",
+                "past more. The agreed number is 5.",
                 DAILY_MESSAGE_CAP,
             )
         if MESSAGE_GAP_MINUTES - MESSAGE_JITTER_MINUTES < 15:

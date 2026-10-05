@@ -23,7 +23,10 @@ owners is a document, and nobody answers a document.
     is what lets `python drip.py` simulate a whole day offline.
 
 THE VOLUME CONTRACT (plan section 8):
-  - at most DAILY_MESSAGE_CAP (3) proactive messages per weekday;
+  - at most DAILY_MESSAGE_CAP (5) COUNTED posts per weekday — meeting prep,
+    meeting follow-ups, reminders, urgent news and answers do not count
+    (`counted_today` is the one counter);
+  - AI news (R1) is planned first, at NEWS_MAIN_TIME, never held or rolled;
   - the first at about SALES_DRIP_START (10:00 IST);
   - then gaps of MESSAGE_GAP_MINUTES (90) plus or minus MESSAGE_JITTER_MINUTES
     (15), so the spacing never falls below 75 minutes at the default settings;
@@ -407,21 +410,167 @@ def sunday_due_monday(group: dict, *, day: date) -> bool:
     monday = day + timedelta(days=1)
     for member in group.get("actions") or ():
         due = member.get("due_date")
-        if due is not None and due <= monday:
+        if due is not None and due == monday:
             return True
     return False
 
 
 def is_sending_day(day: date) -> bool:
-    """Weekdays only, unless DRIP_WEEKDAYS_ONLY is off.
+    """Weekdays, plus the Sunday exception. Saturday never.
 
     The same instinct as the next-action engine's weekend shift, applied to the
     sending rather than to the due date: a nudge that lands on a Saturday is
     read on Monday anyway, having spent the weekend as an unread badge.
+
+    SUNDAY IS A SENDING DAY ONLY FOR SUNDAY_RULE_IDS. This used to answer False
+    for every Sunday, and the live sweep, the test day and the simulation all
+    asked it BEFORE planning — so the Sunday branch in `plan` could never run
+    and the exception existed only in the comments. True here means "plan the
+    day"; `plan` then lets through one post, at SALES_DRIP_START, for those
+    rules alone, and only when something is due on the Monday. With the list
+    empty a Sunday is as silent as a Saturday.
     """
     if not config.DRIP_WEEKDAYS_ONLY:
         return True
+    if day.weekday() == 6:
+        return bool(sunday_rule_ids())
     return day.weekday() < 5
+
+
+# -- the cap ------------------------------------------------------------------
+
+# WHAT NEVER TAKES ONE OF THE DAY'S COUNTED POSTS, whatever bot_rules.yaml says.
+# Meeting prep and the meeting follow-up are time-critical: the meeting happens
+# whether or not Monday's chases fit. A reminder is something a person asked
+# for at a time they chose.
+#
+# THE REST OF THE "NEVER COUNTED" LIST NEVER REACHES `drip_sends` AT ALL, which
+# is how it stays uncounted: one-off reminders (`bot._fire_due_reminders`),
+# breaking news (`bot._maybe_breaking_news`), the approvals sweep
+# (`bot._sweep_proposals`), a reply to a question (`bot._reply`) and the
+# follow-up to a "yes" all post through `guardrails.send` directly. Nothing
+# that is not a row in `drip_sends` can be counted, because `counted_today` is
+# the only counter and that table is all it reads.
+NEVER_COUNTED = frozenset({
+    nextaction.R_MEETING_PREP, nextaction.R_MEETING_FOLLOWUP,
+    nextaction.SCHEDULED_REMINDER,
+})
+
+# NEW CONTENT EVERY DAY, so the re-ask clock does not apply: Monday's news is
+# not Tuesday's, and "asked recently" is a statement about a question, not about
+# a feed. Held, R1 posted Monday, was silent Tuesday, came back Wednesday as a
+# "re-ask" and was silent again on Thursday.
+#
+# THE TWO MEETING RULES RUN ON THEIR OWN CLOCKS, and the re-ask clock must not
+# sit on top of them. R8's touches are computed for exact dates (5 and 3 days
+# before, and the day itself): held as "asked recently" because a different
+# meeting's touch went out yesterday, a day-of note is simply lost. R9's ladder
+# decides when its next rung is due and what it says; the re-ask clock turned
+# its second rung into "one last nudge, then I'll leave it" with two rungs and
+# an escalation still to come.
+NEVER_HELD = frozenset({
+    nextaction.R_AI_NEWS, nextaction.R_MEETING_PREP, nextaction.R_MEETING_FOLLOWUP,
+})
+
+# PLANNED BEFORE EVERYTHING ELSE, so it always holds one of the day's counted
+# posts and the cap can never push it out. Ranked by band it was last (context),
+# which made it the first thing a busy Monday rolled.
+PLANNED_FIRST = frozenset({nextaction.R_AI_NEWS})
+
+
+def counts(item: dict) -> bool:
+    """Does this group — or this sent row — take one of the day's counted posts?
+
+    Takes either shape: a planned group (`type`, `counts_toward_cap`) or a
+    `drip_sends` row (`action_type`, `counts_toward_cap`). A row from before the
+    column existed carries None, and its rule's own flag answers for it.
+    """
+    kind = str(item.get("type") or item.get("action_type") or "")
+    if kind in NEVER_COUNTED:
+        return False
+    flag = item.get("counts_toward_cap")
+    if flag is None:
+        for rule in rules.safe_load():
+            if rule.trigger == kind:
+                return bool(rule.counts_toward_cap)
+        return True
+    return bool(flag)
+
+
+def counted_today(already) -> int:
+    """HOW MANY OF TODAY'S SENT POSTS COUNT AGAINST THE CAP. The one counter.
+
+    `already` is `db.drip_sent_today(...)`. The live sweep's gate, `plan`, the
+    test day and the simulation all ask this, so they cannot disagree about
+    whether the day is full. It used to be answered three ways: the live gate
+    compared `len(already)` with the scalar cap (so an R8 took a slot from a
+    chase, and a Monday's per-day cap was ignored), `plan` read a
+    `counts_toward_cap` the rows did not carry, and the per-day table was a
+    third opinion.
+    """
+    return sum(1 for row in (already or []) if counts(row))
+
+
+def cap_for(day: date) -> int:
+    """The day's cap on COUNTED posts: DAILY_MESSAGE_CAP on a weekday, one on a
+    Sunday (`config.message_cap_for`)."""
+    return max(0, int(config.message_cap_for(day)))
+
+
+def cap_reached(already, day: date) -> bool:
+    """Is the day full? Posts outside the cap (NEVER_COUNTED) may still go."""
+    return counted_today(already) >= cap_for(day)
+
+
+def pinned_time(group: dict, day: date) -> Optional[datetime]:
+    """The fixed send time of a group that has one, else None.
+
+    R8's day-of touch (MEETING_DAYOF_TIME) and R1's main post (NEWS_MAIN_TIME)
+    are about something happening at a known time, so they sit OUTSIDE the
+    spaced window: they take no window slot and the window cannot roll them.
+    """
+    raw = str(group.get("dayof_time") or "").strip()
+    if not raw:
+        return None
+    try:
+        hh, mm = (int(x) for x in raw.split(":")[:2])
+        return datetime(day.year, day.month, day.day, hh, mm, tzinfo=dl.IST)
+    except (TypeError, ValueError):
+        log.warning(
+            "[drip] the fixed time %r on %s is not HH:MM; it takes an ordinary "
+            "window slot instead.", raw, group.get("rule_id") or group.get("type"),
+        )
+        return None
+
+
+def earliest_send_ist() -> tuple:
+    """(hour, minute) IST of the first moment anything may go out on a day: the
+    start of the window, or a fixed time that falls before it.
+
+    THE LIVE SWEEP'S "IS IT TIME YET" GATE. It used to ask only about
+    SALES_DRIP_START, so with the window opening at 14:00 the meeting-prep
+    day-of touch — fixed at MEETING_DAYOF_TIME, 10:00 — was not even planned
+    until 14:00, while a test day posted it at 10:00. `plan` still decides what
+    is due at any given minute; this only says when to start asking.
+    """
+    best = tuple(config.drip_start_ist())
+    for raw in (config.MEETING_DAYOF_TIME, config.NEWS_MAIN_TIME):
+        try:
+            hh, mm = (int(x) for x in str(raw or "").strip().split(":")[:2])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= hh < 24 and 0 <= mm < 60:
+            best = min(best, (hh, mm))
+    return best
+
+
+def _row_pinned(row: dict) -> bool:
+    """Was this sent row a fixed-time post? Rows from before the column existed
+    carry None; R1's is the only one that can be told from its type."""
+    flag = row.get("pinned")
+    if flag is None:
+        return str(row.get("action_type") or "") in PLANNED_FIRST
+    return bool(flag)
 
 
 # -- the re-ask clock ---------------------------------------------------------
@@ -474,6 +623,19 @@ def stage_for(
 # -- the plan -----------------------------------------------------------------
 
 
+def _sunday_was_the_last_word(group: dict, *, history: dict, today: date) -> bool:
+    """Was this group's most recent post the Sunday exception?
+
+    Nothing but the exception sends on a Sunday (with DRIP_WEEKDAYS_ONLY on),
+    so a last-sent date that is a Sunday can only have been that.
+    """
+    if not config.DRIP_WEEKDAYS_ONLY:
+        return False
+    entry = (history or {}).get(group.get("group_key")) or {}
+    last = dl.parse_date(entry.get("last_sent") or entry.get("last_nudge"))
+    return last is not None and last.weekday() == 6 and last < today
+
+
 def plan(
     actions: list, *, day: Optional[date] = None, history: Optional[dict] = None,
     already_sent: Optional[list] = None, cap: Optional[int] = None,
@@ -481,82 +643,43 @@ def plan(
     """TODAY'S MESSAGES: what to say, to whom, and when. Sends nothing.
 
     Returns:
-        {"messages": [...],   the slots to send, in order, each with send_at
-         "sent": [...],       slots already gone out today (from SQLite)
+        {"messages": [...],   the posts to send, in send order, each with send_at
+         "sent": [...],       posts already gone out today (from SQLite)
          "held": [...],       groups suppressed today, each with a reason
          "rolled": [...],     groups over the cap, rolling to tomorrow
          "groups": [...],     every group, ranked, for the preview
+         "counted": int,      counted posts today, sent and planned
+         "cap": int,          the day's cap on counted posts
          "day": date,
          "is_sending_day": bool}
 
-    `already_sent` is `db.drip_sent_today(...)`. The slots it names are skipped
-    and their groups are not re-planned, which is the restart guard: the plan is
-    recomputed in full on every tick and the sent slots simply fall away.
+    `already_sent` is `db.drip_sent_today(...)`. The groups it names are not
+    re-planned, which is the restart guard: the plan is recomputed in full on
+    every tick and what has been sent simply falls away.
 
-    THE POSITIVE-OVERRIDE EXCEPTION TO THE ROLL. Overflow normally waits for
-    tomorrow. A group in the override band does not: it is ranked first by
-    `group()`, so it takes a slot today by construction, and a group that rolled
-    yesterday and has since become an override leads the queue the next morning
-    rather than waiting behind the same groups again. That is the whole
-    mechanism — no special case, just an ordering that re-evaluates daily.
+    THE SAME FUNCTION PLANS A REAL DAY, A TEST DAY AND A SIMULATION, from the
+    same three inputs — the queue, the history and what has been sent — so the
+    three cannot reach different cap decisions.
     """
     day = day or dl.today_ist()
     history = history or {}
     already = list(already_sent or [])
-    # THE PER-DAY CAP. Monday and Tuesday carry more rules than Wednesday, so a
-    # single scalar either throttled those two days or let the quiet ones run
-    # loose. `cap` still overrides everything, for the dry-run and the tests.
-    limit = max(0, int(config.message_cap_for(day) if cap is None else cap))
+    # THE CAP ON COUNTED POSTS. `cap` overrides it, for the dry run and the tests.
+    limit = max(0, int(cap_for(day) if cap is None else cap))
 
     groups = group(actions)
     result = {
         "messages": [], "sent": already, "held": [], "rolled": [],
         "groups": groups, "day": day, "is_sending_day": is_sending_day(day),
+        "counted": counted_today(already), "cap": limit,
     }
 
-    # SATURDAY IS SILENT, FULL STOP. Sunday carries ONE post and only for the
-    # rules in SUNDAY_RULE_IDS whose items are due on the Monday.
-    if not result["is_sending_day"]:
-        if day.weekday() == 6:
-            eligible = [
-                g for g in groups
-                if sunday_allows(g) and sunday_due_monday(g, day=day)
-            ]
-            for g in groups:
-                if g not in eligible:
-                    why = (
-                        HELD_WEEKEND + " (Sunday sends only "
-                        + ", ".join(sorted(sunday_rule_ids()) or ["nothing"])
-                        + ", and only for items due Monday)"
-                    )
-                    result["held"].append({**g, "why": why})
-            if eligible:
-                # The cap is 1 by default and is enforced the same way every
-                # other day's is — through `message_cap_for` — so a team that
-                # wants two Sunday posts changes a setting, not this branch.
-                limit = config.message_cap_for(day)
-                times = slot_times(day, count=max(1, limit))
-                for i, g in enumerate(eligible[:limit]):
-                    result["messages"].append({
-                        **g, "slot": i + 1, "stage": STAGE_NUDGE,
-                        "send_at": times[i],
-                        "why": "Sunday exception: a Deliverables item is due tomorrow",
-                    })
-                for g in eligible[limit:]:
-                    result["rolled"].append({**g, "why": HELD_CAP + " (Sunday's cap)"})
-                log.info(
-                    "[drip] %s is a Sunday — %d post(s) for %s, everything else waits "
-                    "for Monday.", dl.iso(day), len(result["messages"]),
-                    ", ".join(sorted(sunday_rule_ids())),
-                )
-                result["is_sending_day"] = True
-                return result
-            log.info(
-                "[drip] %s is a Sunday with nothing due Monday — silent. %d group(s) "
-                "wait.", dl.iso(day), len(groups),
-            )
-            return result
+    sent_group_keys = {str(r.get("group_key")) for r in already}
+    used_slots = {int(r.get("slot") or 0) for r in already}
+    next_slot = (max(used_slots) + 1) if used_slots else 1
 
+    # SATURDAY IS SILENT, FULL STOP — and so is a Sunday with no SUNDAY_RULE_IDS.
+    if not result["is_sending_day"]:
         for g in groups:
             result["held"].append({**g, "why": HELD_WEEKEND})
         log.info(
@@ -565,43 +688,82 @@ def plan(
         )
         return result
 
-    sent_group_keys = {str(r.get("group_key")) for r in already}
-    used_slots = {int(r.get("slot") or 0) for r in already}
-    next_slot = (max(used_slots) + 1) if used_slots else 1
+    # SUNDAY CARRIES ONE POST, at SALES_DRIP_START, and only for the rules in
+    # SUNDAY_RULE_IDS with something due on the Monday.
+    if config.DRIP_WEEKDAYS_ONLY and day.weekday() == 6:
+        eligible = [
+            g for g in groups
+            if sunday_allows(g) and sunday_due_monday(g, day=day)
+        ]
+        only = (
+            HELD_WEEKEND + " (Sunday sends only "
+            + ", ".join(sorted(sunday_rule_ids()) or ["nothing"])
+            + ", and only for items due Monday)"
+        )
+        for g in groups:
+            if g not in eligible:
+                result["held"].append({**g, "why": only})
+        # WHAT HAS ALREADY GONE COUNTS, which is the restart guard here too: the
+        # live sweep re-plans on every tick, and without this a Sunday post
+        # would have been planned again fifteen minutes after it was sent.
+        room = max(0, limit - len(already))
+        start = slot_times(day, count=1)[0]
+        for g in eligible:
+            if g["group_key"] in sent_group_keys:
+                continue
+            if room <= 0:
+                result["rolled"].append({
+                    **g, "stage": STAGE_NUDGE, "rolled_why": "cap",
+                    "why": HELD_CAP + " (Sunday carries one post)",
+                })
+                continue
+            result["messages"].append({
+                **g, "slot": next_slot, "stage": STAGE_NUDGE,
+                "stage_why": "Sunday exception: a Deliverables item is due tomorrow",
+                "why": "Sunday exception: a Deliverables item is due tomorrow",
+                "counts_toward_cap": True, "pinned": False,
+                "send_at": start, "send_at_hhmm": start.strftime("%H:%M"),
+            })
+            next_slot += 1
+            room -= 1
+            result["counted"] += 1
+        log.info(
+            "[drip] %s is a Sunday — %d already sent, %d post(s) planned for %s, %d "
+            "group(s) wait for Monday. NOTHING HAS BEEN SENT BY THIS MODULE.",
+            dl.iso(day), len(already), len(result["messages"]),
+            ", ".join(sorted(sunday_rule_ids())), len(result["held"]),
+        )
+        return result
 
-    # ENOUGH SLOT TIMES FOR EVERY POST, not just the capped ones. R8 and R9 sit
-    # OUTSIDE the cap, so a day can legitimately carry more posts than `limit`
-    # — and each of those still needs a spaced, deterministic send time.
+    # ---- PASS 1: WHO GOES TODAY --------------------------------------------
+    # THE CAP COUNTS ONLY THE GROUPS THAT COUNT (`counts`), and it starts from
+    # what today's sent rows say about themselves (`counted_today`).
     #
-    # THE WINDOW MAY ALLOW FEWER THAN THE CAP DOES. `fitted_gap` says how many
-    # posts fit between SALES_DRIP_START and SALES_DRIP_END once the gap has
-    # shrunk as far as it may; anything past that rolls, exactly as a group over
-    # the cap does, and for the same reason — a message that would land at
-    # 21:13 is not read that night and is resented in the morning.
-    wanted = max(limit, len(groups)) + len(already) + 1
-    times = slot_times(day, count=wanted)
-    _gap, window_fits = fitted_gap(wanted)
-    window_left = max(0, int(window_fits) - len(already))
-
-    # THE CAP COUNTS ONLY THE GROUPS THAT COUNT. A meeting-prep post and a
-    # meeting-follow-up post are time-critical: the meeting is happening whether
-    # or not Monday's chases fit, and letting a Monday chase crowd one out is
-    # the opposite of what the cap is for. Their rules declare
-    # `counts_toward_cap: false` in bot_rules.yaml and this is where that means
-    # something.
-    counted = sum(
-        1 for r in already
-        if bool(r.get("counts_toward_cap", True))
+    # AI NEWS IS DECIDED FIRST, so it holds one of the counted posts before any
+    # chase can take it. Everything else keeps its rank order.
+    counted = result["counted"]
+    order = sorted(
+        range(len(groups)),
+        key=lambda i: (0 if groups[i]["type"] in PLANNED_FIRST else 1, i),
     )
-
-    for g in groups:
+    chosen: list = []
+    for rank in order:
+        g = groups[rank]
         if g["group_key"] in sent_group_keys:
             continue                       # already said today; not said twice
-        stage, why = stage_for(g["group_key"], history=history, today=day)
+        if g["type"] in NEVER_HELD:
+            stage, why = STAGE_NUDGE, "new content every day — never held, never a re-ask"
+        else:
+            stage, why = stage_for(g["group_key"], history=history, today=day)
+            if stage is None and _sunday_was_the_last_word(g, history=history, today=day):
+                # SUNDAY'S HEADS-UP IS NOT MONDAY'S POST. Without this the one
+                # Sunday message would hold the week's checklist back as
+                # "asked recently" — the exception silencing the rule.
+                stage, why = STAGE_NUDGE, "Sunday's heads-up does not replace today's post"
         if stage is None:
             result["held"].append({**g, "why": why})
             continue
-        against_cap = bool(g.get("counts_toward_cap", True))
+        against_cap = counts(g)
         if against_cap and counted >= limit:
             result["rolled"].append({
                 **g, "stage": stage, "rolled_why": "cap",
@@ -612,70 +774,103 @@ def plan(
                 ),
             })
             continue
+        if against_cap:
+            counted += 1
+        chosen.append({
+            "group": g, "rank": rank, "stage": stage, "why": why,
+            "against_cap": against_cap, "at": pinned_time(g, day),
+        })
 
-        # THE WINDOW ROLLS TOO, and it rolls EVERYTHING — a group outside the
-        # daily cap is still a message that would land after SALES_DRIP_END, and
-        # "this one does not count against the cap" was never a licence to post
-        # it at nine at night.
-        #
-        # A ROLLED GROUP GOES FIRST NEXT TIME. `rolled_why` marks it and
-        # `rolled_first` sorts on it, because a thing that already waited a day
-        # should not queue behind a thing that has not waited at all.
-        if window_left <= 0:
+    # ---- PASS 2: WHEN ------------------------------------------------------
+    # THE WINDOW HOLDS THE SPACED POSTS ONLY. A fixed-time post (R1 at
+    # NEWS_MAIN_TIME, R8's day-of touch at MEETING_DAYOF_TIME) takes no window
+    # slot, so it neither shifts the others nor can be rolled by the window.
+    #
+    # THE WINDOW MAY ALLOW FEWER THAN THE CAP DOES. `fitted_gap` says how many
+    # posts fit between SALES_DRIP_START and SALES_DRIP_END once the gap has
+    # shrunk as far as it may; anything past that rolls, exactly as a group over
+    # the cap does — a message that would land at 21:13 is not read that night
+    # and is resented in the morning. It rolls a group OUTSIDE the cap too:
+    # "this one does not count" was never a licence to post at nine at night.
+    #
+    # A WINDOW SLOT IS INDEXED BY HOW MANY SPACED POSTS HAVE GONE, not by the
+    # slot number — so a fixed-time post going out in the middle of the day does
+    # not push every later post one gap further on.
+    spaced_sent = sum(1 for r in already if not _row_pinned(r))
+    spaced = [c for c in chosen if c["at"] is None]
+    wanted = max(1, spaced_sent + len(spaced))
+    times = slot_times(day, count=wanted)
+    _gap, window_fits = fitted_gap(wanted)
+    room = max(0, int(window_fits) - spaced_sent)
+    going: list = []
+    position = 0
+    for c in chosen:
+        if c["at"] is not None:
+            going.append(c)
+            continue
+        if position >= room:
+            # A ROLLED GROUP GOES FIRST NEXT TIME. `rolled_why` marks it and
+            # `rolled_first` sorts on it, because a thing that already waited a
+            # day should not queue behind a thing that has not waited at all.
             result["rolled"].append({
-                **g, "stage": stage, "rolled_why": "window", "rolled_first": True,
+                **c["group"], "stage": c["stage"], "rolled_why": "window",
+                "rolled_first": True,
                 "why": (
                     f"it would land after {config.SALES_DRIP_END}, so it goes first "
                     "on the next applicable day"
                 ),
             })
+            if c["against_cap"]:
+                counted -= 1
+            position += 1
             continue
-        # THE FIXED-TIME SLOTS. R8's day-of touch fires at MEETING_DAYOF_TIME
-        # (10:00), before the window opens, because it is about something
-        # happening today and the window is about not interrupting anybody's
-        # evening — a different problem. R1's main news post rides the same
-        # field, pinned to NEWS_MAIN_TIME (14:00).
-        send_at = times[next_slot - 1]
-        if g.get("dayof_time"):
-            try:
-                hh, mm = (int(x) for x in str(g["dayof_time"]).split(":")[:2])
-                send_at = datetime(day.year, day.month, day.day, hh, mm, tzinfo=dl.IST)
-            except (TypeError, ValueError):
-                log.warning(
-                    "[drip] MEETING_DAYOF_TIME=%r is not HH:MM; the day-of touch takes "
-                    "its ordinary window slot instead.", g["dayof_time"],
-                )
+        c["at"] = times[spaced_sent + position]
+        c["spaced"] = True
+        position += 1
+        going.append(c)
+
+    # ---- PASS 3: THE ORDER THEY GO IN --------------------------------------
+    # BY SEND TIME, and at the same minute the fixed-time post leads. Both the
+    # live sweep ("the first message that is due") and the test day ("each
+    # message in turn") walk this list from the front, so one order here is
+    # what makes the two days the same day.
+    going.sort(key=lambda c: (
+        c["at"], 0 if c["group"]["type"] in PLANNED_FIRST else 1, c["rank"],
+    ))
+    for c in going:
+        send_at = c["at"]
         result["messages"].append({
-            **g,
+            **c["group"],
             "slot": next_slot,
-            "stage": stage,
-            "stage_why": why,
-            "counts_toward_cap": against_cap,
+            "stage": c["stage"],
+            "stage_why": c["why"],
+            "counts_toward_cap": c["against_cap"],
+            "pinned": not c.get("spaced", False),
             "send_at": send_at,
             "send_at_hhmm": send_at.strftime("%H:%M"),
         })
         next_slot += 1
-        window_left -= 1
-        if against_cap:
-            counted += 1
+    result["counted"] = counted
 
     log.info(
-        "[drip] %s: %d group(s) from %d action(s) -> %d already sent, %d planned "
-        "(%d against the cap, %d outside it), %d held, %d rolling to tomorrow "
-        "(cap %d for %s). NOTHING HAS BEEN SENT BY THIS MODULE — it computes only.",
+        "[drip] %s: %d group(s) from %d action(s) -> %d already sent (%d counted), "
+        "%d planned (%d against the cap, %d outside it), %d held, %d rolling to "
+        "tomorrow (cap %d counted post(s), %d used). NOTHING HAS BEEN SENT BY THIS "
+        "MODULE — it computes only.",
         dl.iso(day), len(groups), len(actions or []), len(already),
-        len(result["messages"]),
-        sum(1 for m in result["messages"] if m.get("counts_toward_cap", True)),
-        sum(1 for m in result["messages"] if not m.get("counts_toward_cap", True)),
-        len(result["held"]), len(result["rolled"]), limit, day.strftime("%A"),
+        counted_today(already), len(result["messages"]),
+        sum(1 for m in result["messages"] if m["counts_toward_cap"]),
+        sum(1 for m in result["messages"] if not m["counts_toward_cap"]),
+        len(result["held"]), len(result["rolled"]), limit, counted,
     )
     for m in result["messages"]:
         log.info(
-            "[drip]   slot %d at %s  %-4s %s x %s  (%d item(s)%s, %s)",
-            m["slot"], m.get("send_at_hhmm") or m["send_at"].strftime("%H:%M"),
+            "[drip]   slot %d at %s  %-4s %s x %s  (%d item(s)%s%s, %s)",
+            m["slot"], m["send_at_hhmm"],
             m.get("rule_id", ""), m["type"],
             m["owner"] or "(unassigned)", m.get("count", len(m["companies"])),
-            "" if m.get("counts_toward_cap", True) else ", OUTSIDE the cap",
+            "" if m["counts_toward_cap"] else ", OUTSIDE the cap",
+            ", fixed time" if m["pinned"] else "",
             m["stage"],
         )
     return result
@@ -839,16 +1034,21 @@ REMINDER_LINES = (
 )
 
 
-def reminder_line(who: str, what: str, company: str = "") -> str:
+def reminder_line(who: str, what: str, company: str = "", *,
+                  was_due: str = "") -> str:
     """One of REMINDER_LINES — the wording closest to how the team opens a
     message (`voice.choose`; at random when there is no voice profile) — with
-    the company in brackets if any."""
+    the company in brackets if any, and "(this was due <date>)" on the end when
+    its date had already passed by the time it could be sent."""
     import voice
 
     body = voice.choose(REMINDER_LINES, slot="reminder").format(
         who=str(who or "").strip(), what=str(what or "").strip())
     company = str(company or "").strip()
-    return f"{body} ({company})" if company else body
+    if company:
+        body = f"{body} ({company})"
+    was_due = str(was_due or "").strip()
+    return f"{body} (this was due {was_due})" if was_due else body
 
 
 def _voice(message: dict, slot: str, variants) -> str:
@@ -962,10 +1162,15 @@ def with_heading(body: str, head: str) -> str:
 
 
 # TYPES POSTED EXACTLY AS RENDERED, never composed by the model: the news
-# (one story per bullet, nothing else) and the deliverables (title and due
-# date, two lines an item). A composer asked to keep a multi-line list intact is a composer
-# that will sometimes not.
-VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES})
+# (one story per bullet, nothing else), the deliverables (title, team, due
+# date and link, several lines an item), and the two posts that END ON AN
+# OFFER a "yes" answers — the events ("remind you again?") and the PoCs to
+# contact ("add the email I found?") — whose wording therefore cannot be left
+# to a composer. A composer asked to keep a multi-line list intact is a
+# composer that will sometimes not. See `is_verbatim`, which also covers a
+# rule's own notice.
+VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
+                            nextaction.R_EVENTS, nextaction.R_PROSPECTS})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1194,17 +1399,26 @@ def _plural(n: int, word: str) -> str:
 
 def render_deliverables(items: list, *, today: Optional[date] = None,
                         limit: int = 20, opener: str = "") -> list:
-    """R4's lines: a count, then each P1 deliverable as EXACTLY TWO LINES.
+    """R4's lines: a count, then each P1 deliverable as its own short block.
 
         2 open:
         1. Pulse Product Overview Document
+           Team: Sales
            Due: Thu 2 Oct · 3 days overdue
+           [Doc](<https://docs.google.com/…>)
         2. MSA template
+           Team: Legal
            Due: Wed 7 Oct
 
-    THE TITLE AND THE DUE DATE, AND NOTHING ELSE. No team, no remarks, no
-    link — whatever the item dict carries. "· N days overdue" only when past
-    due. The week is in the heading (`HEADINGS["R4"]`), not here.
+    THE TITLE, THE TEAM, THE DUE DATE, AND THE LINK IF THE ROW HAS ONE. The
+    team is the Functional Dependency cell, or DELIVERABLE_DEFAULT_OWNER when
+    that is blank. "· N days overdue" only when past due. No remarks. The week
+    is in the heading (`HEADINGS["R4"]`), not here.
+
+    NO REPEATS. The same Action Item appears once — the checklist sometimes
+    carries one deliverable on two rows, and two lines for one thing reads as
+    two things. And each link appears once in the whole message: three items
+    pointing at one tracker get the link under the first of them only.
 
     P1 ONLY. The selection is `nextaction._r_deliverables`; an item that says
     it is not P1 (`is_p1` False) is dropped here as well, so no caller can put
@@ -1217,25 +1431,255 @@ def render_deliverables(items: list, *, today: Optional[date] = None,
     posted verbatim (VERBATIM_TYPES), so what this returns is what is sent.
     """
     today = today or dl.today_ist()
-    rows = sorted(
+    ordered = sorted(
         (a for a in (items or [])
          if (a.get("item") or a.get("deliverable")) and a.get("is_p1") is not False),
         key=lambda a: (str(a.get("deadline") or "9999"),
                        str(a.get("item") or a.get("deliverable") or "").lower()),
     )
+    rows: list = []
+    titles: set = set()
+    for a in ordered:
+        title = " ".join(str(a.get("item") or a.get("deliverable")).split())
+        if title.lower() in titles:
+            continue                       # the same Action Item, on another row
+        titles.add(title.lower())
+        rows.append((title, a))
     lines = [(opener or DELIVERABLES_OPENERS[0]).format(n=len(rows))]
     pad = "   "
-    for i, a in enumerate(rows[:max(1, int(limit))], 1):
-        name = " ".join(str(a.get("item") or a.get("deliverable")).split())
+    links_shown: set = set()
+    for i, (name, a) in enumerate(rows[:max(1, int(limit))], 1):
         due = f"Due: {a.get('deadline_pretty') or a.get('deadline') or 'not set'}"
         days = a.get("days_left")
         if isinstance(days, int) and days < 0:
             due += f" · {_plural(-days, 'day')} overdue"
+        team = " ".join(str(a.get("team") or a.get("owner") or "").split()) \
+            or config.DELIVERABLE_DEFAULT_OWNER
         lines.append(f"{i}. {name}")
+        lines.append(f"{pad}Team: {team}")
         lines.append(pad + due)
+        url = str(a.get("link") or "").strip().strip("<>")
+        if url.lower().startswith(("http://", "https://")) and url not in links_shown:
+            links_shown.add(url)
+            lines.append(f"{pad}[Doc](<{url}>)")
     if len(rows) > limit:
         lines.append(f"(+{len(rows) - limit} more due this week — ask and I'll list them)")
     return lines
+
+
+# -- R7: DM sent, no meeting — contacts, longest wait first -------------------
+
+DM_NO_MEETING_OPENERS = (
+    "DM sent, no meeting booked yet — {n}:",
+    "Still waiting on a meeting with {n}:",
+    "No meeting yet after the DM — {n}:",
+)
+DM_NO_MEETING_CLOSES = (
+    "Chase any of these again, or leave them? Tell me which.",
+    "If any of these has moved, say so and I'll take it off.",
+    "Worth another nudge on any of them? Say skip to leave one.",
+)
+NOTE_MAX_CHARS = 110
+
+
+def _rank_of(action: dict) -> int:
+    """An item's role rank; unranked sorts last. (0 is the BEST rank — founder
+    — so this cannot be written `rank or 10_000`.)"""
+    rank = action.get("role_rank")
+    return 10_000 if rank is None else int(rank)
+
+
+def dm_no_meeting_order(actions: list) -> list:
+    """R7's contacts in the order they are listed: LONGEST SINCE THE DM FIRST;
+    on a tie the more senior role (PROSPECT_ROLE_ORDER — founder first), then
+    sheet order. One contact once."""
+    seen: set = set()
+    rows: list = []
+    for a in actions or []:
+        key = a.get("contact_key") or (a.get("company"), a.get("poc"))
+        if key in seen or not (a.get("poc") or a.get("company")):
+            continue
+        seen.add(key)
+        rows.append(a)
+    return sorted(rows, key=lambda a: (-int(a.get("days_since_dm") or 0),
+                                       _rank_of(a),
+                                       int(a.get("sheet_row") or 0)))
+
+
+def render_dm_no_meeting(actions: list, *, limit: Optional[int] = None) -> tuple:
+    """(lines, extra, total) for R7.
+
+        1. Ada Lovelace — Acme AI — DM sent 21 days ago — waiting on their legal
+        2. Bo Chen — Borealis — DM sent 14 days ago — no note logged
+        (+2 more next Monday)
+
+    AT MOST DM_NO_MEETING_MAX_CONTACTS **CONTACTS**. It used to be capped by
+    COMPANY — five companies, however many people at each — and listed the
+    company and one name, with no days and no note: the two things somebody
+    needs to decide whether to chase.
+    """
+    cap = max(1, int(config.DM_NO_MEETING_MAX_CONTACTS if limit is None else limit))
+    rows = dm_no_meeting_order(actions)
+    lines: list = []
+    for i, a in enumerate(rows[:cap], 1):
+        days = int(a.get("days_since_dm") or 0)
+        note = " ".join(str(a.get("last_note") or "").split())
+        if len(note) > NOTE_MAX_CHARS:
+            note = note[:NOTE_MAX_CHARS - 1].rstrip() + "…"
+        who = str(a.get("poc") or "").strip() or "(no name on the row)"
+        lines.append(f"{i}. {who} — {str(a.get('company') or '').strip()} — DM sent "
+                     f"{_plural(days, 'day')} ago — {note or 'no note logged'}")
+    extra = [f"(+{len(rows) - cap} more next Monday)"] if len(rows) > cap else []
+    return lines, extra, len(rows)
+
+
+# -- R5: PoCs to contact — one line a contact, with the email -----------------
+
+PROSPECT_OPENERS = (
+    "No first contact yet with these {n}:",
+    "{n} to reach out to — no first contact recorded:",
+    "Next up for a first contact — {n}:",
+)
+EMAIL_OFFER = "Want me to add the email{s} I found to the sheet? Say yes."
+
+
+def render_prospects(actions: list, *, limit: int = 5) -> tuple:
+    """(lines, extra, found) for R5 — `found` is the emails the lookup verified.
+
+        1. Ada Lovelace (CTO) — Acme AI — email found: ada@acme.ai ([acme.ai](<…>))
+        2. Bo Chen (Founder) — Borealis — no public email found
+        3. Cy Diaz — Cinder — I've listed them 3 times with nothing changed. Skip them?
+
+    THE EMAIL HALF IS SAID ONLY WHEN IT WAS LOOKED UP. A contact with an email
+    on file, or one past EMAIL_LOOKUP_MAX_PER_POST, has nothing after the
+    company. An address is here only because it appeared, character for
+    character, in a snippet the search returned (`websearch.verified_emails`).
+    """
+    cap = max(1, int(limit))
+    rows = prospect_order(actions)
+    lines: list = []
+    found: list = []
+    for i, a in enumerate(rows[:cap], 1):
+        who = str(a.get("poc") or "").strip() or "(no name on the row)"
+        role = str(a.get("poc_designation") or "").strip()
+        line = f"{i}. {who}" + (f" ({role})" if role else "") \
+            + f" — {str(a.get('company') or '').strip()}"
+        if a.get("ask_to_skip"):
+            line += (f" — I've listed them {int(a.get('repeat_count') or 0)} times "
+                     "with nothing changed. Skip them?")
+        elif a.get("email_found"):
+            src = str(a.get("email_source") or "").strip()
+            line += f" — email found: {a['email_found']}" + (
+                f" ({link('', src)})" if src else "")
+            found.append(a)
+        elif a.get("email_checked"):
+            line += " — no public email found"
+        lines.append(line)
+    extra = [f"(+{len(rows) - cap} more next time)"] if len(rows) > cap else []
+    return lines, extra, found
+
+
+# -- R3: AI events — what is close enough to mention --------------------------
+
+EVENT_OPENERS = (
+    "Coming up in the next two weeks:",
+    "On the events calendar for the next two weeks:",
+    "Events in the next two weeks:",
+)
+EVENTS_OFFER = "Want me to remind you again {when}?"
+
+
+def event_lines(message: dict) -> list:
+    """R3's line items — everything but the research carrier — soonest first."""
+    rows = [a for a in (message.get("actions") or [])
+            if a.get("event_line") and a.get("event_kind") != nextaction.EVENT_CARRIER]
+    return sorted(rows, key=lambda a: (str(a.get("event_deadline") or a.get("event_date")
+                                           or "9999"), str(a.get("company") or "").lower()))
+
+
+def render_events(message: dict, *, limit: int = 5) -> tuple:
+    """(lines, extra, offer) for R3.
+
+        • You're registered for Voice AI Forum on Sat 10 Oct [voiceaiforum.com](<…>)
+        • Register for Data Summit by Fri 2 Oct (event on Tue 6 Oct)
+        Want me to remind you again on Monday?
+
+    The wording of each line is the rule's (`nextaction._r_events`); this adds
+    the row's link and the offer. `offer` is "" when there is nothing to remind
+    anybody about.
+    """
+    cap = max(1, int(limit))
+    rows = event_lines(message)
+    lines: list = []
+    for a in rows[:cap]:
+        url = str(a.get("event_link") or "").strip().strip("<>")
+        tail = f" {link('', url)}" if url.lower().startswith(("http://", "https://")) else ""
+        lines.append(f"• {a['event_line']}{tail}")
+    extra = [f"(+{len(rows) - cap} more — ask and I'll list them)"] if len(rows) > cap else []
+    word = next((str(a.get("remind_word") or "") for a in rows), "")
+    return lines, extra, (EVENTS_OFFER.format(when=word) if rows and word else "")
+
+
+def prospect_order(actions: list) -> list:
+    """R5's contacts in the order they are listed: company by company, and
+    within a company the more senior role first (PROSPECT_ROLE_ORDER — founder
+    first), then sheet order. One contact once."""
+    seen: set = set()
+    rows: list = []
+    for a in actions or []:
+        key = a.get("contact_key") or (a.get("company"), a.get("poc"))
+        if key in seen or not (a.get("poc") or a.get("company")):
+            continue
+        seen.add(key)
+        rows.append(a)
+    first_row: dict = {}
+    for a in rows:
+        company = str(a.get("company") or "").lower()
+        first_row[company] = min(first_row.get(company, 10 ** 9),
+                                 int(a.get("sheet_row") or 0))
+    return sorted(rows, key=lambda a: (first_row[str(a.get("company") or "").lower()],
+                                       str(a.get("company") or "").lower(),
+                                       _rank_of(a),
+                                       int(a.get("sheet_row") or 0)))
+
+
+def shown_contacts(message: dict) -> list:
+    """The contacts a post actually NAMES, in the order it names them — what
+    the email lookup, the email offer and R5's repeat counter all work from."""
+    kind = message.get("type")
+    actions = list(message.get("actions") or [])
+    cap = int(message.get("max_items_per_post") or 0) or len(actions)
+    if kind == nextaction.R_PROSPECTS:
+        return prospect_order(actions)[:cap]
+    if kind == nextaction.R_DM_NO_MEETING:
+        return dm_no_meeting_order(actions)[:max(1, int(config.DM_NO_MEETING_MAX_CONTACTS))]
+    return actions[:cap]
+
+
+def notice_of(message: dict) -> str:
+    """A rule's own ready-made sentence, when that is the whole message (R10's
+    "the columns are empty"). "" otherwise."""
+    for action in message.get("actions") or []:
+        text = str(action.get("notice") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def is_verbatim(message: dict) -> bool:
+    """Is this message posted exactly as rendered, never composed by the model?
+    The VERBATIM_TYPES, and any message that is a rule's notice."""
+    return message.get("type") in VERBATIM_TYPES or bool(notice_of(message))
+
+
+def nothing_to_say(message: dict) -> bool:
+    """Would this message be empty? Only R3 can be: its carrier item is there
+    every Wednesday for the research layer, and in a week with no event close
+    enough to mention and nothing new found, there is nothing to post. The
+    sender then spends the slot silently rather than posting a heading."""
+    if message.get("type") != nextaction.R_EVENTS:
+        return False
+    return not event_lines(message) and not research_of(message)
 
 
 def render_closure(items: list) -> list:
@@ -1259,9 +1703,10 @@ def render_closure(items: list) -> list:
 def points_of(message: dict) -> Optional[dict]:
     """{"header", "lines", "close"} when this message goes out as points, else None.
 
-    R4 always; R10 with two or more deals; any other rule with three or more
-    companies (the structure rule's "more than two facts"). `lines` are the
-    numbered lines only — what the post-check requires verbatim.
+    R4, R7, R5 and R3 always (each has its own line format); R10 with two or
+    more deals; any other rule with three or more companies (the structure
+    rule's "more than two facts"). `lines` are the list lines only — what the
+    post-check requires verbatim.
     """
     kind = message.get("type")
     actions = list(message.get("actions") or [])
@@ -1273,7 +1718,7 @@ def points_of(message: dict) -> Optional[dict]:
         # NO OPEN P1, NO MESSAGE: only the count line came back.
         if len(rendered) < 2:
             return None
-        # TWO LINES AN ITEM, so every line is kept, in order. R4 is posted
+        # SEVERAL LINES AN ITEM, so every line is kept, in order. R4 is posted
         # verbatim (VERBATIM_TYPES) and never recomposed.
         return {"header": rendered[0], "lines": rendered[1:], "extra": [],
                 "close": _voice(message, "r4_close", DELIVERABLES_CLOSES)}
@@ -1290,7 +1735,33 @@ def points_of(message: dict) -> Optional[dict]:
         return {"header": opener, "lines": lines, "extra": [],
                 "close": _voice(message, "r11_close", NEW_COMPANY_CLOSES),
                 "opener_in_block": True}
+    if kind == nextaction.R_DM_NO_MEETING:
+        lines, extra, total = render_dm_no_meeting(actions)
+        if not lines:
+            return None
+        return {"header": _voice(message, "r7_opener", DM_NO_MEETING_OPENERS).format(
+                    n=total),
+                "lines": lines, "extra": extra,
+                "close": _voice(message, "r7_close", DM_NO_MEETING_CLOSES)}
+    if kind == nextaction.R_PROSPECTS:
+        lines, extra, found = render_prospects(actions, limit=cap)
+        if not lines:
+            return None
+        offer = (EMAIL_OFFER.format(s="" if len(found) == 1 else "s")
+                 if found and config.EMAIL_WRITE_ALLOWED else "")
+        return {"header": _voice(message, "r5_opener", PROSPECT_OPENERS).format(
+                    n=len(lines)),
+                "lines": lines, "extra": extra,
+                "close": offer or _voice(message, "list_close", GENERIC_CLOSES)}
+    if kind == nextaction.R_EVENTS:
+        lines, extra, offer = render_events(message, limit=cap)
+        if not lines:
+            return None
+        return {"header": _voice(message, "r3_opener", EVENT_OPENERS),
+                "lines": lines, "extra": extra, "close": offer}
     if kind == nextaction.R_CLOSURE_SUPPORT:
+        if notice_of(message):
+            return None                    # the notice IS the message
         lines = render_closure(actions)
         if len(lines) < 2:
             return None
@@ -1392,14 +1863,35 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
     # their links, which is exactly what a template would be trying to produce.
     research = research_of(message)
 
+    # A RULE'S OWN NOTICE IS THE WHOLE MESSAGE (R10: "the columns are empty").
+    notice = notice_of(message)
+    if notice:
+        return notice
+
     # POINTS: the deterministic list, with its opener and its close. Research
     # (R10's news) rides underneath rather than replacing the list.
-    if message.get("type") in VERBATIM_TYPES:
+    if is_verbatim(message):
         who = ""
     points = points_of(message)
+    if points and message.get("type") == nextaction.R_EVENTS:
+        # R3 ENDS ON ITS OFFER. Whatever the research found (events the tab
+        # lacks, missing deadlines) goes between the list and the question, so
+        # the last thing the reader sees is the thing a "yes" answers.
+        parts = [points_block(points)]
+        if research:
+            parts.append(research)
+        note = note_of(message)
+        if note:
+            parts.append(f"({note})")
+        if points.get("close"):
+            parts.append(points["close"])
+        return "\n".join(parts).strip()
+    if message.get("type") == nextaction.R_EVENTS and research:
+        return research                    # nothing listed; only what was found
     if points:
         lead = "" if points.get("opener_in_block") else who
-        body = (lead + points_block(points) + "\n" + points["close"]).strip()
+        body = (lead + points_block(points)
+                + ("\n" + points["close"] if points.get("close") else "")).strip()
         if research:
             body += "\n\n" + research
         note = note_of(message)
@@ -1537,7 +2029,8 @@ def preview_text(planned: dict) -> str:
     day = planned.get("day")
     lines = [
         f"**Drip plan — {day.strftime('%a %d %b %Y') if day else 'today'}**",
-        f"_cap {config.DAILY_MESSAGE_CAP} message(s), first at {config.SALES_DRIP_START}, "
+        f"_cap {planned.get('cap', config.DAILY_MESSAGE_CAP)} counted post(s), "
+        f"first at {config.SALES_DRIP_START}, "
         f"gaps of {config.MESSAGE_GAP_MINUTES}±{config.MESSAGE_JITTER_MINUTES} min. "
         f"Nothing has been sent._",
         "",
@@ -1596,7 +2089,11 @@ def contract_report(planned: dict) -> dict:
     believed.
     """
     messages = planned.get("messages") or []
-    times = [m["send_at"] for m in messages]
+    # THE SPACING IS A PROMISE ABOUT THE SPACED POSTS. A fixed-time post (R1,
+    # R8's day-of touch) lands when it lands and is not part of the gap.
+    times = [m["send_at"] for m in messages if not m.get("pinned")]
+    counted = int(planned.get("counted", len(messages)))
+    cap = int(planned.get("cap", config.DAILY_MESSAGE_CAP))
     gaps = [
         int((b - a).total_seconds() // 60) for a, b in zip(times, times[1:])
     ]
@@ -1607,8 +2104,9 @@ def contract_report(planned: dict) -> dict:
                    if len({owner_key(a) for a in m["actions"]}) > 1]
     return {
         "messages": len(messages),
-        "cap": config.DAILY_MESSAGE_CAP,
-        "within_cap": len(messages) <= config.DAILY_MESSAGE_CAP,
+        "counted": counted,
+        "cap": cap,
+        "within_cap": counted <= cap,
         "gaps_minutes": gaps,
         "min_gap_minutes": min(gaps) if gaps else None,
         "gap_floor_minutes": floor,
@@ -1679,10 +2177,16 @@ def _self_test() -> int:
           sorted(groups[0]["companies"]), ["Acme", "Borealis"])
 
     print("\nthe plan")
-    planned = plan(seeded, day=today)
+    # A CAP OF 2 COUNTED POSTS, passed in so the test does not depend on .env.
+    planned = plan(seeded, day=today, cap=2)
     report = contract_report(planned)
-    check("at most 3 messages", report["within_cap"], True)
-    check("exactly 3 messages today", report["messages"], 3)
+    check("at most 2 counted posts", report["within_cap"], True)
+    check("exactly 2 counted", report["counted"], 2)
+    check("3 messages today: the 2 counted and the meeting prep outside the cap",
+          report["messages"], 3)
+    check("meeting prep is outside the cap whatever its item says",
+          [m["counts_toward_cap"] for m in planned["messages"]
+           if m["type"] == nextaction.R_MEETING_PREP], [False])
     check("gaps at or above the floor", report["spacing_ok"], True)
     check("the floor is MESSAGE_GAP_MIN_MINUTES on a compressed day",
           min_gap_minutes(), config.MESSAGE_GAP_MIN_MINUTES)
@@ -1713,20 +2217,56 @@ def _self_test() -> int:
           f"{report['gap_floor_minutes']})")
 
     print("\ndeterminism (the restart guard)")
-    again = plan(seeded, day=today)
+    again = plan(seeded, day=today, cap=2)
     check("the same day plans identically",
           [m["send_at_hhmm"] for m in again["messages"]],
           [m["send_at_hhmm"] for m in planned["messages"]])
-    resumed = plan(seeded, day=today, already_sent=[
-        {"slot": 1, "group_key": planned["messages"][0]["group_key"],
-         "action_type": planned["messages"][0]["type"], "owner_label": "Vaishnavi",
-         "companies": "Acme, Borealis", "sent_at": "2026-09-09T10:00"},
-    ])
+    first_sent = {"slot": 1, "group_key": planned["messages"][0]["group_key"],
+                  "action_type": planned["messages"][0]["type"],
+                  "owner_label": "Vaishnavi", "companies": "Acme, Borealis",
+                  "counts_toward_cap": 0, "pinned": 0,
+                  "sent_at": "2026-09-09T10:00"}
+    resumed = plan(seeded, day=today, cap=2, already_sent=[first_sent])
     check("a restart resumes at slot 2",
           [m["slot"] for m in resumed["messages"]], [2, 3])
     check("...and does not re-send slot 1's group",
           planned["messages"][0]["group_key"]
           not in [m["group_key"] for m in resumed["messages"]], True)
+
+    check("...and keeps the same times for the posts still to go",
+          [m["send_at_hhmm"] for m in resumed["messages"]],
+          [m["send_at_hhmm"] for m in planned["messages"][1:]])
+
+    print("\nthe one counter")
+    check("a sent meeting prep is not counted", counted_today([first_sent]), 0)
+    check("a sent chase is counted",
+          counted_today([{"action_type": nextaction.R_DM_NO_MEETING,
+                          "counts_toward_cap": 1}]), 1)
+    check("a meeting follow-up is never counted, even if its row says 1",
+          counted_today([{"action_type": nextaction.R_MEETING_FOLLOWUP,
+                          "counts_toward_cap": 1}]), 0)
+    check("the day is full at the cap and not before",
+          (cap_reached([{"action_type": "x", "counts_toward_cap": 1}] * 4, today),
+           cap_reached([{"action_type": "x", "counts_toward_cap": 1}]
+                       * cap_for(today), today)),
+          (cap_for(today) <= 4, True))
+
+    print("\nAI news is planned first, never held, never rolled")
+    news_item = action("", "", nextaction.R_AI_NEWS, "", nextaction.P_CONTEXT,
+                       today, 0, "R1")
+    news_item["dayof_time"] = "14:00"
+    news_key = group([news_item])[0]["group_key"]
+    with_news = plan(seeded + [news_item], day=today, cap=2,
+                     history={news_key: {"last_nudge": dl.iso(today - timedelta(days=1)),
+                                         "last_sent": dl.iso(today - timedelta(days=1))}})
+    got_news = [m for m in with_news["messages"] if m["type"] == nextaction.R_AI_NEWS]
+    check("posted yesterday, still posts today", len(got_news), 1)
+    check("...as a fresh post, not a re-ask",
+          [m["stage"] for m in got_news], [STAGE_NUDGE])
+    check("...at its own time, outside the spaced window",
+          [(m["send_at_hhmm"], m["pinned"]) for m in got_news], [("14:00", True)])
+    check("it holds one of the 2 counted posts; two chases roll instead of one",
+          (with_news["counted"], len(with_news["rolled"])), (2, 2))
 
     print("\nempty queue means silence")
     check("no messages", len(plan([], day=today)["messages"]), 0)
@@ -1735,6 +2275,34 @@ def _self_test() -> int:
     sat = plan(seeded, day=date(2026, 9, 12))
     check("Saturday sends nothing", len(sat["messages"]), 0)
     check("...and holds every group for Monday", len(sat["held"]), 4)
+    sunday = date(2026, 9, 13)
+    check("Saturday is not a sending day; Sunday is, for SUNDAY_RULE_IDS",
+          (is_sending_day(date(2026, 9, 12)), is_sending_day(sunday)),
+          (False, bool(sunday_rule_ids())))
+    due_monday = action("MSA template", "", nextaction.R_DELIVERABLES, "Legal",
+                        nextaction.P_CHASE, date(2026, 9, 14), 0, "R4")
+    due_thursday = action("Q1 plan", "", nextaction.R_DELIVERABLES, "Sales",
+                          nextaction.P_CHASE, date(2026, 9, 17), 0, "R4")
+    if "R4" in sunday_rule_ids():
+        sun = plan(seeded + [due_monday], day=sunday)
+        check("a Sunday with a deliverable due Monday sends one post",
+              [m["type"] for m in sun["messages"]], [nextaction.R_DELIVERABLES])
+        check("...at the start of the window",
+              sun["messages"][0]["send_at_hhmm"],
+              slot_times(sunday, count=1)[0].strftime("%H:%M"))
+        check("...and everything else waits for Monday", len(sun["held"]), 4)
+        check("a Sunday with nothing due Monday is silent",
+              len(plan(seeded + [due_thursday], day=sunday)["messages"]), 0)
+        again_sun = plan(seeded + [due_monday], day=sunday, already_sent=[
+            {"slot": 1, "group_key": sun["messages"][0]["group_key"],
+             "action_type": nextaction.R_DELIVERABLES, "counts_toward_cap": 1}])
+        check("once it has gone, the next tick plans nothing more",
+              len(again_sun["messages"]), 0)
+        mon = plan([due_monday], day=date(2026, 9, 14), history={
+            sun["messages"][0]["group_key"]: {"last_nudge": "2026-09-13",
+                                              "last_sent": "2026-09-13"}})
+        check("Sunday's heads-up does not hold Monday's checklist back",
+              len(mon["messages"]), 1)
 
     print("\nthe re-ask clock")
     key = groups[0]["group_key"]

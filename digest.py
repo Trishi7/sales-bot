@@ -17,7 +17,7 @@ scattered through the day got the bot muted — and it solved it. Then it create
 the opposite one. A wall of sections reads like a report: it gets skimmed, and
 it asks a person to find their own name in it and work out which three of forty
 lines are theirs. The drip keeps the volume contract that made the digest worth
-having and spends it differently: at most three short messages a weekday, one
+having and spends it differently: at most five counted short messages a weekday, one
 per (action type x owner), each with a single subject and a single owner. A
 message with one ask is answerable. A document is not.
 

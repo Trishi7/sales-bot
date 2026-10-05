@@ -186,11 +186,10 @@ def assert_layouts(bodies, label):
               for l in lines))
     check(f"{label}: no overdue note when not past due",
           any(re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3}", l) for l in lines))
-    check(f"{label}: no team, no link, no remarks",
-          [x for x in ("Team:", "docs.google.com", "waiting on the lawyer")
-           if x in deliv], [])
-    check(f"{label}: two lines an item — one indented line under each title",
-          len([l for l in lines if l.startswith("   ")]), 2)
+    check(f"{label}: no remarks", "waiting on the lawyer" in deliv, False)
+    check(f"{label}: a Team line and a Due line under each title (S3)",
+          (len([l for l in lines if l.startswith("   Team: ")]),
+           len([l for l in lines if l.startswith("   Due: ")])), (2, 2))
     check(f"{label}: the plain close",
           lines[-1] == drip.DELIVERABLES_CLOSE)
     r6 = next((b for h, b in by_head.items() if h == "**LinkedIn connected, no DM yet**"), "")
