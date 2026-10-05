@@ -6,7 +6,8 @@ question about today's AI news read the full contract of the mapping sheet
 three times over to answer it. Two changes, both here:
 
     select()   hands the engine the tools the question's own words call for —
-               news/web gets web_search, fetch_page and strategy_doc; a sheet
+               news gets todays_news (the news already collected) beside
+               web_search and fetch_page; web gets those two and strategy_doc; a sheet
                question gets the sheet and mapping tools; notes get the notes
                tools; reminders the reminder tools. Usually under ten. THE FULL
                SET IS SENT ONLY WHEN THE QUESTION IS UNCLEAR — nothing matched,
@@ -144,6 +145,10 @@ ONE_LINE = {
         "Find named people (PoCs) at a company, optionally in one team, from "
         "search results, each with the page that names them; never guesses a "
         "name, title or email."),
+    "todays_news": (
+        "The AI news already collected — what was posted today and what else "
+        "is worth knowing, most important first — optionally for one company, "
+        "person or subject; call it FIRST for any news question."),
     "web_search": (
         "Search the web and get back up to 8 titles and snippets with their "
         "urls — for news, funding, launches and anything about the outside "
@@ -156,6 +161,8 @@ ONE_LINE = {
 # THE GROUPS. Small on purpose; a tool may sit in several.
 GROUPS = {
     "web": ("web_search", "fetch_page", "strategy_doc"),
+    # A NEWS QUESTION READS THE COLLECTED NEWS FIRST; the web is the fallback.
+    "news": ("todays_news", "web_search", "fetch_page"),
     "people": ("find_people", "lookup_company", "who_to_pitch",
                "cross_check_outreach"),
     "sheet": ("lookup_company", "query_tracker", "prospect_priority",
@@ -182,6 +189,9 @@ _ROUTES = (
         r"launch\w*|hiring|conference\w*|summit\w*|papers?|published|web|online|"
         r"google|search|look\s+(it\s+)?up|what'?s\s+new|in\s+the\s+news|"
         r"industry|market|competitors?)\b", _I)),
+    ("news", re.compile(
+        r"\b(news|headlines?|what'?s\s+(new|happening)|in\s+the\s+news|latest)\b",
+        _I)),
     ("people", re.compile(
         r"\b(find|get|look\s+for)\b.{0,40}\b(pocs?|people|contacts?|someone)\b|"
         r"who\s+should\s+(we|i)\s+(contact|reach|talk\s+to)|\bpeople\s+(at|in)\b|"
@@ -293,9 +303,14 @@ def _self_test() -> int:
 
     print("routing")
     got, groups = names("what's the latest AI news today?")
-    check("news -> the web group", groups, ["web"])
-    check("...web_search, fetch_page, strategy_doc",
-          sorted(got), ["fetch_page", "strategy_doc", "web_search"])
+    check("news -> the web and news groups", groups, ["web", "news"])
+    check("...todays_news with web_search, fetch_page, strategy_doc",
+          sorted(got), ["fetch_page", "strategy_doc", "todays_news", "web_search"])
+    got, groups = names("any headlines?")
+    check("headlines -> news alone", groups, ["news"])
+    got, groups = names("did Acme raise funding?")
+    check("a web question that is not news -> no todays_news",
+          (groups, "todays_news" in got), (["web"], False))
     got, groups = names("where are we with Acme?")
     check("a sheet question -> sheet", groups, ["sheet"])
     check("...under ten tools", len(got) < 10, True)

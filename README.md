@@ -30,6 +30,21 @@ champions"), searches the sales channels' history, reads the meeting notes, and
 triangulates across all of them — citing the tab and the company, and saying
 plainly when a cell is empty.
 
+**News questions read the collected news first.** "What's in today's AI news?",
+"any headlines?", "anything on ElevenLabs this week?" are routed to the `news`
+tool group (`toolsets.py`), whose first tool is `todays_news`: a read of the
+same feed store the 14:00 post is built from, through R1's own code — the same
+poll, the same window (since the previous main post; `days` for longer), the
+same not-yet-posted check and the same scorer. It returns what was already
+posted today, then what else is worth a 3 or more, at most 12 stories, and the
+answer is written like the daily post. It costs a SQLite read plus at most one
+`MODEL_LIGHT` scoring call, and only when something in the window is unscored —
+those scores are written back, so the 14:00 sweep does not pay for them again.
+`web_search` is the fallback: only when the store has nothing on a company or
+topic the asker named, or they ask for more or older news. Answers never
+mention searches, quotas, budgets or tools unless asked. `python
+verify_news_question.py` checks all of it offline.
+
 **Reads one canonical tab: "Outreach PoCs".** Everything the bot says on its own
 initiative comes from that tab of the GTM Playbook, found **by name**
 (`GTM_POCS_TAB_TITLES`) with its columns discovered dynamically. A row is
