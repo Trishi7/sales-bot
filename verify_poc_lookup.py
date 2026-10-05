@@ -25,6 +25,11 @@ os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_TEST_MODE = True
 config.SALES_TEST_CHANNEL_ID = 4242
@@ -43,6 +48,11 @@ import nextaction  # noqa: E402
 import rules as rules_mod  # noqa: E402
 import websearch  # noqa: E402
 from bot import SalesBot  # noqa: E402
+
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
 
 failures = 0
 POSTED: list = []

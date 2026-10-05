@@ -39,6 +39,11 @@ os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_TEST_MODE = True         # the pretend clock refuses without it
 config.SALES_TEST_CHANNEL_ID = 4242
@@ -70,6 +75,11 @@ import websearch  # noqa: E402
 from bot import SalesBot  # noqa: E402
 
 websearch.enabled = lambda: True
+
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
 
 failures = 0
 POSTED: list = []
@@ -278,7 +288,14 @@ async def main():
     POSTED.clear()
     await bot._handle_test_command(FakeMessage(), "make it Monday")
     FakeChannel.on_send = None
-    run1 = list(POSTED)
+    # THE ONE LINE THAT IS NOT A MESSAGE: the day, and the real date the
+    # day name was counted from.
+    confirm = [b for b in POSTED if "the real date is" in b]
+    show("the confirmation", confirm)
+    check("the day is confirmed once, naming the real date", len(confirm), 1)
+    check("...and Monday is the REAL week's Monday",
+          monday, simulation.this_week_day(0, from_day=dl.real_today_ist()))
+    run1 = [b for b in POSTED if "the real date is" not in b]
     show("the channel", run1)
     check("every post starts with [TEST]", all(b.startswith(PREFIX + " ") for b in run1))
     check("no narration, clock line or footer",
@@ -323,7 +340,7 @@ async def main():
     before_search = dict(SEARCHES)
     POSTED.clear()
     await bot._handle_test_command(FakeMessage(), "make it Monday")
-    run2 = list(POSTED)
+    run2 = [b for b in POSTED if "the real date is" not in b]
     show("the channel", run2)
     second_cost = cost_line(mk)
     print("   log:", second_cost)
@@ -369,7 +386,8 @@ async def main():
     config.SALES_TEST_MODE = True
     POSTED.clear()
     await bot._handle_test_command(FakeMessage(), "make it Wednesday")
-    quiet = [b for b in POSTED if "eval suite" not in b.lower()]
+    quiet = [b for b in POSTED if "eval suite" not in b.lower()
+             and "the real date is" not in b]
     show("the channel", POSTED)
     check("the quiet day posted nothing of its own", quiet, [])
     POSTED.clear()

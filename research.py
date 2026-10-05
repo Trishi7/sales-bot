@@ -152,16 +152,33 @@ def fetch(url: str) -> dict:
     if not is_allowed(url):
         return {"ok": False, "url": url, "text": "",
                 "error": f"{domain_of(url) or 'that domain'} is not allowed"}
+    raw = fetch_raw(url)
+    if not raw["ok"]:
+        return {"ok": False, "url": url, "text": "", "error": raw["error"]}
+    return {"ok": True, "url": url, "text": _readable(raw["html"]), "error": ""}
+
+
+def fetch_raw(url: str, *, agent: str = "research-brief") -> dict:
+    """THE SOCKET, and nothing else. Returns {"ok", "url", "html", "error"}.
+
+    NO ALLOW-LIST HERE — this is the shared reader, and each caller owns its own
+    rule about WHICH urls it may be pointed at: `fetch` (above) checks
+    RESEARCH_ALLOWED_DOMAINS first, and `search_backend.fetch_page` checks its
+    block-list. Nothing else may call this.
+
+    Bounded by RESEARCH_FETCH_TIMEOUT_SECONDS and RESEARCH_FETCH_MAX_BYTES.
+    Never raises.
+    """
     try:
         import requests
     except ImportError:
-        return {"ok": False, "url": url, "text": "",
+        return {"ok": False, "url": url, "html": "",
                 "error": "the HTTP client is not installed (pip install requests)"}
     try:
         resp = requests.get(
             url,
             timeout=max(1, int(config.RESEARCH_FETCH_TIMEOUT_SECONDS)),
-            headers={"User-Agent": f"{config.COS_NAME}/research-brief"},
+            headers={"User-Agent": f"{config.COS_NAME}/{agent}"},
             stream=True,
         )
         resp.raise_for_status()
@@ -170,14 +187,17 @@ def fetch(url: str) -> dict:
         )
     except Exception as e:
         log.info("[research] could not fetch %s: %s", url, e)
-        return {"ok": False, "url": url, "text": "",
+        return {"ok": False, "url": url, "html": "",
                 "error": f"{type(e).__name__} fetching that page"}
 
-    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-    return {"ok": True, "url": url, "text": _readable(text), "error": ""}
+    html = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    # WHERE IT ENDED UP, after any redirects — so a caller with a block-list
+    # can refuse a page it was redirected to.
+    return {"ok": True, "url": url, "html": html, "error": "",
+            "final_url": str(getattr(resp, "url", "") or url)}
 
 
-def _readable(html: str) -> str:
+def _readable(html: str, cap: int = 8000) -> str:
     """Tags stripped, whitespace squeezed. Not a parser — enough for a model.
 
     Deliberately crude: an arXiv abstract page is mostly text, and a real HTML
@@ -188,7 +208,7 @@ def _readable(html: str) -> str:
     body = re.sub(r"(?s)<[^>]+>", " ", body)
     body = body.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<")
     body = body.replace("&gt;", ">").replace("&#39;", "'").replace("&quot;", '"')
-    return " ".join(body.split())[:8000]
+    return " ".join(body.split())[:max(0, int(cap))]
 
 
 def linkedin_status() -> dict:

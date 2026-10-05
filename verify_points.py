@@ -47,6 +47,10 @@ import drip  # noqa: E402
 import llm as llm_mod  # noqa: E402
 import nextaction  # noqa: E402
 import rules as rules_mod  # noqa: E402
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
 
 failures = 0
 LOG: list = []
@@ -201,10 +205,15 @@ async def main():
     fm.reply = "Kushal — Acme, Globex and Initech still need a first contact. No rush."
     text, used = await engine.proactive_message(
         prompt="x", fallback="TEMPLATE", facts=drip.fact_count(prose_msg))
-    rejected = [l for l in LOG if "rejected the composed message" in l]
-    print("   log: " + (rejected[0][:170] if rejected else "(nothing logged)"))
-    check("prose with 3 facts and no points also falls back, logged as structure",
-          (text, bool(rejected) and "(structure:" in rejected[0]), ("TEMPLATE", True))
+    # A SOFT FAILURE NOW: one retry with the complaint, and only then the template.
+    soft = [l for l in LOG if "soft failure (structure:" in l]
+    again = [l for l in LOG if "the retry failed too (structure:" in l]
+    for l in soft + again:
+        print("   log: " + l[:170])
+    check("prose with 3 facts and no points gets ONE retry, logged as structure",
+          (len(soft), "retry 1 of 1" in (soft or [""])[0]), (1, True))
+    check("...and falls back to the template when the retry does it again",
+          (text, used, len(again)), ("TEMPLATE", False, 1))
 
     # ------------------------------------------------------------------ (iv)
     print("\n(iv) R10 — CLOSURE SUPPORT AS POINTS")

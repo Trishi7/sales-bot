@@ -43,6 +43,11 @@ os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_TEST_MODE = True
 config.WEB_SEARCH_ENABLED = True
@@ -55,6 +60,11 @@ import news  # noqa: E402
 import nextaction  # noqa: E402
 from bot import SalesBot  # noqa: E402
 from db import DB  # noqa: E402
+
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
 
 failures = 0
 CALLS = []
@@ -132,7 +142,8 @@ def install_fakes(bot, *, reply_for):
     real = bot.llm
 
     class RecordingLLM:
-        async def web_research(self, *, rule, prompt, max_uses=0, lean=False):
+        async def web_research(self, *, rule, prompt, max_uses=0, lean=False,
+                           **_snippet_path):
             CALLS.append({"rule": rule, "prompt": prompt, "lean": lean})
             if LIVE:
                 return await real.web_research(
@@ -218,7 +229,9 @@ async def scenario_main(bot, today):
     print("   " + "\n   ".join(r2["text"].splitlines()))
 
     print("\n5. the budget moved")
-    marker = dl.iso(today)
+    # THE LEDGER IS BANKED AGAINST THE REAL DAY, whatever date the run is
+    # pretending: a search is real money on the day it is made.
+    marker = dl.iso(dl.real_today_ist())
     spent = bot.db.web_searches_today(marker)
     check("the budget counter moved", spent >= 2)
     print(f"   {spent} search(es) banked; "
@@ -304,29 +317,33 @@ async def scenario_degrade(bot, today):
     config.WEB_SEARCH_ENABLED = False
     items = [item(nextaction.R_AI_NEWS, "R1")]
     # A FRESH DAY: `today`'s news is already in the research cache from
-    # scenario 1, and a cache hit rightly needs no search at all.
-    await bot._news_run(items, today=today + timedelta(days=4))
+    # scenario 1, and a cache hit rightly needs no search at all. A PAST one —
+    # a date after the real today is never researched at all ("No news yet").
+    await bot._news_run(items, today=today - timedelta(days=4))
     check("search off is said plainly",
           "WEB_SEARCH_ENABLED is off" in items[0]["research_note"])
     check("...and the item keeps its place in the queue",
           items[0]["web_pending"])
     config.WEB_SEARCH_ENABLED = True
 
-    marker = dl.iso(today + timedelta(days=5))
+    # THE BUDGET IS THE REAL DAY'S, whatever date the run pretends.
+    marker = dl.iso(dl.real_today_ist())
     bot.db.record_web_search(on_date=marker, rule_id="drain",
                              searches=config.WEB_SEARCH_DAILY_BUDGET, errors=0)
     items = [item(nextaction.R_AI_NEWS, "R1")]
-    await bot._news_run(items, today=today + timedelta(days=5))
+    await bot._news_run(items, today=today - timedelta(days=5))
     check("a spent budget is said plainly",
           "budget is spent" in items[0]["research_note"])
     print(f"   note: {items[0]['research_note']}")
+    with bot.db.conn() as c:
+        c.execute("DELETE FROM web_search_usage WHERE rule_id = 'drain'")
 
     def fails(rule, prompt):
         return ""
 
     install_fakes(bot, reply_for=fails)
     items = [item(nextaction.R_AI_NEWS, "R1")]
-    await bot._news_run(items, today=today + timedelta(days=6))
+    await bot._news_run(items, today=today - timedelta(days=6))
     check("a failed call invents nothing",
           "STORY" not in items[0].get("text", ""))
     check("...and says something", bool(items[0].get("research_note")))

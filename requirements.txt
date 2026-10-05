@@ -8,6 +8,16 @@ httpx>=0.27.0
 # Loads .env in config.py.
 python-dotenv>=1.0.0
 
+# --- search and news, fetched outside the model ------------------------------
+# search_backend.py calls the search API (Serper, Brave) and reads pages with
+# plain HTTP; feeds.py reads RSS. Neither involves a model. `requests` was
+# already imported by research.py's fetcher and is now named here because two
+# more modules depend on it.
+requests>=2.31.0
+# RSS/Atom parsing for feeds.poll(). Without it no feed can be read and R1 has
+# no news to score — the poll says so at ERROR rather than failing quietly.
+feedparser>=6.0.10
+
 # --- GTM Playbook, via the Google Sheets API ---------------------------------
 # The sheet is read LIVE through the API with a service account (gtm_sheet.py) —
 # it is never exported, downloaded, or synced to disk. rclone is used ONLY for

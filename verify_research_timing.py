@@ -42,6 +42,11 @@ os.environ["SALES_DIGEST_ENABLED"] = "true"
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_TEST_MODE = True
 config.SALES_TEST_CHANNEL_ID = 4242
@@ -150,7 +155,8 @@ class StubLLM:
     """One billed search per call, and a `[websearch]` line like the real one."""
     wlog = logging.getLogger("llm")
 
-    async def web_research(self, *, rule, prompt, max_uses=0, lean=False):
+    async def web_research(self, *, rule, prompt, max_uses=0, lean=False,
+                           **_snippet_path):
         self.wlog.info("[websearch] %s: 1 search(es) billed (stub)", rule)
         if rule == "R1":
             text = ("STORY | RLHF | Wispr Flow raises $30m | a Series B "

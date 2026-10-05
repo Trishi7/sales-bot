@@ -365,10 +365,13 @@ which way it went (`[sheetwrite] prefilter msg=… RUN the extractor — hint wo
 `QUERY_TOOL_RESULT_KEEP_CHARS` (600) once older than the two most recent
 iterations, marked "(truncated — already read)".
 
-**"@Saley what did you cost this week"** (or "token usage", "how many searches
-today") is answered from the ledgers with no model call: web searches today and
-over 7 days, model tokens per calling method today and over 7 days (input,
-cache reads, cache writes, output), and p50/p90 answer seconds per route.
+**"@Saley what did you cost today"** / **"…this week"** (or "token usage", "how
+many searches today") is answered from the ledgers with no model call, **in
+dollars**: per model and per site from `llm_calls`, search requests from
+`web_search_usage`, then what is left of today's request budget and token
+budget, and p50/p90 answer seconds per route. See "Search and news — fetched
+outside the model" for the prices and for the model tiering, the token budget
+and the tool routing that replaced most of what this section used to cost.
 
 **One thing the prompt cannot shrink.** An hourly news check's own prompt is
 ~1,040 tokens, but the `web_search_20260318` tool definition adds ~4,475 of its
@@ -2905,12 +2908,159 @@ saying *"we'll book something"* is not evidence that a meeting exists now.
 The check runs **immediately before the send**, not at plan time: the queue is
 planned hours ahead, and evidence has to be as fresh as the message.
 
-### Web search
+### Search and news — fetched outside the model
 
-The bot can search the web through **Anthropic's server-side web search tool**,
-declared on the Messages API call. Anthropic runs the search; nothing in this bot
-opens a socket to a search engine.
+**Why.** Anthropic's server-side web search puts ~28k tokens of page text into
+the context per search and re-reads it on every internal iteration: one hourly
+news check cost about $0.21, a four-search question about $0.25, and
+`WEB_SEARCH_DAILY_BUDGET=200` let a day reach $17. The fix is architectural
+rather than a tighter cap: **fetch cheaply outside the model, hand Claude only
+titles and snippets (hundreds of tokens, not tens of thousands), and use Haiku
+for the extraction.** No rule changes what it does — only what it costs.
 
+**Three layers, and the first two contain no LLM at all.**
+
+| Layer | File | What it does |
+|---|---|---|
+| Retrieval | `search_backend.py` | `search(query, n=, news=, site=, days=)` → `[{title, url, snippet, date, source}]`, and `fetch_page(url)` → `{ok, title, text}` |
+| Feeds | `feeds.py` | `poll()` reads RSS into `news_feed_items` — zero API calls |
+| Extraction | `llm.web_research` | same signature and return shape as before; MODEL_LIGHT answers from a SNIPPETS block |
+
+**`search_backend.search`.** The backend is `SEARCH_BACKEND`: `serper` (the
+default — `POST /search` and `/news` with `SERPER_API_KEY`; `site` becomes a
+`site:` prefix and `days` a `tbs=qdr:` filter), `brave`, or `anthropic`. Brave
+is the **automatic fallback** when Serper answers 429 or 5xx and
+`BRAVE_API_KEY` is set. One retry on a timeout; it **never raises** — it
+returns `[]` and logs, and `search_backend.last_error()` says whether that was
+"found nothing" or "could not run". Every request is banked in the existing
+`web_search_usage` ledger against `SEARCH_DAILY_BUDGET` (150 requests, on the
+**real** IST day whatever date a test is pretending), and every result set is
+cached in SQLite (`search_cache`, `SEARCH_CACHE_HOURS`, default 6) so a
+repeated query inside a test day costs nothing. One log line per request:
+
+```
+[search] query='site:linkedin.com/in "Shunya Labs"' backend=serper n=10 cached=no
+```
+
+**`search_backend.fetch_page`.** Uses `research.py`'s fetcher (its timeout and
+byte ceiling), cut to `FETCH_PAGE_MAX_CHARS` (6000), behind the same
+digest/host block-list the news uses (`NEWS_BLOCKED_DOMAINS`, digest and
+newsletter pages). **LinkedIn is never fetched**, a redirect to a refused page
+is refused, and a non-public address (localhost, a private IP, `file:`) is
+refused — a url can come from a model. `focus=("registration", …)` returns the
+passages around those words instead of the top of the page.
+
+**`feeds.poll`.** Reads `NEWS_RSS_FEEDS` (TechCrunch AI, The Verge AI, Ars
+Technica AI, VentureBeat, MIT Technology Review AI) plus one Google News RSS
+query per entry in `NEWS_TOPICS`
+(`news.google.com/rss/search?q=<topic>&hl=en-IN&gl=IN&ceid=IN:en`), with
+`feedparser`. New items go into `news_feed_items` (`url_key`, `headline_key`,
+`title`, `summary` ≤ 300 chars, `source`, `published_at`, `topic_hint`,
+`seen_at`), deduplicated with the same `news.url_key` / `news.headline_key`
+helpers the posted stories use — the outlets' own feeds are read first, so
+their link wins over Google's redirect for the same story. It runs every
+`NEWS_FEED_POLL_MINUTES` (15) from `_sweep_loop`.
+
+**`llm.web_research` kept its signature and changed its insides.** With
+`SEARCH_BACKEND` ≠ `anthropic` it runs the one or two queries the caller
+composes (`max_uses` now caps requests), builds a SNIPPETS block — at most 10
+items of at most 300 characters, each numbered with its url — and calls
+`MODEL_LIGHT` with the caller's prompt plus *"Answer ONLY from the snippets
+above; cite the snippet's url; NOTHING FOUND if they do not contain it."* It
+returns the same dict (`ok, text, sources, searches, errors, note`), with
+`sources` taken from the snippets the answer **actually cited**
+(`websearch.cited_sources`). `news.py` and `events_discovery.py` keep their
+STORY / SCREEN / EVENT / DEADLINE parsers untouched. When a search returns
+nothing at all there is no model call: the result is `NOTHING FOUND`.
+
+**The rules, re-based — same behaviour, new sources.**
+
+| Rule | Where the facts come from now |
+|---|---|
+| **R1 main (14:00)** | **No search at all.** `news_feed_items` from the last 24 h not yet posted; MODEL_LIGHT scores importance 1-5 and assigns a topic in one call (titles + summaries only, ~3k tokens); `news.choose` applies the caps; `news.render` stays deterministic. Sonnet is not called for the news post |
+| **R1 hourly checks** | `feeds.poll()`, then MODEL_LIGHT scores **only** items published since the last check that nobody has scored. Nothing new → **no model call at all**. The grouped breaking message posts at ≥ `NEWS_BREAKING_MIN_IMPORTANCE` exactly as before |
+| **R2** | MODEL_LIGHT, from the stored titles and summaries of today's posted stories. A search (`n=5`) only for a company the stories name but do not describe — the model writes `LOOKUP \| <company>` instead of guessing |
+| **R3 discovery** | `fetch_page` on each url in `EVENTS_CALENDAR_URLS` (default empty) plus `search("AI conference <month> <year> India OR global", n=10)` for this month and next; MODEL_LIGHT returns EVENT lines |
+| **R3 deadlines** | `fetch_page(row link)` first, read around the registration words; `search('"<event>" registration deadline', n=5)` second, only for what the page did not answer |
+| **R6 email** | `search('"<name>" "<company>" email contact', n=8)` → MODEL_LIGHT extracts an address **with its url**, else "no public email found". **Never guessed, and checked:** an address that is not in a snippet character for character is dropped (`websearch.verified_emails`) |
+| **R8 / R10** | `search(company, news=True, days=7, n=8)` → snippets → the existing brief format via MODEL_LIGHT; Sonnet composes the message as before |
+| **R11 yes, `find_people`** | `search('site:linkedin.com/in "<company>" <department>', n=10)` — the result title already reads "Name - Title - Company" — plus `fetch_page` on the company's own team/about page when a second search finds one. MODEL_LIGHT extracts name, title, url, source; `parse_people` still drops anyone the results do not name. LinkedIn itself is never fetched |
+| **Channel questions** | The server-side tool is replaced by two **client** tools: `web_search(query)` → up to 8 snippets, at most `WEB_QUESTION_MAX_SEARCHES` (2) per question, and `fetch_page(url)`. The engine (Sonnet) reasons over the snippets |
+
+**Model tiering.** `MODEL` (Sonnet) is for what speaks or reasons:
+`proactive_message`, `social_reply`, `capability_reply`, the engine, and the
+composing half of a research brief. `MODEL_LIGHT` (Haiku, default
+`claude-haiku-4-5`) is for what routes or extracts: `parse_query`,
+`detect_commitment`, `classify_leave`, `extract_sheet_update`, the news scorer,
+every snippet-extraction call above, and the research brief's extraction step
+(`llm.research_digest`, which reduces the fetched pages to sourced facts before
+Sonnet writes). The token log records the model per call:
+
+```
+[tokens] site=score_news:main model=claude-haiku-4-5 in=2913 cache_r=0 cache_w=0 out=412 t=3.1s
+```
+
+**Cost control.**
+
+- **`TOKEN_DAILY_BUDGET`** (1,500,000 input tokens, cache reads at 10%) is read
+  from `llm_calls` before every call. Over budget: research skips with the
+  honest note ("web research unavailable today — the daily token budget is
+  spent"), the hourly checks skip silently, and the engine answers **without
+  web tools and says so**. Nothing a person asked for goes unanswered. The log
+  WARNs at 50% and 80%.
+- **Future dates cost nothing.** No research and no feed scoring for a date
+  after the **real** today; the news slot renders "No news yet — Mon 5 Oct
+  hasn't happened."
+- **A non-result is never cached.** `research_cache_put` runs only for research
+  that came back with at least one source. Per-row research (R6, R8, R10) is
+  keyed on the item with a `RESEARCH_CACHE_DAYS` (7) TTL, not on the date.
+- **The engine is sent only the tools a question needs** (`toolsets.py`):
+  news/web → `web_search`, `fetch_page`, `strategy_doc`; sheet → the sheet and
+  mapping tools; notes → the notes tools; reminders → the reminder tools; the
+  full set only when the question is unclear. Usually under ten tools, each
+  with a one-sentence description, and the engine prompt's notes / mapping /
+  channel sections ride only with their tools. Routing is by the question's
+  own words — deterministic, no model call — and a follow-up inherits the
+  group of the question before it.
+- **`CACHE_TTL`** is `5m` (default) or `1h`. The drip compose path no longer
+  carries a cache breakpoint: its messages are 90 minutes apart, so every
+  compose wrote a cache entry at 1.25x that nothing ever read.
+- **"what did you cost today / this week"** answers in **dollars** per model
+  and per site (Sonnet $3/$15 per million in/out, cache write $3.75, read
+  $0.30; Haiku $1/$5, $1.25, $0.10; search from `SERPER_COST_PER_1K`), plus
+  the requests used and the token budget remaining. The `[test-cost]` line at
+  the end of a test run carries the dollar figure too:
+
+```
+[test-cost] date=2026-10-01 calls=7 searches=0 requests=3 cache_hits=2 dollars=$0.0412
+```
+
+**Simulations and test days use the same code** — one sender — so nothing
+extra applies to them. The ledgers and the caches (`llm_calls`,
+`web_search_usage`, `search_cache`, `news_feed_items`, the per-row research
+cache) stay in the real database while a simulation runs on its throwaway
+copy, so a simulated call is still counted and a second "simulate week" finds
+its searches cached.
+
+`python -m search_backend`, `python -m feeds` and `python -m toolsets` are the
+offline self-tests (HTTP stubbed). `python verify_search_backend.py` checks the
+whole path against real services and prints the token log for each step.
+
+### Web search — the Anthropic backend (`SEARCH_BACKEND=anthropic`)
+
+**This is the old path**, kept working behind the same `llm.web_research` for
+comparison. With `SEARCH_BACKEND=anthropic` the bot searches through
+**Anthropic's server-side web search tool**, declared on the Messages API call:
+Anthropic runs the search and nothing in this bot opens a socket to a search
+engine. Under the default backend none of that runs.
+
+> **Reading the sections below.** What they say about *how a search call is
+> made* — the tool string, "The search prompt is lean", "One search call per
+> rule run", "The daily budget", "Two things the live API taught us" — is this
+> backend only; the section above is what runs by default. What they say about
+> *what happens to the result* — `news.choose`, the main post, the breaking
+> valve, R3's proposals and permission, R6's order, the safety rules — is
+> unchanged under every backend.
 > `research.py`'s fetch path is **unchanged** and still governs the other half:
 > it fetches only URLs **already on a row**, only from `RESEARCH_ALLOWED_DOMAINS`
 > (default `arxiv.org`), and never searches. The two do not overlap and neither
@@ -3889,7 +4039,7 @@ Same gates — test channel, approvers.
 | `clear leave` | drops the override |
 | `advance clock 3 days` | shifts `simulation.today()` for the throwaway simulations. **Refused unless `SALES_TEST_MODE` is on** — a live bot with a shifted clock would send Thursday's messages on Monday. For a clock that STAYS put and runs against real state, use `make it Monday` below |
 | `reset clock` | back to real time |
-| `reset test state` | wipes the test database and starts a fresh one. `start over` is the plain-language form, and it asks you to confirm first |
+| `reset test state` | wipes the **operational** tables of the test database — sends, proposals, snoozes, reminders, posted stories, the pretend clock — and **keeps what was paid for**: `research_cache`, `search_cache`, `news_feed_items`, `llm_calls` and `web_search_usage`. The reply says so, with the row counts it kept. `start over` is the plain-language form, and it asks you to confirm first |
 
 > **`reset test state` refuses unless `DB_PATH` ends in `_test.db`.** The name
 > check is the whole safety: typed against a live bot it would delete every
@@ -4488,8 +4638,11 @@ guardrails forbid.
 | `notes.py` | syncs the Drive meeting notes into `NOTES_DIR`, filters them to the sales ones, reads those |
 | `query.py` | Discord read primitives, scoped to the sales channels |
 | `query_engine.py` | the bounded tool-use loop; holds no tools of its own. Caches the prompt (4 breakpoints) and trims old tool results |
-| `usage.py` | the token log: one `[tokens]` line and one `llm_calls` row per Anthropic call |
-| `llm.py` | the short model calls: routing, replies, commitment detection |
+| `usage.py` | the token log: one `[tokens]` line and one `llm_calls` row per Anthropic call, with its model; the price table and `dollars()`; the daily token budget; the `[test-cost]` tally |
+| `llm.py` | the short model calls: routing, replies, commitment detection — on `MODEL` or `MODEL_LIGHT` — plus `web_research` (snippets in, MODEL_LIGHT out), `score_news` and `research_digest` |
+| `search_backend.py` | **the retrieval layer, no LLM**: `search` (Serper, Brave fallback, SQLite cache, the request budget) and `fetch_page` (research.py's fetcher, the block-list, never LinkedIn) |
+| `feeds.py` | **the feed layer, no LLM**: `poll()` reads `NEWS_RSS_FEEDS` and one Google News RSS query per topic into `news_feed_items`, deduplicated on the url and headline keys |
+| `toolsets.py` | **which tools a question needs**: the keyword routing, the groups, and each tool's one-sentence description |
 | `followups.py` | commitment prefilter, due-time maths, fallback nudge text |
 | `db.py` | SQLite: `chases`, `nudges`, `deadlines`, `flags_sent`, `digest_items` (carry-forward ages), `nextstep_state` (rule (i)'s clock), `prep_briefs` (one brief per meeting), `meta` (the once-a-day digest marker, the to-do sheet's id and its announcement marker) |
 | `memory.py` | short-term per-channel conversation memory (in-memory only) |

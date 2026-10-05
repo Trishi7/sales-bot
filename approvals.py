@@ -200,11 +200,9 @@ def pending_text(proposals: list) -> str:
     n = len(proposals or [])
     if not n:
         return ""
-    head = (
-        "A few things still waiting for a yes:" if n > 1
-        else "One thing still waiting for a yes:"
-    )
-    lines = [head]
+    import tone
+    several, one = tone.pick(PENDING_HEADS)
+    lines = [several if n > 1 else one]
     for p in proposals[:8]:
         who = p.get("company") or "that row"
         if p.get("poc"):
@@ -216,29 +214,61 @@ def pending_text(proposals: list) -> str:
         lines.append(f"  - {who}: {asked}")
     if n > 8:
         lines.append(f"  - ...and {n - 8} more")
-    lines.append(
-        "Reply yes to any of them and I will apply it. If one is wrong, say no and "
-        "I will drop it \u2014 otherwise I will let them go after tomorrow."
-    )
+    lines.append(tone.pick(PENDING_CLOSES))
     return "\n".join(lines)
+
+
+# THE PROPOSAL LINES, three wordings each, one picked at random per post
+# (`tone.pick`). What they SAY is fixed — what is waiting, that a yes applies
+# it, that a no drops it, and when it lapses — only the phrasing moves.
+#
+# (several, one) pairs: the head for a list, and for a single proposal.
+PENDING_HEADS = (
+    ("A few things still waiting for a yes:", "One thing still waiting for a yes:"),
+    ("These are still waiting on a yes from you:",
+     "This one's still waiting on a yes from you:"),
+    ("Still open, whenever you get a minute:",
+     "One still open, whenever you get a minute:"),
+)
+PENDING_CLOSES = (
+    "Reply yes to any of them and I'll apply it. If one's wrong, say no and I'll "
+    "drop it — otherwise I'll let them go after tomorrow.",
+    "A yes on any of them and I'll make the change. Say no if one's wrong and "
+    "it's gone — I'll let the rest go after tomorrow either way.",
+    "Say yes to the ones you want and I'll apply them, or no and I'll drop them. "
+    "Anything left goes after tomorrow.",
+)
+# {what} is the proposal's own text, which ends in its own full stop.
+NUDGE_LINES = (
+    "Still holding this one: {what} If it's not right, just say no and I'll drop "
+    "it — otherwise I'll let it go after today.",
+    "This one's still open: {what} A yes and I'll apply it; a no and it's gone. "
+    "I'll let it go after today either way.",
+    "Last ask on this: {what} Say no if it's wrong and I'll drop it — otherwise "
+    "it goes after today.",
+)
+DROPPED_LINES = (
+    "Dropping this one, nobody got to it: {what} Nothing has changed in the "
+    "sheet. Tell me again if it still needs doing.",
+    "I've let this one go: {what} The sheet is untouched. Just ask again if you "
+    "still want it.",
+    "Nobody picked this up, so I've dropped it: {what} Nothing was written. Tell "
+    "me if it should come back.",
+)
 
 
 def nudge_text(proposal: dict) -> str:
     """The ONE follow-up, the next working day. Softer, and it says it is the
     last time — which is what makes it a courtesy rather than a second demand."""
-    return (
-        f"Still holding this one: {proposal.get('proposed_text') or 'the change I proposed'} "
-        "If it is not right, just say no and I will drop it — otherwise I will "
-        "let it go after today."
-    )
+    import tone
+    return tone.pick(NUDGE_LINES).format(
+        what=proposal.get("proposed_text") or "the change I proposed.")
 
 
 def dropped_text(proposal: dict) -> str:
-    return (
-        f"Dropping this one, nobody got to it: "
-        f"{proposal.get('proposed_text') or 'the change I proposed'} "
-        "Nothing has changed in the sheet. Tell me again if it still needs doing."
-    )
+    import tone
+    return tone.pick(DROPPED_LINES).format(
+        what=proposal.get("proposed_text") or "the change I proposed.")
 
 
 def _self_test() -> int:

@@ -34,6 +34,11 @@ os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_CHANNEL_IDS = [4242]
 config.SALES_CHANNEL_ID_SET = {4242}

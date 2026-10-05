@@ -56,6 +56,11 @@ import query_engine  # noqa: E402
 from bot import SalesBot  # noqa: E402
 from db import DB  # noqa: E402
 
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
+
 failures = 0
 
 

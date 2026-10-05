@@ -465,7 +465,10 @@ class TestProposalSweep:
         pending = db.stale_proposals(before_iso="2026-09-21", nudged=False)
         text = approvals.pending_text(pending)
         assert text.count("\n  - ") == 3
-        assert text.startswith("A few things still waiting for a yes:")
+        # ONE OF THREE WORDINGS, picked at random — and always the list form.
+        assert text.splitlines()[0] in [several for several, _one
+                                        in approvals.PENDING_HEADS]
+        assert text.splitlines()[-1] in approvals.PENDING_CLOSES
 
     def test_no_message_when_nothing_is_pending(self):
         import approvals

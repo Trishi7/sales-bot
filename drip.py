@@ -59,6 +59,7 @@ import deadlines as dl
 import gtm_sheet
 import nextaction
 import rules
+import tone
 
 log = logging.getLogger(__name__)
 
@@ -682,73 +683,138 @@ def plan(
 
 # -- the message --------------------------------------------------------------
 
-# WHAT EACH TYPE IS ASKING FOR, as a plain phrase the composer builds on. These
-# are the FALLBACK wording, used when the model is off or unreachable. They are
-# deliberately complete sentences with an out already in them, because a
-# fallback that reads like a template is what people will actually receive on
-# the day the API is down.
+# WHAT EACH TYPE SAYS WITHOUT THE MODEL — the wording that goes out when the
+# model is off, unreachable, or failed its checks twice.
+#
+# THREE VARIANTS EACH, ONE PICKED AT RANDOM PER SEND (`_voice`), written the way
+# a colleague types in a team channel: contractions, the first name, one short
+# sentence of context, the ask, an easy out. A fallback is what people actually
+# receive on the day the API is down, and one fixed sentence every Tuesday is
+# what makes it read as a system notification.
+#
+# THE THREE SHAPES, the same for every type:
+#     "{hey}..."     "Hey Vaishnavi — PolyAI accepted ..."
+#     "{name}..."    "Vaishnavi, quick one: PolyAI and Agoda ..."
+#     no name        "The connection with PolyAI went through ..."
+# {hey} and {name} are "" when the message has no owner, and the first letter
+# is then capitalised (`_fill`).
+#
+# THE WORDS THAT AGREE: {is} is/are, {isnt} isn't/aren't, {has} has/have,
+# {them} it/them — one company or several. {ago} is "19 days ago", or "a while
+# ago" when the sheet has no date to count from. NOTHING HERE STATES A FACT THE
+# MESSAGE DOES NOT CARRY — no weekday, no name, no number that was not handed in.
 _ASK = {
     # R1 IS POSTED AS ITS STORIES (see VERBATIM_TYPES); this is only the
     # never-expected case of a news message with no stories on it.
-    nextaction.R_AI_NEWS: "{who}Nothing new on the news today.",
+    nextaction.R_AI_NEWS: (
+        "Quiet day in AI — nothing worth your time today.",
+        "Nothing new on the AI front since yesterday.",
+        "Checked the news: nothing you need to see today.",
+    ),
     nextaction.R_NEWS_SCREEN: (
-        "{who}some companies in the news this week are not in the Master Pipeline. "
-        "Below is why each one fits us or not. Tell me which ones to add, if any, "
-        "and I will add them."
+        "{hey}a few companies in this week's news aren't in the Master Pipeline "
+        "yet. Want any of them added? Tell me which and I'll put them in.",
+        "{name}quick one: some names from this week's news aren't in our pipeline. "
+        "Worth adding any? Say skip if not.",
+        "Some companies in the news this week aren't in the Master Pipeline. Shall I "
+        "add any of them, or leave them for now?",
     ),
     nextaction.R_EVENTS: (
-        "{who}{companies} is coming up and we have not registered. Please look at it "
-        "before registration closes. If it is not for us, tell me and I will stop "
-        "asking."
+        "{hey}{companies} {is} coming up and we haven't registered. Want to take a "
+        "look before registration closes? If it's not for us, just say and I'll "
+        "drop it.",
+        "{name}quick one: we're not registered for {companies} yet. Worth a look "
+        "this week? Say skip and I'll stop asking.",
+        "{companies} {is} coming up and nobody's registered yet. Shall we go, or "
+        "should I take {them} off my list?",
     ),
-    # R4 IS ALWAYS POINTS (see `points_of`); this sentence is only the
-    # never-expected case of a deliverables message with no items on it.
+    # R4 IS ALWAYS POINTS (see `points_of`); these are only the never-expected
+    # case of a deliverables message with no items on it.
     nextaction.R_DELIVERABLES: (
-        "{who}here is the deliverables list for this week. " + "{close}"
+        "{hey}here's this week's deliverables list. {close}",
+        "{name}this week's deliverables are below. {close}",
+        "Here's where this week's deliverables stand. {close}",
     ),
     nextaction.R_PROSPECTS: (
-        "{who}nobody has contacted {companies} yet. Can you contact them when you "
-        "have time? Tell me when it is done and I will move to the next ones."
+        "{hey}nobody's contacted {companies} yet. Want to reach out this week? Tell "
+        "me when it's done and I'll move to the next ones.",
+        "{name}quick one: {companies} {is} still waiting on a first message. Got "
+        "time for {them} this week? Say skip if not.",
+        "No first contact with {companies} yet. Do you want to pick {them} up this "
+        "week? If it's already done, just tell me.",
     ),
     nextaction.R_LI_NO_DM: (
-        "{who}{companies} accepted the LinkedIn connection a few days ago and there "
-        "is no DM yet. Do you want to send one? If you already did, tell me and I "
-        "will note it."
+        "{hey}{companies} accepted your connection a few days ago but there's no DM "
+        "yet. Want to send one this week? If you already have, just tell me.",
+        "{name}quick one: {companies} {is} connected but un-messaged. Worth a DM "
+        "while they still remember the name? Say skip if not.",
+        "The connection with {companies} went through and nobody's followed up yet. "
+        "Shall I note it as done, or do you want a nudge in a few days?",
     ),
     nextaction.R_DM_NO_MEETING: (
-        "{who}the DM to {companies} went out {days} days ago and no meeting is "
-        "booked yet. Do you want to follow up? Tell me if they replied."
+        "{hey}the DM to {companies} went out {ago} and there's no meeting booked "
+        "yet. Want to follow up? If they've replied, just tell me.",
+        "{name}quick one: the DM to {companies} went out {ago} and nothing's booked. "
+        "Worth another message? Say skip if not.",
+        "No meeting yet with {companies}, and the DM went out {ago}. Shall I leave "
+        "it with you, or ask again next week?",
     ),
     nextaction.R_MEETING_PREP: (
-        "{who}the {companies} meeting is coming up. Are the deck, the package and "
-        "the demo ready? If everything is ready, tell me and I will not ask again."
+        "{hey}the {companies} meeting is coming up. Are the deck, the package and "
+        "the demo ready? If they are, just say and I won't ask again.",
+        "{name}quick one: the {companies} meeting's nearly here. Anything still "
+        "missing from the deck, the package or the demo? Say all good if not.",
+        "The {companies} meeting is coming up soon. Is everything ready, or is "
+        "something still open? Tell me and I'll stop asking.",
     ),
     nextaction.R_MEETING_FOLLOWUP: (
-        "{who}the {companies} meeting is marked as done, but there are no next steps "
-        "on the sheet. What was agreed, which package did you discuss, and about how "
-        "big is the deal? Tell me and I will stop asking."
+        "{hey}the {companies} meeting is marked done but there are no next steps on "
+        "the sheet. What was agreed, which package came up, and roughly how big is "
+        "the deal? Tell me and I'll stop asking.",
+        "{name}quick one on {companies}: the meeting's done but the sheet has no "
+        "next steps. What came out of it — next step, package, rough deal size? One "
+        "line is plenty.",
+        "{companies} is down as met, with nothing after it. Can you give me the "
+        "next step, the package and a rough size? If there's nothing yet, just say.",
     ),
     # THE SUPPORTIVE VERSION, from the call. Two or more deals go as points
     # with the same offer as the close (see `points_of`).
     nextaction.R_CLOSURE_SUPPORT: (
-        "{who}{companies} is in the closure stage. Can I help? I can prepare the "
-        "PoC's background, a note on the company, or a package summary. Tell me "
-        "which one you need."
+        "{hey}{companies} {is} in the closure stage. Can I help? I can pull together "
+        "the PoC's background, a note on the company, or a package summary — just "
+        "tell me which.",
+        "{name}quick one: {companies} {is} close to closing. Want anything from me — "
+        "the PoC's background, a company note, a package summary? Say no if you're "
+        "set.",
+        "{companies} {is} at the closure stage. Shall I prepare something for it — "
+        "the PoC's background, a company note or a package summary — or are you all "
+        "set?",
     ),
-    # R11 IS ALWAYS POINTS (see `points_of`); this is the never-expected case
+    # R11 IS ALWAYS POINTS (see `points_of`); these are the never-expected case
     # of a new-company message with no company on it.
     nextaction.R_NEW_COMPANY: (
-        "{who}a new company landed in the pipeline. Want me to look for relevant "
-        "PoCs for outreach? Say yes and I'll dig in."
+        "{hey}a new company landed in the pipeline. Want me to look for relevant "
+        "PoCs for outreach? Say yes and I'll dig in.",
+        "{name}quick one: there's a new company in the pipeline. Shall I find the "
+        "right people to contact? Just say yes.",
+        "A new company just showed up in the pipeline. I can look up who to reach "
+        "out to — want me to? Say skip if not.",
     ),
     nextaction.R_PACKAGES: (
-        "{who}{companies} is still not marked ready. What is still missing, and when "
-        "do you expect it to be ready? There is no rush. I only want to be sure "
-        "before we offer it."
+        "{hey}{companies} {is} still not marked ready. What's left on it, and "
+        "roughly when? No rush — I just don't want us to offer it early.",
+        "{name}quick one: {companies} {isnt} marked ready yet. Anything blocking "
+        "it? A rough date is plenty.",
+        "{companies} {is} still open on the packages list. Is there a date I should "
+        "know, or shall I check back next week?",
     ),
     nextaction.SCHEDULED_REMINDER: (
-        "{who}you asked me to remind you about {companies} today. Tell me when it is "
-        "done, or tell me a new date."
+        "{hey}you asked me to remind you about {companies} today. Tell me when it's "
+        "done, or give me a new date.",
+        "{name}here's the reminder you asked for: {companies}. Already done? Just "
+        "say, or tell me when to ask again.",
+        "Today's the day you wanted a reminder about {companies}. Shall I mark it "
+        "done, or move it to another date?",
     ),
 }
 
@@ -756,9 +822,71 @@ _ASK = {
 # that it is the last time — which is what makes it land as a courtesy rather
 # than as a second demand.
 _REASK = (
-    "{who}this is my last reminder about {companies}. If it is done or no longer "
-    "needed, tell me and I will stop asking."
+    "{hey}last one from me on {companies}. If it's done or not needed any more, "
+    "just say and I'll drop it.",
+    "{name}one last nudge on {companies}, then I'll leave it. Done, or not needed? "
+    "Either answer works.",
+    "I won't ask about {companies} again after this. If it's handled or off the "
+    "list, just tell me.",
 )
+
+# THE ONE-OFF REMINDER, posted at the minute somebody asked for
+# (`bot._fire_due_reminders`). {who} is the asker's tag.
+REMINDER_LINES = (
+    "{who} — you asked me to remind you: {what}",
+    "{who}, here's the reminder you asked for: {what}",
+    "{who} — it's time for this one: {what}",
+)
+
+
+def reminder_line(who: str, what: str, company: str = "") -> str:
+    """One of REMINDER_LINES, at random, with the company in brackets if any."""
+    body = tone.pick(REMINDER_LINES).format(who=str(who or "").strip(),
+                                            what=str(what or "").strip())
+    company = str(company or "").strip()
+    return f"{body} ({company})" if company else body
+
+
+def _voice(message: dict, slot: str, variants) -> str:
+    """This message's variant for `slot`, picked at random ONCE and kept.
+
+    KEPT ON THE MESSAGE, because one send asks for the same line several
+    times: the close is rendered into the template, quoted in the composer's
+    prompt, and — for R11's opener — checked as a required line. Three random
+    picks would be three different sentences and a composition that could
+    never pass its own check.
+    """
+    if isinstance(variants, str):
+        return variants
+    chosen = message.setdefault("_voice", {})
+    if slot not in chosen:
+        chosen[slot] = tone.pick_index(len(variants))
+    return variants[chosen[slot] % len(variants)]
+
+
+def _first_name(address: str) -> str:
+    """"Vaishnavi" from "Vaishnavi Rao"; a mention token is left as it is."""
+    text = " ".join(str(address or "").split())
+    if not text or text.startswith("<@"):
+        return text
+    return text.split()[0]
+
+
+def _fill(template: str, *, name: str = "", companies: list = (), days: int = 0,
+          close: str = "") -> str:
+    """One template, filled. See the note above `_ASK` for the keys."""
+    many = len([c for c in (companies or []) if str(c).strip()]) > 1
+    days = int(days or 0)
+    ago = (f"{days} day{'' if days == 1 else 's'} ago" if days > 0 else "a while ago")
+    body = template.format(
+        hey=f"Hey {name} — " if name else "",
+        name=f"{name}, " if name else "",
+        companies=companies_sentence(list(companies or [])) or "these",
+        ago=ago, close=close,
+        **{"is": "are" if many else "is", "isnt": "aren't" if many else "isn't",
+           "has": "have" if many else "has", "them": "them" if many else "it"},
+    ).strip()
+    return body[:1].upper() + body[1:]
 
 
 # -- the heading: one bold first line per message type ------------------------
@@ -767,19 +895,22 @@ _REASK = (
 # the tags line, after composition, so a composer that ignored it or a template
 # that forgot it cannot produce a message without one. {day} is the send day,
 # {week} that week's Monday, {company} the first company on the message.
+#
+# A LABEL A PERSON WOULD WRITE: "AI news, Tue 29 Sep", not "AI news — Tue 29
+# Sep". No dash-separated fields, no "week of" stamp.
 HEADINGS = {
-    "R1": "AI news — {day}",
+    "R1": "AI news, {day}",
     "R1_breaking": "Breaking AI news",
     "R2": "Companies in the news",
     "R3": "AI events & summits",
-    "R4": "Deliverables — week of {week}",
+    "R4": "This week's deliverables",
     "R5": "PoCs to contact",
     "R6": "LinkedIn connected, no DM yet",
     "R7": "DM sent, no meeting yet",
-    "R8": "Meeting prep — {company}",
-    "R9": "Meeting follow-up — {company}",
+    "R8": "Meeting prep for {company}",
+    "R9": "Follow-up on the {company} meeting",
     "R10": "Closure support",
-    "R11": "New companies in the pipeline",
+    "R11": "New in the pipeline",
     "R12": "Sales packages",
     "reminder": "Reminder",
     "approvals": "Waiting for your yes",
@@ -800,7 +931,7 @@ def _day_label(day: date) -> str:
 
 
 def heading(key: str, *, day: Optional[date] = None, company: str = "") -> str:
-    """`**AI news — Tue 29 Sep**` for a HEADINGS key. "" for an unknown key."""
+    """`**AI news, Tue 29 Sep**` for a HEADINGS key. "" for an unknown key."""
     pattern = HEADINGS.get(str(key or ""))
     if not pattern:
         return ""
@@ -977,28 +1108,79 @@ def with_sources(body: str, message: dict) -> str:
 # a one-line close around them, and `llm._proactive_problem` rejects any
 # composition that lost or reworded a line (logged as `structure`).
 
-DELIVERABLES_CLOSE = "Tell me if any of these have moved and I will update my list."
-CLOSURE_CLOSE = ("Can I help with any of these? I can prepare the PoC's background, "
-                 "a note on the company, or a package summary. Tell me which one.")
-GENERIC_CLOSE = "Tell me when they are done and I will move to the next ones."
-NEW_COMPANY_CLOSE = ("Want me to look for relevant PoCs for outreach? Say yes and "
-                     "I'll dig in.")
+#
+# THE OPENERS AND CLOSES AROUND THEM COME IN THREES, like the templates: one is
+# picked per message (`_voice`) and used everywhere that message needs it.
+
+DELIVERABLES_CLOSES = (
+    "If any of these have moved, just tell me and I'll update my list.",
+    "Anything here already done? Say which and I'll take it off.",
+    "Tell me if any of these have changed and I'll fix my list.",
+)
+CLOSURE_CLOSES = (
+    "Can I help with any of these? I can pull together the PoC's background, a "
+    "note on the company, or a package summary — just tell me which.",
+    "Want anything from me on these — the PoC's background, a company note, a "
+    "package summary? Say no if you're set.",
+    "Shall I prepare something for one of them — the PoC's background, a company "
+    "note or a package summary — or are you all set?",
+)
+GENERIC_CLOSES = (
+    "Tell me when they're done and I'll move to the next ones.",
+    "Already done some? Just say which and I'll take them off.",
+    "Say skip on any you'd rather leave, and I'll move on.",
+)
+NEW_COMPANY_CLOSES = (
+    "Want me to look for relevant PoCs for outreach? Say yes and I'll dig in.",
+    "Shall I find the right people to contact there? Just say yes.",
+    "I can look up who to reach out to — want me to? Say skip if not.",
+)
+# The first variant of each, under the old names, for callers that want "a"
+# close rather than this message's.
+DELIVERABLES_CLOSE = DELIVERABLES_CLOSES[0]
+CLOSURE_CLOSE = CLOSURE_CLOSES[0]
+GENERIC_CLOSE = GENERIC_CLOSES[0]
+NEW_COMPANY_CLOSE = NEW_COMPANY_CLOSES[0]
+
+# R4's first line. {n} is how many are open.
+DELIVERABLES_OPENERS = (
+    "{n} open:",
+    "{n} still open:",
+    "Here's what's open — {n}:",
+)
+# R10's first line, above two or more deals.
+CLOSURE_OPENERS = (
+    "These deals are in the closure stage:",
+    "In the closure stage right now:",
+    "These are close to closing:",
+)
+# R11's first line: (one company, several). {count} is "two", "three", ...
+NEW_COMPANY_OPENERS = (
+    ("Hey team — a new company landed in the pipeline:",
+     "Hey team — {count} new companies landed in the pipeline:"),
+    ("Team, a new company was just added to the pipeline:",
+     "Team, {count} new companies were just added to the pipeline:"),
+    ("New in the pipeline today — one company:",
+     "New in the pipeline today — {count} companies:"),
+)
 _COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five"}
 
 
-def render_new_companies(companies: list) -> tuple:
+def render_new_companies(companies: list, *, variant: int = 0) -> tuple:
     """R11's (opener, lines). One company per line, no links, nothing else.
 
         Hey team — two new companies landed in the pipeline:
         • Shunya Labs
         • Synthflow AI
+
+    `variant` picks which of NEW_COMPANY_OPENERS opens it.
     """
     names = [str(c).strip() for c in (companies or []) if str(c).strip()]
+    one, several = NEW_COMPANY_OPENERS[int(variant) % len(NEW_COMPANY_OPENERS)]
     if len(names) == 1:
-        opener = "Hey team — a new company landed in the pipeline:"
+        opener = one
     else:
-        count = _COUNT_WORDS.get(len(names), str(len(names)))
-        opener = f"Hey team — {count} new companies landed in the pipeline:"
+        opener = several.format(count=_COUNT_WORDS.get(len(names), str(len(names))))
     return opener, [f"• {n}" for n in names]
 
 
@@ -1007,7 +1189,7 @@ def _plural(n: int, word: str) -> str:
 
 
 def render_deliverables(items: list, *, today: Optional[date] = None,
-                        limit: int = 20) -> list:
+                        limit: int = 20, opener: str = "") -> list:
     """R4's lines: a count, then each deliverable as its own numbered point.
 
         6 open:
@@ -1030,7 +1212,7 @@ def render_deliverables(items: list, *, today: Optional[date] = None,
                        str(a.get("deadline") or "9999"),
                        str(a.get("item") or a.get("deliverable") or "").lower()),
     )
-    lines = [f"{len(rows)} open:"]
+    lines = [(opener or DELIVERABLES_OPENERS[0]).format(n=len(rows))]
     pad = "   "
     for i, a in enumerate(rows[:max(1, int(limit))], 1):
         name = str(a.get("item") or a.get("deliverable")).strip()
@@ -1082,28 +1264,35 @@ def points_of(message: dict) -> Optional[dict]:
     actions = list(message.get("actions") or [])
     cap = int(message.get("max_items_per_post") or 0) or 20
     if kind == nextaction.R_DELIVERABLES:
-        rendered = render_deliverables(actions, limit=cap)
+        rendered = render_deliverables(
+            actions, limit=cap,
+            opener=_voice(message, "r4_opener", DELIVERABLES_OPENERS))
         if len(rendered) < 2:
             return None
         # THE LAYOUT IS MULTI-LINE, so every line is kept, in order. R4 is
         # posted verbatim (VERBATIM_TYPES) and never recomposed.
         return {"header": rendered[0], "lines": rendered[1:], "extra": [],
-                "close": DELIVERABLES_CLOSE}
+                "close": _voice(message, "r4_close", DELIVERABLES_CLOSES)}
     if kind == nextaction.R_NEW_COMPANY:
         companies = [c for c in (message.get("companies") or []) if str(c).strip()]
         if not companies:
             return None
-        opener, lines = render_new_companies(companies[:cap])
+        opener, lines = render_new_companies(
+            companies[:cap],
+            variant=NEW_COMPANY_OPENERS.index(
+                _voice(message, "r11_opener", NEW_COMPANY_OPENERS)))
         # THE OPENER IS PART OF THE BLOCK: the message is exactly this shape,
         # and the composer writes nothing before it (`compose_prompt`).
         return {"header": opener, "lines": lines, "extra": [],
-                "close": NEW_COMPANY_CLOSE, "opener_in_block": True}
+                "close": _voice(message, "r11_close", NEW_COMPANY_CLOSES),
+                "opener_in_block": True}
     if kind == nextaction.R_CLOSURE_SUPPORT:
         lines = render_closure(actions)
         if len(lines) < 2:
             return None
-        return {"header": "These deals are in the closure stage:", "lines": lines,
-                "extra": [], "close": CLOSURE_CLOSE}
+        return {"header": _voice(message, "r10_opener", CLOSURE_OPENERS),
+                "lines": lines, "extra": [],
+                "close": _voice(message, "r10_close", CLOSURE_CLOSES)}
     companies = [c for c in (message.get("companies") or []) if str(c).strip()]
     if len(companies) >= 3:
         lines = []
@@ -1115,7 +1304,8 @@ def points_of(message: dict) -> Optional[dict]:
                  if len(companies) > len(lines) else [])
         label = message.get("type_label") or "To look at"
         return {"header": f"{label} — {len(companies)}:", "lines": lines,
-                "extra": extra, "close": GENERIC_CLOSE}
+                "extra": extra,
+                "close": _voice(message, "list_close", GENERIC_CLOSES)}
     return None
 
 
@@ -1125,11 +1315,24 @@ def points_block(points: dict) -> str:
 
 
 def fact_count(message: dict) -> int:
-    """How many facts the message carries — companies, items or reasons."""
-    actions = message.get("actions") or []
-    reasons = {str(a.get("why") or "") for a in actions if a.get("why")}
-    return max(len(message.get("companies") or []), len(actions),
-               len(reasons) if len(actions) > 1 else 0)
+    """How many facts the composer was asked to LIST — what the points check
+    (`tone.check_detail`) is held to.
+
+    THE SAME COUNT THE PROMPT USED. A message that goes out as points
+    (`points_of`) carries as many facts as it has companies or items. One that
+    does not is, by construction, one or two companies named in a sentence —
+    and that is what `compose_prompt` asks for, however many people or reasons
+    sit behind them.
+
+    This used to count the ACTIONS and the reasons too, so two companies with
+    three people between them counted as "3 facts": the prompt asked for one
+    sentence, the check demanded points, and the composition could never pass.
+    Every such message went out as the template.
+    """
+    companies = len([c for c in (message.get("companies") or []) if str(c).strip()])
+    if points_of(message) is None:
+        return min(companies, 2)
+    return max(companies, len(message.get("actions") or []))
 
 
 def required_lines(message: dict) -> list:
@@ -1207,15 +1410,19 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
     if message.get("type") == nextaction.R_AI_NEWS and note_of(message):
         return f"I couldn't check the news today — {note_of(message)}."
 
-    template = (
-        _REASK if message.get("stage") == STAGE_REASK
-        else _ASK.get(message.get("type"), _ASK[nextaction.R_DM_NO_MEETING])
-    )
+    # ONE OF THREE WORDINGS, picked once for this message (`_voice`).
+    if message.get("stage") == STAGE_REASK:
+        template = _voice(message, "reask", _REASK)
+    else:
+        template = _voice(message, "ask", _ASK.get(
+            message.get("type"), _ASK[nextaction.R_DM_NO_MEETING]))
     days = next((int(a["days_since_dm"]) for a in (message.get("actions") or [])
                  if isinstance(a.get("days_since_dm"), int)),
                 int(message.get("overdue_days") or 0))
-    body = template.format(who=who, companies=companies or "these", days=days,
-                           close=DELIVERABLES_CLOSE).strip()
+    body = _fill(
+        template, name=_first_name(address or message.get("owner") or ""),
+        companies=message.get("companies") or [], days=days,
+        close=_voice(message, "r4_close", DELIVERABLES_CLOSES))
     note = note_of(message)
     return f"{body} ({note})" if note else body
 
@@ -1545,15 +1752,92 @@ def _self_test() -> int:
           STAGE_NUDGE)
 
     print("\nthe voice of the fallback")
-    msg = dict(planned["messages"][0])
-    text = compose_fallback(msg)
-    check("no headers or bullets", any(c in text for c in ("**", "\\n-", "•")), False)
-    check("names the owner once", text.count("Vaishnavi"), 1)
-    check("gives an out", any(p in text.lower() for p in
-                              ("no rush", "tell me", "just say", "your call")), True)
-    msg["stage"] = STAGE_REASK
-    check("the re-ask says it is the last one",
-          "my last reminder" in compose_fallback(msg), True)
+    outs = ("no rush", "tell me", "just say", "your call", "say skip", "say all good",
+            "say no", "shall i", "either answer", "is plenty", "or ")
+    banned = ("nothing to act on", "quiet cycle", "worth flagging", "as per",
+              "kindly", "please note")
+    base = dict(planned["messages"][0])
+    seen = set()
+    for i in range(3):
+        msg = dict(base, _voice={"ask": i, "reask": i})
+        text = compose_fallback(msg)
+        seen.add(text)
+        print(f"   [{i}] {text}")
+        check(f"variant {i}: no headers or bullets",
+              any(c in text for c in ("**", "\\n-", "•")), False)
+        check(f"variant {i}: names the owner at most once",
+              text.count("Vaishnavi") <= 1, True)
+        check(f"variant {i}: gives an out", any(p in text.lower() for p in outs), True)
+        check(f"variant {i}: uses a contraction", "'" in text, True)
+        check(f"variant {i}: no banned phrase",
+              [p for p in banned if p in text.lower()], [])
+        msg["stage"] = STAGE_REASK
+        again = compose_fallback(msg)
+        check(f"variant {i}: the re-ask says it is the last one",
+              any(p in again.lower() for p in ("last one", "one last", "won't ask")),
+              True)
+    check("three variants, three different sentences", len(seen), 3)
+    check("the first two name the owner, the third does not",
+          [compose_fallback(dict(base, _voice={"ask": i})).count("Vaishnavi")
+           for i in range(3)], [1, 1, 0])
+    once = dict(base)
+    check("one message keeps ONE wording however often it is asked",
+          compose_fallback(once), compose_fallback(once))
+
+    print("\nevery template, every variant")
+    for kind, variants in list(_ASK.items()) + [("reask", _REASK)]:
+        check(f"{kind}: three variants", len(variants), 3)
+        for many in (["Acme"], ["Acme", "Borealis"]):
+            for v in variants:
+                for name in ("Vaishnavi", ""):
+                    filled = _fill(v, name=name, companies=many, days=9,
+                                   close=DELIVERABLES_CLOSES[0])
+                    bad = ("{" in filled or filled[:1].islower()
+                           or any(p in filled.lower() for p in banned)
+                           or " is are " in filled or "  " in filled)
+                    if bad:
+                        check(f"{kind}: fills cleanly ({many}, {name!r})", filled, "")
+    check("one company agrees", _fill(_ASK[nextaction.R_PACKAGES][1], name="",
+                                      companies=["Hinglish STT"]),
+          "Quick one: Hinglish STT isn't marked ready yet. Anything blocking it? "
+          "A rough date is plenty.")
+    check("two companies agree", _fill(_ASK[nextaction.R_LI_NO_DM][1], name="Vaishnavi",
+                                       companies=["PolyAI", "Agoda"]),
+          "Vaishnavi, quick one: PolyAI and Agoda are connected but un-messaged. "
+          "Worth a DM while they still remember the name? Say skip if not.")
+    check("a DM with no date says 'a while ago', never '0 days'",
+          "a while ago" in _fill(_ASK[nextaction.R_DM_NO_MEETING][0], name="Sid",
+                                 companies=["Acme"], days=0), True)
+    for label, options in (("deliverables close", DELIVERABLES_CLOSES),
+                         ("closure close", CLOSURE_CLOSES),
+                         ("list close", GENERIC_CLOSES),
+                         ("new-company close", NEW_COMPANY_CLOSES),
+                         ("deliverables opener", DELIVERABLES_OPENERS),
+                         ("closure opener", CLOSURE_OPENERS),
+                         ("new-company opener", NEW_COMPANY_OPENERS),
+                         ("reminder line", REMINDER_LINES)):
+        check(f"{label}: three different variants", len(set(options)), 3)
+
+    print("\nthe facts the composer is held to")
+    two = {"type": nextaction.R_LI_NO_DM, "companies": ["PolyAI", "Agoda"],
+           "actions": [{"company": "PolyAI", "poc": "A", "why": "x"},
+                       {"company": "PolyAI", "poc": "B", "why": "y"},
+                       {"company": "Agoda", "poc": "C", "why": "z"}]}
+    check("two companies, three people: no points...", points_of(two), None)
+    check("...so two facts, not three (the sentence the prompt asks for)",
+          fact_count(two), 2)
+    three = dict(two, companies=["PolyAI", "Agoda", "Acme"])
+    check("three companies go in points", bool(points_of(three)), True)
+    check("...and count as three facts", fact_count(three), 3)
+
+    print("\nthe headings")
+    check("AI news", heading("R1", day=date(2026, 9, 29)), "**AI news, Tue 29 Sep**")
+    check("deliverables", heading("R4", day=date(2026, 9, 29)),
+          "**This week's deliverables**")
+    check("new company", heading("R11"), "**New in the pipeline**")
+    check("reminder", heading("reminder"), "**Reminder**")
+    check("no heading uses a dash as a separator",
+          [k for k, v in HEADINGS.items() if "—" in v], [])
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

@@ -212,7 +212,8 @@ SCREEN_OFFERINGS = (
 )
 
 
-def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "") -> str:
+def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "",
+                  allow_lookup: bool = False) -> str:
     """R2 — which of today's news companies are NOT in the pipeline.
 
     READS THE STORIES R1 ALREADY POSTED. The question is about a result set we
@@ -250,6 +251,17 @@ def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "") 
         "row is added and that is a separate step you are not part of.",
         "If every company in the news is already tracked, reply: NOTHING NEW",
     ]
+    if allow_lookup:
+        # ONLY WHEN THE STORY DOES NOT SAY. The stories are titles and one-line
+        # summaries; most say what the company does. For one that does not, a
+        # LOOKUP line asks the caller for a five-result search rather than
+        # letting the model fill the gap from memory.
+        lines += [
+            "",
+            "If a story names a company but does NOT say what it does, do not "
+            "guess — instead of its SCREEN line write:",
+            "  LOOKUP | <company>",
+        ]
     if use_cases.strip():
         lines += ["", "WHAT MEMBRANE SELLS (from the sales strategy):", use_cases.strip()]
     lines += ["", "TODAY'S STORIES:"]
@@ -440,6 +452,21 @@ def parse_screen_skips(text: str) -> list:
     return out
 
 
+_LOOKUP_RE = re.compile(r"^\s*LOOKUP\s*\|\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def parse_screen_lookups(text: str) -> list:
+    """The LOOKUP lines: companies the stories name without describing."""
+    out: list = []
+    for line in str(text or "").splitlines():
+        m = _LOOKUP_RE.match(line)
+        if m:
+            name = m.group(1).split("|")[0].strip()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
 def found_nothing(text: str) -> bool:
     body = " ".join(str(text or "").split()).upper()
     return "NOTHING FOUND" in body or "NOTHING NEW" in body
@@ -563,15 +590,32 @@ def _topic_label(topic: str) -> str:
 
 # What a quiet main sweep posts under its heading. A quiet hourly check posts
 # nothing at all.
-QUIET_MAIN = "Nothing new on the news today."
+#
+# THREE LINES, IN ROTATION BY DATE (`quiet_line`): three quiet days in a row
+# read as three different sentences, and the same day always gets the same one,
+# so a restart or a re-run does not change what was said. None of them says
+# "nothing to act on" — news never asks for an action in the first place.
+QUIET_LINES = (
+    "Quiet day in AI — nothing worth your time today.",
+    "Nothing new on the AI front since yesterday.",
+    "Checked the news: nothing you need to see today.",
+)
+QUIET_MAIN = QUIET_LINES[0]
 BREAKING_HEADING = "**Breaking AI news**"
+
+
+def quiet_line(day: date) -> str:
+    """The quiet-day line for `day` — one of QUIET_LINES, rotating by working
+    day, so Friday and the Monday after it differ too (`tone.rotate`)."""
+    import tone
+    return tone.rotate(QUIET_LINES, day)
 
 
 def render(stories: list, *, mode: str = MODE_MAIN) -> str:
     """One bullet per story: `• Headline — what happened. [site](<url>)`.
 
     NO TOPIC TAG AND NO CLOSING LINE — news never needs an action, so nothing
-    after the bullets asks for one. The main post's heading ("AI news — Tue 29
+    after the bullets asks for one. The main post's heading ("AI news, Tue 29
     Sep") is added by the drip sender; a breaking post carries its own heading
     here, because it is sent outside the drip, and every story it is given, in
     ONE message.
@@ -588,8 +632,180 @@ def render(stories: list, *, mode: str = MODE_MAIN) -> str:
         head = _no_pings(s.get("headline") or "").strip()
         what = _no_pings(s.get("what") or "").strip().rstrip(".")
         body = f"{head} — {what}." if what else head
-        lines.append(f"• {body} {links.link('', s['url'])}")
+        lines.append(f"• {body} {links.link(_link_label(s), s['url'])}")
     return "\n".join(lines)
+
+
+def _link_label(story: dict) -> str:
+    """The masked link's name. "" (the site name) for an outlet's own link; the
+    OUTLET for a Google News link, whose host would otherwise read
+    "news.google.com" under every story it carried."""
+    host = (urlsplit(str(story.get("url") or "")).hostname or "").lower()
+    if host.endswith("news.google.com"):
+        return _no_pings(story.get("source") or "").strip()
+    return ""
+
+
+# -- R1 from the feeds: choosing what the scorer sees, and reading its verdicts --
+#
+# THE NEWS IS NOT SEARCHED FOR ANY MORE. `feeds.poll()` stores what the outlets
+# published; the light model is shown TITLES AND SUMMARIES ONLY — about 3k
+# tokens for forty items — and gives each a topic and an importance. Nothing
+# here opens a socket or calls a model; bot.py does both.
+
+SCORE_TITLE_CHARS = 140
+SCORE_SUMMARY_CHARS = 120
+
+
+def future_note(day: date) -> str:
+    """What R1's slot says for a date that has not happened. No model, no feed,
+    no cost — there is no news from the future to report."""
+    return (f"No news yet — {day.strftime('%a')} {day.day} {day.strftime('%b')} "
+            "hasn't happened.")
+
+
+def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
+    """The feed items worth showing the scorer, at most `cap`, newest first.
+
+    THE OUTLETS' OWN FEEDS GO FIRST (no `topic_hint`): they are AI desks and
+    nearly everything on them is in scope — but they get at most 60% of the
+    call, so a busy day on five desks cannot crowd out the topic queries, which
+    are where a story off those desks (a regulator, an Indian outlet) arrives.
+    The Google News queries fill the rest, at most `per_hint` per topic, so one
+    busy topic ("robot") cannot spend the whole call; any room still left goes
+    back to the outlets. Two rows with one headline key count once.
+    """
+    cap = max(1, int(cap))
+    ordered = sorted(items or [], key=lambda r: str(r.get("published_at") or ""),
+                     reverse=True)
+    out: list = []
+    heads: set = set()
+    per: dict = {}
+
+    def take(row, limit: int) -> bool:
+        hkey = row.get("headline_key") or row.get("url_key")
+        if hkey in heads or len(out) >= limit:
+            return False
+        heads.add(hkey)
+        out.append(row)
+        return True
+
+    outlets = [r for r in ordered if not (r.get("topic_hint") or "").strip()]
+    queries = [r for r in ordered if (r.get("topic_hint") or "").strip()]
+    share = cap if not queries else max(1, int(cap * 0.6))
+    for row in outlets:
+        take(row, share)
+    for row in queries:
+        hint = row["topic_hint"].strip()
+        if per.get(hint, 0) >= int(per_hint):
+            continue
+        if take(row, cap):
+            per[hint] = per.get(hint, 0) + 1
+    for row in outlets:
+        take(row, cap)
+    return out
+
+
+def score_prompt(items: list, topics: list, *, today: date, mode: str) -> str:
+    """ONE scoring call for a batch of feed items: titles and summaries only.
+
+    The model does not search and is given no page text. It returns one SCORE
+    line per item worth a 3 or more; everything it leaves out is recorded as
+    filler (1) by the caller, so no item is ever paid for twice.
+    """
+    seeds = [str(t).strip() for t in (topics or []) if str(t).strip()]
+    lines = [
+        "Below are news items from RSS feeds — a title and sometimes a summary "
+        f"each. Today is {dl.iso(today)}. Score them for a sales team at an "
+        "AI-data company (human data, evals, RLHF, voice and speech data, "
+        "red-teaming).",
+        "",
+        "TOPICS — these are SEEDS, NOT LIMITS. The team's sheet says 'not limited "
+        "to these', so important news off this list is welcome; tag it OTHER:",
+        "  " + ", ".join(seeds),
+        "",
+        "IMPORTANCE, 1-5:",
+        "  5 = the whole industry is talking about it today",
+        "  4 = a sales team must know this week",
+        "  3 = useful",
+        "  2-1 = filler",
+    ]
+    if mode == MODE_CHECK:
+        lines.append("BE STRICT WITH 4 AND 5: this is an hourly check for MAJOR news "
+                     "only — a big launch, a large round, a regulation, a leadership "
+                     "move the whole industry is discussing.")
+    lines += ["", "ITEMS:"]
+    for i, it in enumerate(items, 1):
+        title = " ".join(str(it.get("title") or "").split())[:SCORE_TITLE_CHARS]
+        summary = " ".join(str(it.get("summary") or "").split())[:SCORE_SUMMARY_CHARS]
+        source = " ".join(str(it.get("source") or "").split())[:30]
+        lines.append(f"{i} | {source} | {title}" + (f" — {summary}" if summary else ""))
+    lines += [
+        "",
+        "FOR EACH ITEM THAT IS AI NEWS WORTH 3 OR MORE, one line in exactly this "
+        "shape and nothing else:",
+        "  SCORE | <item number> | <topic from the list, or OTHER> | <importance 1-5> "
+        "| <what happened, one clause>",
+        "",
+        "THE CLAUSE COMES FROM THAT ITEM'S TITLE AND SUMMARY ONLY — add nothing you "
+        "know from elsewhere. Leave out everything else: items not about AI, "
+        "opinion, how-to guides, listicles, deals and discounts.",
+        "One line per story — when two items are the same story, score the first "
+        "and leave the other out.",
+        "If nothing is worth 3, reply with exactly: NOTHING FOUND",
+    ]
+    return "\n".join(lines)
+
+
+_SCORE_RE = re.compile(r"^\s*[-*•]?\s*SCORE\s*\|", re.IGNORECASE)
+
+
+def story_from_feed(row: dict, *, topics: Optional[list] = None) -> dict:
+    """A stored, scored feed row as the story dict `choose` and `render` use."""
+    return {
+        "topic": _canonical_topic(row.get("topic") or "", topics),
+        "headline": str(row.get("title") or "").strip(),
+        "what": str(row.get("what") or "").strip(),
+        "url": str(row.get("url") or "").strip(),
+        "url_key": str(row.get("url_key") or ""),
+        "headline_key": str(row.get("headline_key") or ""),
+        "importance": max(1, min(5, int(row.get("importance") or 3))),
+        "source": str(row.get("source") or "").strip(),
+    }
+
+
+def parse_scores(text: str, items: list, *, topics: Optional[list] = None) -> list:
+    """The SCORE lines, as story dicts — in the order the items were shown.
+
+    THE HEADLINE AND THE LINK COME FROM THE FEED ROW, never from the model: it
+    is given a number to point at and cannot return a url it made up. A line
+    whose number is not one of the items shown is dropped.
+    """
+    out: list = []
+    seen: set = set()
+    for line in str(text or "").splitlines():
+        if not _SCORE_RE.match(line):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 4:
+            continue
+        m = re.search(r"\d+", parts[1])
+        if not m:
+            continue
+        index = int(m.group(0)) - 1
+        if index < 0 or index >= len(items) or index in seen:
+            continue
+        imp = _IMPORTANCE_RE.match(parts[3])
+        if not imp:
+            continue
+        seen.add(index)
+        row = dict(items[index])
+        row["topic"] = parts[2]
+        row["importance"] = int(imp.group(1))
+        row["what"] = _URL_RE.sub("", " ".join(parts[4:])).strip(" -–—") \
+            if len(parts) > 4 else ""
+        out.append(story_from_feed(row, topics=topics))
+    return out
 
 
 def render_screen(rows: list, *, limit: int = 5) -> str:
@@ -892,6 +1108,71 @@ def _self_test() -> int:
           ["• Shunya Labs — builds Indic speech models [n.com](<https://n.com/1>)",
            "  fits voice & multilingual speech: they need Hinglish preference data"])
     check("it asks before adding", "without a yes" in body, True)
+
+    print("\nscoring feed items")
+    feed = [
+        {"url": "https://techcrunch.com/a", "url_key": "techcrunch.com/a",
+         "headline_key": headline_key("Lab ships eval suite"),
+         "title": "Lab ships eval suite", "summary": "A public benchmark.",
+         "source": "TechCrunch", "published_at": "2026-09-29T06:00:00+00:00",
+         "topic_hint": ""},
+        {"url": "https://news.google.com/rss/articles/x", "url_key": "news.google.com/x",
+         "headline_key": headline_key("Nebius raises seven hundred million"),
+         "title": "Nebius raises seven hundred million", "summary": "",
+         "source": "Reuters", "published_at": "2026-09-29T07:00:00+00:00",
+         "topic_hint": "RLHF"},
+        {"url": "https://news.google.com/rss/articles/y", "url_key": "news.google.com/y",
+         "headline_key": headline_key("Lab ships eval suite"),
+         "title": "Lab Ships Eval Suite", "summary": "", "source": "Wired",
+         "published_at": "2026-09-29T08:00:00+00:00", "topic_hint": "evals"},
+    ] + [
+        {"url": f"https://news.google.com/rss/articles/r{i}",
+         "url_key": f"news.google.com/r{i}", "headline_key": f"robot story {i}",
+         "title": f"Robot story {i}", "summary": "", "source": "X",
+         "published_at": f"2026-09-29T0{i}:30:00+00:00", "topic_hint": "robot"}
+        for i in range(1, 6)
+    ]
+    picked = preselect(feed, cap=40, per_hint=3)
+    check("the outlet's own feed leads", picked[0]["source"], "TechCrunch")
+    check("one busy topic is capped at three",
+          sum(1 for p in picked if p["topic_hint"] == "robot"), 3)
+    check("the same headline from a second outlet is not shown twice",
+          sum(1 for p in picked if p["headline_key"] == feed[0]["headline_key"]), 1)
+    check("the cap holds", len(preselect(feed, cap=2)), 2)
+    sp = score_prompt(picked[:2], topics, today=today, mode=MODE_MAIN)
+    check("it shows titles, numbered", "1 | TechCrunch | Lab ships eval suite — "
+          "A public benchmark." in sp, True)
+    check("it carries no url", "http" in sp, False)
+    check("it asks for SCORE lines", "SCORE | <item number> |" in sp, True)
+    check("seeds, not limits", "SEEDS, NOT LIMITS" in sp, True)
+    check("the check is strict",
+          "BE STRICT WITH 4 AND 5" in score_prompt(picked[:2], topics, today=today,
+                                                   mode=MODE_CHECK), True)
+    scored = parse_scores(
+        "SCORE | 2 | RLHF | 5 | raised $700m for inference capacity\n"
+        "SCORE | 1 | evals | 4 | a public benchmark for agents\n"
+        "SCORE | 9 | evals | 5 | not an item that was shown\n"
+        "SCORE | 1 | evals | 3 | a second line for the same item\n",
+        picked[:2], topics=topics)
+    check("two stories, the out-of-range and the repeat dropped", len(scored), 2)
+    check("the headline is the feed's, not the model's",
+          scored[0]["headline"], "Nebius raises seven hundred million")
+    check("the link is the feed's", scored[0]["url"],
+          "https://news.google.com/rss/articles/x")
+    check("the importance is read", [s["importance"] for s in scored], [5, 4])
+    check("the topic is the list's spelling", scored[1]["topic"], "evals")
+    body = render(scored)
+    check("a Google News link is named for its outlet",
+          "[Reuters](<https://news.google.com/rss/articles/x>)" in body, True)
+    check("an outlet's own link keeps its site name",
+          "[techcrunch.com](<https://techcrunch.com/a>)" in body, True)
+    check("a future date says so", future_note(date(2026, 10, 5)),
+          "No news yet — Mon 5 Oct hasn't happened.")
+    check("a lookup is read", parse_screen_lookups("LOOKUP | Shunya Labs\nSCREEN | a | b | c"),
+          ["Shunya Labs"])
+    check("the lookup line is offered only when asked for",
+          ("LOOKUP |" in screen_prompt([S("evals", "x")], ["Acme"], allow_lookup=True),
+           "LOOKUP |" in screen_prompt([S("evals", "x")], ["Acme"])), (True, False))
 
     print("\nfound-nothing")
     check("an honest empty", found_nothing("NOTHING FOUND"), True)

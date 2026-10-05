@@ -263,6 +263,22 @@ def describe(when: Optional[datetime] = None) -> str:
     return f"{line} (test time)" if pretending() else f"{line} (IST)"
 
 
+def real_date_label() -> str:
+    """"Thu 1 Oct" — the REAL date, the short way a person writes it."""
+    real = real_today_ist()
+    return f"{real.strftime('%a')} {real.day} {real.strftime('%b')}"
+
+
+def describe_with_real() -> str:
+    """"Monday 28 Sep, 1:17 PM (test time) — the real date is Thu 1 Oct."
+
+    WHAT A TESTER IS TOLD WHEN THEY NAME A DAY. Day names are read against the
+    real date, so the reply says both: where the clock now stands, and the
+    date it was counted from.
+    """
+    return f"{describe()} — the real date is {real_date_label()}."
+
+
 def status() -> dict:
     """{pretending, now, real_now, set_by, pretend_date, override} — for the
     boot log and `test help`."""

@@ -208,16 +208,20 @@ def read_day(phrase: str) -> Optional[date]:
     today), passed or not — the same rule `this_week_day` gives the simulations.
     "make it Monday" on a Wednesday is the Monday two days ago; on a Monday it
     is today. "next monday" / "last monday" step a week either way.
+
+    EVERY WORD HERE IS READ AGAINST THE REAL DATE (`real_today`), never the
+    pretend one: with the clock parked on Monday 5 Oct and the real date Thu
+    1 Oct, "monday" is 28 Sep, "today" is 1 Oct and "tomorrow" is 2 Oct.
     """
     want = " ".join(str(phrase or "").split()).strip().lower().strip(".,!?")
     if not want:
         return None
     if want in ("today", "now"):
-        return today()
+        return real_today()
     if want == "tomorrow":
-        return today() + timedelta(days=1)
+        return real_today() + timedelta(days=1)
     if want == "yesterday":
-        return today() - timedelta(days=1)
+        return real_today() - timedelta(days=1)
 
     parts = want.split()
     if len(parts) == 1 and parts[0] in _WEEKDAY_INDEX:
@@ -235,7 +239,7 @@ def read_day(phrase: str) -> Optional[date]:
     # A bare day-and-month ("28 Sep") is the commonest form and that parser
     # wants a year. Try this year, then next, and prefer one not in the past —
     # somebody testing a date almost always means the one coming up.
-    base = today()
+    base = real_today()
     for year in (base.year, base.year + 1):
         got = dl.parse_date(f"{want} {year}")
         if got is not None and got >= base:
@@ -261,7 +265,9 @@ def help_text() -> str:
         "                      has passed; say 'next monday' or 'last monday'",
         "                      for another week. 'tomorrow' or a date like",
         "                      28 Sep works too.",
-        "  next day            Move on to the following day and post that.",
+        "                      Day names, 'today' and 'tomorrow' always count",
+        "                      from the REAL date, wherever the pretend day is.",
+        "  next day            Move on from the pretend day to the one after.",
         "  back to today       Stop pretending. The real date comes back.",
         "  start over          Wipe everything I have recorded while testing",
         "                      and begin again. I will ask you to confirm.",
@@ -324,8 +330,31 @@ def reset_clock() -> str:
 
 
 def today() -> date:
-    """Today, as the bot sees it. The offset applies only in test mode."""
+    """Today, as the bot sees it: the PRETEND date when one is set (plus the
+    test offset). What "next day" moves on from — and never the base for
+    resolving a weekday or a week; that is `real_today`."""
     return dl.today_ist() + timedelta(days=clock_offset_days())
+
+
+def real_today() -> date:
+    """The REAL date (plus the test offset), whatever the pretend clock says.
+
+    THE BASE FOR EVERY WEEKDAY AND EVERY WEEK. A tester who parked the clock on
+    Monday 5 Oct and then says "make it monday" means the Monday of the week
+    they are actually sitting in. Resolved against the pretend date, each
+    "make it monday" drifted further from the calendar on the wall.
+    """
+    return dl.real_today_ist() + timedelta(days=clock_offset_days())
+
+
+def dates_line() -> str:
+    """"real date 2026-10-01 | pretend date 2026-09-28" (or "none") — the one
+    line boot and every test command log."""
+    import clock
+
+    st = clock.status()
+    pretend = dl.iso(st["pretend_date"]) if st["pretend_date"] else "none"
+    return f"real date {dl.iso(real_today())} | pretend date {pretend}"
 
 
 def now() -> datetime:
@@ -443,31 +472,34 @@ def parse(text: str) -> Optional[dict]:
 
 
 def this_week_day(index: int, *, from_day: Optional[date] = None) -> date:
-    """That weekday in the week (Monday to Sunday) containing today.
+    """That weekday in the week (Monday to Sunday) containing the REAL today.
 
     PASSED OR NOT. "simulate monday" on a Wednesday is the Monday two days ago —
     a tester means this week. A past pretend date is fine: the research cache
     and drip_sends are keyed per date, so nothing collides with today.
+
+    THE REAL WEEK, not the pretend clock's (`real_today`).
     """
-    base = from_day or today()
+    base = from_day or real_today()
     monday = base - timedelta(days=base.weekday())
     return monday + timedelta(days=int(index))
 
 
 def next_weekday(index: int, *, from_day: Optional[date] = None) -> date:
-    """The first date on or after `from_day` (today) that falls on `index`.
+    """The first date on or after `from_day` (the real today) that falls on
+    `index`.
 
     Forward-only, today included. Bare weekday names do NOT use this — they
     mean this week (`this_week_day`).
     """
-    base = from_day or today()
+    base = from_day or real_today()
     delta = (int(index) - base.weekday()) % 7
     return base + timedelta(days=delta)
 
 
 def week_of(start: Optional[date] = None) -> list:
-    """Monday to Sunday of the week containing `start` (default: today)."""
-    monday = this_week_day(0, from_day=start or today())
+    """Monday to Sunday of the week containing `start` (default: the REAL today)."""
+    monday = this_week_day(0, from_day=start or real_today())
     return [monday + timedelta(days=i) for i in range(7)]
 
 
@@ -475,8 +507,9 @@ def next_date_for_rule(rule_id: str, *, from_day: Optional[date] = None) -> Opti
     """The next date the named rule would fire on. None when it never would.
 
     THIS WEEK FIRST, THEN NEXT. Unlike a bare weekday this looks forward only:
-    the scan starts at today, so a rule whose day is today or later this week
-    gets that day, and one whose day has already passed gets next week's.
+    the scan starts at the REAL today, so a rule whose day is today or later
+    this week gets that day, and one whose day has already passed gets next
+    week's.
 
     ANCHORED RULES (R8, R9) HAVE NO WEEKDAY, so "the next date it would fire" is
     simply the next working day — their own evaluators decide whether anything
@@ -488,7 +521,7 @@ def next_date_for_rule(rule_id: str, *, from_day: Optional[date] = None) -> Opti
     rule = rules_mod.by_id(str(rule_id).upper())
     if rule is None or not rule.enabled:
         return None
-    base = from_day or today()
+    base = from_day or real_today()
     for offset in range(0, 21):
         day = base + timedelta(days=offset)
         if rule.runs_on(day):
@@ -796,9 +829,9 @@ def _self_test() -> int:
     check("in order", days == sorted(days), True)
 
     print("\nthis week in commands (clock pinned to Tue 22 Sep)")
-    global today
-    real_today = today
-    today = lambda: base  # noqa: E731
+    global today, real_today
+    was_today, was_real = today, real_today
+    today = real_today = lambda: base  # noqa: E731
     try:
         check("simulate monday -> this Monday",
               parse("simulate monday")["date"], date(2026, 9, 21))
@@ -813,7 +846,56 @@ def _self_test() -> int:
         check("make it next monday", read_day("next monday"), date(2026, 9, 28))
         check("tomorrow unchanged", read_day("tomorrow"), date(2026, 9, 23))
     finally:
-        today = real_today
+        today, real_today = was_today, was_real
+
+    # THE PRETEND CLOCK IS NEVER THE BASE. Parked on Mon 5 Oct, real date Thu
+    # 1 Oct: `clock`'s two answers are swapped for fixed ones, and the real
+    # `today()` / `real_today()` above are what get exercised.
+    print("\nweekdays resolve from the REAL date (pretend Mon 5 Oct, real Thu 1 Oct)")
+    import clock
+    was_now, was_pretend = clock.real_now_ist, clock.today_ist
+    clock.real_now_ist = lambda: datetime(2026, 10, 1, 13, 17, tzinfo=dl.IST)
+    clock.today_ist = lambda: date(2026, 10, 5)
+    try:
+        check("the pretend date", today(), date(2026, 10, 5))
+        check("the real date", real_today(), date(2026, 10, 1))
+        check("make it monday", parse_test_command("make it monday")["date"],
+              date(2026, 9, 28))
+        check("make it tuesday", parse_test_command("make it tuesday")["date"],
+              date(2026, 9, 29))
+        check("make it next monday",
+              parse_test_command("make it next monday")["date"], date(2026, 10, 5))
+        check("make it last monday",
+              parse_test_command("make it last monday")["date"], date(2026, 9, 21))
+        check("make it today", read_day("today"), date(2026, 10, 1))
+        check("make it tomorrow", read_day("tomorrow"), date(2026, 10, 2))
+        check("make it yesterday", read_day("yesterday"), date(2026, 9, 30))
+        # A BARE DAY-AND-MONTH IS THE NEXT ONE ON OR AFTER THE REAL DATE. With
+        # the pretend date as the base, "3 Oct" was read as 3 Oct NEXT year.
+        check("a bare 3 Oct is this year's, counted from the real date",
+              read_day("3 Oct"), date(2026, 10, 3))
+        check("a bare 5 Oct is not pushed a year by the pretend date",
+              read_day("5 Oct"), date(2026, 10, 5))
+        check("a dated day is itself", read_day("2026-09-28"), date(2026, 9, 28))
+        check("simulate monday", parse("simulate monday")["date"], date(2026, 9, 28))
+        week = week_of(parse("simulate week")["date"])
+        check("simulate week starts", week[0], date(2026, 9, 28))
+        check("simulate week ends", week[-1], date(2026, 10, 4))
+        check("week_of() with no date is the real week", week_of()[0],
+              date(2026, 9, 28))
+        check("simulate next monday", parse("simulate next monday")["date"],
+              date(2026, 10, 5))
+        check("simulate last week", parse("simulate last week")["date"],
+              date(2026, 9, 21))
+        check("next weekday scans from the real date", next_weekday(0),
+              date(2026, 10, 5))
+        check("\"next day\" is a command, not a date (it moves the pretend day)",
+              parse_test_command("next day")["cmd"], CMD_NEXT_DAY)
+        # "back to today": the pretend clock is dropped, so both agree again.
+        clock.today_ist = lambda: clock.real_now_ist().date()
+        check("back to today", today(), date(2026, 10, 1))
+    finally:
+        clock.real_now_ist, clock.today_ist = was_now, was_pretend
 
     print("\nrendering")
     config.ROSTER_DISPLAY_NAMES = {"111": "Vaishnavi", "222": "Sid"}

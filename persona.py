@@ -109,6 +109,11 @@ making that welcome rather than annoying.
 SOUND LIKE A WARM SALES HEAD who has already looked at the sheet and is
 mentioning one thing on the way past. Not a dashboard. Not a ticketing system.
 
+Write like a teammate in a group chat, not a system notification. Use
+contractions. Address people by first name. One warm, specific opening phrase;
+never 'nothing to act on', 'quiet cycle', 'worth flagging', 'as per', 'kindly',
+'please note'. End with the ask or an easy out, not a summary.
+
 ONE THOUGHT PER MESSAGE. One subject, one person, one ask. If you find yourself
 writing "and also", stop — the second thing is a different message on a
 different day.
@@ -172,14 +177,15 @@ def _exemplars_from_policy(text: str) -> str:
 
 
 def proactive_voice_blocks(*, recent_openers=None) -> list:
-    """The proactive system prompt as blocks: the STRATEGY (cached), then the
-    tone, the voice, the exemplars and the rules (not cached — the tone block
-    carries the recent openers, which change after every send)."""
-    text = proactive_voice_prompt(recent_openers=recent_openers)
-    strategy = strategy_preamble()
-    if text.startswith(strategy):
-        return [cached_block(strategy), {"type": "text", "text": text[len(strategy):]}]
-    return [{"type": "text", "text": text}]
+    """The proactive system prompt as ONE UNCACHED block.
+
+    NO CACHE BREAKPOINT ON THE DRIP COMPOSE PATH. The day's messages are 90
+    minutes apart and a cache entry lives 5: every compose WROTE the strategy
+    to the cache at 1.25x and nothing ever read it back. Sent plain, the same
+    tokens cost 1x.
+    """
+    return [{"type": "text",
+             "text": proactive_voice_prompt(recent_openers=recent_openers)}]
 
 
 def proactive_voice_prompt(*, recent_openers=None) -> str:
@@ -446,6 +452,16 @@ def policy_block() -> str:
     return _POLICY_HEADER + policy + truncated + "\n\n"
 
 
+def cache_control() -> dict:
+    """The breakpoint marker, with CACHE_TTL: 5 minutes by default, "1h" when
+    the setting says so. ONE place, so every breakpoint in a request carries
+    the same lifetime — the API rejects a 1-hour one placed after a 5-minute."""
+    marker = {"type": "ephemeral"}
+    if str(getattr(config, "CACHE_TTL", "5m")) == "1h":
+        marker["ttl"] = "1h"
+    return marker
+
+
 def cached_block(text: str) -> dict:
     """A system text block that is a prompt-cache breakpoint.
 
@@ -453,7 +469,7 @@ def cached_block(text: str) -> dict:
     (mtime, size) caches above, so between edits every call sends exactly the
     same bytes and the cache key holds.
     """
-    return {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
+    return {"type": "text", "text": text, "cache_control": cache_control()}
 
 
 def system_blocks(*, include_sources: bool = True, tail: str = "",
@@ -722,13 +738,18 @@ def model_failure_reply(reason: str = "") -> str:
 # promises only what is true — the web lines are used only once a search has
 # actually run this turn (see bot._answer_with_engine), so Saley never says it
 # is checking the web while it is reading the sheet.
+#
+# THREE OF EACH, the way somebody would type it across a desk: contractions,
+# no "please hold", nothing that reads as a status banner.
 INTERIM_LINES_WEB = (
-    "On it — checking the web for this, give me a minute or two.",
-    "Looking this up now, back shortly with what I find.",
+    "On it — I'm checking the web for this, give me a minute or two.",
+    "Looking this up now. Back shortly with what I find.",
+    "Give me a couple of minutes — I'm searching for this.",
 )
 INTERIM_LINES_ENGINE = (
-    "Give me a moment, digging through the sheet and notes for that.",
-    "One sec — pulling this together.",
+    "Give me a moment, I'm going through the sheet and the notes for that.",
+    "One sec — I'm pulling this together.",
+    "Let me check the sheet and the notes. Won't be long.",
 )
 
 

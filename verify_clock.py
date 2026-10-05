@@ -60,6 +60,11 @@ logging.getLogger().setLevel(logging.INFO)
 for _n in ("httpx", "httpcore", "anthropic", "discord", "gtm_sheet", "mapping_sheet"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
+
 failures = 0
 POSTED: list = []
 

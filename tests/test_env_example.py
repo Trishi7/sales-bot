@@ -53,6 +53,20 @@ HELPERS = {
 # file does not have to carry them.
 NOT_SETTINGS = {"PYTHONPATH", "PYTEST_CURRENT_TEST", "TZ"}
 
+# RETIRED, BUT STILL READ ON ONE PATH. Web search moved out of the model
+# (search_backend.py), and these ten shape Anthropic's server-side tool, which
+# is now reached only under SEARCH_BACKEND=anthropic — kept for comparison.
+# Under the default backend they do nothing, so they belong in the RETIRED
+# block; the code still reads them, so they are the one exception to "a
+# retired name is read nowhere". The set is closed: adding to it needs the
+# same justification, written in the RETIRED block itself.
+ANTHROPIC_BACKEND_ONLY = {
+    "WEB_SEARCH_MAX_USES", "WEB_SEARCH_RESPONSE_INCLUSION",
+    "WEB_SEARCH_ALLOWED_CALLERS", "WEB_SEARCH_ALLOWED_DOMAINS",
+    "WEB_SEARCH_BLOCKED_DOMAINS", "WEB_SEARCH_CITY", "WEB_SEARCH_REGION",
+    "WEB_SEARCH_COUNTRY", "WEB_SEARCH_TIMEZONE", "NEWS_CHECK_MAX_USES",
+}
+
 _VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 # A live line: KEY=..., no leading "#", indentation tolerated.
 _LIVE_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]{2,})\s*=", re.M)
@@ -164,7 +178,8 @@ class TestEveryVariableIsListed:
         the value in the code where nobody reading `.env` can see it.
         """
         dead = [v for v in variables_read_by_the_code()
-                if v not in live_keys() and v in commented_keys()]
+                if v not in live_keys() and v in commented_keys()
+                and v not in ANTHROPIC_BACKEND_ONLY]
         assert not dead, (
             "commented out in .env.example but still read by the code: "
             + ", ".join(dead)
@@ -185,12 +200,31 @@ class TestRetiredVariablesStayRetired:
 
     def test_a_retired_variable_is_not_read_anywhere(self):
         live = set(variables_read_by_the_code())
-        zombies = sorted(retired_keys() & live)
+        zombies = sorted((retired_keys() & live) - ANTHROPIC_BACKEND_ONLY)
         assert not zombies, (
             "listed as RETIRED but still read by the code: "
             + ", ".join(zombies)
             + ". Either the code should stop reading it, or it is not retired."
         )
+
+    def test_the_server_side_search_settings_are_retired_and_say_why(self):
+        """The ten settings of Anthropic's server-side tool live in RETIRED —
+        commented, never live — and the block says when they ARE read."""
+        retired = retired_keys()
+        missing = sorted(ANTHROPIC_BACKEND_ONLY - retired)
+        assert not missing, "not in the RETIRED block: " + ", ".join(missing)
+        still_live = sorted(ANTHROPIC_BACKEND_ONLY & live_keys())
+        assert not still_live, (
+            "retired but still an uncommented line: " + ", ".join(still_live))
+        text = _example_text()
+        block = text[list(_BANNER_RE.finditer(text))[-1].start():]
+        assert "SEARCH_BACKEND=" in block and "anthropic" in block, (
+            "the RETIRED block must say these are read only under "
+            "SEARCH_BACKEND=anthropic")
+        unread = sorted(ANTHROPIC_BACKEND_ONLY - set(variables_read_by_the_code()))
+        assert not unread, (
+            "listed as read under SEARCH_BACKEND=anthropic but no longer read "
+            "at all — drop it from ANTHROPIC_BACKEND_ONLY: " + ", ".join(unread))
 
     def test_the_retired_block_exists(self):
         assert "RETIRED" in _example_text(), (

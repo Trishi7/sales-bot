@@ -29,6 +29,11 @@ os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_TEST_MODE = True
 config.SALES_TEST_CHANNEL_ID = 4242
@@ -47,11 +52,15 @@ import news  # noqa: E402
 import nextaction  # noqa: E402
 import rules as rules_mod  # noqa: E402
 import simulation  # noqa: E402
+import tone  # noqa: E402
 from bot import SalesBot  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 for _noisy in ("httpx", "httpcore", "anthropic", "discord", "gtm_sheet", "mapping_sheet"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
 
 failures = 0
 POSTED: list = []
@@ -110,7 +119,8 @@ STORIES = [
 def build_messages(day, *, quiet_news=False):
     R = rules_mod.by_id
     items = []
-    body = news.QUIET_MAIN if quiet_news else news.render(STORIES, mode=news.MODE_MAIN)
+    body = (news.quiet_line(day) if quiet_news
+            else news.render(STORIES, mode=news.MODE_MAIN))
     items.append(nextaction._item(
         rule=R("R1"), trigger=nextaction.R_AI_NEWS, today=day, due=day, why="R1",
         text=body, extra={"research": body, "sources": [] if quiet_news else [
@@ -155,7 +165,7 @@ def assert_layouts(bodies, label):
     print(f"   headings seen ({label}):", heads)
     check(f"{label}: every message opens with a bold heading",
           all(re.match(r"^\*\*[^*]+\*\*$", h) for h in heads))
-    news_body = next((b for h, b in by_head.items() if h.startswith("**AI news — ")), "")
+    news_body = next((b for h, b in by_head.items() if h.startswith("**AI news, ")), "")
     check(f"{label}: R1 heading carries the day", bool(news_body))
     bullets = [l for l in news_body.splitlines() if l.startswith("• ")]
     check(f"{label}: one story per bullet", len(bullets), 2)
@@ -167,7 +177,7 @@ def assert_layouts(bodies, label):
                           "wispr-flow-series-b/>)"])
     check(f"{label}: no closing line after the stories",
           news_body.rstrip().splitlines()[-1].startswith("• "))
-    deliv = next((b for h, b in by_head.items() if h.startswith("**Deliverables — week of ")),
+    deliv = next((b for h, b in by_head.items() if h == "**This week's deliverables**"),
                  "")
     lines = deliv.splitlines()
     check(f"{label}: deliverable point, line 1", "1. Pulse Product Overview Document" in lines)
@@ -181,10 +191,10 @@ def assert_layouts(bodies, label):
                            r"Due: \w{3} \d{1,2} \w{3}", l) for l in lines))
     check(f"{label}: remarks as their own short line", "   waiting on the lawyer" in lines)
     check(f"{label}: the plain close",
-          lines[-1] == "Tell me if any of these have moved and I will update my list.")
+          lines[-1] == drip.DELIVERABLES_CLOSE)
     r6 = next((b for h, b in by_head.items() if h == "**LinkedIn connected, no DM yet**"), "")
     check(f"{label}: R6 has its heading", bool(r6))
-    check(f"{label}: R11 has its heading", "**New companies in the pipeline**" in heads)
+    check(f"{label}: R11 has its heading", "**New in the pipeline**" in heads)
     stray = [u for b in bodies for u in links.bare_urls(b)]
     check(f"{label}: no bare url anywhere", stray, [])
     return by_head
@@ -213,8 +223,8 @@ async def main():
     fb = drip.compose_fallback(r6)
     show(fb)
     check("R6 fallback is the plain wording",
-          "accepted the LinkedIn connection a few days ago and there is no DM yet. Do "
-          "you want to send one? If you already did, tell me and I will note it." in fb)
+          "accepted your connection a few days ago but there's no DM yet. Want to "
+          "send one this week? If you already have, just tell me." in fb)
 
     print('\n"make it Tuesday" — the real sender, live composition where it applies')
     POSTED.clear()
@@ -223,7 +233,13 @@ async def main():
     for b in POSTED:
         show(b)
         print("   |")
-    day_bodies = list(POSTED)
+    # THE ONE LINE THAT IS NOT A MESSAGE: where the clock stands, and the real
+    # date the day name was counted from.
+    confirm = [b for b in POSTED if "the real date is" in str(b)]
+    check("the day is confirmed, with the real date", len(confirm), 1)
+    check("...and it is this REAL week's Tuesday",
+          dl.today_ist(), simulation.this_week_day(1))
+    day_bodies = [b for b in POSTED if "the real date is" not in str(b)]
     assert_layouts(day_bodies, "test day")
     r6_sent = next(b for b in day_bodies if "**LinkedIn connected, no DM yet**" in b)
     check("R6 as sent names the company", "Acme AI" in r6_sent)
@@ -240,8 +256,8 @@ async def main():
     day = dl.today_ist()
     check("heading, tags line, one line — nothing else",
           (re.sub(r"^\[TEST\]\s*", "", got[0]) if got else "", got[-1] if got else ""),
-          (f"**AI news — {day.strftime('%a')} {day.day} {day.strftime('%b')}**",
-           "Nothing new on the news today."))
+          (f"**AI news, {day.strftime('%a')} {day.day} {day.strftime('%b')}**",
+           news.quiet_line(day)))
     check("at most three lines (heading, tags, the line)", len(got) <= 3)
 
     print("\n(iii) a breaking post — the hourly check, search stubbed to one big story")

@@ -866,7 +866,57 @@ CREATE TABLE IF NOT EXISTS research_cache (
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (item_key, on_date)
 );
+
+-- THE QUERY -> RESULTS CACHE (search_backend.py), and fetched pages.
+--
+-- A search request costs money; the same query asked again inside
+-- SEARCH_CACHE_HOURS does not. `cache_key` is a hash of the query and its
+-- options (or "page|<url>" for a fetched page). `fetched_at` is REAL UTC time,
+-- never the pretend clock: the cache is about what the web said recently.
+--
+-- KEPT BY "reset test state" — wiping it would make the next test day pay
+-- again for answers it already had.
+CREATE TABLE IF NOT EXISTS search_cache (
+    cache_key    TEXT PRIMARY KEY,
+    backend      TEXT NOT NULL DEFAULT '',
+    query        TEXT NOT NULL DEFAULT '',
+    results_json TEXT NOT NULL DEFAULT '[]',
+    fetched_at   TEXT NOT NULL              -- ISO datetime, UTC
+);
+
+-- R1: WHAT THE FEEDS HAVE CARRIED (feeds.py). One row per story.
+--
+-- A poll reads RSS and stores what is new here; no model and no search API is
+-- involved. `url_key` and `headline_key` are the same two identities the
+-- posted stories use (news.url_key / news.headline_key), so one story from
+-- two feeds is one row. `importance`, `topic` and `what` are filled in later
+-- by the light model's scoring call (`scored_at` says when); 0 = not scored.
+-- Every timestamp is REAL UTC.
+CREATE TABLE IF NOT EXISTS news_feed_items (
+    url_key      TEXT PRIMARY KEY,
+    headline_key TEXT NOT NULL DEFAULT '',
+    url          TEXT NOT NULL DEFAULT '',
+    title        TEXT NOT NULL DEFAULT '',
+    summary      TEXT NOT NULL DEFAULT '',   -- at most 300 characters
+    source       TEXT NOT NULL DEFAULT '',
+    published_at TEXT NOT NULL DEFAULT '',   -- ISO datetime, UTC
+    topic_hint   TEXT NOT NULL DEFAULT '',   -- the NEWS_TOPICS query it came from
+    seen_at      TEXT NOT NULL DEFAULT '',   -- ISO datetime, UTC
+    importance   INTEGER NOT NULL DEFAULT 0, -- 1-5 once scored
+    topic        TEXT NOT NULL DEFAULT '',
+    what         TEXT NOT NULL DEFAULT '',
+    scored_at    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_news_feed_published ON news_feed_items(published_at);
+CREATE INDEX IF NOT EXISTS ix_news_feed_headline ON news_feed_items(headline_key);
 """
+
+# WHAT "reset test state" / "start over" KEEP. Everything else is operational
+# state and is wiped. These four are caches and ledgers of things that were
+# PAID FOR (or fetched): deleting them would make the next test run pay again,
+# and would make "what did you cost" forget what testing cost.
+KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls",
+                 "web_search_usage")
 
 
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` won't
@@ -892,6 +942,10 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # the asker in plain text.
     ("scheduled_reminders", "channel_id", "TEXT NOT NULL DEFAULT ''"),
     ("scheduled_reminders", "asker_id", "TEXT NOT NULL DEFAULT ''"),
+    # WHICH BACKEND A DAY'S SEARCHES RAN ON (serper | brave | anthropic), so
+    # "what did you cost" can price a request. '' on rows from before this is
+    # read as anthropic, which is what they were.
+    ("web_search_usage", "backend", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 # Indexes on migrated columns. They cannot live in SCHEMA — on an existing DB
@@ -2635,33 +2689,40 @@ class DB:
                 "than searching an unknown number of times."
             )
             import config as _config
-            return max(0, int(_config.WEB_SEARCH_DAILY_BUDGET))
+            return _config.search_daily_budget()
 
     def web_search_budget_left(self, on_date: str) -> int:
+        """Requests left today — SEARCH_DAILY_BUDGET under serper/brave,
+        WEB_SEARCH_DAILY_BUDGET under the anthropic backend."""
         import config as _config
-        budget = max(0, int(_config.WEB_SEARCH_DAILY_BUDGET))
+        budget = _config.search_daily_budget()
         return max(0, budget - self.web_searches_today(on_date))
 
     def record_web_search(self, *, on_date: str, rule_id: str, searches: int,
-                          errors: int = 0) -> int:
+                          errors: int = 0, backend: str = "") -> int:
         """Bank one call's billed searches. Returns the new day total.
 
         Called AFTER the response comes back, with the count the API reported —
         which is why a call that errored adds 0 to `searches` and 1 to `errors`.
         Reserving before the call would spend a budget on searches that never
         happened.
+
+        `backend` (serper | brave | anthropic) is stored beside the count so
+        "what did you cost" can price each request.
         """
         try:
             with self.conn() as c:
                 c.execute(
                     "INSERT INTO web_search_usage (on_date, rule_id, searches, calls, "
-                    "errors) VALUES (?,?,?,1,?) "
+                    "errors, backend) VALUES (?,?,?,1,?,?) "
                     "ON CONFLICT(on_date, rule_id) DO UPDATE SET "
                     "searches = searches + excluded.searches, "
                     "calls = calls + 1, errors = errors + excluded.errors, "
+                    "backend = CASE WHEN excluded.backend <> '' THEN excluded.backend "
+                    "          ELSE backend END, "
                     "updated_at = CURRENT_TIMESTAMP",
                     (str(on_date), str(rule_id or ""), max(0, int(searches or 0)),
-                     max(0, int(errors or 0))),
+                     max(0, int(errors or 0)), str(backend or "")),
                 )
         except Exception:
             log.exception("[websearch] could not record %d search(es) for %s",
@@ -2673,7 +2734,8 @@ class DB:
         try:
             with self.conn() as c:
                 rows = c.execute(
-                    "SELECT rule_id, searches, calls, errors FROM web_search_usage "
+                    "SELECT rule_id, searches, calls, errors, backend "
+                    "FROM web_search_usage "
                     "WHERE on_date = ? ORDER BY searches DESC", (str(on_date),),
                 ).fetchall()
             return [dict(r) for r in rows]
@@ -2686,9 +2748,10 @@ class DB:
         try:
             with self.conn() as c:
                 rows = c.execute(
-                    "SELECT rule_id, SUM(searches) AS searches, SUM(calls) AS calls "
+                    "SELECT rule_id, SUM(searches) AS searches, SUM(calls) AS calls, "
+                    "MAX(backend) AS backend "
                     "FROM web_search_usage WHERE on_date BETWEEN ? AND ? "
-                    "GROUP BY rule_id ORDER BY searches DESC",
+                    "GROUP BY rule_id, backend ORDER BY searches DESC",
                     (str(start_iso), str(end_iso)),
                 ).fetchall()
             return [dict(r) for r in rows]
@@ -2731,6 +2794,176 @@ class DB:
             rows = c.execute("SELECT * FROM llm_calls WHERE ts >= ? ORDER BY ts, rowid",
                              (str(since_ts),)).fetchall()
         return [dict(r) for r in rows]
+
+    def llm_usage_by_site_model(self, since_ts: str) -> list[dict]:
+        """[{site, model, calls, input_tokens, cache_write, cache_read,
+        output_tokens}] since `since_ts` — the grain the dollar figures need,
+        because a token's price depends on the model that read it."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT site, model, COUNT(*) AS calls, "
+                "SUM(input_tokens) AS input_tokens, SUM(cache_write) AS cache_write, "
+                "SUM(cache_read) AS cache_read, SUM(output_tokens) AS output_tokens "
+                "FROM llm_calls WHERE ts >= ? GROUP BY site, model", (str(since_ts),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def llm_budget_tokens_since(self, since_ts: str) -> int:
+        """Input tokens spent since `since_ts`, as TOKEN_DAILY_BUDGET counts
+        them: uncached input and cache writes in full, cache reads at 10%.
+
+        FAILS OPEN, at zero. An unreadable token log must not be the reason a
+        person's question goes unanswered; the search-request budget (which
+        fails closed) still bounds the day.
+        """
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT COALESCE(SUM(input_tokens + cache_write), 0) AS full, "
+                    "COALESCE(SUM(cache_read), 0) AS reads FROM llm_calls "
+                    "WHERE ts >= ?", (str(since_ts),),
+                ).fetchone()
+            return int(row["full"] or 0) + int(round(int(row["reads"] or 0) * 0.1))
+        except Exception:
+            log.exception("[tokens] the token log could not be read for the budget")
+            return 0
+
+    # -- the search cache (search_backend.py) -------------------------------
+
+    def search_cache_get(self, cache_key: str, *, since_utc: str) -> Optional[dict]:
+        """The cached row for this key fetched at or after `since_utc`, or None.
+        FAILS OPEN, to a miss — the budget still bounds what a miss costs."""
+        import json
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT backend, query, results_json, fetched_at FROM search_cache "
+                    "WHERE cache_key = ? AND fetched_at >= ?",
+                    (str(cache_key), str(since_utc)),
+                ).fetchone()
+            if row is None:
+                return None
+            return {"backend": row["backend"], "query": row["query"],
+                    "results": json.loads(row["results_json"] or "[]"),
+                    "fetched_at": row["fetched_at"]}
+        except Exception:
+            log.exception("[search] the cache could not be read; treating as a miss")
+            return None
+
+    def search_cache_put(self, cache_key: str, *, backend: str, query: str,
+                         results, fetched_at: str) -> bool:
+        import json
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO search_cache (cache_key, backend, query, results_json, "
+                    "fetched_at) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET backend = excluded.backend, "
+                    "query = excluded.query, results_json = excluded.results_json, "
+                    "fetched_at = excluded.fetched_at",
+                    (str(cache_key), str(backend or ""), str(query or "")[:500],
+                     json.dumps(results, ensure_ascii=False), str(fetched_at)),
+                )
+            return True
+        except Exception:
+            log.exception("[search] could not store a cache row")
+            return False
+
+    # -- R1: the feed store (feeds.py) --------------------------------------
+
+    def news_feed_add(self, items: list) -> int:
+        """Store the feed items that are NEW. Returns how many were.
+
+        NEW MEANS NEITHER KEY IS KNOWN: the same link (url_key) or the same
+        headline from another outlet (headline_key) is the same story and is
+        not stored twice.
+        """
+        added = 0
+        with self.conn() as c:
+            for it in items or []:
+                ukey = str(it.get("url_key") or "").strip()
+                hkey = str(it.get("headline_key") or "").strip()
+                if not ukey:
+                    continue
+                seen = c.execute(
+                    "SELECT 1 FROM news_feed_items WHERE url_key = ? "
+                    "OR (? <> '' AND headline_key = ?) LIMIT 1", (ukey, hkey, hkey),
+                ).fetchone()
+                if seen is not None:
+                    continue
+                c.execute(
+                    "INSERT INTO news_feed_items (url_key, headline_key, url, title, "
+                    "summary, source, published_at, topic_hint, seen_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (ukey, hkey, str(it.get("url") or ""), str(it.get("title") or "")[:300],
+                     str(it.get("summary") or "")[:300], str(it.get("source") or "")[:120],
+                     str(it.get("published_at") or ""), str(it.get("topic_hint") or ""),
+                     str(it.get("seen_at") or "")),
+                )
+                added += 1
+        return added
+
+    def news_feed_between(self, since_utc: str, until_utc: str) -> list[dict]:
+        """Every stored item published in [since, until], newest first."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_feed_items WHERE published_at >= ? "
+                "AND published_at <= ? ORDER BY published_at DESC",
+                (str(since_utc), str(until_utc)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def news_feed_set_scores(self, scored: list, *, scored_at: str) -> int:
+        """Write the light model's verdicts back: [{url_key, importance, topic,
+        what}]. An item scored once is never paid for again."""
+        rows = [(max(1, min(5, int(s.get("importance") or 1))),
+                 str(s.get("topic") or ""), str(s.get("what") or "")[:300],
+                 str(scored_at), str(s["url_key"]))
+                for s in (scored or []) if str(s.get("url_key") or "").strip()]
+        if not rows:
+            return 0
+        with self.conn() as c:
+            c.executemany(
+                "UPDATE news_feed_items SET importance = ?, topic = ?, what = ?, "
+                "scored_at = ? WHERE url_key = ?", rows)
+        return len(rows)
+
+    def news_feed_prune(self, before_utc: str) -> int:
+        with self.conn() as c:
+            return int(c.execute(
+                "DELETE FROM news_feed_items WHERE published_at < ? AND seen_at < ?",
+                (str(before_utc), str(before_utc))).rowcount or 0)
+
+    def news_feed_count(self) -> int:
+        with self.conn() as c:
+            return int(c.execute(
+                "SELECT COUNT(*) AS n FROM news_feed_items").fetchone()["n"] or 0)
+
+    # -- "reset test state" / "start over" ----------------------------------
+
+    def wipe_operational(self, keep=KEPT_ON_RESET) -> dict:
+        """Empty every table EXCEPT `keep`. {"wiped": [...], "kept": {name: rows}}.
+
+        THE CACHES AND THE COST LEDGERS SURVIVE. A reset is for the state a
+        test day builds up — sends, proposals, snoozes, reminders, posted
+        stories, the pretend clock — not for answers that were paid for. The
+        schema is untouched; only rows go.
+        """
+        kept = {str(k) for k in (keep or ())}
+        wiped: list = []
+        counts: dict = {}
+        with self.conn() as c:
+            names = [r["name"] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'").fetchall()]
+            for name in names:
+                if name in kept:
+                    counts[name] = int(c.execute(
+                        f"SELECT COUNT(*) AS n FROM {name}").fetchone()["n"] or 0)
+                    continue
+                c.execute(f"DELETE FROM {name}")
+                wiped.append(name)
+        return {"wiped": sorted(wiped), "kept": counts}
 
     # -- how long answers take ---------------------------------------------
 
@@ -3207,8 +3440,14 @@ class DB:
         except (TypeError, ValueError):
             return empty
 
-    def research_cache_get(self, item_key: str, *, on_date: str) -> Optional[dict]:
-        """Today's research for one item, or None. FAILS OPEN, to a miss.
+    def research_cache_get(self, item_key: str, *, on_date: str = "",
+                           max_age_days: int = 0) -> Optional[dict]:
+        """The cached research for one item, or None. FAILS OPEN, to a miss.
+
+        TWO WAYS TO ASK. `max_age_days` — the per-row research (R6, R8, R10):
+        the newest row for this ITEM stored within that many REAL days, whatever
+        date it was stored under. `on_date` alone — the day's news run, which
+        is about that day and nothing else.
 
         An unreadable cache costs one search, which the budget check still
         bounds; failing the other way would leave an item unresearched for the
@@ -3216,10 +3455,18 @@ class DB:
         """
         try:
             with self.conn() as c:
-                row = c.execute(
-                    "SELECT * FROM research_cache WHERE item_key = ? AND on_date = ?",
-                    (str(item_key), str(on_date)),
-                ).fetchone()
+                if int(max_age_days or 0) > 0:
+                    row = c.execute(
+                        "SELECT * FROM research_cache WHERE item_key = ? "
+                        "AND created_at >= datetime('now', ?) "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (str(item_key), f"-{int(max_age_days)} days"),
+                    ).fetchone()
+                else:
+                    row = c.execute(
+                        "SELECT * FROM research_cache WHERE item_key = ? "
+                        "AND on_date = ?", (str(item_key), str(on_date)),
+                    ).fetchone()
         except Exception:
             log.exception("[research-cache] could not read %s; treating it as a miss",
                           item_key)

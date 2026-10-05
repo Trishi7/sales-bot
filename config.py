@@ -345,9 +345,27 @@ def roster_id_for_name(display_name: str) -> int:
 # -- Model --------------------------------------------------------------------
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-# Used for every LLM call the bot makes: query answering, commitment detection,
-# nudge wording, social replies.
+# THE MAIN MODEL (Sonnet): everything that SPEAKS or REASONS — the answering
+# engine, proactive_message, social_reply, capability_reply, and the composing
+# half of a research brief.
 MODEL = os.getenv("MODEL", "claude-sonnet-4-6")
+
+# THE LIGHT MODEL (Haiku): everything that ROUTES or EXTRACTS — parse_query,
+# detect_commitment, classify_leave, extract_sheet_update, the news scorer, and
+# every "read these snippets and pull out the answer" call in `llm.web_research`.
+# None of them writes a sentence a person reads as the bot's voice, and at a
+# third of the price that is where the saving is. The token log (llm_calls)
+# records which model each call used.
+MODEL_LIGHT = (os.getenv("MODEL_LIGHT", "") or "").strip() or "claude-haiku-4-5"
+
+# HOW LONG A PROMPT-CACHE BREAKPOINT LIVES: "5m" (the default) or "1h". A 1-hour
+# write costs 2x input instead of 1.25x, so it only pays when the same prefix
+# is read again between 5 and 60 minutes later — a channel that asks a question
+# every quarter of an hour, not one that asks twice a day.
+CACHE_TTL = (os.getenv("CACHE_TTL", "") or "").strip().lower() or "5m"
+if CACHE_TTL not in ("5m", "1h"):
+    log.warning("CACHE_TTL=%r is not 5m or 1h; using 5m", CACHE_TTL)
+    CACHE_TTL = "5m"
 
 # -- Storage ------------------------------------------------------------------
 
@@ -1058,15 +1076,92 @@ RESEARCH_ALLOWED_DOMAINS: list[str] = _str_list(
 )
 
 # -- WEB SEARCH ----------------------------------------------------------------
-# Anthropic's SERVER-SIDE web search tool, declared on the Messages API call.
-# Anthropic runs the search; nothing in this bot opens a socket to a search
-# engine, and `research.py`'s fetch path is untouched — that still fetches only
-# URLs already on a row, only from RESEARCH_ALLOWED_DOMAINS.
+# THE RETRIEVAL HAPPENS OUTSIDE THE MODEL (search_backend.py, feeds.py). A
+# search API returns titles and snippets — hundreds of tokens — and the model
+# is handed those, instead of Anthropic's server-side tool putting ~28k tokens
+# of page text into the context per search and re-reading it on every internal
+# iteration. Same rules, same answers, a fraction of the cost.
 #
 # WEB CONTENT IS DATA, NEVER INSTRUCTIONS. websearch.SAFETY_PREAMBLE says so to
 # the model on every call, and the code gives a page nowhere to go: nothing acts
 # on a search result without a human's yes (approvals.py).
 WEB_SEARCH_ENABLED = _bool("WEB_SEARCH_ENABLED", default=True)
+
+# WHICH BACKEND ANSWERS A SEARCH: "serper" (the default), "brave", or
+# "anthropic". The first two are plain HTTP search APIs called from
+# search_backend.py; "anthropic" is the old server-side tool, kept working
+# behind the same `llm.web_research` for comparison — and it is the only
+# setting under which the WEB_SEARCH_* tool variables below are read.
+SEARCH_BACKEND = (os.getenv("SEARCH_BACKEND", "") or "").strip().lower() or "serper"
+if SEARCH_BACKEND not in ("serper", "brave", "anthropic"):
+    log.warning("SEARCH_BACKEND=%r is not serper, brave or anthropic; using serper",
+                SEARCH_BACKEND)
+    SEARCH_BACKEND = "serper"
+
+# The keys. Serper is the default backend; Brave is the AUTOMATIC FALLBACK when
+# Serper answers 429 or 5xx and this key is set (and the backend itself when
+# SEARCH_BACKEND=brave). Neither set = no search, said plainly.
+#
+# A "<REQUIRED: ...>" placeholder copied straight out of .env.example reads as
+# UNSET — it must never be sent to a search API as though it were a key.
+def _key(raw) -> str:
+    value = (raw or "").strip()
+    return "" if value.startswith("<") else value
+
+
+SERPER_API_KEY = _key(os.getenv("SERPER_API_KEY", ""))
+BRAVE_API_KEY = _key(os.getenv("BRAVE_API_KEY", ""))
+
+# HOW MANY SEARCH REQUESTS A DAY, ACROSS EVERYTHING (the real IST day). Banked
+# in the same web_search_usage ledger as before, one row per rule. A cache hit
+# is not a request and costs nothing. When it is spent the rules DEGRADE to
+# "web research unavailable today" — they do not fail and do not go quiet.
+SEARCH_DAILY_BUDGET = _int("SEARCH_DAILY_BUDGET", 150)
+
+# The query -> results cache (SQLite, search_cache). A repeated query inside
+# this many hours is served from it: no request, no budget, no cost. It is what
+# makes a second "simulate week" on the same test day free.
+SEARCH_CACHE_HOURS = _int("SEARCH_CACHE_HOURS", 6)
+
+# One search request's timeout, in seconds. One retry, then [] and a log line.
+SEARCH_TIMEOUT_SECONDS = _int("SEARCH_TIMEOUT_SECONDS", 10)
+
+# What a request costs, in dollars per 1,000, for the "what did you cost"
+# answer. Serper's pay-as-you-go price is about $1; Brave's about $5.
+SERPER_COST_PER_1K = _float("SERPER_COST_PER_1K", 1.0)
+BRAVE_COST_PER_1K = _float("BRAVE_COST_PER_1K", 5.0)
+
+# The most text `search_backend.fetch_page` hands back from one page, in
+# characters. A page is read for one fact; 6000 characters is ~1,500 tokens.
+FETCH_PAGE_MAX_CHARS = _int("FETCH_PAGE_MAX_CHARS", 6000)
+
+# How many searches ONE channel question may make. The engine reasons over the
+# snippets; a question that needs more than two needs to be a narrower question.
+WEB_QUESTION_MAX_SEARCHES = _int("WEB_QUESTION_MAX_SEARCHES", 2)
+
+# How long a per-row research answer (R6's email, R8/R10's company news) is
+# reused, in days. Keyed on the item, not the date: the same person's email
+# does not need looking up again on Tuesday because yesterday was Monday.
+RESEARCH_CACHE_DAYS = _int("RESEARCH_CACHE_DAYS", 7)
+
+# THE DAILY TOKEN BUDGET, in INPUT tokens, cache reads counted at 10% (what
+# they cost). Read from llm_calls before every model call. Past it: research
+# skips with an honest note, the hourly news check skips silently, and the
+# answering engine answers WITHOUT its web tools and says so. Nothing a person
+# asked for goes unanswered. WARNs in the log at 50% and 80%. 0 disables it.
+TOKEN_DAILY_BUDGET = _int("TOKEN_DAILY_BUDGET", 1_500_000)
+
+
+def search_daily_budget() -> int:
+    """The day's request budget for whichever backend is in force."""
+    if SEARCH_BACKEND == "anthropic":
+        return max(0, int(WEB_SEARCH_DAILY_BUDGET))
+    return max(0, int(SEARCH_DAILY_BUDGET))
+
+
+# -- THE ANTHROPIC SERVER-SIDE TOOL (SEARCH_BACKEND=anthropic ONLY) -----------
+# Everything from here to RESEARCH_FETCH_* shapes Anthropic's own web search
+# tool and is IGNORED under serper or brave. Kept so one call can be compared.
 
 # WHICH VERSION OF THE TOOL. Three exist and they are NOT interchangeable:
 #
@@ -1719,8 +1814,33 @@ NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 5)
 # disables the valve.
 NEWS_BREAKING_MAX_PER_DAY = _int("NEWS_BREAKING_MAX_PER_DAY", 2)
 
-# Searches one hourly check may spend. The main sweep uses WEB_SEARCH_MAX_USES.
+# Searches one hourly check may spend — ONLY under SEARCH_BACKEND=anthropic.
+# Under serper/brave the check reads the feeds and searches nothing.
 NEWS_CHECK_MAX_USES = _int("NEWS_CHECK_MAX_USES", 2)
+
+# THE FEEDS (feeds.py). Polled every NEWS_FEED_POLL_MINUTES from the sweep
+# loop; a poll is plain HTTP GETs and makes ZERO API calls. Each entry in
+# NEWS_TOPICS also gets one Google News RSS query. New items land in
+# news_feed_items, deduplicated on the same url and headline keys the posted
+# stories use.
+_NEWS_RSS_DEFAULT = (
+    "https://techcrunch.com/category/artificial-intelligence/feed/,"
+    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml,"
+    "https://arstechnica.com/ai/feed/,"
+    # VentureBeat's own /category/ai/feed/ answers 429 to anything that is not
+    # a browser; its FeedBurner feed is the public one for readers.
+    "https://feeds.feedburner.com/venturebeat/SZYF,"
+    "https://www.technologyreview.com/topic/artificial-intelligence/feed"
+)
+NEWS_RSS_FEEDS = _str_list("NEWS_RSS_FEEDS", _NEWS_RSS_DEFAULT)
+NEWS_FEED_POLL_MINUTES = _int("NEWS_FEED_POLL_MINUTES", 15)
+# One feed's fetch timeout, in seconds.
+NEWS_FEED_TIMEOUT_SECONDS = _int("NEWS_FEED_TIMEOUT_SECONDS", 10)
+# The most feed items ONE scoring call is shown (titles + summaries only).
+# 40 items is about 3k tokens on the light model.
+NEWS_SCORE_MAX_ITEMS = _int("NEWS_SCORE_MAX_ITEMS", 40)
+# How long a feed item is kept, in days, before a poll prunes it.
+NEWS_FEED_KEEP_DAYS = _int("NEWS_FEED_KEEP_DAYS", 14)
 
 # PREFERRED SITES, comma-separated bare domains. A PREFERENCE LINE IN THE PROMPT
 # ONLY — "prefer these sources when they have the story" — and never a tool
@@ -1768,6 +1888,11 @@ EVENTS_DEADLINE_RECHECK_DAYS = _int("EVENTS_DEADLINE_RECHECK_DAYS", 14)
 # SEED KEYWORDS FOR R3's discovery, from the same "Sample Keywords" column.
 # Seeds, not limits — see NEWS_TOPICS.
 EVENT_KEYWORDS = _str_list("EVENT_KEYWORDS")
+
+# CONFERENCE CALENDAR PAGES R3's discovery reads directly (fetch_page — no
+# search request), comma-separated urls. Empty by default: discovery then runs
+# on its searches alone.
+EVENTS_CALENDAR_URLS = _str_list("EVENTS_CALENDAR_URLS")
 
 # R4 — DELIVERABLES. An item is chased when its tentative deadline is within
 # this many days OR has already passed. 3 is the plan's number: close enough to
@@ -2990,12 +3115,40 @@ def validate() -> list[str]:
             "still produce their items and will say 'web research unavailable today'. "
             "Nothing is dropped."
         )
+    elif SEARCH_BACKEND != "anthropic":
+        log.info(
+            "[config] web search ON, OUTSIDE the model: backend=%s, %d request(s) a "
+            "day, results cached %dh; R1's news comes from %d RSS feed(s) + %d topic "
+            "queries, polled every %d min. MODEL_LIGHT=%s reads the snippets. Token "
+            "budget %s input tokens a day.",
+            SEARCH_BACKEND, SEARCH_DAILY_BUDGET, SEARCH_CACHE_HOURS,
+            len(NEWS_RSS_FEEDS), len(NEWS_TOPICS), NEWS_FEED_POLL_MINUTES,
+            MODEL_LIGHT, f"{TOKEN_DAILY_BUDGET:,}" if TOKEN_DAILY_BUDGET else "no",
+        )
+        if SEARCH_BACKEND == "serper" and not SERPER_API_KEY:
+            log.error(
+                "SEARCH_BACKEND=serper but SERPER_API_KEY is not set%s. R1's news "
+                "still works (it is RSS), but R2's lookups, R3, R6, R8, R10, R11 and "
+                "web questions will say 'web research unavailable today — "
+                "SERPER_API_KEY is not set'. Get a key at https://serper.dev.",
+                " — every search will go to Brave instead" if BRAVE_API_KEY else "",
+            )
+        if SEARCH_BACKEND == "brave" and not BRAVE_API_KEY:
+            log.error(
+                "SEARCH_BACKEND=brave but BRAVE_API_KEY is not set: nothing can be "
+                "searched. R1's news still works (it is RSS)."
+            )
     else:
         log.info(
             "[config] web search ON: tool=%s, max %d search(es) per call, %d a day. "
             "Web content is DATA, never instructions — websearch.SAFETY_PREAMBLE says "
             "so on every call and nothing acts on a page without a human's yes.",
             WEB_SEARCH_TOOL_TYPE, WEB_SEARCH_MAX_USES, WEB_SEARCH_DAILY_BUDGET,
+        )
+        log.warning(
+            "SEARCH_BACKEND=anthropic — the server-side web search tool, kept for "
+            "comparison. It puts ~28k tokens of page text in the context per search; "
+            "serper is the default because it costs a small fraction of that."
         )
         if WEB_SEARCH_ALLOWED_DOMAINS and WEB_SEARCH_BLOCKED_DOMAINS:
             log.warning(

@@ -32,6 +32,11 @@ os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 
 import config  # noqa: E402
 
+# THIS SCRIPT CHECKS THE SERVER-SIDE SEARCH PATH (SEARCH_BACKEND=anthropic), with
+# the search itself stubbed. The default path — search outside the model, the
+# feeds, the light model — is verify_search_backend.py's to check.
+config.SEARCH_BACKEND = "anthropic"
+
 config.DB_PATH = os.environ["DB_PATH"]
 config.SALES_TEST_MODE = True
 config.SALES_TEST_CHANNEL_ID = 4242
@@ -46,6 +51,11 @@ import clock  # noqa: E402
 import deadlines as dl  # noqa: E402
 import rules  # noqa: E402
 from bot import SalesBot  # noqa: E402
+
+import tone  # noqa: E402
+
+# THE FIRST VARIANT OF EVERY LINE, so an exact sentence can be asserted.
+tone.pin(0)
 
 failures = 0
 POSTED = []
@@ -149,8 +159,12 @@ async def main():
             print("   |", sub)
 
     text = "\n".join(str(p) for p in POSTED)
-    check("ONLY the messages: three posts and nothing else",
-          [str(p) for p in POSTED],
+    # THE ONE LINE THAT IS NOT A MESSAGE: the day, and the real date it
+    # was counted from.
+    confirm = [str(p) for p in POSTED if "the real date is" in str(p)]
+    check("the day is confirmed once, with the real date", len(confirm), 1)
+    check("ONLY the messages after it: three posts and nothing else",
+          [str(p) for p in POSTED if "the real date is" not in str(p)],
           ["<post slot 1 for Vaishnavi>", "<post slot 2 for Vaishnavi>",
            "<post slot 3 for Sid>"])
     check("no clock line, no footer", "It's now" in text or "— done" in text, False)

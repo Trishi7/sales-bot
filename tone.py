@@ -7,7 +7,7 @@ without changing this file", and this is that configuration.
     SALEY_FORMALITY  casual | balanced | formal (balanced)
     SALEY_EMOJI      none | light | expressive  (light — at most one)
     SALEY_LENGTH     short | medium             (short — 1-3 sentences)
-    SALEY_HUMOUR     off | light                (off)
+    SALEY_HUMOUR     off | light                (light)
 
 READ FROM THE ENVIRONMENT ON EVERY COMPOSE, not once at import. That is the
 whole point: somebody changes SALEY_WARMTH, the next message is warmer, and
@@ -19,11 +19,13 @@ directly and is the one exception.
     unrecognised value logs once and falls back rather than raising: a typo in a
     tone dial must not stop the bot talking.
 
-TWO OF THE FIVE ARE ENFORCED IN CODE, NOT JUST ASKED FOR. SALEY_EMOJI and
-SALEY_LENGTH go into the prompt AND into `llm._proactive_problem`, which rejects
-a composed message that breaks them and sends the deterministic template
-instead. The other three are prompt-only: a message that is 10% too formal is
-still a good message, and rejecting it would cost more than it saved.
+TWO OF THE FIVE ARE CHECKED IN CODE, NOT JUST ASKED FOR. SALEY_EMOJI and
+SALEY_LENGTH go into the prompt AND into `llm.proactive_verdict`. A composed
+message that breaks one is a SOFT failure: it goes back to the composer ONCE
+with the specific complaint ("that was 7 sentences; make it 3 or fewer"), and
+only if the second attempt also fails does the template go out. The other
+three are prompt-only: a message that is 10% too formal is still a good
+message, and rejecting it would cost more than it saved.
 
     THAT ENFORCEMENT REPLACED TWO BLUNTER RULES. The checker used to ban EVERY
     emoji (`ord > 0x2100`) and cap length at 600 characters. The first made
@@ -33,6 +35,7 @@ still a good message, and rejecting it would cost more than it saved.
 """
 import logging
 import os
+import random
 import re
 from typing import Optional
 
@@ -57,7 +60,7 @@ DEFAULTS = {
     "formality": "balanced",
     "emoji": "light",
     "length": "short",
-    "humour": "off",
+    "humour": "light",
 }
 
 _ALLOWED = {
@@ -237,9 +240,9 @@ def prompt_block(*, recent_openers: Optional[list] = None) -> str:
         ]
     parts += [
         "",
-        "THE TWO THAT ARE CHECKED IN CODE. A message that breaks either is "
-        "thrown away and a plain template is sent instead, so they are not "
-        "advisory: at most "
+        "THE TWO THAT ARE CHECKED IN CODE. A message that breaks either comes "
+        "back to you once to be fixed, and if the fix breaks it too a plain "
+        "template is sent instead, so they are not advisory: at most "
         f"{EMOJI_BUDGET[s['emoji']]} emoji, and at most "
         f"{SENTENCE_BUDGET[s['length']]} sentences.",
     ]
@@ -308,39 +311,57 @@ def count_sentences(text: str) -> int:
     return max(1, ends)
 
 
-def check(text: str, *, facts: int = 0) -> str:
-    """Why this message breaks the ENFORCED tone settings, or "".
+def check_detail(text: str, *, facts: int = 0) -> Optional[dict]:
+    """{"reason", "fix"} for the first enforced setting this message breaks,
+    or None. `reason` is the log line; `fix` is what the composer is told on
+    its one retry, in the plainest words there are: "that was 7 sentences;
+    make it 3 or fewer".
 
     Only the ones that are enforced. Warmth, formality and humour are
     prompt-only on purpose: a message that is 10% too formal is still a good
     message, and throwing it away would cost more than it saved.
 
-    STRUCTURE: a message carrying 3+ facts (`facts` — the companies, items or
-    reasons in the message dict) with NO line starting with a bullet or a
-    number fails, and the caller sends the template. The reason starts with
-    "structure" so it reads as one in the log.
+    STRUCTURE: a message carrying 3+ facts (`facts` — the companies or items
+    the composer was asked to list) with NO line starting with a bullet or a
+    number fails. The reason starts with "structure" so it reads as one in the
+    log.
 
     THE SENTENCE CAP COUNTS PROSE ONLY — the point lines are facts, and "1. "
     is not a sentence end.
     """
     if int(facts or 0) >= 3 and not any(
             is_point_line(l) for l in str(text or "").splitlines()):
-        return (f"structure: {int(facts)} facts and no numbered or bulleted line — "
-                "more than two facts go in points")
+        return {
+            "reason": (f"structure: {int(facts)} facts and no numbered or bulleted "
+                       "line — more than two facts go in points"),
+            "fix": (f"that put {int(facts)} facts in a sentence; put them in "
+                    "numbered points, one per line"),
+        }
     s = settings()
     emoji = count_emoji(text)
     allowed = EMOJI_BUDGET[s["emoji"]]
     if emoji > allowed:
-        return (
-            f"{emoji} emoji but SALEY_EMOJI={s['emoji']} allows {allowed}"
-        )
+        return {
+            "reason": f"{emoji} emoji but SALEY_EMOJI={s['emoji']} allows {allowed}",
+            "fix": (f"that had {emoji} emoji; "
+                    + ("use none" if not allowed else f"use at most {allowed}")),
+        }
     sentences = count_sentences(prose_of(text))
     cap = SENTENCE_BUDGET[s["length"]]
     if sentences > cap:
-        return (
-            f"{sentences} sentences but SALEY_LENGTH={s['length']} allows {cap}"
-        )
-    return ""
+        return {
+            "reason": (f"{sentences} sentences but SALEY_LENGTH={s['length']} "
+                       f"allows {cap}"),
+            "fix": f"that was {sentences} sentences; make it {cap} or fewer",
+        }
+    return None
+
+
+def check(text: str, *, facts: int = 0) -> str:
+    """Why this message breaks the ENFORCED tone settings, or "". The reason
+    alone — see `check_detail` for the words the retry uses."""
+    detail = check_detail(text, facts=facts)
+    return detail["reason"] if detail else ""
 
 
 def describe() -> str:
@@ -351,6 +372,72 @@ def describe() -> str:
         f"(<={EMOJI_BUDGET[s['emoji']]}) length={s['length']} "
         f"(<={SENTENCE_BUDGET[s['length']]} sentences) humour={s['humour']}"
     )
+
+
+# -- the variants: three ways of saying each fixed line ------------------------
+#
+# EVERY LINE THE BOT SENDS WITHOUT THE MODEL HAS THREE WORDINGS — the drip
+# templates, the closes, the reminder, the approval lines, the interim lines.
+# One fixed sentence, seen every Tuesday, is what makes a message read as a
+# system notification however warmly it is worded; three, picked at random,
+# is the difference between a form letter and somebody typing.
+#
+# ONE GENERATOR, HERE, so a verify script can seed it (`tone.RNG.seed(0)`) and
+# get the same wording twice.
+RNG = random.Random()
+
+
+class _Pinned:
+    """A generator that always answers with the same variant."""
+
+    def __init__(self, index: int):
+        self.index = int(index)
+
+    def choice(self, options):
+        return options[self.index % len(options)]
+
+    def randrange(self, count: int) -> int:
+        return self.index % max(1, int(count))
+
+    def seed(self, *_a, **_k) -> None:
+        pass
+
+
+def pin(index: Optional[int] = 0) -> None:
+    """Always pick variant `index` (None: back to random). For the verify
+    scripts that assert an exact sentence — never called by the bot."""
+    global RNG
+    RNG = random.Random() if index is None else _Pinned(index)
+
+
+def pick(variants) -> str:
+    """One of `variants`, at random. A bare string is returned as it is."""
+    if isinstance(variants, str):
+        return variants
+    options = [v for v in (variants or ()) if str(v).strip()]
+    return RNG.choice(options) if options else ""
+
+
+def pick_index(count: int) -> int:
+    """A random index below `count` — for a caller that must make the SAME
+    choice twice (a message whose close is quoted in its own prompt)."""
+    return RNG.randrange(max(1, int(count)))
+
+
+def rotate(variants, day) -> str:
+    """The variant for `day`, in strict rotation: three consecutive days get
+    three different lines, and the same day always gets the same one — so a
+    restart, or a second look at the day, does not change what was said.
+
+    COUNTED IN WORKING DAYS. Friday and the Monday after it are consecutive
+    days to anybody reading the channel, so they are consecutive here too; a
+    rotation on the calendar date would hand both the same line.
+    """
+    options = [v for v in (variants or ()) if str(v).strip()]
+    if not options:
+        return ""
+    working = ((day.toordinal() - 1) // 7) * 5 + min(day.weekday(), 4)
+    return options[working % len(options)]
 
 
 def opener_of(text: str, *, words: int = 4) -> str:
@@ -447,7 +534,38 @@ def _self_test() -> int:
     check_("names the length rule", "ONE TO THREE SENTENCES" in block, True)
     check_("carries the human touches", "USE FIRST NAMES" in block, True)
     check_("lists the recent openers", "worth a look at" in block, True)
-    check_("says which two are enforced", "thrown away" in block, True)
+    check_("says which two are enforced", "CHECKED IN CODE" in block, True)
+    check_("says a failure comes back once", "comes back to you once" in block, True)
+    check_("humour is light by default", "HUMOUR: LIGHT" in block, True)
+
+    print("\nwhat the retry is told")
+    check_("too long", check_detail("One. Two. Three. Four.")["fix"],
+           "that was 4 sentences; make it 3 or fewer")
+    check_("too many emoji", check_detail("\U0001F44D \U0001F389 nice")["fix"],
+           "that had 2 emoji; use at most 1")
+    check_("facts in a sentence",
+           "numbered points" in check_detail("A, B and C are waiting.", facts=3)["fix"],
+           True)
+    check_("a fine message has nothing to fix", check_detail("One. Two."), None)
+
+    print("\nthe variants")
+    three = ("a", "b", "c")
+    from datetime import date as _date
+    days = [_date(2026, 9, 28), _date(2026, 9, 29), _date(2026, 9, 30)]
+    check_("three days in a row rotate through all three",
+           sorted(rotate(three, d) for d in days), ["a", "b", "c"])
+    check_("Thursday, Friday and the Monday after are three different lines",
+           len({rotate(three, d) for d in (_date(2026, 10, 1), _date(2026, 10, 2),
+                                           _date(2026, 10, 5))}), 3)
+    check_("the same day is the same line", rotate(three, days[0]),
+           rotate(three, days[0]))
+    check_("a pick is one of the variants", pick(three) in three, True)
+    check_("a bare string is itself", pick("only"), "only")
+    RNG.seed(7)
+    first = [pick(three) for _ in range(6)]
+    RNG.seed(7)
+    check_("seeded, it repeats", [pick(three) for _ in range(6)], first)
+    check_("...and it does vary", len(set(first)) > 1, True)
     check_("no openers -> no opener section",
            "ALREADY USED" in prompt_block(), False)
 

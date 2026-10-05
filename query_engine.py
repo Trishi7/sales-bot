@@ -92,15 +92,25 @@ def _engine_text(*, requester_name: str, today: str, tool_names: list[str]) -> s
     ACTUALLY has this turn rather than ones it remembers from another context —
     the tool set is caller-supplied and can legitimately differ between calls."""
     tools_line = ", ".join(tool_names) if tool_names else "(none — you have no tools this turn)"
+    have = set(tool_names or [])
+    # A HINT IS ONLY SENT WITH ITS TOOL. The engine is handed the tools a
+    # question needs rather than all of them, and a line telling the model to
+    # use a tool it was not given is a line it will try to obey.
+    hints = ""
+    if "schedule_reminder" in have:
+        hints += ("When somebody asks to be reminded of something, use "
+                  "schedule_reminder even if no company is mentioned.\n")
+    if "find_people" in have:
+        hints += ("When somebody asks to find PoCs, people or contacts at a named "
+                  "company (or one of its teams), use find_people and give its "
+                  "text unchanged.\n")
 
-    return f"""You are answering a question asked in one of
+    text = f"""You are answering a question asked in one of
 the team's SALES channels. Today's date is {today} (IST). The person asking is
 **{requester_name}**; when they say "me", "my" or "I" they mean themselves.
 
 THE TOOLS YOU HAVE RIGHT NOW: {tools_line}
-When somebody asks to be reminded of something, use schedule_reminder even if no company is mentioned.
-When somebody asks to find PoCs, people or contacts at a named company (or one of its teams), use find_people and give its text unchanged.
-
+{hints}
 === WHAT YOU CAN SEE (read the SOURCE STATUS block above before choosing a tool) ===
 You are READ-ONLY everywhere. You cannot send, edit, file, or change anything —
 you look things up and you report what you find.
@@ -245,6 +255,37 @@ name in it is right.
   with one line like "…and 9 more — narrow it down and I'll pull them".
 - When a tool errors, say briefly what failed. Don't retry endlessly."""
 
+    # A SECTION RIDES ONLY WITH ITS TOOLS. The notes rules, the mapping rules
+    # and the channel rules are ~1,500 tokens between them, re-sent on every
+    # iteration; a question routed to the web tools reads none of them. With
+    # the full tool set the text is exactly what it always was.
+    for heading, tools in _SECTION_TOOLS:
+        if not (have & tools):
+            text = _without_section(text, heading)
+    return text
+
+
+# Which tools make a section of the engine prompt worth sending.
+_SECTION_TOOLS = (
+    ("=== MEETING-NOTES QUESTIONS",
+     {"list_meeting_notes", "read_meeting_note", "meeting_facts"}),
+    ("=== RESEARCHER MAPPING QUESTIONS",
+     {"who_to_pitch", "mapping_rules", "mapping_coverage", "mapping_edges",
+      "cross_check_outreach"}),
+    ("=== CHANNEL QUESTIONS",
+     {"recent_channel_activity", "recent_sales_activity", "search_channel_history"}),
+)
+
+
+def _without_section(text: str, heading: str) -> str:
+    """`text` with the "=== …" section starting at `heading` removed, up to the
+    next "=== " section. Unchanged when there is no such section."""
+    start = text.find(heading)
+    if start < 0:
+        return text
+    end = text.find("\n=== ", start + len(heading))
+    return text[:start] + (text[end + 1:] if end >= 0 else "")
+
 
 def _searches_billed(response) -> int:
     """How many web searches the API BILLED for this response.
@@ -343,7 +384,7 @@ def _move_history_breakpoint(messages: list) -> None:
                 if block.get("type") == "tool_result":
                     last = m
     if last is not None:
-        last["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        last["content"][-1]["cache_control"] = persona.cache_control()
 
 
 class QueryEngine:
@@ -375,6 +416,10 @@ class QueryEngine:
                   "messages": messages}
         if tools:
             kwargs["tools"] = tools
+        # The token budget is read before every call (the 50% / 80% warnings).
+        # The engine itself never skips — past the budget the caller hands it
+        # no web tools and tells it to say so.
+        await asyncio.to_thread(usage.budget_state)
         t0 = time.monotonic()
         try:
             resp = await asyncio.to_thread(self._client.messages.create, **kwargs)
@@ -453,7 +498,7 @@ class QueryEngine:
         # THE TOOLS BREAKPOINT: tools render first, so a marker on the last one
         # caches the whole tool list, which is identical on every question.
         if schemas:
-            schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
+            schemas[-1] = {**schemas[-1], "cache_control": persona.cache_control()}
 
         report = outcome if outcome is not None else {}
         report.setdefault("model_error", "")
