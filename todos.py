@@ -38,6 +38,18 @@ CITATIONS ARE STRUCTURAL HERE. "Source meeting" is a real column, filled from
 `meetings.citation`, so the rule that a meeting-derived claim names its meeting
 is enforced by the schema rather than by remembering to add it.
 
+A ROW IS SHOWN ONLY WHEN ITS SOURCE MEETING IS A SALES NOTE THE BOT CAN READ.
+The sheet is edited by hand, so a row can cite anything — including the AM/PM
+product standups this bot must never repeat. `split_visible` therefore HIDES,
+from every reply, each row whose "Source meeting" is not the citation of a note
+`notes.py` currently allows. Hiding is all it does: the row is never edited and
+never deleted, and `read_rows` (which the refresh's dedup uses) still sees it.
+AND IT IS SILENT IN THE CHANNEL — no count, no hint, no "some rows are not
+shown" — because a line about hidden rows is itself sync content leaking by
+another door. The operator hears instead: one log line and one audit event per
+distinct set of hidden rows, and `python tools/list_hidden_todos.py` lists them
+for cleaning the sheet by hand.
+
 NO DISCORD IN THIS FILE. It returns text and dicts; bot.py decides what becomes
 a digest section. There is no send path here and there must never be one.
 """
@@ -51,7 +63,9 @@ import deadlines as dl
 import drive
 import gtm_sheet
 import meetings
+import notes
 import state
+import wording
 
 log = logging.getLogger(__name__)
 
@@ -309,16 +323,126 @@ def read_rows(db) -> dict:
     return out
 
 
+# Why a row is hidden. Operator-facing only: these words go to the log, the
+# audit file and tools/list_hidden_todos.py, never to the model or the channel.
+HIDDEN_STANDUP = "standup"
+HIDDEN_NO_SOURCE = "no_source_meeting"
+HIDDEN_NOT_ALLOWED = "source_not_an_allowed_note"
+
+# A DECISION, KEPT AS ONE SWITCH. A row whose "Source meeting" cell is BLANK is
+# HIDDEN: the team decided (7 Oct) that "hide every row whose source meeting
+# isn't an allowed sales note" includes a blank, which is not one. False would
+# show such rows. Rule 2 of `split_visible` is the only reader of this.
+_HIDE_BLANK_SOURCE = True
+
+
+def split_visible(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
+    """(shown, hidden). `hidden` rows are copies carrying a `reason`.
+
+    The rules, in order — a row is SHOWN only by rule 3:
+
+      1. the Source meeting names a product standup    -> hidden, `standup`.
+         Checked first and against the title guard alone, so it holds whatever
+         notes happen to be on disk.
+      2. the Source meeting is blank                   -> hidden,
+         `no_source_meeting` (see _HIDE_BLANK_SOURCE).
+      3. the Source meeting is the citation of a note the bot can read now —
+         and, when "Date raised" is an ISO date, it is that note's date
+                                                       -> SHOWN.
+      4. anything else                                 -> hidden,
+         `source_not_an_allowed_note`.
+
+    When the notes source is not connected, unreachable or empty there are no
+    allowed notes, so every row with a source is hidden. That is intended: the
+    bot cannot tell a sales row from a standup row without the notes to check
+    it against, and it must not guess in the standup's favour.
+
+    PURE. No write, no log, no network: the rows are only sorted into two lists.
+    """
+    allowed = meetings.allowed_citations()
+    shown: list[dict] = []
+    hidden: list[dict] = []
+    for row in rows or []:
+        source = str(row.get("source_meeting") or "").strip()
+        if source and notes.is_standup_title(source):
+            hidden.append(dict(row, reason=HIDDEN_STANDUP))
+            continue
+        if not source:
+            if _HIDE_BLANK_SOURCE:
+                hidden.append(dict(row, reason=HIDDEN_NO_SOURCE))
+            else:
+                shown.append(row)
+            continue
+        dates = allowed.get(notes._norm_title(source))
+        if dates is not None:
+            try:
+                raised = date.fromisoformat(str(row.get("date_raised") or "").strip()).isoformat()
+            except ValueError:
+                raised = ""
+            if not raised or raised in dates:
+                shown.append(row)
+                continue
+        hidden.append(dict(row, reason=HIDDEN_NOT_ALLOWED))
+    return shown, hidden
+
+
+# The set of hidden rows last logged at INFO. `open_items` runs on every "show
+# the to-dos"; the log and the audit file get one entry per CHANGE.
+_LAST_HIDDEN_LOGGED: Optional[tuple] = None
+
+
+def _log_hidden(hidden: list[dict], total_open: int) -> None:
+    """Tell the OPERATOR what was hidden — once per distinct set of rows.
+
+    This is the only trace hidden rows leave, and it is deliberately not in the
+    tool result: the count and the row numbers go to the log and to
+    audit.jsonl (no task text — that is the content being kept out), DEBUG on
+    repeats. Hiding nothing logs nothing.
+    """
+    global _LAST_HIDDEN_LOGGED
+    signature = tuple(sorted((int(r.get("row") or 0), r["reason"]) for r in hidden))
+    if not hidden:
+        _LAST_HIDDEN_LOGGED = signature
+        return
+    counts = {HIDDEN_STANDUP: 0, HIDDEN_NO_SOURCE: 0, HIDDEN_NOT_ALLOWED: 0}
+    for r in hidden:
+        counts[r["reason"]] = counts.get(r["reason"], 0) + 1
+    line = (
+        "[todos] hid %d of %d open row(s) whose source meeting is not an allowed "
+        "sales note (standup=%d, no_source_meeting=%d, source_not_an_allowed_note=%d)"
+    )
+    args = (len(hidden), total_open, counts[HIDDEN_STANDUP], counts[HIDDEN_NO_SOURCE],
+            counts[HIDDEN_NOT_ALLOWED])
+    if signature == _LAST_HIDDEN_LOGGED:
+        log.debug(line, *args)
+        return
+    _LAST_HIDDEN_LOGGED = signature
+    log.info(line, *args)
+    state.audit(
+        "todo_rows_hidden",
+        reason="a to-do row is shown only when its source meeting is a sales note "
+               "the bot can read; hidden rows are never edited or deleted",
+        hidden=len(hidden), open_total=total_open, counts=counts,
+        rows=[{"row": row, "reason": why} for row, why in signature],
+    )
+
+
 def open_items(db, *, limit: Optional[int] = None) -> dict:
     """The open to-dos, oldest first — the answer to "@bot show the to-dos".
 
     Oldest first because the point of the list is what has been sitting there,
     not what was added this morning.
+
+    ONLY VISIBLE ROWS, and nothing that says otherwise: `open_total` and
+    `shown` count what `split_visible` let through, and the result has no key
+    for what it held back — whatever is in this dict can reach the channel.
     """
     data = read_rows(db)
     if not data["ok"]:
         return data
-    rows = [r for r in data["rows"] if r["open"]]
+    open_rows = [r for r in data["rows"] if r["open"]]
+    rows, hidden = split_visible(open_rows)
+    _log_hidden(hidden, len(open_rows))
     rows.sort(key=lambda r: (r.get("date_raised") or "9999", r.get("row", 0)))
     cap = max(1, int(limit if limit is not None else config.TODO_SHOW_MAX))
     data["rows"] = rows[:cap]
@@ -344,7 +468,7 @@ def format_items(data: dict, *, db=None) -> str:
     head = f"**{config.TODO_SHEET_TITLE}** — {url}"
     if not rows:
         return head + "\nNothing open on it right now."
-    lines = [head, f"{total} open item(s)" + (f", showing {len(rows)}" if len(rows) < total else "") + ":"]
+    lines = [head, wording.plural(total, "open item") + (f", showing {len(rows)}" if len(rows) < total else "") + ":"]
     for r in rows:
         bits = [r["task"]]
         if r["owner"]:
@@ -430,7 +554,7 @@ def refresh(db, *, today: Optional[date] = None,
         fresh.append(item)
         if len(fresh) >= max(1, int(config.TODO_MAX_NEW_PER_REFRESH)):
             log.info(
-                "[todos] %d new item(s) found; appending the first %d this run",
+                "[todos] new items found: %d; appending the first %d this run",
                 len(found) - out["skipped"], len(fresh),
             )
             break
@@ -565,7 +689,7 @@ def announcement_lines(ensured: dict) -> list[str]:
         )
     if ensured.get("failed"):
         lines.append(
-            "I could NOT share it with "
+            "I couldn't share it with "
             + ", ".join(f["email"] for f in ensured["failed"])
             + " — "
             + (ensured["failed"][0].get("remedy") or "check the address is a Google account")

@@ -509,14 +509,29 @@ COS_PERSONA_ENABLED = _bool("COS_PERSONA_ENABLED", default=True)
 # Three sources the bot reasons over (sources.py). Each self-reports connected /
 # awaiting-access, and "what can you do" answers honestly from those statuses.
 
-# Local folder of Drive-synced meeting notes (notes.py reads it). Empty → the
-# meeting-notes source reports awaiting-access. The folder is CREATED at startup
-# when it doesn't exist, so a fresh box doesn't need a manual mkdir before the
-# first sync.
+# Local folder the sales meeting notes are synced into (notes.py reads it).
+# Empty → the meeting-notes source reports awaiting-access. The folder is CREATED
+# at startup when it doesn't exist, so a fresh box doesn't need a manual mkdir
+# before the first sync. The bot also keeps `_quarantine/` inside it.
 NOTES_DIR = (os.getenv("NOTES_DIR", "") or "").strip()
 
+# THE TAG: the ONE Drive folder the notes come from, by name. It must appear,
+# character for character, inside NOTES_SYNC_CMD. Empty → the notes source is
+# NOT CONNECTED: no sync runs, nothing in NOTES_DIR is read, and the bot says
+# "Meeting notes aren't connected to me yet."
+#
+# It is a variable of its own, rather than something read out of the command,
+# because a command being set proves nothing: the live .env already had one,
+# pointing at a folder that did not exist. Naming the folder here is the
+# deliberate act that connects the source. There is no default and there must
+# not be one — the folder's name is the operator's to give (DEPLOY.md).
+NOTES_SOURCE_FOLDER = (os.getenv("NOTES_SOURCE_FOLDER", "") or "").strip()
+
 # The full sync command — an entire rclone invocation, run through the shell.
-# Empty → no sync ever runs and the bot reads whatever is already on disk.
+# It must name NOTES_SOURCE_FOLDER and write into NOTES_DIR. Use `rclone sync`
+# (a mirror) with --exclude "/_quarantine/**": a mirror removes a note that was
+# taken out of the Drive folder, and the exclude stops it deleting what the bot
+# set aside. The bot refuses to run a mirror without that exclude.
 #
 # WINDOWS: this runs as a SUBPROCESS, which does not see PowerShell aliases or
 # functions. `rclone` must be on PATH or written as a full path to rclone.exe.
@@ -528,22 +543,42 @@ NOTES_SYNC_MINUTES = _int("NOTES_SYNC_MINUTES", 30)
 # the incremental ones, so this is generous by default.
 NOTES_SYNC_TIMEOUT_SECONDS = _int("NOTES_SYNC_TIMEOUT_SECONDS", 120)
 
-# -- Which synced notes stay OUT of context -----------------------------------
-# The sync pulls every "Notes by Gemini" doc shared with the sync account, and
-# the bot loads ALL of them EXCEPT the recurring product standups. A doc is
-# excluded when its TITLE contains any of these, matched case-insensitively as a
-# substring. Everything else — PM calls, customer calls, ad-hoc meets — is in.
+# -- Which notes are read: an ALLOWLIST ---------------------------------------
+# A file in NOTES_DIR is read only when it came from NOTES_SOURCE_FOLDER (the
+# bot keeps a manifest of what each sync left there), has a date, does not
+# carry a standup's title, and — when tags are required — carries a tag.
+# Everything else stays unread, and anything the manifest does not vouch for is
+# moved to NOTES_DIR/_quarantine at the next sync. Never deleted.
 #
-# This is an EXCLUDE list, not an include list, and the direction matters. The
-# previous include-based filter (a sales attendee marker or a sales title hint)
-# admitted zero of the 72 docs on the live folder, because the invite list didn't
-# survive the Gemini export and nobody titles a real call "sales sync". An
-# include-list that matches nothing looks exactly like "no meetings happened",
-# which is the failure the notes pipeline exists to prevent. The worst an
-# exclude-list does is put a standup in context: visible, and harmless.
+# WHY AN ALLOWLIST. Until 6 Oct this was an exclude list: read everything in
+# the folder except titles containing "AM sync" / "PM sync". The folder held
+# files left over from an older, broader sync, two of them internal product
+# calls with other titles, and the sales bot answered a sales question from
+# one. An exclude list only names what somebody already thought of.
 #
-# Setting this EMPTY is legal and means "load everything, exclude nothing".
-NOTES_EXCLUDE_TITLE_PATTERNS = _str_list("NOTES_EXCLUDE_TITLE_PATTERNS", "AM sync,PM sync")
+# AND WHY IT CANNOT FAIL SILENTLY, which is what killed the include-list before
+# it (zero of 72 docs admitted, indistinguishable from "no meetings happened"):
+# nothing is asked of a title by default — the folder is the tag — and every
+# scan counts each file into exactly one bucket, logs the counts on every sync
+# and every change, and WARNs, naming the bucket and the setting, when files
+# came from the folder and none loaded (notes._report_counts).
+
+# OPTIONAL second lock, EMPTY by default and meant to stay empty: when set, a
+# note is read only if its title carries one of these (comma-separated, matched
+# on whole words, case-insensitively). Nobody should have to rename a meeting
+# to have it read; this exists for a folder that cannot be kept clean.
+NOTES_REQUIRE_TITLE_TAGS = _str_list("NOTES_REQUIRE_TITLE_TAGS", "")
+
+# Standup titles that are refused even inside the sales folder. These ADD to a
+# built-in floor of the same seven (notes._STANDUP_FLOOR) that no value here can
+# remove — so an empty or out-of-date line in a server's .env no longer means
+# "load the standups". Matched on whole words after punctuation is flattened:
+# "AM sync" catches "( AM Sync)" and "AM-Sync" but not "Program sync". A bare
+# "sync" is deliberately absent: it would refuse a real "Sales sync".
+NOTES_EXCLUDE_TITLE_PATTERNS = _str_list(
+    "NOTES_EXCLUDE_TITLE_PATTERNS",
+    "AM sync,PM sync,NFThing Kick-off,NFThing Wrap-up,standup,stand-up,daily sync",
+)
 
 # The sales spreadsheet is no longer a stub: it is the GTM Playbook, read live
 # through the Sheets API. Its settings live in the GTM SPREADSHEET section below
@@ -691,10 +726,31 @@ QUERY_HISTORY_MAX_MATCHES = _int("QUERY_HISTORY_MAX_MATCHES", 8)
 QUERY_HISTORY_MAX_CONTEXT = _int("QUERY_HISTORY_MAX_CONTEXT", 6)
 
 # Tool-use loop bounds for query_engine.py.
-# Five, down from eight: most answers finish in two or three, and every extra
-# iteration resends the whole system prompt and history.
-QUERY_ENGINE_MAX_TOOL_ITERATIONS = _int("QUERY_ENGINE_MAX_TOOL_ITERATIONS", 5)
+# Seven: WEB_QUESTION_MAX_SEARCHES + 3 — room for four sequential searches, one
+# other tool round and the answer. Most answers still finish in two or three
+# (the prompt asks for independent calls in ONE turn), and an unused iteration
+# costs nothing. It was five, which let a two-person profile lookup run out of
+# rounds before it ran out of searches.
+QUERY_ENGINE_MAX_TOOL_ITERATIONS = _int("QUERY_ENGINE_MAX_TOOL_ITERATIONS", 7)
+# THE ONE EXTENSION. CHEAP FIRST: a question starts at the cap above, and only
+# one that reaches it while still searching gets this larger cap — once, logged
+# (query_engine.QuestionLimits). Never below the base; equal to it turns the
+# extension off. Pairs with WEB_QUESTION_EXTENDED_SEARCHES.
+# The value as it was SET is kept beside the one that is used, only so that
+# validate() can say when it was below the base and has been read up to it.
+QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS_RAW = _int(
+    "QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS", 9)
+QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS = max(
+    QUERY_ENGINE_MAX_TOOL_ITERATIONS, QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS_RAW)
 QUERY_ENGINE_MAX_TOKENS = _int("QUERY_ENGINE_MAX_TOKENS", 1536)
+
+# THE ANSWER GUARD (replyguard.py). The prompt asks the model to answer first
+# and never to open with "Sure!", "Here's what I found" or the question said
+# back; this is the part that does not depend on being obeyed. It removes that
+# opening from an outgoing answer, logs "[voice] guard … rule=…" when it does,
+# and changes nothing else: it never adds a word and never calls the model.
+# False sends the model's text exactly as it came.
+ANSWER_GUARD_ENABLED = _bool("ANSWER_GUARD_ENABLED", True)
 
 # TOOL RESULTS ARE TRIMMED, NOT DROPPED. Every new tool_result is capped at
 # QUERY_TOOL_RESULT_MAX_CHARS; once a result is older than the two most recent
@@ -844,7 +900,7 @@ SHEET_WRITES_ENABLED = _bool("SHEET_WRITES_ENABLED", default=True)
 # catches that only if somebody reads the echo. A proposal catches it before it
 # happens.
 #
-# WHO MAY SAY YES. Only SALES_APPROVER_IDS — Sid and Vaishnavi. Anybody may tell
+# WHO MAY SAY YES. Only the approvers (SALES_APPROVER_IDS). Anybody may tell
 # the bot something and it will propose the change; only an approver's yes
 # applies it.
 SALES_APPROVER_IDS: list[int] = _int_list("SALES_APPROVER_IDS")
@@ -961,7 +1017,7 @@ def may_write_new_row_column(index0) -> bool:
 
 
 # -- FOCUS COMMANDS -----------------------------------------------------------
-# "Prioritise only AI Voice Agents for the next two weeks." Sid or Vaishnavi can
+# "Prioritise only AI Voice Agents for the next two weeks." The approvers can
 # redirect prospecting at any time; R5 then offers matching contacts FIRST.
 #
 # A FOCUS NARROWS, IT DOES NOT SILENCE. When nothing on the sheet matches, R5
@@ -1147,9 +1203,19 @@ SEARCH_TIMEOUT_SECONDS = _int("SEARCH_TIMEOUT_SECONDS", 10)
 # characters. A page is read for one fact; 6000 characters is ~1,500 tokens.
 FETCH_PAGE_MAX_CHARS = _int("FETCH_PAGE_MAX_CHARS", 6000)
 
-# How many searches ONE channel question may make. The engine reasons over the
-# snippets; a question that needs more than two needs to be a narrower question.
-WEB_QUESTION_MAX_SEARCHES = _int("WEB_QUESTION_MAX_SEARCHES", 2)
+# How many searches ONE channel question may make. Four: "LinkedIn and research
+# profile for these two people" is four searches by itself, and at two the bot
+# stopped halfway and said it had hit a limit (6 Oct). SEARCH_DAILY_BUDGET is
+# still the day's safety net; at the limit the tool lists what was searched and
+# what was not, so the answer can say "not checked yet" per person.
+WEB_QUESTION_MAX_SEARCHES = _int("WEB_QUESTION_MAX_SEARCHES", 4)
+# THE ONE EXTENSION: a question that reaches the limit above with a NEW query
+# still to run gets this many in all — once, logged, never more. Most questions
+# never pay for it, which is why the base stays at four. Never below the base;
+# equal to it turns the extension off.
+WEB_QUESTION_EXTENDED_SEARCHES_RAW = _int("WEB_QUESTION_EXTENDED_SEARCHES", 6)
+WEB_QUESTION_EXTENDED_SEARCHES = max(
+    WEB_QUESTION_MAX_SEARCHES, WEB_QUESTION_EXTENDED_SEARCHES_RAW)
 
 # How long a per-row research answer (R6's email, R8/R10's company news) is
 # reused, in days. Keyed on the item, not the date: the same person's email
@@ -2900,28 +2966,64 @@ def validate() -> list[str]:
             ", ".join(sorted(TEAM_ROSTER_NAMES)),
         )
 
-    if not NOTES_DIR:
+    # The meeting notes. Not connected is a supported state, so it is INFO; a
+    # command the bot will refuse to run is a WARNING, because somebody meant
+    # to connect the notes and they are not connected.
+    _notes_missing = [
+        name for name, value in (
+            ("NOTES_DIR", NOTES_DIR),
+            ("NOTES_SOURCE_FOLDER", NOTES_SOURCE_FOLDER),
+            ("NOTES_SYNC_CMD", NOTES_SYNC_CMD),
+        ) if not value
+    ]
+    if _notes_missing:
         log.info(
-            "NOTES_DIR is unset — the meeting-notes source will report "
-            "awaiting-access, and the bot will say so when asked what it can do."
+            "%s unset — the meeting notes are NOT CONNECTED: no sync runs, nothing in "
+            "the notes folder is read, and the bot says so when asked. All three of "
+            "NOTES_DIR, NOTES_SOURCE_FOLDER and NOTES_SYNC_CMD are needed (DEPLOY.md).",
+            ", ".join(_notes_missing),
         )
-    elif not NOTES_SYNC_CMD:
-        log.info(
-            "NOTES_SYNC_CMD is unset — nothing will refresh %r, so the bot reads "
-            "whatever is already on disk and its notes go stale silently.", NOTES_DIR,
-        )
+    else:
+        # Late import: notes.py reads this module lazily, so it is safe here and
+        # keeps ONE definition of "is this command a mirror".
+        import notes as _notes
+        _mode = _notes.sync_mode(NOTES_SYNC_CMD)
+        if NOTES_SOURCE_FOLDER not in NOTES_SYNC_CMD:
+            log.warning(
+                "NOTES_SYNC_CMD does not name the folder in NOTES_SOURCE_FOLDER (%r) — "
+                "the sync will NOT run and no meeting note is read. The folder's name "
+                "must appear in the command character for character (mind an en dash "
+                "typed as a hyphen).", NOTES_SOURCE_FOLDER,
+            )
+        elif _mode == "mirror" and _notes.QUARANTINE_DIRNAME not in NOTES_SYNC_CMD:
+            log.warning(
+                "NOTES_SYNC_CMD mirrors (rclone sync) without excluding the quarantine "
+                "— the sync will NOT run, because it would delete the files the bot set "
+                "aside. Add --exclude \"/%s/**\" to the command.",
+                _notes.QUARANTINE_DIRNAME,
+            )
+        elif _mode == "copy":
+            log.warning(
+                "NOTES_SYNC_CMD copies rather than mirrors: a note removed from the "
+                "folder stays readable until it is moved out of NOTES_DIR by hand. Use "
+                "'rclone sync ... --exclude \"/%s/**\"' instead.",
+                _notes.QUARANTINE_DIRNAME,
+            )
     if NOTES_SYNC_MINUTES < 1:
         log.warning(
             "NOTES_SYNC_MINUTES=%s is below 1 — it will be clamped to 1 minute, which "
             "will hammer the sync. The default is 30.", NOTES_SYNC_MINUTES,
         )
-    if not NOTES_EXCLUDE_TITLE_PATTERNS:
-        # Not a mistake, but worth stating: the product standups will now be read
-        # into context alongside the real meetings.
+    if NOTES_REQUIRE_TITLE_TAGS:
+        # Legal, but it is the setting that can empty the notes without anyone
+        # noticing, so it is announced on every boot.
         log.info(
-            "NOTES_EXCLUDE_TITLE_PATTERNS is empty — EVERY synced meeting note is "
-            "loaded, including the AM/PM product standups. Set it to "
-            "'AM sync,PM sync' to keep those out."
+            "NOTES_REQUIRE_TITLE_TAGS=%s — a note in the sales folder is read ONLY if "
+            "its title carries one of these. A tag is matched as whole words, "
+            "ignoring punctuation and case, so it must be a distinctive word "
+            "(\"[SalesNotes]\", not a word ordinary titles contain). Untagged notes "
+            "are counted as missing_tag in the [notes] log line, not read.",
+            NOTES_REQUIRE_TITLE_TAGS,
         )
 
     if COS_NUDGE_MAX_ATTEMPTS < 1:
@@ -3231,6 +3333,48 @@ def validate() -> list[str]:
         )
 
     # -- web search ----------------------------------------------------------
+    # NO SILENT FLOOR: an explicit .env value is obeyed, and said. With fewer
+    # rounds than searches + 3 a question can run out of rounds before it has
+    # used its searches, and the answer stops halfway for no visible reason.
+    # Checked for the base pair and for the extended pair, each on its own.
+    ext_searches = max(WEB_QUESTION_MAX_SEARCHES, WEB_QUESTION_EXTENDED_SEARCHES)
+    ext_rounds = max(QUERY_ENGINE_MAX_TOOL_ITERATIONS,
+                     QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS)
+    # AN EXTENDED VALUE SET BELOW ITS BASE IS READ AS THE BASE — the extension
+    # never lowers a limit — and that silently switches the extension off for
+    # that limit. Said here, because nothing else would show it.
+    for ext_name, raw, base_name, base in (
+        ("WEB_QUESTION_EXTENDED_SEARCHES", WEB_QUESTION_EXTENDED_SEARCHES_RAW,
+         "WEB_QUESTION_MAX_SEARCHES", WEB_QUESTION_MAX_SEARCHES),
+        ("QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS",
+         QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS_RAW,
+         "QUERY_ENGINE_MAX_TOOL_ITERATIONS", QUERY_ENGINE_MAX_TOOL_ITERATIONS),
+    ):
+        if raw < base:
+            log.warning(
+                "[config] %s=%d is below %s=%d; it is read as %d, so that limit "
+                "has no extension", ext_name, raw, base_name, base, base,
+            )
+    for rounds_name, rounds, searches_name, searches in (
+        ("QUERY_ENGINE_MAX_TOOL_ITERATIONS", QUERY_ENGINE_MAX_TOOL_ITERATIONS,
+         "WEB_QUESTION_MAX_SEARCHES", WEB_QUESTION_MAX_SEARCHES),
+        ("QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS", ext_rounds,
+         "WEB_QUESTION_EXTENDED_SEARCHES", ext_searches),
+    ):
+        if rounds < searches + 3:
+            log.warning(
+                "[config] %s=%d is below %s + 3 (%d + 3): a question that "
+                "searches one at a time can hit the tool-round cap before its "
+                "search limit. Set %s=%d.",
+                rounds_name, rounds, searches_name, searches, rounds_name,
+                searches + 3,
+            )
+    log.info(
+        "[config] one question: up to %d web search(es) and %d tool round(s); "
+        "one extension to %d and %d.",
+        WEB_QUESTION_MAX_SEARCHES, QUERY_ENGINE_MAX_TOOL_ITERATIONS,
+        ext_searches, ext_rounds,
+    )
     if not WEB_SEARCH_ENABLED:
         log.info(
             "[config] WEB_SEARCH_ENABLED=false — R1, R2, R3, R6, R8, R10 and R11 will "
@@ -3311,7 +3455,7 @@ def validate() -> list[str]:
         log.error(
             "SALES_APPROVER_IDS is empty — NOBODY can approve a sheet write, so every "
             "proposal the bot makes will expire unanswered and no cell will ever "
-            "change. Set it to Sid's and Vaishnavi's Discord ids."
+            "change. Set it to the approvers' Discord ids."
         )
     else:
         off_roster = [u for u in SALES_APPROVER_IDS if u not in TEAM_ROSTER_IDS]

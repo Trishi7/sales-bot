@@ -59,7 +59,16 @@ TMP = tempfile.mkdtemp(prefix="saley-search-verify-")
 os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 os.environ.setdefault("DISCORD_TOKEN", "x")
 
+import os as _os  # noqa: E402  NFT2-1064 offline guard: canned source statuses, real Sheets/Drive calls blocked
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tests"))
+import offline_guard  # noqa: E402
+if "--stub" in _sys.argv:
+    GUARD = offline_guard.install_script()
 import config  # noqa: E402
+import canned_sheet  # noqa: E402  NFT2-1064: canned rows for the real-sheet read the offline guard blocks
+if "--stub" in _sys.argv:
+    canned_sheet.install()
 
 SID = 1001
 config.DB_PATH = os.environ["DB_PATH"]

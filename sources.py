@@ -15,10 +15,11 @@ A sales Chief of Staff is only as good as what it can see. Five sources matter:
                        Drive API (strategy.py). Reports DEGRADED rather than
                        connected when the plan is stale, because an answer built
                        on a plan nobody has revised in a month has to say so.
-  sales_meeting_notes  the Drive-synced meeting notes (notes.py) — what was
-                       actually said and committed to. LIVE, and filtered: only
-                       notes that are SALES meetings are ever loaded. Everything
-                       derived from them carries a CITATION — see meetings.py.
+  sales_meeting_notes  the sales meeting notes (notes.py) — what was actually
+                       said and committed to. LIVE, and an ALLOWLIST: only notes
+                       synced from the ONE sales notes folder are ever loaded,
+                       and never a product standup. Everything derived from
+                       them carries a CITATION — see meetings.py.
   todo_sheet           "Membrane Sales To-Dos" (todos.py) — the sheet the bot
                        creates, SHARES with the team and appends action items
                        to. A source because its failure mode is silent: an
@@ -437,22 +438,30 @@ class TodoSheet(Source):
 
 
 class SalesMeetingNotes(Source):
-    """Drive-synced sales meeting notes. WIRED UP, including the sync (notes.py).
+    """The sales meeting notes: ONE Drive folder, synced by rclone (notes.py).
 
-    The bot runs NOTES_SYNC_CMD — an rclone command — to pull the Drive docs into
-    NOTES_DIR at startup, every NOTES_SYNC_MINUTES and before answering a notes
-    question. It still holds no Google credential of its own: rclone owns that.
+    The bot runs NOTES_SYNC_CMD to pull the folder named in NOTES_SOURCE_FOLDER
+    into NOTES_DIR at startup, every NOTES_SYNC_MINUTES and before answering a
+    notes question. It still holds no Google credential of its own: rclone owns
+    that. What it reads is an ALLOWLIST — only files its own sync pulled from
+    that folder, minus anything titled like a product standup.
 
-    TWO different failures have to stay distinguishable here, because they have
-    different fixes and only one of them is the bot's fault:
+    The status follows `notes.source_state()`, and the states have to stay
+    distinguishable because they have different fixes:
 
-      the SYNC is broken   → DEGRADED. The folder is readable, it's just going
-                             stale. The detail names the fix (usually rclone not
-                             being on PATH, or an expired token).
-      nothing SALES came    → CONNECTED with zero notes loaded. The sync works;
-      down                   the sales calls simply aren't being recorded, or the
-                             sync account wasn't invited to them. No amount of
-                             config fixes that, so the detail asks the question.
+      not connected   → AWAITING-ACCESS. Nobody has named the folder yet, or
+      (or misconfigured) the command is one the bot refuses to run. Supported,
+                         and the detail names what is missing.
+      unreachable     → DEGRADED. Configured, but the folder has never been
+                         pulled (or its emptiness is unconfirmed). The detail
+                         carries the sync error and the fix.
+      empty           → CONNECTED. A clean sync says the folder holds nothing.
+      ok              → CONNECTED, or DEGRADED while the sync is failing and
+                         the notes on disk are the folder's last good copy.
+
+    THE DETAIL IS FOR THE OPERATOR — the startup log and state/summary.json. It
+    opens with the exact sentence the channel is given for that state, then
+    says why. The notes TOOLS hand the model only the sentence.
     """
 
     key = "sales_meeting_notes"
@@ -460,81 +469,73 @@ class SalesMeetingNotes(Source):
     purpose = "what was said, decided and committed to in sales meetings"
 
     def _probe(self) -> tuple[str, str]:
-        if not config.NOTES_DIR:
+        st = notes.sync_status()
+        state_now = st["state"]
+        say = notes.nothing_to_say()
+        lead = f"{say} " if say else ""
+
+        if state_now in (notes.STATE_NOT_CONFIGURED, notes.STATE_MISCONFIGURED):
+            _, what, fix = notes._config_problem()
             return (
                 AWAITING_ACCESS,
-                "No notes folder is configured (NOTES_DIR), so I can't read meeting notes.",
+                f"{lead}{what} {fix} Until then no sync runs and nothing in the notes "
+                "folder is read.",
             )
 
-        st = notes.sync_status()
-        if not st["dir_exists"]:
-            return (
-                AWAITING_ACCESS,
-                f"NOTES_DIR is set to {config.NOTES_DIR!r} but that folder doesn't exist "
-                "and I couldn't create it — check the path is writable.",
-            )
+        folder = st["source_folder"]
 
         # 1. THE SYNC: when it last ran, and whether it is working.
-        if not st["cmd_configured"]:
-            sync_line = (
-                "No sync command is configured (NOTES_SYNC_CMD), so nothing refreshes this "
-                "folder — what's in it is whatever was last copied there by hand."
-            )
-        elif st["ok"] is None:
+        if st["ok"] is None:
             sync_line = f"The sync (every {st['interval_minutes']} min) hasn't run yet this session."
         elif st["ok"]:
             sync_line = f"Last synced {st['last_success']} (every {st['interval_minutes']} min)."
         else:
-            stale = (
-                f" The newest thing I have is whatever the last good sync ({st['last_success']}) "
-                "left behind, so it may be out of date."
-                if st["last_success"]
-                else " I have never completed a sync, so I'm reading whatever was already on disk."
-            )
             sync_line = (
                 f"The sync is FAILING (last tried {st['last_attempt']}): {st['error']} "
-                f"Fix: {st['remedy']}{stale}"
+                f"Fix: {st['remedy']}"
+            )
+        if st["sync_mode"] == "copy":
+            sync_line += (
+                " The command copies rather than mirrors: a note removed from the folder "
+                "stays readable until it is moved out of NOTES_DIR by hand."
             )
 
-        # 2. THE FILTER: how much came down, how much went into context, and how
-        #    much was held back. The filter is EXCLUDE-based — everything loads
-        #    except the product standups — so the honest phrasing is "loaded /
-        #    excluded", not "qualified / didn't qualify".
+        # 2. WHERE EVERY FILE WENT. Five buckets that sum to what is on disk, so
+        #    "nothing loaded" always comes with the reason.
         counts = (
-            f"{st['docs_seen']} doc(s) on disk, {st['docs_loaded']} loaded, "
-            f"{st['docs_excluded']} excluded (product standups)"
+            f"{st['docs_seen']} file(s) on disk: {st['docs_from_folder']} from the folder "
+            f"({st['docs_loaded']} loaded, {st['docs_excluded']} held back as standups, "
+            f"{st['docs_missing_tag']} missing a required tag, {st['docs_undated']} undated) "
+            f"and {st['docs_not_from_folder']} not from it (unread; moved to "
+            f"{st['quarantine_dir']} at the next sync). {st['quarantined']} moved there "
+            "since startup."
         )
+        scope = f"Source: the Drive folder {folder!r}, and only that folder."
 
-        # 3. Nothing loaded is NOT "no notes" and NOT "no access". Under an
-        #    exclude-based filter it means either everything that came down was a
-        #    standup, or nothing that came down parsed as a dated note — and those
-        #    have different fixes, so say which one it is.
-        if not st["docs_loaded"]:
-            undated = max(0, st["docs_seen"] - st["notes_seen"])
-            why = []
-            if st["docs_excluded"]:
-                why.append(
-                    f"{st['docs_excluded']} were excluded as standups by "
-                    f"{st['exclude_patterns']}"
-                )
-            if undated:
-                why.append(f"{undated} had no parseable date, so they aren't meeting notes")
-            detail = (
-                f"{sync_line} {counts} — nothing is loaded into context"
-                + (": " + " and ".join(why) if why else "")
-                + ". That is not the same as no meetings happening. Every synced doc is "
-                "loaded EXCEPT titles matching "
-                f"{st['exclude_patterns']}; widen or clear NOTES_EXCLUDE_TITLE_PATTERNS "
-                "if a real meeting is being caught by it."
-            )
-        else:
+        if state_now == notes.STATE_UNREACHABLE:
+            return DEGRADED, f"{lead}{scope} {sync_line} {counts}"
+
+        if state_now == notes.STATE_OK and st["docs_loaded"]:
             latest_date, _ = notes.freshness()
             detail = (
-                f"{sync_line} {counts}; the most recent loaded note is from {latest_date}. "
-                "Everything the sync pulls is read EXCEPT titles matching "
-                f"{st['exclude_patterns']} — those are the product standups and they stay "
-                "on disk, unread."
+                f"{scope} {sync_line} {counts} The most recent loaded note is from "
+                f"{latest_date}."
             )
+            if st["degraded"]:
+                detail += (
+                    " What I can read is the folder's last good copy "
+                    f"({st['last_success'] or 'from an earlier run'}), so it may be out "
+                    "of date."
+                )
+        else:
+            detail = f"{lead}{scope} {sync_line} {counts}"
+            if st["docs_from_folder"]:
+                detail += (
+                    " Files came from the folder and none loaded — that is not the same "
+                    f"as no meetings happening. Standup titles refused: {st['exclude_patterns']}"
+                    + (f"; required tags: {st['require_tags']}" if st["require_tags"] else "")
+                    + "."
+                )
 
         # DEGRADED, not CONNECTED, while the sync is broken: the notes are readable
         # but going stale, and an answer built on them has to say so.
@@ -546,8 +547,8 @@ class SalesMeetingNotes(Source):
         return notes.sync_for_question(question)
 
     def latest(self) -> Optional[dict]:
-        """The most recent LOADED meeting note, parsed — the newest note that isn't
-        an excluded standup. None when unavailable."""
+        """The most recent LOADED sales meeting note, parsed. None when
+        unavailable."""
         return notes.read_note()
 
 

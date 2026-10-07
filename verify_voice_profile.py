@@ -46,6 +46,12 @@ ONLY = ""
 if "--only" in sys.argv:
     ONLY = sys.argv[sys.argv.index("--only") + 1].strip().lower()
 
+import os as _os  # noqa: E402  NFT2-1064 offline guard: canned source statuses, real Sheets/Drive calls blocked
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tests"))
+import offline_guard  # noqa: E402
+if "--offline" in _sys.argv:
+    GUARD = offline_guard.install_script()
 import config  # noqa: E402
 
 REAL_DB = config.DB_PATH

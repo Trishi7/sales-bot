@@ -103,7 +103,7 @@ REPLY_ROLES: tuple = (
     "meeting_status",
     # S and U, inside the restricted right-hand band. Kept in the tier list so
     # that the refusal names the COLUMN ("I never write to Next Steps/Notes")
-    # instead of falling through to "I have no rule for that" — the second is
+    # instead of falling through to "I don't have a rule for that" — the second is
     # true and useless, and it reads as the bot not having listened.
     "next_steps",
     "prospect_status",
@@ -125,7 +125,7 @@ TRIGGER_COMMAND = "command"
 # CONTACT DETAILS. These live in the restricted identity band, and people hand
 # them over in replies constantly — "sure, her email is a@b.com". They get their
 # own handling for one reason: the useful answer is "I have got that, could you
-# put it in", and the generic refusal ("I have no rule for that") loses the
+# put it in", and the generic refusal ("I don't have a rule for that") loses the
 # information AND reads as the bot not listening.
 #
 # Listed by role as well as caught by the band check, because the band check
@@ -282,7 +282,7 @@ def plan_writes(
         #      A role with no column is almost always a RETIRED one
         #      (gtm_sheet.RETIRED_POCS_ROLES — response, assets_shared,
         #      followups_count and the rest of the tracker era). Letting the
-        #      tier check answer first would refuse it with "I have no rule for
+        #      tier check answer first would refuse it with "I don't have a rule for
         #      that", which is true and useless: it tells somebody who just
         #      reported a real fact nothing about why it went nowhere. "There
         #      is no Assets Shared column on this tab any more" is actionable.
@@ -293,7 +293,7 @@ def plan_writes(
                 "role": role,
                 "why": (
                     f"there is no column for {label} on this tab"
-                    + (" any more — it is a retired tracker-era column, and "
+                    + (" any more — it's a retired tracker-era column, and "
                        "nothing records it now" if retired else "")
                 ),
             })
@@ -311,7 +311,7 @@ def plan_writes(
             else:
                 out["skipped"].append({
                     "role": role,
-                    "why": f"I have no rule that lets me write {role!r}",
+                    "why": f"I don't have a rule that lets me write {role!r}",
                 })
             continue
 
@@ -332,7 +332,7 @@ def plan_writes(
                     "role": role,
                     "why": (f"setting {ROLE_LABELS.get(role, role)} to {value!r} stops "
                             f"that row for good, and nobody actually said it — tell me "
-                            f"plainly and I will"),
+                            f"plainly and I'll do it"),
                 })
                 continue
 
@@ -342,7 +342,7 @@ def plan_writes(
         if old and not supersedes:
             out["skipped"].append({
                 "role": role,
-                "why": (f"{header} already says {old!r} and your reply did not clearly "
+                "why": (f"{header} already says {old!r} and your reply didn't clearly "
                         f"replace it, so I left it alone"),
             })
             continue
@@ -369,9 +369,9 @@ def plan_writes(
     if len(out["writes"]) > cap:
         out["skipped"].append({
             "role": "(all)",
-            "why": (f"that would change {len(out['writes'])} cells and my ceiling is "
-                    f"{cap} — I have not written anything. Tell me one thing at a time "
-                    f"and I will get it right"),
+            "why": (f"that would change {len(out['writes'])} cells and my limit is "
+                    f"{cap}, so I haven't written anything. Tell me one thing at a time "
+                    f"and I'll get it right"),
         })
         out["writes"] = {}
         out["applied"] = []
@@ -403,8 +403,8 @@ def echo_line(*, company: str, poc: str, applied: list, asks: list,
     if asks:
         got = " and ".join(f"{a['label'].lower()} ({a['value']})" for a in asks)
         parts.append(
-            f"I have got the {got} — that column is one I never write to, so could you "
-            f"drop it in yourself?"
+            f"I've got the {got}, but that column is one I never write to. Could you "
+            f"add it yourself?"
         )
     ask_roles = {a["role"] for a in (asks or [])}
     for entry in skipped:
@@ -415,7 +415,7 @@ def echo_line(*, company: str, poc: str, applied: list, asks: list,
             parts.append(why[0].upper() + why[1:] + ".")
             break
     if applied:
-        parts.append(f"Say undo any time in the next {undo_hours}h and I will put it back.")
+        parts.append(f"Say undo in the next {undo_hours}h and I'll put it back.")
     return " ".join(p for p in parts if p).strip()
 
 
@@ -694,7 +694,7 @@ def snooze_confirmation(plan: dict, *, company: str) -> str:
     about = f" about {plan['about']}" if plan.get("about") else ""
     if plan["kind"] == "scheduled":
         return (
-            f"Got it — I will bring {company}{about} back up on {when}{at}. "
+            f"Got it — I'll bring {company}{about} back up on {when}{at}. "
             f"Nothing from me on it before then."
         )
     return (
@@ -856,7 +856,7 @@ def _self_test() -> int:
     p10 = plan(many, trigger=TRIGGER_COMMAND)
     check("over the cell ceiling -> nothing at all", p10["writes"], {})
     check("...refused whole, and said so",
-          any("ceiling" in str(sk.get("why")) for sk in p10["skipped"]), True)
+          any("my limit is" in str(sk.get("why")) for sk in p10["skipped"]), True)
 
     print("\necho line")
     line = echo_line(company="Acme", poc="Ann", applied=p1["applied"], asks=[],

@@ -1,0 +1,279 @@
+{
+ "version": 1,
+ "note": "Model outputs the offline tone tests run against. There are NO live cases yet: every 'synthetic' case is hand-written by the tester (before = the shape the old prompt produced, after = the target voice), made-up companies and people only (Acme AI, Globex, Initech, Ada Lovelace), and is test data, not model output. 'oct6-verbatim' cases quote the bot lines in tests/fixtures/oct6_exchange.md as before only. 'live' cases appear only after tools/tone_samples.py --live-model --record, which the human runs.",
+ "cases": [
+  {
+   "id": "syn-fact-01",
+   "source": "synthetic",
+   "question": "where are we with Acme?",
+   "asker": "Vaishnavi",
+   "type": "fact",
+   "items": 0,
+   "before": "Here's the status on Acme:\nAcme replied on 12 Aug and the demo is booked for Thursday. No next step on the sheet after that.",
+   "after": "Acme replied on 12 Aug and the demo is booked for Thursday. No next step on the sheet after that.",
+   "expect_guard_on_before": [
+    "lead-in"
+   ]
+  },
+  {
+   "id": "syn-fact-02",
+   "source": "synthetic",
+   "question": "is Globex on hold?",
+   "asker": "Vaishnavi",
+   "type": "fact",
+   "items": 0,
+   "before": "Sure! Yes, until their pilot is done (Sales Bot Discussion, 2 Sep).",
+   "after": "Yes, until their pilot is done (Sales Bot Discussion, 2 Sep).",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-fact-03",
+   "source": "synthetic",
+   "question": "when is the Acme demo?",
+   "asker": "Vaishnavi",
+   "type": "fact",
+   "items": 0,
+   "before": "Based on the tracker, the Acme demo is on Thursday 15 Oct at 4pm.",
+   "after": "Thursday 15 Oct at 4pm. The invite went out on 12 Aug.",
+   "expect_guard_on_before": [
+    "based-on"
+   ]
+  },
+  {
+   "id": "syn-fact-04",
+   "source": "synthetic",
+   "question": "who owns Acme?",
+   "asker": "Vaishnavi",
+   "type": "fact",
+   "items": 0,
+   "before": "You asked who owns Acme. Kushal took it over on 12 Aug.",
+   "after": "Kushal took it over on 12 Aug.",
+   "expect_guard_on_before": [
+    "echo-frame"
+   ]
+  },
+  {
+   "id": "syn-fact-05",
+   "source": "synthetic",
+   "question": "what's the next step on Globex?",
+   "asker": "Vaishnavi",
+   "type": "fact",
+   "items": 0,
+   "before": "Great question. The next step on Globex is a pricing call on 14 Oct.",
+   "after": "Pricing call on 14 Oct. Sid is sending the invite.",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-list-01",
+   "source": "synthetic",
+   "question": "who are the PoCs at Acme AI?",
+   "asker": "Vaishnavi",
+   "type": "list",
+   "items": 2,
+   "before": "Great question. Two on the sheet:\n• Ada Lovelace — CTO\n• Sam Lee — Head of Research",
+   "after": "Two on the sheet:\n• Ada Lovelace — CTO\n• Sam Lee — Head of Research",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-list-02",
+   "source": "synthetic",
+   "question": "list the open to-dos",
+   "asker": "Vaishnavi",
+   "type": "list",
+   "items": 3,
+   "before": "Here's what I found:\n• Send the Acme deck — Asha\n• Chase Globex on pricing — Ben\n• Update the tracker — Chen",
+   "after": "• Send the Acme deck — Asha\n• Chase Globex on pricing — Ben\n• Update the tracker — Chen",
+   "expect_guard_on_before": [
+    "lead-in"
+   ]
+  },
+  {
+   "id": "syn-list-03",
+   "source": "synthetic",
+   "question": "what are the sales objectives for today?",
+   "asker": "Vaishnavi",
+   "type": "list",
+   "items": 3,
+   "before": "The sales objectives for today are:\n1. Chase Globex on pricing\n2. Send the Acme deck\n3. Book the Initech intro",
+   "after": "1. Chase Globex on pricing\n2. Send the Acme deck\n3. Book the Initech intro",
+   "expect_guard_on_before": [
+    "restated-question"
+   ]
+  },
+  {
+   "id": "syn-news-01",
+   "source": "synthetic",
+   "question": "top 5 AI headlines",
+   "asker": "Vaishnavi",
+   "type": "news",
+   "items": 5,
+   "before": "Here are the top 5 AI headlines:\n• Acme AI raises a seed round — [Example Wire](<https://example.com/a>)\n• Globex ships a speech model — [Example Wire](<https://example.com/b>)\n• Initech opens a Bengaluru lab — [Example Wire](<https://example.com/c>)\n• Umbrella AI hires a new CTO — [Example Wire](<https://example.com/d>)\n• Hooli updates its pricing — [Example Wire](<https://example.com/e>)",
+   "after": "• Acme AI raises a seed round — [Example Wire](<https://example.com/a>)\n• Globex ships a speech model — [Example Wire](<https://example.com/b>)\n• Initech opens a Bengaluru lab — [Example Wire](<https://example.com/c>)\n• Umbrella AI hires a new CTO — [Example Wire](<https://example.com/d>)\n• Hooli updates its pricing — [Example Wire](<https://example.com/e>)",
+   "expect_guard_on_before": [
+    "lead-in"
+   ]
+  },
+  {
+   "id": "syn-news-02",
+   "source": "synthetic",
+   "question": "any AI news today?",
+   "asker": "Vaishnavi",
+   "type": "news",
+   "items": 2,
+   "before": "Based on today's search, here are the headlines:\n• Acme AI raises a seed round — [Example Wire](<https://example.com/a>)\n• Globex ships a speech model — [Example Wire](<https://example.com/b>)",
+   "after": "• Acme AI raises a seed round — [Example Wire](<https://example.com/a>)\n• Globex ships a speech model — [Example Wire](<https://example.com/b>)",
+   "expect_guard_on_before": [
+    "based-on",
+    "lead-in"
+   ]
+  },
+  {
+   "id": "syn-profile-01",
+   "source": "synthetic",
+   "question": "LinkedIn and research links for Ada Lovelace and Sam Lee (Acme AI)",
+   "asker": "Vaishnavi",
+   "type": "profile",
+   "items": 0,
+   "people": 2,
+   "before": "Here's what I found:\n**Ada Lovelace**\nLinkedIn: [Ada Lovelace – Acme AI](<https://example.com/in/ada>)\nResearch: not found in public search\n**Sam Lee**\nLinkedIn: not found in public search\nResearch: not checked yet",
+   "after": "**Ada Lovelace**\nLinkedIn: [Ada Lovelace – Acme AI](<https://example.com/in/ada>)\nResearch: not found in public search\n**Sam Lee**\nLinkedIn: not found in public search\nResearch: not checked yet",
+   "expect_guard_on_before": [
+    "lead-in"
+   ]
+  },
+  {
+   "id": "syn-profile-02",
+   "source": "synthetic",
+   "question": "research profile for Ada Lovelace",
+   "asker": "Vaishnavi",
+   "type": "profile",
+   "items": 0,
+   "people": 1,
+   "before": "Sure! Found her page.\n**Ada Lovelace**\nResearch: [Scholar page](<https://example.com/scholar/ada>)\nLinkedIn: not checked yet",
+   "after": "Found her page.\n**Ada Lovelace**\nResearch: [Scholar page](<https://example.com/scholar/ada>)\nLinkedIn: not checked yet",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-summary-01",
+   "source": "synthetic",
+   "question": "what happened in the Sales Bot Discussion?",
+   "asker": "Vaishnavi",
+   "type": "summary",
+   "items": 0,
+   "before": "Sure thing! Acme goes on hold until the pilot is done. Sid owns the pricing sheet and Ada sends the deck by Friday (Sales Bot Discussion, 2 Sep).\nNext: Sid to confirm the Globex call.",
+   "after": "Acme goes on hold until the pilot is done. Sid owns the pricing sheet and Ada sends the deck by Friday (Sales Bot Discussion, 2 Sep).\nNext: Sid to confirm the Globex call.",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-summary-02",
+   "source": "synthetic",
+   "question": "give me a channel recap for this week",
+   "asker": "Vaishnavi",
+   "type": "summary",
+   "items": 0,
+   "before": "Here's the rundown:\nGlobex asked for pricing on Tuesday and Sid sent it. Acme went quiet after the demo. Initech wants an intro next week.",
+   "after": "Globex asked for pricing on Tuesday and Sid sent it. Acme went quiet after the demo. Initech wants an intro next week.",
+   "expect_guard_on_before": [
+    "lead-in"
+   ]
+  },
+  {
+   "id": "syn-gap-01",
+   "source": "synthetic",
+   "question": "where are we with Globex?",
+   "asker": "Vaishnavi",
+   "type": "gap",
+   "items": 0,
+   "before": "Sure! Nothing on Globex in the channel in the last two weeks. I can't see the pipeline sheet yet, so that's all I have.",
+   "after": "Nothing on Globex in the channel in the last two weeks. I can't see the pipeline sheet yet, so that's all I have.",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-gap-02",
+   "source": "synthetic",
+   "question": "what's the deal stage for Initech?",
+   "asker": "Vaishnavi",
+   "type": "gap",
+   "items": 0,
+   "before": "Based on what I could check, I can't see the pipeline sheet yet, so I can't say.",
+   "after": "I can't see the pipeline sheet yet, so I can't say.",
+   "expect_guard_on_before": [
+    "based-on"
+   ]
+  },
+  {
+   "id": "syn-social-01",
+   "source": "synthetic",
+   "question": "thanks",
+   "asker": "Vaishnavi",
+   "type": "social",
+   "items": 0,
+   "before": "Sure! Anytime.",
+   "after": "Anytime.",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-social-02",
+   "source": "synthetic",
+   "question": "asdf qwerty",
+   "asker": "Vaishnavi",
+   "type": "social",
+   "items": 0,
+   "before": "Good question! Couldn't follow that one. Which company do you mean?",
+   "after": "Couldn't follow that one. Which company do you mean?",
+   "expect_guard_on_before": [
+    "interjection"
+   ]
+  },
+  {
+   "id": "syn-cap-01",
+   "source": "synthetic",
+   "question": "what can you do?",
+   "asker": "Vaishnavi",
+   "type": "capability",
+   "items": 0,
+   "before": "Great question! Here's what I can do:\n- Answer from the sales channels and the sheets\n- Search the web for public pages, news and profile links\n- Keep track of what's due and nudge the team\nI can't see the pipeline sheet yet, so status questions wait on that.",
+   "after": "Answer from the sales channels and the sheets, search the web for public pages, news and profile links, and keep track of what's due.\nI can't see the pipeline sheet yet, so status questions wait on that.",
+   "expect_guard_on_before": [
+    "interjection",
+    "lead-in"
+   ]
+  },
+  {
+   "id": "oct6-verbatim-05",
+   "source": "oct6-verbatim",
+   "question": "@Saley research profiles for Sigil Wen",
+   "asker": "Vaishnavi",
+   "type": "gap",
+   "items": 0,
+   "before": "I hit my search limit before I could check.",
+   "after": null,
+   "expect_guard_on_before": []
+  },
+  {
+   "id": "oct6-verbatim-08",
+   "source": "oct6-verbatim",
+   "question": "@Saley LinkedIn and research profile links for Janajit Bagchi and Suryansh Shukla (ARTPARK India)",
+   "asker": "Vaishnavi",
+   "type": "gap",
+   "items": 0,
+   "before": "Same answer as before — I can't pull LinkedIn or research profile links. I don't have a web search or LinkedIn scraping tool, and the strategy explicitly bars me from guessing or fabricating URLs.",
+   "after": null,
+   "expect_guard_on_before": []
+  }
+ ]
+}

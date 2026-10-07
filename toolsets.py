@@ -8,10 +8,20 @@ three times over to answer it. Two changes, both here:
     select()   hands the engine the tools the question's own words call for —
                news gets todays_news (the news already collected) beside
                web_search and fetch_page; web gets those two and strategy_doc; a sheet
-               question gets the sheet and mapping tools; notes get the notes
-               tools; reminders the reminder tools. Usually under ten. THE FULL
+               question gets the sheet and mapping tools; a MEETING question
+               gets the three notes tools; a to-do question gets the to-do
+               sheet (`todos`); reminders the reminder tools. Usually under
+               ten routed tools. "What do we need to do today?" gets the
+               `today` group and NOTHING ELSE — see _EXCLUSIVE. THE FULL
                SET IS SENT ONLY WHEN THE QUESTION IS UNCLEAR — nothing matched,
                which is what a bare follow-up ("and Globex?") looks like.
+
+               web_search AND fetch_page RIDE WITH EVERY ROUTE BUT AN EXCLUSIVE
+               ONE — see ALWAYS. On 6 Oct a question about two people on the
+               sheet was routed to the sheet tools, was handed no web tool, and
+               the bot said, truthfully for that turn, that it had no web
+               search. A minute later the word "web" in the question got it
+               one. What the bot can do must not depend on the asker's wording.
 
     slim()     gives every tool a ONE-SENTENCE description. The long versions
                stay in bot.py beside the handlers, as the documentation they
@@ -48,21 +58,23 @@ ONE_LINE = {
         "The commitments people made in the sales channels that I am still "
         "waiting on — my own tracking, not a pipeline or a task list."),
     "list_meeting_notes": (
-        "List the recent meeting notes on file (date, label, title) with sync "
-        "and freshness — for when it is unclear which meeting is meant or "
-        "what notes exist."),
+        "List the recent sales meeting notes on file (date, label, title) — "
+        "for when it is unclear which meeting is meant; if the result has a "
+        "'say' field, reply with that sentence only."),
     "read_meeting_note": (
-        "Read ONE meeting note (summary, decisions, next steps) by date "
-        "(YYYY-MM-DD) and optional label; omit the date for the most recent."),
+        "Read ONE sales meeting note (summary, decisions, next steps) by date "
+        "(YYYY-MM-DD) and optional label; omit the date for the most recent; "
+        "if the result has a 'say' field, reply with that sentence only."),
     "meeting_facts": (
-        "Holds, decisions and commitments from the meeting notes, each with a "
-        "citation you must print — for 'is X on hold' or 'what did we decide "
-        "about X'."),
+        "Holds, decisions and commitments from the sales meeting notes, each "
+        "with a citation you must print — for 'is X on hold' or 'what did we "
+        "decide about X'; a 'say' field is the whole answer about notes."),
     "show_todos": (
         "The team to-do sheet's link and its open items — always print both."),
     "todo_candidates": (
-        "Action items from this week's meeting notes that could go on the "
-        "to-do sheet; read-only."),
+        "Action items from this week's sales meeting notes that could go on "
+        "the to-do sheet; read-only; if the result has a 'say' field, reply "
+        "with that sentence only."),
     "strategy_doc": (
         "The sales & marketing strategy doc: what it says, when it was last "
         "revised, and the targets it names."),
@@ -151,27 +163,50 @@ ONE_LINE = {
         "person or subject; call it FIRST for any news question."),
     "web_search": (
         "Search the web and get back up to 8 titles and snippets with their "
-        "urls — for news, funding, launches and anything about the outside "
-        "world."),
+        "urls — for anything about the outside world: news, funding, launches, "
+        "and a named person's public profile link (LinkedIn, Google Scholar, "
+        "personal site, X)."),
     "fetch_page": (
-        "Read one public web page (never LinkedIn) by its url, when a snippet "
-        "is not enough."),
+        "Read one public web page by its url when a snippet is not enough; "
+        "linkedin.com is never fetched — a LinkedIn link from a search result "
+        "is quoted as it is."),
+    "propose_poc_add": (
+        "Ask the team whether to add named people to Outreach PoCs; it writes "
+        "nothing — an approver's yes is what adds a row — and the question is "
+        "added to your reply for you."),
 }
+
+# OFFERED ON EVERY ROUTED QUESTION (all but an _EXCLUSIVE route). Their two
+# one-liners cost ~120 tokens; a question handed no web tool is a question the
+# bot says it cannot look up — and it says so truthfully, which is the 6 Oct
+# refusal. The asker then has to argue it into work it could always do.
+ALWAYS = ("web_search", "fetch_page")
 
 # THE GROUPS. Small on purpose; a tool may sit in several.
 GROUPS = {
-    "web": ("web_search", "fetch_page", "strategy_doc"),
+    "web": ("web_search", "fetch_page", "strategy_doc", "propose_poc_add"),
     # A NEWS QUESTION READS THE COLLECTED NEWS FIRST; the web is the fallback.
     "news": ("todays_news", "web_search", "fetch_page"),
     "people": ("find_people", "lookup_company", "who_to_pitch",
-               "cross_check_outreach"),
+               "cross_check_outreach", "propose_poc_add"),
+    # A NAMED PERSON'S PUBLIC PROFILE LINK. The web pair to look, the tracker
+    # to see whether they are already on Outreach PoCs, and the one tool that
+    # can ASK whether to add them. Small on purpose.
+    "profile": ("web_search", "fetch_page", "lookup_company", "propose_poc_add"),
     "sheet": ("lookup_company", "query_tracker", "prospect_priority",
               "positioning_matrix", "next_action", "sheet_status",
               "who_to_pitch", "cross_check_outreach"),
     "mapping": ("who_to_pitch", "mapping_rules", "mapping_coverage",
                 "mapping_edges", "cross_check_outreach", "lookup_company"),
-    "notes": ("list_meeting_notes", "read_meeting_note", "meeting_facts",
-              "todo_candidates", "show_todos"),
+    # MEETING questions only. The to-do tools left this group on 7 Oct: with
+    # them here, the words "to do" in "what do we need to do today?" handed a
+    # question about the day's work the notes tools and nothing else.
+    "notes": ("list_meeting_notes", "read_meeting_note", "meeting_facts"),
+    # "WHAT DO WE NEED TO DO TODAY?" — the to-do sheet, and only that, until
+    # NFT2-1063 adds the objectives tool to THIS tuple. Deliberately no notes
+    # tool and no cadence_preview here.
+    "today": ("show_todos",),
+    "todos": ("show_todos", "todo_candidates"),
     "reminders": ("schedule_reminder", "list_reminders", "cancel_reminder",
                   "snooze_row", "set_deadline", "list_deadlines"),
     "channel": ("recent_sales_activity", "recent_channel_activity",
@@ -196,14 +231,36 @@ _ROUTES = (
         r"\b(find|get|look\s+for)\b.{0,40}\b(pocs?|people|contacts?|someone)\b|"
         r"who\s+should\s+(we|i)\s+(contact|reach|talk\s+to)|\bpeople\s+(at|in)\b|"
         r"\bpocs?\s+(at|in|for)\b", _I)),
+    # PROFILE LINKS: "LinkedIn", "LI", "profile", "links", "url", "website",
+    # "scholar", "research profile", "twitter", "x handle". Not exclusive — it
+    # sits beside whatever else the question is about.
+    ("profile", re.compile(
+        r"\blinked\s?in\b|\bLI\b|\bprofiles?\b|\blinks?\b|\burls?\b|\bwebsites?\b|"
+        r"\b(google\s+)?scholar\b|\bresearch\s+profiles?\b|\btwitter\b|\bx\.com\b|"
+        r"\bx\s+(handle|profile|account)\b", _I)),
     ("reminders", re.compile(
         r"\bremind\w*|\bping\s+me\b|\bsnooze\b|follow\s+up\s+(in|on)\b|"
         r"come\s+back\s+to\b|\bdeadlines?\b|\bdue\s+date\b|what'?s\s+due\b|"
         r"leave\s+(them|it|him|her)\s+alone", _I)),
+    # MEETING WORDS. Not "sync" or "standup" (the sales bot has no standup to
+    # answer from, and "sync the sheet" is not about a meeting), not a bare
+    # "notes", and not "to do" — those are what misrouted the 6 Oct question.
     ("notes", re.compile(
-        r"\bmeetings?\b|\bnotes?\b|\bstandup\b|\bsync\b|\bcall\s+(with|notes)\b|"
-        r"\bdecid\w+|\bdecisions?\b|\bon\s+hold\b|\baction\s+items?\b|"
-        r"\bto-?\s?dos?\b|what\s+do\s+i\s+owe|came\s+out\s+of", _I)),
+        r"\bmeetings?\b|\bmeeting\s+notes?\b|\bnotes?\s+(from|of|on|for)\b|"
+        r"\bminutes\b|\bcall\s+(with|notes)\b|\bdecid\w+|\bdecisions?\b|"
+        r"\bon\s+hold\b|\baction\s+items?\s+from\b|came\s+out\s+of", _I)),
+    # "what do we need to do today", "what should I do today", "what's on
+    # today". It must not match "objectives" (NFT2-1063's question, which keeps
+    # the full set) or a news question that merely ends in "today".
+    ("today", re.compile(
+        r"\bwhat\s+(do|should|must)\s+(we|i)\s+(need\s+to\s+|have\s+to\s+)?do\b"
+        r"[^?.!\n]{0,30}\btoday\b|"
+        r"\bwhat(\s+is|'?s)\s+on\s+(for\s+)?today\b", _I)),
+    # THE TO-DO SHEET, by name. "to-dos", "todo", "to-do list" — never the bare
+    # words "to do", which are in half the questions anyone asks.
+    ("todos", re.compile(
+        r"\bto-?dos\b|\btodos?\b|\bto-?\s?do\s+(list|sheet|items?)\b|"
+        r"\baction\s+items?\b(?!\s+from)|what\s+do\s+i\s+owe", _I)),
     ("channel", re.compile(
         r"anything\s+i\s+missed|what'?s\s+been\s+(going\s+on|happening)|"
         r"\bdid\s+(we|anyone|anybody|\w+)\s+(ever\s+)?(send|sent|follow|say|said|"
@@ -235,11 +292,28 @@ _ROUTES = (
 )
 
 
+# GROUPS THAT TAKE THE WHOLE QUESTION. When one of these matches, it is the only
+# group returned, whatever else matched: "what do we need to do today about the
+# Acme meeting?" mentions a meeting, and must still get the to-do sheet alone.
+_EXCLUSIVE = ("today",)
+
+
 def route(text: str) -> list:
     """The groups this question's words call for, in a stable order. [] when
-    nothing matched — which is "unclear", and gets the full set."""
+    nothing matched — which is "unclear", and gets the full set. A group in
+    _EXCLUSIVE, when it matches, is returned alone."""
     body = str(text or "")
-    return [name for name, pattern in _ROUTES if pattern.search(body)]
+    groups = [name for name, pattern in _ROUTES if pattern.search(body)]
+    for name in _EXCLUSIVE:
+        if name in groups:
+            return [name]
+    return groups
+
+
+def is_exclusive(groups) -> bool:
+    """True when one of `groups` takes the whole question (_EXCLUSIVE) — the
+    one kind of route that gets no web tools and no web note."""
+    return any(name in _EXCLUSIVE for name in (groups or []))
 
 
 def select(tools: list, text: str, *, previous: str = "") -> tuple:
@@ -252,6 +326,12 @@ def select(tools: list, text: str, *, previous: str = "") -> tuple:
 
     FULL SET WHEN UNCLEAR: nothing matched even with `previous`, or the groups
     named no tool that is actually available this turn.
+
+    THE WEB PAIR IS ADDED TO EVERY ROUTE — the question's own or an inherited
+    one — unless the route is exclusive (ALWAYS). "No routed tool is
+    available" is still judged on the ROUTED names alone: a route whose own
+    tools are all missing is unclear, and web_search being there does not make
+    it clear.
     """
     groups = route(text)
     why = "the question's words"
@@ -266,6 +346,9 @@ def select(tools: list, text: str, *, previous: str = "") -> tuple:
     picked = [t for t in (tools or []) if t["schema"]["name"] in wanted]
     if not picked:
         return list(tools or []), [], "no routed tool is available — the full set"
+    if not is_exclusive(groups):
+        wanted.update(ALWAYS)
+        picked = [t for t in (tools or []) if t["schema"]["name"] in wanted]
     return picked, groups, why
 
 
@@ -301,11 +384,17 @@ def _self_test() -> int:
         picked, groups, _ = select(tools, text, previous=previous)
         return [t["schema"]["name"] for t in picked], groups
 
+    def routed(got):
+        # What the "under ten" target counts: the tools the ROUTE chose,
+        # without the web pair that now rides with every route.
+        return [n for n in got if n not in ALWAYS]
+
     print("routing")
     got, groups = names("what's the latest AI news today?")
     check("news -> the web and news groups", groups, ["web", "news"])
-    check("...todays_news with web_search, fetch_page, strategy_doc",
-          sorted(got), ["fetch_page", "strategy_doc", "todays_news", "web_search"])
+    check("...todays_news with web_search, fetch_page, strategy_doc and the ask",
+          sorted(got), ["fetch_page", "propose_poc_add", "strategy_doc",
+                        "todays_news", "web_search"])
     got, groups = names("any headlines?")
     check("headlines -> news alone", groups, ["news"])
     got, groups = names("did Acme raise funding?")
@@ -313,7 +402,8 @@ def _self_test() -> int:
           (groups, "todays_news" in got), (["web"], False))
     got, groups = names("where are we with Acme?")
     check("a sheet question -> sheet", groups, ["sheet"])
-    check("...under ten tools", len(got) < 10, True)
+    check("...under ten routed tools", len(routed(got)) < 10, True)
+    check("...and it has web_search now", "web_search" in got, True)
     check("...with the mapping join", "cross_check_outreach" in got, True)
     got, groups = names("remind me tomorrow at 2pm about the deck")
     check("a reminder -> the reminder tools", groups, ["reminders"])
@@ -331,6 +421,27 @@ def _self_test() -> int:
     check("nothing matched -> the full set", (len(got), groups), (len(every), []))
     got, groups = names("and Globex?", previous="where are we with Acme?")
     check("a follow-up inherits its question's group", groups, ["sheet"])
+    check("...and still has web_search", "web_search" in got, True)
+
+    print("\nthe web pair, and the one route without it")
+    got, groups = names("what do we need to do today?")
+    check("today is exclusive: the to-do sheet alone", (got, groups),
+          (["show_todos"], ["today"]))
+    got, groups = names("and tomorrow?", previous="what do we need to do today?")
+    check("...a follow-up that inherits today has no web tool either",
+          "web_search" in got, False)
+    check("is_exclusive", (is_exclusive(["today"]), is_exclusive(["sheet"]),
+                           is_exclusive([])), (True, False, False))
+
+    print("\nprofile links (the 6 Oct questions)")
+    for ask in ("research profiles for Sigil Wen",
+                "LinkedIn and research profile links for Janajit Bagchi and "
+                "Suryansh Shukla (ARTPARK India)",
+                "can you find their LI profile links from the web?"):
+        got, groups = names(ask)
+        check(f"{ask[:40]!r} -> profile, with web_search",
+              ("profile" in groups, "web_search" in got, "propose_poc_add" in got),
+              (True, True, True))
     picked, groups, why = select(tools[:0], "latest news")
     check("no routed tool available -> whatever there is", picked, [])
 
@@ -339,9 +450,11 @@ def _self_test() -> int:
             "remind me tomorrow at 2pm about the deck", "what did we decide "
             "in yesterday's meeting?", "find PoCs at Shunya Labs",
             "anything I missed this week?", "cadence preview")
-    sizes = [len(names(a)[0]) for a in asks]
-    check("every single-topic question is under ten tools",
-          all(s < 10 for s in sizes), True)
+    sizes = [len(routed(names(a)[0])) for a in asks]
+    # TEN, NOT NINE, since propose_poc_add joined the people group: "find PoCs
+    # at X" routes to people AND sheet, whose union was nine and is now ten.
+    check("every single-topic question is at most ten routed tools",
+          all(s <= 10 for s in sizes), True)
 
     print("\none sentence each")
     check("every grouped tool has a one-liner",

@@ -13,7 +13,7 @@ row, which column or which date — and then a person's data has been overwritte
 by a machine nobody told to do it. The undo window catches that only if somebody
 reads the echo. A proposal catches it before it happens.
 
-WHO MAY SAY YES. Only `SALES_APPROVER_IDS` — Sid and Vaishnavi. ANYBODY may tell
+WHO MAY SAY YES. Only the approvers (`SALES_APPROVER_IDS`). ANYBODY may tell
 the bot something, and it will propose the change and say who can approve it;
 only an approver's answer applies it. Somebody else saying "yes" gets a polite
 no and the proposal stays open.
@@ -159,6 +159,105 @@ def proposal_text(*, company: str, poc: str, applied: list, kind: str = "cell_up
     return f"Shall I set {changes} for {who}? Reply yes."
 
 
+# THE ADD OFFER, word for word. The ONE place its wording lives — the engine
+# never writes its own (bot._strip_unbacked_offer removes it if it tries).
+#
+# WHY THESE TWO SENTENCES. The 6 Oct wording was "I'll propose adding both to
+# Outreach PoCs for approval", and it read as though something was already in
+# motion. So: a question (it is asking), and "only … once one of you says yes"
+# (nothing happens on its own). "Them" for one person too — the bot does not
+# guess a pronoun from a name. "One of you", not the approvers by name: naming
+# them pings every approver on every offer, and somebody who cannot approve is
+# told who can when they answer (`not_an_approver_reply`). The wording is the
+# human's (NFT2-1065); Vaishnavi confirms it before deploy.
+ROW_ADD_OFFER = ("Want me to add {names} to {tab}? I'll only add them once one "
+                 "of you says yes.")
+
+
+def _name_list(names: list) -> str:
+    """"A", "A and B", "A, B and C"."""
+    names = [" ".join(str(n or "").split()) for n in (names or [])]
+    names = [n for n in names if n]
+    if len(names) <= 1:
+        return names[0] if names else "them"
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def row_add_offer(names: list, tab: str) -> str:
+    """The offer to add people to a tab, as it is posted. See ROW_ADD_OFFER."""
+    return ROW_ADD_OFFER.format(names=_name_list(names), tab=tab or "the sheet")
+
+
+def row_add_question(names: list, tab: str) -> str:
+    """"Add A and B to Outreach PoCs?" — the proposal's own text, which the
+    next-day nudge and the pending list quote back. Short, because both wrap
+    it in a sentence of their own."""
+    return f"Add {_name_list(names)} to {tab or 'the sheet'}?"
+
+
+# THE SIGNATURE ON A ROW THE BOT ADDS, word for word — a cell NOTE on the new
+# row's Name cell, never a value and never a column of its own.
+#
+# WHY A ROW IS SIGNED. Outreach PoCs is the team's own sheet, typed by people.
+# A row a machine wrote must say so on its face: who approved it, when, and
+# where that approval can be read. Line 2 is the Discord link to the approver's
+# "yes"; line 3, present only when the row carries a LinkedIn url, says that
+# link came from a web search and repeats it, so the reader can see it was
+# found and not typed from memory.
+ROW_SIGNATURE = "Added by {bot} · approved by {approver} · {date} IST\nApproval: {approval_link}"
+ROW_SIGNATURE_LINKEDIN = "\nLinkedIn link found by web search: {linkedin_url}"
+
+
+def row_signature(*, approver: str, on_date, approval_link: str,
+                  linkedin_url: str = "") -> str:
+    """The note for one added row. `on_date` is the REAL IST date — a write is
+    real whatever clock a test day is running on."""
+    text = ROW_SIGNATURE.format(
+        bot=config.COS_NAME, approver=" ".join(str(approver or "").split()) or "an approver",
+        date=f"{on_date.day} {on_date:%b %Y}", approval_link=str(approval_link or "").strip())
+    if str(linkedin_url or "").strip():
+        text += ROW_SIGNATURE_LINKEDIN.format(linkedin_url=str(linkedin_url).strip())
+    return text
+
+
+def approver_names(*, joiner: str = "or") -> str:
+    """Who may approve, in plain words and without a ping: "A or B",
+    "A, B or C" (`joiner="and"`: "A and B"), or "one of the approvers".
+
+    FROM THE CONFIGURATION, NEVER FROM A CONSTANT. Three replies used to name
+    two people in so many words while SALES_APPROVER_IDS held five ids, so the
+    bot sent people to two of the five. The names are ROSTER_DISPLAY_NAMES'
+    for the ids in `config.approver_ids()`, in that order.
+
+    PLAIN NAMES, NEVER A MENTION. These go in refusals and help lines, and a
+    refusal must not ping every approver. `who_can_approve` is the one that
+    tags: it is sent to get one of them to act.
+
+    AN APPROVER WITHOUT A NAME IS NOT LEFT OUT: listing only the named ones
+    would say the others cannot approve. With some names missing the list ends
+    "or another approver"; with none it is "one of the approvers". Never an
+    id, never a guessed name, and it never raises.
+    """
+    try:
+        roster = getattr(config, "ROSTER_DISPLAY_NAMES", None) or {}
+        names, unnamed = [], 0
+        for uid in config.approver_ids():
+            name = str(roster.get(str(uid)) or roster.get(uid) or "").strip()
+            if name and name not in names:
+                names.append(name)
+            elif not name:
+                unnamed += 1
+    except Exception:
+        return "one of the approvers"
+    if not names:
+        return "one of the approvers"
+    if unnamed:
+        return ", ".join(names) + " or another approver"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" {joiner or 'or'} " + names[-1]
+
+
 def who_can_approve() -> str:
     """A phrase naming the approvers, for the proposal message."""
     import guardrails
@@ -175,12 +274,12 @@ def not_an_approver_reply(name: str) -> str:
     """The polite no for somebody who is not an approver.
 
     POLITE, AND IT SAYS WHY RATHER THAN JUST REFUSING. The person was trying to
-    help; the answer is that this particular thing needs Sid or Vaishnavi, not
+    help; the answer is that this particular thing needs an approver, not
     that they did something wrong.
     """
     return (
         f"Thanks {name} — I need a yes from {who_can_approve().replace(' can approve it', '')} "
-        "before I touch the sheet, so I will leave this one open."
+        "before I touch the sheet, so I'll leave this one open."
     )
 
 
@@ -343,6 +442,22 @@ def _self_test() -> int:
                         kind="row_add", tab="Master Pipeline")
     check("a row addition reads as one", "add a new row" in add, True)
     print(f"    -> {add}")
+
+    print("\nthe add offer")
+    two = row_add_offer(["Janajit Bagchi", "Suryansh Shukla"], "Outreach PoCs")
+    check("two people",
+          two, "Want me to add Janajit Bagchi and Suryansh Shukla to Outreach "
+               "PoCs? I'll only add them once one of you says yes.")
+    one = row_add_offer(["Janajit Bagchi"], "Outreach PoCs")
+    check("one person",
+          one, "Want me to add Janajit Bagchi to Outreach PoCs? I'll only add "
+               "them once one of you says yes.")
+    check("three people", "A, B and C" in row_add_offer(["A", "B", "C"], "T"), True)
+    check("no mention in it", "<@" in two, False)
+    check("the proposal's own text",
+          row_add_question(["Janajit Bagchi", "Suryansh Shukla"], "Outreach PoCs"),
+          "Add Janajit Bagchi and Suryansh Shukla to Outreach PoCs?")
+    print(f"    -> {two}")
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

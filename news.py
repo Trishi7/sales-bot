@@ -1066,7 +1066,7 @@ def render_screen(rows: list, *, limit: int = 5) -> str:
         lines.append(f"• {_no_pings(r['company'])}" + (f" — {what}" if what else "") + link)
         if why:
             lines.append(f"  {why}")
-    lines.append("Tell me which ones to add. I will not add anything without a yes.")
+    lines.append("Tell me which ones to add. I won't add anything without a yes.")
     return "\n".join(lines)
 
 

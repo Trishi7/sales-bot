@@ -101,6 +101,73 @@ def bare_urls(text: str) -> list:
     return _BARE_RE.findall(body)
 
 
+def _host_path(url: str) -> tuple:
+    """(host, path) of a url: host lower-cased without "www.", path without a
+    query string, a fragment, a trailing slash or trailing punctuation.
+    ("", "") when it is not an http(s) url."""
+    m = re.match(r"^\s*<?https?://([^/\s?#]+)([^\s?#>]*)", str(url or ""),
+                 re.IGNORECASE)
+    if not m:
+        return "", ""
+    host = m.group(1).lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host, m.group(2).rstrip(".,;:!?").rstrip("/")
+
+
+def profile_kind(url: str) -> str:
+    """What a LinkedIn url points at: "profile", "post", "company" or "other".
+
+    A SEARCH FOR SOMEBODY'S PROFILE OFTEN RETURNS A POST THAT MENTIONS THEM, a
+    comment thread, or their employer's page — all on linkedin.com, all with
+    the person's name in the title. Presented as "their LinkedIn" that is a
+    wrong link the reader has no reason to doubt. Only /in/… is a profile.
+    Read from the url alone: nothing is fetched, LinkedIn least of all.
+    """
+    host, path = _host_path(url)
+    if host != "linkedin.com" and not host.endswith(".linkedin.com"):
+        return "other"
+    low = path.lower() + "/"
+    if low.startswith("/in/") and len(low) > len("/in/"):
+        return "profile"
+    if low.startswith(("/posts/", "/feed/", "/pulse/")):
+        return "post"
+    if low.startswith(("/company/", "/school/")):
+        return "company"
+    return "other"
+
+
+_TRACKING = ("utm_", "trk", "ref", "fbclid", "gclid", "originalsubdomain")
+
+
+def _query(url: str) -> tuple:
+    """The query parameters that IDENTIFY a page, sorted; tracking ones dropped."""
+    m = re.search(r"\?([^#\s>]*)", str(url or ""))
+    if not m:
+        return ()
+    parts = [p for p in m.group(1).rstrip(".,;:!").split("&") if p]
+    return tuple(sorted(p for p in parts
+                        if not p.split("=")[0].lower().startswith(_TRACKING)))
+
+
+def same_url(a: str, b: str) -> bool:
+    """Do two urls name the same page? Scheme, "www.", host case, a trailing
+    slash, trailing punctuation and tracking parameters are ignored — the ways
+    a link a search returned differs from the same link written out again. The
+    PATH must match exactly: /in/x and /in/x-123 are two different people.
+
+    A LINKEDIN URL'S QUERY IS IGNORED WHOLE (it never names the page). Anywhere
+    else the identifying parameters must match too: on Google Scholar the
+    person IS the query (citations?user=…), and ignoring it would let a made-up
+    profile pass as the found one."""
+    one, two = _host_path(a), _host_path(b)
+    if not one[0] or one != two:
+        return False
+    if one[0] == "linkedin.com" or one[0].endswith(".linkedin.com"):
+        return True
+    return _query(a) == _query(b)
+
+
 def _self_test() -> int:
     failures = 0
 
@@ -127,6 +194,25 @@ def _self_test() -> int:
     check("a jump link reads as 'message'",
           link("", "https://discord.com/channels/1/2/3"),
           "[message](<https://discord.com/channels/1/2/3>)")
+    check("a profile", profile_kind("https://in.linkedin.com/in/jane-doe-1a2b/"),
+          "profile")
+    check("a post is not a profile",
+          profile_kind("https://www.linkedin.com/posts/jane-doe_ai-activity-1"), "post")
+    check("a company page", profile_kind("https://www.linkedin.com/company/acme"),
+          "company")
+    check("another site's /in/", profile_kind("https://notlinkedin.com/in/jane"),
+          "other")
+    check("same page, written two ways",
+          same_url("http://LinkedIn.com/in/x?trk=1", "https://www.linkedin.com/in/x/"),
+          True)
+    check("a different person", same_url("https://linkedin.com/in/x-123",
+                                         "https://linkedin.com/in/x"), False)
+    check("a different Scholar profile",
+          same_url("https://scholar.google.com/citations?user=abc",
+                   "https://scholar.google.com/citations?user=xyz"), False)
+    check("the same Scholar profile, with a tracking parameter",
+          same_url("https://scholar.google.com/citations?user=abc&utm_source=x",
+                   "https://scholar.google.com/citations?user=abc"), True)
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0
 

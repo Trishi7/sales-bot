@@ -47,10 +47,12 @@ EMOJI_VALUES = ("none", "light", "expressive")
 LENGTH_VALUES = ("short", "medium")
 HUMOUR_VALUES = ("off", "light")
 
-# THE STRUCTURE RULE — the same words in the proactive voice, the tone block
-# and the question engine's output section, so every long thing Saley writes
-# is held to one standard. Defined here, where the check that enforces it
-# lives; persona.py and query_engine.py import it rather than copy it.
+# THE STRUCTURE RULE — the same words in the proactive voice and the tone
+# block, so every proactive list Saley writes is held to one standard. Defined
+# here, where the check that enforces it lives; persona.py imports it rather
+# than copies it. NOT in the question engine's output section any more: there
+# it turned a three-fact answer into bullets, and an answer has its own list
+# rule (a list only for a real list).
 STRUCTURE_RULE = (
     "When there are more than two facts, use numbered or bulleted points, one fact per line, each line under ~15 words. No paragraph longer than two sentences. Lead with the point; put the detail after a dash. Never pad."
 )

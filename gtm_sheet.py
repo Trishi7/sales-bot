@@ -421,7 +421,7 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
     POCS: {
         # A-I: THE IDENTITY BLOCK. Restricted from writing (A:I), never from
         # reading. Mapped so the bot can NAME the column when it refuses to
-        # write one — "I never write to Email id" beats "I have no rule for that".
+        # write one — "I never write to Email id" beats "I don't have a rule for that".
         "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
         "company": ("company uni", "company/uni", "company", "company name",
                     "university", "uni", "account", "client", "organisation",
@@ -2480,7 +2480,9 @@ class GTMSheets:
         return str(best + 1)
 
     def append_row(self, tab: "Tab", values: dict, *, reason: str,
-                   expect_company: str = "", dry_run: bool = False) -> dict:
+                   expect_company: str = "", dry_run: bool = False,
+                   note_role: str = "", note_text: str = "",
+                   fill_serial: bool = True) -> dict:
         """Append ONE row. Returns {ok, sheet_row, written, error, remedy, duplicate}.
 
         THE ONLY WAY A ROW IS EVER CREATED, and it runs only after an approver
@@ -2503,10 +2505,29 @@ class GTMSheets:
              arithmetic said it was empty a moment ago" — re-read, because
              somebody typing into the sheet between the two is exactly the race
              this would lose.
-          5. WRITE.
+          5. WRITE. With `note_role` and `note_text` (a row the bot SIGNS —
+             today only an approved Outreach PoCs add), every value AND the
+             note go in ONE spreadsheets.batchUpdate, which the Sheets API
+             applies all-or-nothing: a signed row or no row. Never an unsigned
+             one, and so never a row that has to be taken back out because its
+             note failed. Values go as literal text (a name or a url is never
+             parsed as a formula), an all-digit serial as a number. Without
+             them the write is the one it always was.
           6. READ BACK AND COMPARE EVERY CELL. On any mismatch the written
              cells are CLEARED and the failure is reported. A half-written row
-             is worse than no row: it looks like data.
+             is worse than no row: it looks like data. On a signed row the
+             note is read back too; if the values are right and the note
+             cannot be confirmed the row STAYS and is flagged (`signed=False`,
+             `note_error`) for a human — nothing is cleared over a note.
+
+        `note_role` names the cell that carries the note ("name"). If that cell
+        is not among the ones being written, nothing is written at all: a row
+        the bot cannot sign is a row it does not add.
+
+        `fill_serial` (default True) is the serial number: on a tab with a Sr No
+        column a new row is numbered max + 1 so it reads like the rows above
+        it. False leaves that cell unwritten, for a caller told to write only
+        the cells it was asked for; nothing else about the row changes.
 
         `dry_run` (SHEET_WRITES_ENABLED=false) stops after step 4 and reports
         exactly what would have been written.
@@ -2567,7 +2588,7 @@ class GTMSheets:
         cells: list = []
         refused: list = []
         payload = dict(values)
-        sr = self._next_sr_no(tab)
+        sr = self._next_sr_no(tab) if fill_serial else ""
         if sr and "sr_no" not in payload:
             payload["sr_no"] = sr
 
@@ -2599,6 +2620,20 @@ class GTMSheets:
         if not cells:
             out["error"] = "nothing in that row maps to a column I may write"
             return out
+
+        # A SIGNED ROW NEEDS ITS NOTE'S CELL. Checked before the sheet is
+        # opened, so "cannot sign" never follows a write.
+        signing = bool(note_role or note_text)
+        note_column = ""
+        if signing:
+            note_column = next(
+                (c["column"] for c in cells if c["role"] == note_role), "")
+            if not note_column or not str(note_text or "").strip():
+                out["error"] = (
+                    "I cannot sign the row (no Name cell to put my note on), so I "
+                    "have not written anything"
+                )
+                return out
 
         try:
             sh = self._open(ORIGINAL)
@@ -2633,9 +2668,13 @@ class GTMSheets:
             log.warning("[gtm.append] refused: row %d on %r is occupied", target, tab.title)
             return out
 
+        note_cell = f"{note_column}{target}" if signing else ""
+
         if dry_run:
             out["ok"] = True
             out["written"] = [dict(c, old="") for c in cells]
+            if signing:
+                out["would_sign"] = note_cell
             log.info(
                 "[gtm.append] DRY RUN — would write %d cell(s) into row %d of %r: %s",
                 len(cells), target, tab.title,
@@ -2643,12 +2682,33 @@ class GTMSheets:
             )
             return out
 
-        # WRITE, one batch.
+        # WRITE, one batch. A signed row: the values and the note in ONE
+        # all-or-nothing request, so there is never a row without its note.
         try:
-            ws.batch_update([
-                {"range": f"{c['column']}{target}", "values": [[c["value"]]]}
-                for c in cells
-            ], value_input_option="USER_ENTERED")
+            if signing:
+                from gspread.utils import a1_range_to_grid_range
+
+                requests = []
+                for c in cells:
+                    text = str(c["value"])
+                    data = {"userEnteredValue": (
+                        {"numberValue": int(text)} if re.fullmatch(r"[0-9]+", text)
+                        else {"stringValue": text})}
+                    fields = "userEnteredValue"
+                    if c["role"] == note_role:
+                        data["note"] = str(note_text)
+                        fields = "userEnteredValue,note"
+                    requests.append({"updateCells": {
+                        "range": a1_range_to_grid_range(
+                            f"{c['column']}{target}", ws.id),
+                        "fields": fields,
+                        "rows": [{"values": [data]}]}})
+                sh.batch_update({"requests": requests})
+            else:
+                ws.batch_update([
+                    {"range": f"{c['column']}{target}", "values": [[c["value"]]]}
+                    for c in cells
+                ], value_input_option="USER_ENTERED")
         except Exception as e:
             # A 403 HERE IS A SHARING PROBLEM, NOT A BUG, and it is worth saying
             # so in those words. The service account can READ the playbook — it
@@ -2713,6 +2773,13 @@ class GTMSheets:
                     "I could NOT clear them — row %d of %r needs a human eye"
                     % (target, tab.title)
                 )
+            if signing:
+                # No signature left behind on a row whose values were cleared.
+                try:
+                    ws.clear_note(note_cell)
+                except Exception:
+                    log.exception("[gtm.append] could not clear the note on %s",
+                                  note_cell)
             out["error"] = (
                 "the row did not read back as written (" + "; ".join(mismatches[:3])
                 + "), so " + cleared
@@ -2721,6 +2788,33 @@ class GTMSheets:
 
         out["ok"] = True
         out["written"] = cells
+        if signing:
+            # THE NOTE IS READ BACK TOO. The values are right, so the row
+            # STAYS whatever this finds: an unconfirmed note is flagged for a
+            # human, never answered by clearing or deleting a good row.
+            note_error = ""
+            try:
+                got_note = str(ws.get_note(note_cell) or "")
+                if got_note.strip() != str(note_text).strip():
+                    note_error = f"the note on {note_cell} did not read back as written"
+            except Exception as e:
+                note_error = f"the note could not be read back ({type(e).__name__})"
+            out["note_cell"] = note_cell
+            out["signed"] = not note_error
+            if note_error:
+                out["note_error"] = note_error
+                log.error(
+                    "[gtm.append] ROW %d OF %r IS UNSIGNED: the row was written but "
+                    "its note did not read back (%s). Left in place for a human.",
+                    target, tab.title, note_error,
+                )
+            else:
+                log.info(
+                    "[gtm.append] wrote, signed and verified %d cell(s) into row %d "
+                    "of %r: note on %s (%s)",
+                    len(cells), target, tab.title, note_cell, reason,
+                )
+            return out
         log.info(
             "[gtm.append] wrote and verified %d cell(s) into row %d of %r (%s)",
             len(cells), target, tab.title, reason,

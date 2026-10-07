@@ -793,7 +793,7 @@ def format_sources(sources: list, *, limit: int = 6) -> str:
         rows.append(links.link(source.get("title") or "", source["url"]))
     extra = max(0, len(sources or []) - len(rows))
     if extra:
-        rows.append(f"…and {extra} more source(s)")
+        rows.append(f"…and {extra} more {'source' if extra == 1 else 'sources'}")
     return "\n".join(rows)
 
 
@@ -1071,7 +1071,7 @@ def _self_test() -> int:
     check("untitled links by site name", "[b.com](<https://b.com/y>)" in line, True)
     many = format_sources([{"url": f"https://{i}.com", "title": ""} for i in range(9)],
                           limit=3)
-    check("capped, and says how many more", "…and 6 more source(s)" in many, True)
+    check("capped, and says how many more", "…and 6 more sources" in many, True)
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

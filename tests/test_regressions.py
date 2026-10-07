@@ -382,9 +382,18 @@ class TestAppendDuplicateRefusal:
             pocs_tab, company="Wispr Flow", poc="Someone New"
         ) is None
 
-    def test_the_commercial_block_is_refused_on_a_new_row(self, pocs_tab):
+    def test_the_commercial_block_is_refused_on_a_new_row(self, pocs_tab, monkeypatch):
         """A:I is writable on a NEW row; S-X never is, on any row."""
         import gtm_sheet
+        from types import SimpleNamespace
+
+        # append_row opens the sheet to find the first empty row BEFORE its dry-run return, so this test
+        # used to read the REAL Outreach PoCs tab. A fake sheet with the fixture's rows replaces that
+        # read (the offline guard now blocks the real one); the assertions below are unchanged.
+        grid = [["x"] * 3] * (1 + len(pocs_tab.rows))
+        ws = SimpleNamespace(get_all_values=lambda: grid, row_values=lambda n: [])
+        monkeypatch.setattr(gtm_sheet.SHEETS, "_open",
+                            lambda which=None: SimpleNamespace(worksheet=lambda title: ws))
         out = gtm_sheet.SHEETS.append_row(
             pocs_tab,
             {"company": "Nova Labs", "name": "Someone", "closure_prob": "80%"},

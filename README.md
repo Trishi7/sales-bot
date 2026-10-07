@@ -304,8 +304,8 @@ concludes the bot does not work and stops using it.
 
 So a raised call gets its own sentence (`persona.model_failure_reply`):
 
-> I can't think right now — the AI service behind me isn't responding
-> (`APIConnectionError`). Your message was fine; try again shortly.
+> Something's down on my side (`APIConnectionError`), so I couldn't answer
+> that. Your message was fine. Try me again in a minute.
 
 Three things, deliberately: **the failure is mine**, **here is its shape**, and
 **your message was not the problem**. The reason is the exception **class**, not
@@ -375,7 +375,12 @@ prefilter says the message looks like an update — a word from
 `SHEET_UPDATE_HINT_WORDS`, a company on the Outreach PoCs tab, a reply to a drip
 message about a row, or "undo" — and never for "remind me …". Each message logs
 which way it went (`[sheetwrite] prefilter msg=… RUN the extractor — hint word
-'mark'`). The engine's iteration cap is 5 (was 8); tool results are capped at
+'mark'`). The engine's iteration cap is 7 (`QUERY_ENGINE_MAX_TOOL_ITERATIONS`:
+`WEB_QUESTION_MAX_SEARCHES` + 3, so four searches made one at a time still
+leave a round for another tool and one for the answer; startup warns when it is
+set lower), with ONE extension per question to 9
+(`QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS`) when the round at the cap was still
+searching; tool results are capped at
 `QUERY_TOOL_RESULT_MAX_CHARS` (6,000) and shrink to
 `QUERY_TOOL_RESULT_KEEP_CHARS` (600) once older than the two most recent
 iterations, marked "(truncated — already read)".
@@ -399,6 +404,63 @@ strategy/policy present, tools, cache breakpoints, message size, frequency).
 `python verify_tokens.py [--live]` checks caching against the real API, the
 trimming, the prefilter and the check's token count.
 
+### How an answer sounds
+
+An answer is written the way somebody on the team would type it in the channel
+(`persona.COS_PERSONA`, and the HOW TO ANSWER and OUTPUT sections of
+`query_engine._engine_text`):
+
+- **The answer first.** Never the question said back, never "Here's what I
+  found", "Based on", "Great question" or "Sure!".
+- **Length follows the question.** A one-line question gets one to three lines.
+- **What it found, not how it looked.** Nothing about tools, searches, sources
+  gone through, limits or today's date unless asked. When a gap changes the
+  answer it says so in ONE plain line: "I can't see the pipeline sheet yet",
+  "not checked yet".
+- **A list only for a real list** (three or more parallel things); links masked.
+- **A meeting fact still ends with its meeting**, and only that:
+  "Acme is on hold (Sales Bot Discussion, 2 Sep)". No "according to the
+  meeting notes" beside it.
+
+Every honesty rule is still there (never invent; never report awaiting-access
+or an error as empty; say what was not checked); each is now worded as what the
+reader must end up knowing, not as a procedure to recite.
+
+**The guard.** The prompt asks; `replyguard.py` checks. Before an engine
+answer, a greeting or a "what can you do" reply is sent, `bot._voiced` passes
+it through `replyguard.clean`, which removes a throat-clearing OPENING and
+nothing else:
+
+| Rule | Removes |
+|---|---|
+| `interjection` | "Sure!", "Great question.", "Of course," … |
+| `lead-in` | "Here's what I found:", "Here are the top 5 …:" |
+| `based-on` | "Based on the tracker," |
+| `echo-frame` | "You asked about …", "To answer your question," |
+| `restated-question` | a first sentence made only of the question's own words |
+
+It never adds a word and never calls the model. It leaves alone a sentence
+carrying a number, a link, a meeting citation or a bold name the question did
+not have, the one line about what is missing, the three "no sales notes"
+sentences, a list, a yes/no answer, and anything whose removal would leave
+nothing. When a banned phrase is there but not safe to remove, the reply goes
+out as written and the rule is logged as `<rule>:kept`. Not guarded:
+`find_people`'s own text, the add offer, fixed lines, the interim line and
+everything proactive.
+
+```
+[voice] guard msg=… rule=lead-in removed="Here's what I found:"
+[voice] msg=… q_words=6 lines=2 chars=141 guard=lead-in
+```
+
+The first line appears only when the guard fires; the second once per engine
+answer. Many guard lines in a day mean the prompt needs another pass.
+`ANSWER_GUARD_ENABLED=false` sends the model's text untouched.
+
+**Fixed lines** (no model writes them) for the answer and write paths are in
+`wording.py`, with the register they are held to; its docstring maps where
+every other family of fixed lines lives.
+
 ### A slow answer says so — once
 
 A 40-second silence reads as ignored; a "one moment" that arrives two seconds
@@ -419,12 +481,17 @@ before the answer reads as broken. So there are two layers:
    off.
 
 The line is **deterministic** — a line that exists because the model is slow
-must not wait on the model. It is picked at random from `persona.INTERIM_LINES_*`:
+must not wait on the model. It is picked from `persona.INTERIM_LINES_*` (the
+words are in `wording.py`), three of each:
 
 | Turn | Lines |
 |---|---|
-| web | "On it — checking the web for this, give me a minute or two." / "Looking this up now, back shortly with what I find." |
-| engine | "Give me a moment, digging through the sheet and notes for that." / "One sec — pulling this together." |
+| web | "On it — I'm checking the web for this, give me a minute or two." / "Looking this up now. Back shortly with what I find." / "Give me a couple of minutes — I'm searching for this." |
+| engine | "Give me a moment, I'm looking into that." / "One sec — I'm pulling this together." / "Let me check. Won't be long." |
+
+The engine lines name no source: the bot does not know which ones the model
+will read, and the old "going through the sheet and the notes" went out on
+questions routed to neither.
 
 **What counts as a web turn.** Web search is attached to nearly every engine
 turn (whenever it is on and the budget has room), so "attached" alone would put
@@ -556,15 +623,19 @@ restart, never a search-and-replace.
 |---|---|---|
 | `sales_spreadsheet` | **wired up** (Sheets API) | the GTM Playbook: the canonical **Outreach PoCs** tab, plus five read-only context tabs (Deliverables Checklist, Master Pipeline, Sales Packages, AI Events & Summits, Q4 Goal Setting) and the signature-found master data, positioning matrix and prospect priority |
 | `researcher_mapping` | **wired up** (Sheets API, **read-only**) | which researcher to pitch at each org, in which ICP lane, with what hook — and who must not be pitched |
-| `sales_meeting_notes` | **wired up** (rclone sync + standup exclusion) | what was said, decided and committed to in the team's meetings — every synced note except the product standups. Everything derived from them carries a **citation** |
+| `sales_meeting_notes` | **wired up** (rclone sync of ONE Drive folder; an allowlist) | what was said, decided and committed to in the team's **sales** meetings — only notes synced from the sales notes folder, never a product standup. Ships **not connected**. Everything derived from them carries a **citation** |
 | `strategy_doc` | **wired up** (Drive API, **read-only**) | the current strategy, how current it is, and what outreach is checked against |
 | `todo_sheet` | **wired up** (Drive + Sheets API, **append-only**) | *Membrane Sales To-Dos* — the shared action-item list |
 
 Each source self-reports `connected` / `degraded` / `awaiting-access` / `error`
-with a one-sentence detail a human can act on. **`degraded` means readable but
-going stale** — the notes folder is fine, the sync that fills it is failing. The
-bot may answer from a degraded source, but only while saying what is wrong with
-it; it may not answer at all from `awaiting-access` or `error`.
+with a one-sentence detail a human can act on. **`degraded` means something
+behind the source is broken** — usually readable but going stale. The bot may
+answer from a degraded source, but only while saying what is wrong with it; it
+may not answer at all from `awaiting-access` or `error`. For the meeting notes
+`degraded` covers two cases, and the detail says which: the sales folder was
+pulled before and the latest sync is failing (the last good copy is read, and
+the answer says it may be stale), or the folder has never been reached (nothing
+is read, and the bot says it can't reach the sales notes folder).
 
 `researcher_mapping` reports **degraded** rather than connected in one specific
 case: the rows are readable but the legend or the departures list is not. That
@@ -590,64 +661,130 @@ to say the plan they are quoting hasn't been revised in a month.
 
 ---
 
-### Meeting notes: the sync, and the standup exclusion
+### Meeting notes: the sales folder, the sync and the standup guard
 
-`notes.py` owns both halves of the pipeline.
+`notes.py` owns both halves of the pipeline. Every source the bot reads, and how
+each is scoped, is written down in [docs/SOURCES.md](docs/SOURCES.md).
 
-**The sync.** `NOTES_SYNC_CMD` is a full rclone command. The bot runs it:
+**One folder, and it is the tag.** The bot reads sales meeting notes from the
+single Drive folder named in `NOTES_SOURCE_FOLDER` (the folder in use is named
+in [DEPLOY.md](DEPLOY.md), section 4). It does not read "whatever is in Drive",
+and it never reads the AM/PM sync notes. Putting a doc in that folder is what
+makes it a sales note; nobody has to rename a meeting.
+
+> **Why.** Until 6 Oct the rule was exclude-only: read everything in `NOTES_DIR`
+> except titles containing "AM sync" / "PM sync". The folder held 76 files left
+> over from an older, broader sync — 74 standups, which were held back, and two
+> internal product calls with other titles, which were not. Asked *"what do we
+> need to do today?"*, the sales bot answered from one of them. An exclude list
+> only names what somebody already thought of.
+
+**The allowlist.** A file in `NOTES_DIR` is read only when **all** of these
+hold, checked in this order:
+
+1. **It came from the folder.** The bot keeps a manifest —
+   `STATE_DIR/notes_manifest.json` — of the source folder's name, the notes
+   directory and the files each sync left there. No manifest, an unreadable one,
+   or one written for a different folder or directory means *nothing* is from
+   the folder. A file that is not in it is never opened.
+2. **It has a date** in its filename or first lines (what makes a file a meeting
+   note at all).
+3. **Its title is not a standup's** — the standup guard, below.
+4. **It carries a required tag** — only when `NOTES_REQUIRE_TITLE_TAGS` is set.
+   It is empty by default and meant to stay empty. **A tag must be a distinctive
+   word:** tags are matched as whole words, ignoring punctuation and case, so
+   the brackets mean nothing — `[Sales]` is just the word "sales" and matches
+   "Sales sync – …" and "Acme sales call". Use something no ordinary title
+   contains, such as `[SalesNotes]`.
+
+Only the title is matched, never the body: a sales call whose notes *quote* the
+AM sync is still a sales call, and is read. A doc that sits in the sales folder
+*and* somewhere internal is read — it is in the folder.
+
+**The standup guard.** Seven titles are refused even inside the sales folder:
+`am sync`, `pm sync`, `nfthing kick-off`, `nfthing wrap-up`, `standup`,
+`stand-up`, `daily sync`. They are built in and cannot be configured away;
+`NOTES_EXCLUDE_TITLE_PATTERNS` **adds** to them, so an empty or out-of-date
+value no longer loads the standups. Titles are compared as lowercase words with
+all punctuation flattened, on whole words: `am sync` catches `( AM Sync)`,
+`AM-Sync` and `AM_SYNC`, but not `Program sync`. A bare `sync` is deliberately
+absent — "Sales sync" is a real meeting and is read.
+
+**The sync.** `NOTES_SYNC_CMD` is a full rclone command that must name
+`NOTES_SOURCE_FOLDER`. The bot runs it:
 
 * once at **startup**, before it reports its source statuses,
 * every **`NOTES_SYNC_MINUTES`** (default 30) on a background task of its own —
   separate from the chase sweeper, so a slow rclone can't delay a chase,
 * **on demand** before answering a notes question. A question about a recent
-  meeting ("what did we say today?") forces a pull; anything else only syncs if
-  the last attempt is older than the interval, so asking twice doesn't run rclone
+  meeting ("the latest call") forces a pull; anything else only syncs if the
+  last attempt is older than the interval, so asking twice doesn't run rclone
   twice.
+
+Use `rclone sync` (a mirror), so a note taken out of the Drive folder disappears
+here too, and give it `--exclude "/_quarantine/**"`. The bot **refuses to run**
+a command that does not name the folder, or a mirror without that exclude, and
+the log names the fix. Notes must sit at the top level of the Drive folder;
+subfolders are not read.
+
+**The sweep and the quarantine.** Immediately before every sync, each file at
+the top level of `NOTES_DIR` that the manifest does not vouch for is **moved** —
+never deleted — to `NOTES_DIR/_quarantine/<YYYYMMDD-HHMMSS>/`, with one WARNING
+and one `notes_quarantined` audit event. Changing `NOTES_SOURCE_FOLDER`
+invalidates the whole manifest, so the old notes become unreadable at once and
+are all moved at the next sync. `_quarantine` is never listed, scanned or read,
+at any depth. [DEPLOY.md](DEPLOY.md) says how to inspect and clear it.
 
 `NOTES_DIR` is created if it doesn't exist. A failure — rclone missing, an
 expired token, a timeout — **never crashes the bot and never spams the log**: it
-is recorded, logged **once** at ERROR with the fix named, repeated identical
-failures drop to DEBUG, and the source flips to `degraded` so answers say the
-notes may be stale.
+is recorded, logged **once** at ERROR with the fix named, and repeated identical
+failures drop to DEBUG.
 
 > **Windows: a PowerShell alias for `rclone` is invisible to a subprocess.** The
 > sync runs through a shell subprocess, so an alias or function defined in your
 > profile will fail with *"'rclone' is not recognized as an internal or external
-> command"*. Put `rclone.exe` on `PATH`, or write the full path in the command:
-> `NOTES_SYNC_CMD=C:\rclone\rclone.exe copy gdrive: ./notes --drive-shared-with-me --drive-export-formats txt`
-> The same applies to a service account running under a different Windows user:
-> it has its own `rclone.conf`.
+> command"*. Put `rclone.exe` on `PATH`, or write its full path at the start of
+> `NOTES_SYNC_CMD`. The same applies to a service account running under a
+> different Windows user: it has its own `rclone.conf`.
 
-**The filter is EXCLUDE-based.** The sync pulls *every* `Notes by Gemini` doc
-shared with the sync account, and the bot loads **all of them except the
-recurring product standups**. A doc is excluded when its **title** contains any
-of `NOTES_EXCLUDE_TITLE_PATTERNS` (default `AM sync,PM sync`), matched
-case-insensitively as a substring. Everything else — PM calls, customer calls,
-ad-hoc meets — is loaded and readable.
+**The states, and what the channel hears.** The source is always in exactly one
+state (`notes.source_state()`):
 
-Only the title is matched, never the body: a real meeting whose notes merely
-*mention* "the PM sync" is still a real meeting. The title is the filename, or
-the document's first line when the filename carries none.
+| State | When | Source status | The bot says |
+|---|---|---|---|
+| `not_configured` | `NOTES_DIR`, `NOTES_SOURCE_FOLDER` or `NOTES_SYNC_CMD` is empty | awaiting-access | Meeting notes aren't connected to me yet. |
+| `misconfigured` | the command doesn't name the folder, or a mirror lacks the quarantine exclude | awaiting-access | Meeting notes aren't connected to me yet. |
+| `unreachable` | configured, but the folder has never been pulled — or it is empty and no clean sync confirms that | degraded | I can't reach the sales notes folder right now, so I haven't checked the notes. |
+| `empty` | a clean sync says the folder holds nothing | connected | There are no sales meeting notes in the *folder name* folder yet. |
+| `ok` | the manifest lists files | connected (degraded while the sync is failing) | the notes — or the "no sales meeting notes" sentence when none of them loads |
 
-> **Why exclude rather than include.** This used to be an include-list: a note
-> counted only if its attendee list named a specific person or its title carried
-> a sales keyword. On the live folder that admitted **zero of 72** synced docs —
-> the invite list doesn't survive the Gemini export, and nobody titles a real
-> call "sales sync". An include-list that matches nothing is indistinguishable
-> from *"no meetings happened"*, which is the one failure this pipeline exists to
-> prevent. The worst an exclude-list does is put a standup in context: visible,
-> and harmless. On that same folder the default now loads 2 and excludes 70.
+Those three sentences are the **whole** answer about notes when there is nothing
+to read. Every notes tool returns the sentence in a `say` field with an
+instruction to add no reason, fix, file name or count, and not to answer from or
+point at any other folder, document, sheet, channel or memory. In the first two
+states no sync runs and no file is moved, so deploying with an untouched `.env`
+changes nothing on disk. In `ok` with the sync failing, the notes on disk are
+the sales folder's own last good copy: they stay readable and the answer says
+they may be stale.
 
-Each sync logs one line — `synced 72 docs, 2 loaded, 70 excluded (standups)` —
-and the source status reports the same facts: when it last synced, how many docs
-are on disk, how many went into context, and how many were held back.
+**Nothing loaded is never silent — to the operator.** Each sync, and each
+change, logs one line saying where every file went:
 
-**Nothing loaded is not "no notes".** With docs on disk but nothing loaded, the
-source says *which* it is, because the two causes have different fixes: every doc
-was a standup (widen or clear `NOTES_EXCLUDE_TITLE_PATTERNS`), or nothing that
-came down carried a parseable date (so it isn't a meeting note at all). Set the
-patterns empty and every synced note loads, standups included — legal, and logged
-at startup so it isn't a surprise.
+```
+[notes] source=<folder> state=ok on_disk=4 from_folder=4 loaded=3 standup=1 missing_tag=0 undated=0 quarantined=0
+```
+
+The buckets always sum to `on_disk`. When files came from the folder and none
+loaded, a WARNING names the bucket that took them and the setting to look at,
+once per distinct situation; the same counts are in the source's status detail
+(the startup log and `state/summary.json`). None of it is said in the channel.
+
+> **The include-list this is not.** An earlier filter admitted a note only if
+> its attendee list named a sales person or its title carried a sales keyword,
+> and on the live folder that admitted **zero of 72** docs — silently, looking
+> exactly like "no meetings happened". This allowlist asks nothing of a title by
+> default (the folder is the tag), and the counts line and the WARNING above are
+> what stop a zero from passing unnoticed.
 
 A file counts as a meeting note if its filename or first lines carry a date;
 `.docx`, `.txt`, `.md` and `.html` are all readable, and the usual `Summary` /
@@ -1143,7 +1280,7 @@ bot:     Shall I set Meeting Date to 21-09-2026 for Sahaj (Wispr Flow)?
          Reply yes. (@Sid or @Vaishnavi can approve it.)
 Vaishnavi: yes
 bot:     Noted — I set Wispr Flow · Sahaj's meeting date to 21-09-2026.
-         Say undo any time in the next 24h and I will put it back.
+         Say undo in the next 24h and I'll put it back.
 ```
 
 **What this costs and why it is worth it.** The old loop was one message:
@@ -1190,6 +1327,79 @@ Silence there would leave Vaishnavi believing the sheet had changed.
 all read as no; an unrecognised sentence reads as neither and leaves the proposal
 open. An ambiguous message resolves to the **safe** answer, because a refusal
 leaves the sheet as it is and a wrong yes writes to it.
+
+#### The add offer from a question (`row_add`, NFT2-1065)
+
+Asked for people's public profile links, the engine may call `propose_poc_add`
+with their names. The tool writes nothing and opens nothing: it checks each
+person (a name from this conversation or a search result; not already on the
+tab; a LinkedIn url kept only when it is a `linkedin.com/in/…` profile a search
+returned this turn; two people with the same name at the same company refuse
+the whole call). After the answer, the bot records a **`row_add` proposal** and
+then posts the question as its own message, in one fixed wording
+(`approvals.ROW_ADD_OFFER`):
+
+```
+Want me to add Janajit Bagchi and Suryansh Shukla to Outreach PoCs? I'll only
+add them once one of you says yes.
+```
+
+The model never writes the offer itself: any sentence of its own that says
+something was added to, proposed for or will be added to Outreach PoCs is
+removed from the reply (`bot._strip_unbacked_offer`), so the bot never says it
+proposed something unless a proposal exists.
+
+| Who answers | What happens |
+|---|---|
+| An approver says yes (a reply to the offer, or a bare "@Saley yes") | the same vote flow as every other proposal; "yes for Janajit" narrows it to the people named |
+| An approver says no | "Leaving that one then — … Nothing has changed in the sheet." |
+| Someone who is not an approver says yes | the polite no that names who can approve; the proposal stays open, nothing is written |
+| Nobody answers | one nudge the next working day, then dropped, like a cell update |
+| "Sure." as a reply to a *different* bot message | not a vote on the add offer |
+
+Offered only when `SHEET_ROW_ADDITIONS_ENABLED` is on and `outreach_pocs` is in
+`SHEET_APPENDABLE_TABS`.
+
+**What an approved add writes** (`bot._write_poc_row` →
+`gtm_sheet.append_row`), on a NEW row only: the serial number (`append_row`
+numbers every row it appends), Name, Company, and the LinkedIn URL only when a
+search returned a `linkedin.com/in/…` link. Nothing else, and no existing row
+is touched.
+
+**Every such row is signed.** The Name cell carries a cell note
+(`approvals.ROW_SIGNATURE`):
+
+```
+Added by Saley · approved by Vaishnavi · 7 Oct 2026 IST
+Approval: <link to the approver's "yes" in Discord>
+LinkedIn link found by web search: <the linkedin.com/in/… url>
+```
+
+The third line is there only when the row has a LinkedIn URL. The values and
+the note go to the sheet in ONE request that the Sheets API applies
+all-or-nothing, so a row without its note cannot be written, and nothing is
+ever cleared or deleted because a note failed. The reply says "Added … at row
+N, with my note on the Name cell." If the row is right but the note cannot be
+read back, the row stays and the reply says it is unsigned and needs a human
+(audit `poc_row_unsigned`). With no link to the approval, nothing is added.
+
+**It writes the real sheet, in test mode too.** With `SHEET_WRITES_ENABLED=true`
+an approved add is a real row whatever `SALES_TEST_MODE` says (only a
+simulation forces a dry run); test mode and live differ by the `[TEST…]` tag
+and nothing else.
+
+Three one-line switches in code, the last two awaiting the human's answer:
+
+| Constant | Now | What it decides |
+|---|---|---|
+| `bot.POC_ROW_ADD_WRITE_WIRED` | `True` | the whole feature. `False` switches off the write AND the offer together: `propose_poc_add` is not handed to the engine, no proposal is opened and the question is never asked — an offer whose yes could not be honoured is not made |
+| `bot.POC_ROW_ADD_FILL_SERIAL` | `True` | whether the new row gets the next serial number in Sr No. `False` writes Name, Company and the found LinkedIn URL only |
+| `approvals.ROW_SIGNATURE` / `ROW_SIGNATURE_LINKEDIN` | both lines | the note's text. "The source link" is carried both ways (the approval's Discord link, and the LinkedIn link the search returned); dropping either is one line |
+
+On a profile turn the reply's links are also checked after the model
+(`bot._only_found_links`): a link that no tool result, the question or an
+earlier answer carried is replaced by "(link removed: it did not come from a
+search result)" and logged.
 
 ### Row additions
 
@@ -1370,15 +1580,15 @@ Somebody replies *"sure, her email is ann@acme.com"*. The email column is in the
 identity band.
 
 ```
-Noted — I set Acme · Ann's next steps to send the deck. I have got the email
-(ann@acme.com) — that column is one I never write to, so could you drop it in
-yourself? Say undo any time in the next 24h and I will put it back.
+Noted — I set Acme · Ann's next steps to send the deck. I've got the email
+(ann@acme.com), but that column is one I never write to. Could you add it
+yourself? Say undo in the next 24h and I'll put it back.
 ```
 
 Refusing silently would lose the information; writing it would break the one
 guarantee the bands exist to make. `email` and `li_url` have **mapped roles**
 precisely so the bot can name the column it is declining, rather than saying
-*"I have no rule for that"*. (`phone` and the old `linkedin` spelling stay in
+*"I don't have a rule for that"*. (`phone` and the old `linkedin` spelling stay in
 `CONTACT_ROLES` so a tab that still has those columns behaves the same way; the
 canonical tab has no phone column.)
 
@@ -1431,7 +1641,7 @@ about an account for reasons nobody could reconstruct. Confirmed once, in the
 plan's voice:
 
 ```
-Got it — I will bring Acme back up on Sat 12 Sep at 6pm. Nothing from me on it
+Got it — I'll bring Acme back up on Sat 12 Sep at 6pm. Nothing from me on it
 before then.
 ```
 
@@ -2651,6 +2861,15 @@ real, and is now pinned**, plus one file that enforces a contract rather than
 pinning a bug. Sixty-eight tests, all offline — no sheet, no network, no
 Discord; the two that touch a database use a temporary file.
 
+The answer voice has its own files: `tests/test_answer_voice.py` (the guard's
+strip and never-strip tables, the prompt's rules, the voice block's place in
+the cache, the fixed lines' register, the frozen baseline), run against the
+recorded outputs in `tests/fixtures/tone_outputs.json`, and
+`tests/test_tone_samples.py` (the samples script, without the model).
+`verify_answer_voice.py` runs the same through the real `on_message` path with
+a scripted model. `python -m replyguard` and `python -m wording` are the two
+modules' own self-tests.
+
 | Class | The bug it pins |
 |---|---|
 | `TestFocusContainmentDirection` | `matches()` tested containment both ways, so a focus on *"Quantum Robotics"* matched every *"Robotics"* row — the focus was narrower than the cell and the match made it wider |
@@ -3313,7 +3532,7 @@ nothing at all there is no model call: the result is `NOTHING FOUND`.
 | **R6 email** | `search('"<name>" "<company>" email contact', n=8)` → MODEL_LIGHT extracts an address **with its url**, else "no public email found". **Never guessed, and checked:** an address that is not in a snippet character for character is dropped (`websearch.verified_emails`) |
 | **R8 / R10** | `news(company, days=7, n=8)` — Google News RSS, falling back to `search(company, news=True, days=7)` only when the feed is empty → snippets → the existing brief format via MODEL_LIGHT; Sonnet composes the message as before |
 | **R11 yes, `find_people`** | `search('site:linkedin.com/in "<company>" <department>', n=10)` — the result title already reads "Name - Title - Company" — plus `fetch_page` on the company's own team/about page when a second search finds one. MODEL_LIGHT extracts name, title, url, source; `parse_people` still drops anyone the results do not name. LinkedIn itself is never fetched |
-| **Channel questions** | The server-side tool is replaced by two **client** tools: `web_search(query)` → up to 8 snippets, at most `WEB_QUESTION_MAX_SEARCHES` (2) per question, and `fetch_page(url)`. The engine (Sonnet) reasons over the snippets |
+| **Channel questions** | The server-side tool is replaced by two **client** tools: `web_search(query)` → up to 8 snippets, at most `WEB_QUESTION_MAX_SEARCHES` (4) per question, and `fetch_page(url)`. **Cheap first, one extension:** a question that reaches the limit and asks for a search it has not run yet gets `WEB_QUESTION_EXTENDED_SEARCHES` (6) in all and `QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS` (9) tool rounds — once per question, logged as `[engine] msg=… LIMIT EXTENDED ONCE`, never more; a repeated query never extends (`query_engine.QuestionLimits`). Both are offered on **every** question except "what do we need to do today?", whatever the question's route, and a `profile` route covers "LinkedIn / profile / link / url / scholar / X" questions. At the limit the tool returns what was searched and what was not, and the answer says per person what was found, what was not found and what is "not checked yet". The engine (Sonnet) reasons over the snippets |
 
 **Model tiering.** `MODEL` (Sonnet) is for what speaks or reasons:
 `proactive_message`, `social_reply`, `capability_reply`, the engine, and the
@@ -3344,9 +3563,20 @@ Sonnet writes). The token log records the model per call:
   keyed on the item with a `RESEARCH_CACHE_DAYS` (7) TTL, not on the date.
 - **The engine is sent only the tools a question needs** (`toolsets.py`):
   news/web → `web_search`, `fetch_page`, `strategy_doc`; sheet → the sheet and
-  mapping tools; notes → the notes tools; reminders → the reminder tools; the
-  full set only when the question is unclear. Usually under ten tools, each
-  with a one-sentence description, and the engine prompt's notes / mapping /
+  mapping tools; a meeting question (`notes`) → the three notes tools; a to-do
+  question (`todos`) → `show_todos` and `todo_candidates`; reminders → the
+  reminder tools; the full set only when the question is unclear. **"What do
+  we need to do today?" (`today`) → `show_todos` and nothing else** — an
+  exclusive group, so not the notes tools and not `cadence_preview` even when
+  the question also mentions a meeting. That is the interim answer until
+  NFT2-1063 adds the objectives tool to the same group. The words "to do",
+  "sync" and "standup" no longer route to the notes tools. **`web_search` and
+  `fetch_page` ride with every route except `today`** (`toolsets.ALWAYS`,
+  NFT2-1065): a question routed to the sheet tools used to get no web tool,
+  and the bot then said it had no web search. A `profile` route ("LinkedIn",
+  "LI", "profile", "links", "url", "website", "scholar", "X handle") adds
+  `lookup_company` and `propose_poc_add`. Usually under ten routed tools (the
+  web pair is on top), each with a one-sentence description, and the engine prompt's notes / mapping /
   channel sections ride only with their tools. Routing is by the question's
   own words — deterministic, no model call — and a follow-up inherits the
   group of the question before it.
@@ -4070,7 +4300,13 @@ queue evaluated, SQLite and `audit.jsonl` written, `cadence preview` and
 | `SALEY_FORMALITY` | `casual` · `balanced` · `formal` | **balanced** |
 | `SALEY_EMOJI` | `none` · `light` · `expressive` | **light** — at most one |
 | `SALEY_LENGTH` | `short` · `medium` | **short** — 1–3 sentences |
-| `SALEY_HUMOUR` | `off` · `light` | **off** |
+| `SALEY_HUMOUR` | `off` · `light` | **light** |
+
+**The dials shape proactive messages only** (the drip, reminders, nudges);
+`tone.prompt_block` is read by `persona.proactive_voice_prompt` and nothing
+else. An answer to a question follows the fixed voice rules in
+`persona.COS_PERSONA` and the learned voice profile, and carries no emoji
+whatever `SALEY_EMOJI` says.
 
 **Read from the environment on every compose, not once at import.** Every other
 setting in the bot is cached at import — deliberately, for things that must not
@@ -4170,8 +4406,7 @@ voice"** (an approver).
 | Path | How |
 |---|---|
 | every drip compose | `persona.proactive_voice_prompt(voice_seed=…)` |
-| the question engine's reply style | `persona.reply_style_block()`, behind the OUTPUT rules |
-| greetings and "I couldn't follow that" | the same block, behind `SOCIAL_REPLY_PROMPT` |
+| the question engine, greetings and "I couldn't follow that", "what can you do" | `persona.reply_style_block()`, inside the cached policy block (`persona.system_blocks(voice=True)`): read with the persona, from the cache, no extra call |
 | the interim line, the one-off reminder | `voice.choose` — the wording closest to how the team opens a message, never the same line twice running |
 | the quiet-news line | `voice.order` sets which wording leads; the three-day rotation stays |
 
@@ -4729,8 +4964,9 @@ which is how a line ends up uncited when one caller forgets.
 
 ### What is extracted
 
-Only through `notes.list_notes` / `notes.read_note`, so a document the standup
-exclusion holds back can never reach a digest line.
+Only through `notes.list_notes` / `notes.read_note`, so a document that is not
+from the sales notes folder — or is a product standup's — can never reach a
+digest line, a nudge's evidence or a prep brief.
 
 | Kind | From | What it changes |
 |---|---|---|
@@ -4858,6 +5094,42 @@ both, every time. The link alone is a shrug; the items alone leave the asker
 unable to edit anything, and editing is the whole point of a sheet the humans
 own. `todo_candidates` answers *"what came out of this week's meetings"* and is
 **read-only** — asking what would go on the sheet must never trigger a write.
+When there is no sales note to read it returns the same one sentence the notes
+tools do (see *Meeting notes* above) rather than an empty list.
+
+*"@bot what do we need to do today?"* is answered from this sheet too, and from
+nothing else, until NFT2-1063 adds the day's objectives.
+
+### Rows the bot will not show
+
+**A row is shown only when its *Source meeting* is a sales note the bot can
+read.** The sheet is edited by hand, so a row can cite anything — including the
+AM/PM product standups the sales bot must never repeat. `todos.split_visible`
+sorts every row, in this order:
+
+| Source meeting | Result | Reason (operator-facing) |
+|---|---|---|
+| names a product standup (the standup guard) | hidden | `standup` |
+| blank | hidden | `no_source_meeting` |
+| the citation of a note the bot can read now — and, when *Date raised* is an ISO date, that note's date | **shown** | |
+| anything else | hidden | `source_not_an_allowed_note` |
+
+When the notes are not connected, unreachable or empty there are no allowed
+notes, so every row is hidden.
+
+* **Hidden is all it is.** The bot never edits or deletes such a row, and the
+  weekly refresh still sees it when de-duplicating, so it is never re-appended.
+* **Nothing is said in the channel.** The reply holds only the visible rows;
+  the open count counts only those; there is no "some rows are not shown".
+* **The operator is told.** One log line per distinct set of hidden rows —
+  `[todos] hid N of M open row(s) whose source meeting is not an allowed sales
+  note (standup=a, no_source_meeting=b, source_not_an_allowed_note=c)` — and one
+  `todo_rows_hidden` audit event with the sheet row numbers and reasons (no task
+  text).
+* **The list for cleaning the sheet by hand:** `python tools/list_hidden_todos.py`
+  prints the hidden rows — open and closed — as a Markdown table. It is
+  read-only: it never creates the sheet, never writes a cell, never runs the
+  notes sync.
 
 ### It needs the Drive API enabled
 
@@ -5065,7 +5337,7 @@ guardrails forbid.
 | `evidence.py` | **suppress-or-convert**: the staged evidence ladder, the identifier matching, and the record-offer text. Almost pure — only `gather` does I/O |
 | `events.py` | **events & summits and the weekly funnel line**: the T-minus window, the permanent dedup key, and the counts-only Friday message. Pure — rows in, action dicts out |
 | `research.py` | **research briefs**: link extraction, the domain allow-list, the bounded fetch, the LinkedIn status, and the brief prompt. Copy material only — never sent, never written |
-| `approvals.py` | **permission before every write**: reading a yes/no from a message, the Sid-wins tie-break computed from *all* the votes, and the proposal text. Pure |
+| `approvals.py` | **permission before every write**: reading a yes/no from a message, the Sid-wins tie-break computed from *all* the votes, the proposal text, and the one wording of the add offer (`ROW_ADD_OFFER`, `row_add_offer`, `row_add_question`). Pure |
 | `focus.py` | **focus commands**: parsing the command and its duration, matching a row against the focus, and the ordering R5 applies. Pure |
 | `simulation.py` | **simulation and test mode**: the `simulate …` parser, the throwaway database copy, the injected clock, the leave override, the [TEST]/DM rendering, and the silent channel gate — plus the **plain-language test commands** (`test help`, `make it Monday`, `next day`, `back to today`, `start over`), matched as text before any model call. Nearly pure — the only I/O is copying a file |
 | `tests/` | **the regression suite** — one class per bug that shipped and was caught by running something real, plus `test_env_example.py`, which pins the `.env.example` contract by reading every module's AST for the variables it uses. `pytest`, all offline |
@@ -5085,7 +5357,9 @@ guardrails forbid.
 | `drive.py` | the **second** Google credential — Drive + Docs + the Sheets REST calls for the bot's own sheet. Wider scopes live here so `gtm_sheet.py` keeps its narrow one |
 | `guardrails.py` | **the hard rules** — every send and every read passes through here |
 | `config.py` | environment → typed settings, with loud warnings for likely mistakes |
-| `persona.py` | the voice, plus loading `sales_policy.md` fresh on every question. Hands every prompt the learned voice profile (`team_voice_block`, `reply_style_block`) |
+| `persona.py` | the answer voice (`COS_PERSONA`), plus loading `sales_policy.md` fresh on every question. Hands every prompt the learned voice profile (`team_voice_block`, `reply_style_block`); for a channel reply it rides in the cached policy block (`system_blocks(voice=True)`) |
+| `replyguard.py` | the answer guard: strips a throat-clearing opener from an outgoing answer, in code, and reports what it did. `re` only; no model, no config |
+| `wording.py` | the fixed lines of the answer and write paths in one place, the register they are held to, and a map of where the other fixed lines live |
 | `voice.py` | **the voice profile**: reads the team's own messages in the real sales channels, computes how the team writes, picks the examples closest to the median style, stores one row (`voice_profile`), and wraps it as DATA for every prompt. Also `choose`/`order` for the fixed lines, "how do you sound" and "forget my messages" |
 | `sales_policy.md` | the operating policy — the eleven principles |
 | `sources.py` | the five sources and their connected / degraded / awaiting-access status |
@@ -5097,14 +5371,19 @@ guardrails forbid.
 | `events_discovery.py` | **R3's web half**: event discovery in the current and next month, tolerant matching against what the tab already has, the per-run and per-month limits, and the registration-deadline backfill. Proposes; never writes. No I/O |
 | `gtm_sheet.write_cells_on` | a **tab-aware** single-cell write for the Events tab: allow-listed tabs, mapped columns, one cell at a time, and it **never overwrites a non-empty cell** |
 | `deadlines.py` | IST working-day maths, cadence resolution, the announcement. `today_ist()`/`now_ist()` go through `clock`, and they are the ONLY functions in the codebase that answer "what time is it" |
-| `notes.py` | syncs the Drive meeting notes into `NOTES_DIR`, filters them to the sales ones, reads those |
+| `notes.py` | syncs ONE Drive folder of sales meeting notes into `NOTES_DIR`, keeps the manifest of what came from it, quarantines everything else, and reads only what the allowlist admits |
+| `tools/list_hidden_todos.py` | read-only: lists the to-do rows the bot hides, for cleaning the sheet by hand |
+| `tools/redact_env.py` | writes `.env.agent` — the real configuration with every secret masked |
+| `tools/tone_samples.py` | NFT2-1064: ten questions, old prompt against new, for the sign-off page. Dry by default; `--live-model` only on the human's go, key from the shell, hard cap 25 calls |
+| `tools/tone_baseline.py` | the answer prompt as it stood on 7 Oct, frozen for that page. Not imported by the bot; delete after sign-off |
 | `query.py` | Discord read primitives, scoped to the sales channels |
 | `query_engine.py` | the bounded tool-use loop; holds no tools of its own. Caches the prompt (4 breakpoints) and trims old tool results |
 | `usage.py` | the token log: one `[tokens]` line and one `llm_calls` row per Anthropic call, with its model; the price table and `dollars()`; the daily token budget; the `[test-cost]` tally |
 | `llm.py` | the short model calls: routing, replies, commitment detection — on `MODEL` or `MODEL_LIGHT` — plus `web_research` (snippets in, MODEL_LIGHT out), `score_news` and `research_digest` |
 | `search_backend.py` | **the retrieval layer, no LLM and no paid API**: `search` (SearXNG, then `SEARCH_FALLBACKS` — DuckDuckGo, Google CSE; SQLite cache, the request budget), `news` (Google News RSS first) and `fetch_page` (research.py's fetcher, the block-list, never LinkedIn) |
 | `feeds.py` | **the feed layer, no LLM**: `poll()` reads `NEWS_RSS_FEEDS` and one Google News RSS query per topic into `news_feed_items`, deduplicated on the url and headline keys |
-| `toolsets.py` | **which tools a question needs**: the keyword routing, the groups, and each tool's one-sentence description |
+| `toolsets.py` | **which tools a question needs**: the keyword routing, the groups (`profile` among them), the web pair that rides with every route but `today` (`ALWAYS`), and each tool's one-sentence description |
+| `links.py` | every url as a masked link; and for profile lookups, `profile_kind` (is a LinkedIn url a profile, a post or a company page — from the url alone, nothing fetched) and `same_url` (is this the link a search returned) |
 | `followups.py` | commitment prefilter, due-time maths, fallback nudge text |
 | `db.py` | SQLite: `chases`, `nudges`, `deadlines`, `flags_sent`, `digest_items` (carry-forward ages), `nextstep_state` (rule (i)'s clock), `prep_briefs` (one brief per meeting), `meta` (the once-a-day digest marker, the to-do sheet's id and its announcement marker) |
 | `memory.py` | short-term per-channel conversation memory (in-memory only) |
@@ -5156,6 +5435,154 @@ it has. The source statuses are in the system prompt, the prompt forbids
 answering from an unreachable source, and the capability answer has a
 deterministic fallback (`persona.fallback_capability_reply`) so it stays honest
 even when the model call fails.
+
+---
+
+## Environment changes — NFT2-1062 (sales notes folder)
+
+**NEW**
+
+| Variable | Default | What it is |
+|---|---|---|
+| `NOTES_SOURCE_FOLDER` | empty | the one Drive folder the notes come from, by name. Must appear verbatim in `NOTES_SYNC_CMD`. Empty → *"Meeting notes aren't connected to me yet."* |
+| `NOTES_REQUIRE_TITLE_TAGS` | empty | optional title tags; stays empty — the folder is the tag |
+
+**CHANGED default**
+
+| Variable | Was | Now |
+|---|---|---|
+| `NOTES_EXCLUDE_TITLE_PATTERNS` | `AM sync,PM sync` | `AM sync,PM sync,NFThing Kick-off,NFThing Wrap-up,standup,stand-up,daily sync` — and it now ADDS to a built-in floor of the same seven; an empty value no longer loads everything |
+
+**CHANGED meaning (default unchanged)**
+
+* `NOTES_SYNC_CMD` — must name `NOTES_SOURCE_FOLDER`; a mirror (`rclone sync`)
+  must carry `--exclude "/_quarantine/**"`. A command that fails either test is
+  not run.
+* `NOTES_DIR` — the bot now keeps `_quarantine/` inside it.
+
+**RETIRED** — none.
+
+The exact lines for the server's `.env` and the laptop's, with the folder's
+name, are in [DEPLOY.md](DEPLOY.md), section 4. Both files need them; an
+untouched `.env` runs **not connected**.
+
+### NFT2-1065 — web search on every question, profile links, the add offer
+
+**NEW**
+
+| Variable | Default | What it is |
+|---|---|---|
+| `WEB_QUESTION_EXTENDED_SEARCHES` | `6` | the search limit after a question's ONE extension; never read as less than the base, equal to it switches the extension off |
+| `QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS` | `9` | the tool-round cap after that extension; same rules |
+
+**CHANGED default**
+
+| Variable | Was | Now |
+|---|---|---|
+| `WEB_QUESTION_MAX_SEARCHES` | `2` | `4` — a two-person, two-profile lookup is four searches |
+| `QUERY_ENGINE_MAX_TOOL_ITERATIONS` | `5` | `7` — searches + 3; startup warns when it is lower |
+
+**RETIRED** — none.
+
+A `.env` that SETS a variable keeps its own value: changing the default changes
+nothing there. Set all four lines in the laptop's `.env` and the server's
+(`/opt/sales-bot/.env`):
+
+```bash
+WEB_QUESTION_MAX_SEARCHES=4
+QUERY_ENGINE_MAX_TOOL_ITERATIONS=7
+WEB_QUESTION_EXTENDED_SEARCHES=6
+QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS=9
+```
+
+The steps and the live-channel checklist are in [DEPLOY.md](DEPLOY.md),
+"Upgrading to NFT2-1065".
+
+### NFT2-1064 — answers that read like a teammate
+
+**What changed.** The answer prompt was rewritten (see *How an answer sounds*):
+`persona.COS_PERSONA`, `persona.CITATION_RULE`, and the HOW TO ANSWER,
+MEETING-NOTES, CHANNEL and OUTPUT sections of the engine prompt. The learned
+voice block moved from the uncached end of the prompt into the cached policy
+block, and greetings and "what can you do" now carry it too. `replyguard.py`
+checks the opening of every answer in code. The reactive fixed lines moved to
+`wording.py` and were brought into one register (contractions, no "(s)", no
+claim of a check that was not made). No extra model call anywhere; still four
+cache breakpoints.
+
+**Not changed:** the three "no sales notes" sentences (NFT2-1062), the
+NFT2-1065 wording and coverage rules ("not checked yet", per-person found /
+not found, never claim to lack a tool), the proactive templates, and the five
+tone dials, which shape proactive messages only.
+
+**The samples page.** `tools/tone_samples.py` puts ten questions through the
+old prompt (`tools/tone_baseline.py`, frozen on 7 Oct) and the new one, from
+the same canned evidence, and writes `docs/tone-samples.md` for sign-off:
+
+```bash
+python tools/tone_samples.py                 # dry run: no model, prints the page
+# only when the human says go; the key comes from the shell, never from .env:
+python tools/tone_samples.py --live-model --voice-db ./sales_bot_test.db
+```
+
+The ten questions are the seven from the 6 Oct exchange plus "where are we
+with <company>?", "who should we pitch at <company>?" and "remind me to follow
+up with <PoC> on Friday"; the company and the PoC are the first canned sheet
+row, never a typed-in name, because the evidence under them is canned. 20
+model calls, hard cap 25. A real run must name the database the learned voice
+profile comes from (`--voice-db`, opened read-only and copied; the file is
+never written) or say `--no-voice`. Each sample is sent without a tool list
+first; if the API rejects the first call for its shape, the script prints
+`NO-TOOLS FINAL CALL FAILED`, writes it as the page's second line and sends
+the list for the whole run (`--keep-tools` does that from the start). That
+line is a finding about the bot: the engine's forced final call
+(`query_engine.py:732`) sends the same shape. `--record` also adds the outputs
+to `tests/fixtures/tone_outputs.json`. Wait for NFT2-1063 before the real run.
+
+**Who may approve is read from the configuration.** Three replies used to
+name "Sid or Vaishnavi" in so many words: the "refresh voice" refusal, the
+focus refusal and the simulation refusal. They now use
+`approvals.approver_names()`: the `ROSTER_DISPLAY_NAMES` of
+`SALES_APPROVER_IDS`, "… or another approver" when some have no name, and
+"one of the approvers" when none has. Plain names, never a ping; the
+proposal line and the polite no still tag the approvers, because those are
+sent to get one of them to act. With today's configuration (five approver
+ids, a display name for one of them) these lines read "Vaishnavi or another
+approver": fill `ROSTER_DISPLAY_NAMES` with the approvers' real ids to get
+their names.
+
+**NEW**
+
+| Variable | Default | What it is |
+|---|---|---|
+| `ANSWER_GUARD_ENABLED` | `true` | the opener guard on answers; `false` sends the model's text untouched |
+
+**CHANGED default**
+
+| Variable | Was | Now |
+|---|---|---|
+| `SALEY_HUMOUR` | `off` in `.env.example`, `light` in the code | `light` in both |
+
+**RETIRED** — none.
+
+Nothing is required in either `.env`. Both the laptop's `.env` and the
+server's (`/opt/sales-bot/.env`) SET `SALEY_HUMOUR=off` today, so the new
+default changes nothing there until that line is edited. `SALEY_EMOJI=medium`
+is not a valid value and already falls back to `light` with a warning.
+
+```bash
+# recommended: the valid spelling of what already happens
+SALEY_EMOJI=light
+# only if proactive messages should use the new default; leave "off" to keep today's behaviour
+SALEY_HUMOUR=light
+# optional, only to make the default explicit
+ANSWER_GUARD_ENABLED=true
+# recommended: one entry per id in SALES_APPROVER_IDS, so refusals can name who may approve
+ROSTER_DISPLAY_NAMES={"<approver id>":"<first name>", …}
+```
+
+The steps and the live-channel checklist are in [DEPLOY.md](DEPLOY.md),
+"Upgrading to NFT2-1064".
 
 ---
 

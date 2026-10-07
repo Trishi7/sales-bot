@@ -74,7 +74,16 @@ SOURCE_DB = os.path.join(HERE, "sales_bot_test.db")
 os.environ["STATE_DIR"] = os.path.join(TMP, "state")
 os.environ["DB_PATH"] = os.path.join(TMP, "base_test.db")
 
+import os as _os  # noqa: E402  NFT2-1064 offline guard: canned source statuses, real Sheets/Drive calls blocked
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tests"))
+import offline_guard  # noqa: E402
+if "--fixture-only" in _sys.argv:
+    GUARD = offline_guard.install_script()
 import config  # noqa: E402
+import canned_sheet  # noqa: E402  NFT2-1064: canned rows for the real-sheet read the offline guard blocks
+if "--fixture-only" in _sys.argv:
+    canned_sheet.install()
 
 BASE_DB = os.environ["DB_PATH"]
 for suffix in ("", "-wal", "-shm"):

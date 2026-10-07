@@ -2504,6 +2504,19 @@ class DB:
         except sqlite3.IntegrityError:
             return False
 
+    def set_proposal_message(self, proposal_key: str, message_id: str) -> None:
+        """Key an open proposal to the message that ASKED it.
+
+        For a proposal recorded BEFORE its question is posted (the row_add
+        offer: no proposal, no message) — the id only exists once the message
+        has landed, and a reply to that message is how a yes finds it.
+        """
+        with self.conn() as c:
+            c.execute(
+                "UPDATE write_proposals SET message_id = ? WHERE proposal_key = ?",
+                (str(message_id or ""), str(proposal_key)),
+            )
+
     def proposal(self, proposal_key: str) -> Optional[dict]:
         """One proposal, with its votes. None when there is no such key."""
         import json as _json
@@ -2554,6 +2567,21 @@ class DB:
                 "SELECT proposal_key FROM write_proposals "
                 "WHERE message_id = ? AND status = 'open' ORDER BY created_at, rowid",
                 (str(message_id or ""),),
+            ).fetchall()
+        out = [self.proposal(r["proposal_key"]) for r in rows]
+        return [p for p in out if p]
+
+    def open_proposals_of_kind(self, kind: str) -> list[dict]:
+        """Every open proposal of one kind, oldest first.
+
+        So a question already waiting on a yes is not asked a second time: the
+        add offer reads the open `row_add` proposals before it names anybody.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT proposal_key FROM write_proposals "
+                "WHERE kind = ? AND status = 'open' ORDER BY id",
+                (str(kind or ""),),
             ).fetchall()
         out = [self.proposal(r["proposal_key"]) for r in rows]
         return [p for p in out if p]

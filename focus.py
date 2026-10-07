@@ -1,6 +1,6 @@
 """FOCUS COMMANDS — "prioritise only AI Voice Agents for the next two weeks".
 
-Sid or Vaishnavi can redirect prospecting at any time. R5 then offers matching
+The approvers (SALES_APPROVER_IDS) can redirect prospecting at any time. R5 then offers matching
 contacts FIRST, and everything else waits behind them until the focus expires.
 
 A FOCUS NARROWS, IT DOES NOT SILENCE. When nothing on the sheet matches the
@@ -30,6 +30,7 @@ from typing import Optional
 import config
 import deadlines as dl
 import gtm_sheet
+import wording
 
 log = logging.getLogger(__name__)
 
@@ -192,53 +193,58 @@ def apply_to(rows: list, focus: Optional[dict]) -> tuple:
 
     if not hits:
         return rows, (
-            f"Nothing on the sheet matches the current focus ({value}), so I am "
+            f"Nothing on the sheet matches the current focus ({value}), so I'm "
             "going in sheet order instead"
         )
     where = matches(hits[0], value)
     return hits + rest, (
-        f"Focused on {value} — {len(hits)} matching contact(s), by {where}"
+        f"Focused on {value} — {len(hits)} matching "
+        f"{'contact' if len(hits) == 1 else 'contacts'}, by {where}"
     )
 
 
 def describe(focus: Optional[dict], *, today: Optional[date] = None) -> str:
     """The answer to "show focus"."""
     if not focus:
-        return "No focus is set — I am going in sheet order."
+        return "No focus is set, so I'm going in sheet order."
     day = today or dl.today_ist()
     ends = dl.parse_date(str(focus.get("expires_on") or ""))
     left = (ends - day).days if ends else 0
     return (
         f"Focused on **{focus.get('value')}** until "
         f"{dl.format_date(ends) if ends else 'further notice'}"
-        + (f" ({left} day(s) left)" if ends and left >= 0 else "")
+        + (f" ({wording.plural(left, 'day')} left)" if ends and left >= 0 else "")
         + f", set by {focus.get('set_by') or 'someone'}."
     )
 
 
 def confirmation(focus_value: str, *, days: int, ends: date) -> str:
     return (
-        f"Right — focusing on {focus_value} for the next {days} day(s), until "
-        f"{dl.format_date(ends)}. I will put matching contacts first and say so "
+        f"Right — focusing on {focus_value} for the next "
+        f"{wording.plural(days, 'day')}, until "
+        f"{dl.format_date(ends)}. I'll put matching contacts first and say so "
         "when nothing matches. Say clear focus any time."
     )
 
 
 def expiry_announcement(focus: dict) -> str:
     return (
-        f"The focus on {focus.get('value')} has run out, so I am back to sheet "
+        f"The focus on {focus.get('value')} has run out, so I'm back to sheet "
         "order from now on."
     )
 
 
 def not_allowed_reply(name: str) -> str:
     """The polite no. Says WHO can, because the person was trying to help."""
+    import approvals
     import guardrails
     who = [guardrails.mention_for(uid) for uid in config.approver_ids()]
-    who = " or ".join([w for w in who if w]) or "Sid or Vaishnavi"
+    # With nobody to tag, the names come from the configuration
+    # (`approvals.approver_names`), never from a constant.
+    who = " or ".join([w for w in who if w]) or approvals.approver_names()
     return (
-        f"Thanks {name} — setting the focus is {who}'s call, so I have not "
-        "changed anything. Ask one of them and I will pick it up straight away."
+        f"Thanks {name} — only {who} can set the focus, so I haven't "
+        "changed anything. Ask one of them and I'll pick it up straight away."
     )
 
 

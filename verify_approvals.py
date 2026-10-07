@@ -18,6 +18,11 @@ os.environ.setdefault("DISCORD_TOKEN", "x")
 os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 
 import approvals
+import os as _os  # noqa: E402  NFT2-1064 offline guard: canned source statuses, real Sheets/Drive calls blocked
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tests"))
+import offline_guard  # noqa: E402
+GUARD = offline_guard.install_script()
 import config
 import db as dbmod
 import deadlines as dl
@@ -31,6 +36,12 @@ SID, VAISHNAVI, TRISHI = 111, 222, 333
 config.TEAM_ROSTER_IDS = [SID, VAISHNAVI, TRISHI]
 config.SALES_APPROVER_IDS = [SID, VAISHNAVI]
 config.SALES_FINAL_SAY_ID = SID
+# THE RESTRICTED BANDS ARE PINNED TO THE CONTRACT (.env.example: A:I,S:X), not read from whatever this machine's
+# .env holds: on 7 Oct the laptop's value became A:I,Q:W,Z:AE, which put Meeting Date (column Q) inside a band
+# and made five checks below fail for a reason that has nothing to do with approvals.
+config.RESTRICTED_COLUMN_RANGES = "A:I,S:X"
+config.RESTRICTED_COLUMN_BANDS = config.parse_column_ranges("A:I,S:X")
+config.RESTRICTED_COLUMN_INDEXES = frozenset(i for lo, hi in config.RESTRICTED_COLUMN_BANDS for i in range(lo, hi + 1))
 config.ROSTER_DISPLAY_NAMES = {str(SID): "Sid", str(VAISHNAVI): "Vaishnavi",
                                str(TRISHI): "Trishi"}
 

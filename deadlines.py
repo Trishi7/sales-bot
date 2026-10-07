@@ -36,6 +36,7 @@ from typing import Optional
 
 import clock
 import config
+import wording
 
 log = logging.getLogger(__name__)
 
@@ -56,17 +57,17 @@ KINDS: dict[str, dict] = {
     KIND_OUTREACH: {
         "label": "follow-up",
         "days_attr": "OUTREACH_FOLLOWUP_DAYS",
-        "rule": "outreach follow-up: {n} working day(s) after the last touch",
+        "rule": "outreach follow-up: {n} after the last touch",
     },
     KIND_REPLY: {
         "label": "reply chase",
         "days_attr": "REPLY_CHASE_DAYS",
-        "rule": "reply chase: {n} working day(s) after we wrote",
+        "rule": "reply chase: {n} after we wrote",
     },
     KIND_MEETING_PREP: {
         "label": "meeting prep",
         "days_attr": "MEETING_PREP_DAYS",
-        "rule": "meeting prep: {n} working day(s) before the meeting",
+        "rule": "meeting prep: {n} before the meeting",
     },
 }
 
@@ -350,7 +351,7 @@ def cadence_from_strategy(text: Optional[str]) -> dict[str, int]:
             if 1 <= n <= 30:
                 out[kind] = n
                 log.info(
-                    "[deadlines] strategy doc sets the %s cadence to %d working day(s)",
+                    "[deadlines] strategy doc sets the %s cadence, in working days, to %d",
                     kind, n,
                 )
                 break
@@ -361,6 +362,13 @@ def default_days(kind: str) -> int:
     """The configured default for a kind, in working days."""
     attr = KINDS.get(kind, {}).get("days_attr")
     return int(getattr(config, attr, 3)) if attr else 3
+
+
+def _rule_text(spec: dict, n: int) -> str:
+    """A rule's sentence with its number in: "{n}" in KINDS[...]["rule"] is the
+    whole quantity ("1 working day", "3 working days"), because the rule goes
+    verbatim into a message the team reads, and a bracketed plural reads as a form."""
+    return spec["rule"].format(n=wording.plural(n, "working day"))
 
 
 def resolve_rule(kind: str, *, strategy_text: Optional[str] = None) -> tuple[int, str]:
@@ -374,9 +382,9 @@ def resolve_rule(kind: str, *, strategy_text: Optional[str] = None) -> tuple[int
     cadence = cadence_from_strategy(strategy_text)
     if kind in cadence:
         n = cadence[kind]
-        return n, spec["rule"].format(n=n) + ", per the strategy doc"
+        return n, _rule_text(spec, n) + ", per the strategy doc"
     n = default_days(kind)
-    return n, spec["rule"].format(n=n)
+    return n, _rule_text(spec, n)
 
 
 def compute_due(
@@ -417,7 +425,8 @@ def compute_due(
         overdue = working_days_between(due, today)
         due = add_working_days(today, 0)
         rule = (
-            f"{rule}; that fell {overdue} working day(s) ago, so it is due now"
+            f"{rule}; that fell {wording.plural(overdue, 'working day')} ago, "
+            "so it's due now"
         )
 
     return due, rule, n

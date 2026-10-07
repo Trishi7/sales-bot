@@ -20,8 +20,9 @@ the team has to take the bot's word for it, and the first time it is wrong they
 stop taking its word for anything.
 
 WHAT IS EXTRACTED, and from where. `notes.py` owns the folder, the sync and the
-exclusion filter; this module reads ONLY through `notes.list_notes` /
-`notes.read_note`, so a doc the filter holds back can never reach a digest line.
+allowlist; this module reads ONLY through `notes.list_notes` /
+`notes.read_note`, so a doc that is not from the sales notes folder — or is a
+standup's — can never reach a digest line.
 From each loaded note:
 
     HOLDS         a line saying work on a named company is paused, parked,
@@ -199,6 +200,32 @@ def citation(note: Optional[dict]) -> str:
     return name or when
 
 
+def allowed_citations() -> dict[str, set[str]]:
+    """{normalised citation: {ISO dates}} for every note that is readable NOW.
+
+    The to-do sheet's "Source meeting" cell holds a citation string, so this is
+    how a row is tied back to a note the bot is allowed to read (todos.py). The
+    dates ride along because a citation carries no year: "Pipeline review,
+    5 Oct" must not vouch for a row raised on some other 5 Oct.
+
+    Reads through `notes.list_notes`, so it is {} whenever the notes source is
+    not connected, unreachable or empty — and then no row can match. Never
+    raises.
+    """
+    out: dict[str, set[str]] = {}
+    try:
+        metas = notes.list_notes(days=3650)
+    except Exception:
+        log.info("[meetings] the notes folder could not be listed; no allowed citations",
+                 exc_info=True)
+        return out
+    for meta in metas:
+        key = notes._norm_title(citation(meta))
+        if key:
+            out.setdefault(key, set()).add(str(meta.get("date") or ""))
+    return out
+
+
 def cite(text: str, note: Optional[dict]) -> str:
     """Append the citation to a line. THE ONE FUNCTION every caller should use.
 
@@ -291,6 +318,11 @@ def _cache_key(days: int, index: list[tuple[str, str]]) -> tuple:
         st.get("last_success"),
         st.get("docs_seen"),
         st.get("docs_loaded"),
+        # The SOURCE is part of the key: facts read from one folder must not be
+        # served after the folder changes or stops being readable.
+        st.get("state"),
+        st.get("source_folder"),
+        st.get("docs_from_folder"),
     )
 
 

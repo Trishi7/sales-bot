@@ -91,3 +91,31 @@ def tone_env():
         os.environ.pop(k, None)
         if saved[k] is not None:
             os.environ[k] = saved[k]
+
+
+def pytest_addoption(parser):
+    """tests/test_tone_samples.py executes tools/tone_samples.py (against a fake client, in a sandbox copy
+    of the repo). That is off unless asked for: `pytest --run-tone-samples`. A command-line option, not an
+    environment variable, so .env.example has nothing to list."""
+    parser.addoption("--run-tone-samples", action="store_true", default=False,
+                     help="also run the tests that execute tools/tone_samples.py (fake model, sandbox copy)")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "tone_samples_run: executes tools/tone_samples.py; needs --run-tone-samples")
+
+
+import offline_guard  # noqa: E402  (tests/ is on sys.path under pytest's rootdir import mode)
+
+
+@pytest.fixture(autouse=True)
+def _offline_guard():
+    """No test reaches the real Sheets or Drive, and every prompt a test builds sees canned source
+    statuses. A blocked attempt fails the test at teardown even if the code under test swallowed the
+    exception. See tests/offline_guard.py."""
+    guard = offline_guard.install()
+    guard.calls.clear()
+    yield guard
+    calls = list(guard.calls)
+    guard.calls.clear()
+    assert not calls, f"live Sheets/Drive calls attempted during the test: {calls}"

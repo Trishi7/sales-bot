@@ -1,0 +1,7 @@
+{
+ "note": "sha256 of the pre-NFT2-1064 prompt pieces, taken from the working tree on 2026-10-07 before any 1064 edit to persona/query_engine (requester Kushal, today 2026-10-07; engine_every = every tool in toolsets.GROUPS). tools/tone_baseline must reproduce them.",
+ "persona": "750e5775b7e78aa28ba0d4e674ebafd9f559046bf8fd9b329992851d3e59bb72",
+ "citation_rule": "f4cad8cb93d58d57d3611faed7f4796739bf69c9521c9c43ca6af315ac733743",
+ "engine_none": "a8dbad967781ccbdabaf8a771ff8721cc0aa49cc2ef8ad6601abc3df1366c8cf",
+ "engine_every": "ecd4999f79b34d5a9e72f69b0c865da74b6cb2eca7e44d831923ff70ff6b8f69"
+}

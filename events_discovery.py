@@ -338,7 +338,7 @@ def render_proposal(events: list) -> str:
     if not events:
         return ""
     lines = [
-        f"{len(events)} AI event(s) coming up that aren't on the Events tab:" if
+        f"{len(events)} AI events coming up that aren't on the Events tab:" if
         len(events) != 1 else "An AI event coming up that isn't on the Events tab:"
     ]
     for e in events:

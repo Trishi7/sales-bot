@@ -770,9 +770,11 @@ def may_run(channel_id, user_id) -> tuple:
     if not config.is_test_channel(channel_id):
         return False, ""          # silent: wrong channel
     if not config.is_approver(user_id):
+        import approvals
+
         return False, (
-            "Simulations are Sid's and Vaishnavi's to run — they compose real "
-            "messages and cost real model calls."
+            f"Simulations are for {approvals.approver_names()} to run — they "
+            "compose real messages and cost real model calls."
         )
     return True, ""
 

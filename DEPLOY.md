@@ -165,27 +165,82 @@ one cell at a time, and a human-entered date is never overwritten.
 
 ---
 
-## 4. Meeting-notes sync (optional, enables the third source)
+## 4. Meeting notes: the sales notes folder (optional, enables the third source)
+
+The bot reads sales meeting notes from **one Drive folder and nothing else**. It
+does not read "whatever is in Drive", and it never reads the AM/PM sync notes.
+The full list of what it reads is in [docs/SOURCES.md](docs/SOURCES.md).
 
 The bot holds no Google credential — rclone does. **The bot runs the sync
-itself** now: at startup, every `NOTES_SYNC_MINUTES`, and on demand before a
-notes question. No cron entry is needed.
+itself**: at startup, every `NOTES_SYNC_MINUTES`, and on demand before a notes
+question. No cron entry is needed.
 
-```bash
-sudo apt-get install -y rclone
-rclone config                       # add a Google Drive remote, once, interactively
-rclone listremotes                  # confirm the remote's real name
-```
+**Not connected is a supported state.** With `NOTES_SOURCE_FOLDER` unset (the
+default) no sync runs, nothing in `NOTES_DIR` is read or moved, the source
+reports *awaiting-access*, and asked about a meeting the bot says *"Meeting
+notes aren't connected to me yet."* Deploying this version with `.env` untouched
+therefore changes nothing on disk.
 
-Then in `.env`:
+### Setup
 
-```
-NOTES_DIR=/opt/sales-bot/notes
-NOTES_SYNC_CMD=rclone copy "gdrive:Sales Meeting Notes" /opt/sales-bot/notes
-NOTES_SYNC_MINUTES=30
-```
+1. **In Drive, create the folder `Saley – Sales Notes`.** The dash is an EN DASH
+   (`–`), not a hyphen.
+2. **Share it with `claudedrive@nfthing.com`** — the account behind the rclone
+   remote.
+3. **Put the sales meeting notes in it**, at the TOP LEVEL (subfolders are not
+   read), or Drive shortcuts to them. **Do not put AM/PM sync notes in it.** A
+   doc whose title carries any of these is refused even inside the folder: `am
+   sync`, `pm sync`, `nfthing kick-off`, `nfthing wrap-up`, `standup`,
+   `stand-up`, `daily sync`. A bare "sync" is fine — "Sales sync" is read.
+4. **rclone, once, as the bot's user:**
 
-`NOTES_DIR` is created at startup if it doesn't exist, so no `mkdir` is needed.
+   ```bash
+   sudo apt-get install -y rclone
+   rclone config                       # add a Google Drive remote, once, interactively
+   rclone listremotes                  # confirm the remote's real name (here: gdrive)
+   ```
+
+5. **In `.env`** (server, `/opt/sales-bot/.env`):
+
+   ```
+   NOTES_SOURCE_FOLDER=Saley – Sales Notes
+   NOTES_SYNC_CMD=rclone sync "gdrive:Saley – Sales Notes" /opt/sales-bot/notes --exclude "/_quarantine/**"
+   NOTES_EXCLUDE_TITLE_PATTERNS=AM sync,PM sync,NFThing Kick-off,NFThing Wrap-up,standup,stand-up,daily sync
+   NOTES_REQUIRE_TITLE_TAGS=
+   ```
+
+   * **Copy the folder name, don't retype it** — a hyphen in place of the en dash
+     makes the command name a folder that does not exist. Save `.env` as UTF-8.
+   * The name in `NOTES_SOURCE_FOLDER` must appear, character for character, in
+     `NOTES_SYNC_CMD`. If it doesn't, the bot **does not run the sync** and says
+     so in the log.
+   * **`rclone sync`, not `rclone copy`.** A mirror removes a note here when it
+     is taken out of the Drive folder; a copy would leave it readable for ever.
+   * **The `--exclude "/_quarantine/**"` is required.** Without it `rclone sync`
+     would delete the quarantine (below). The bot refuses to run a mirror that
+     lacks it, and the log names the flag.
+   * **The sync destination must be the same folder as `NOTES_DIR`.**
+     `NOTES_DIR=./notes` is `/opt/sales-bot/notes` when the bot runs from
+     `/opt/sales-bot`. If they differ the bot sees an empty folder and says so.
+   * `NOTES_REQUIRE_TITLE_TAGS` stays empty: the folder is the tag, and nobody
+     has to rename a meeting. If it is ever set, **the tag must be a distinctive
+     word**: tags are matched as whole words, ignoring punctuation and case, so
+     `[Sales]` is just the word "sales" and matches "Sales sync – …" and "Acme
+     sales call". Use something like `[SalesNotes]`.
+
+   On the laptop the destination is `./notes` instead of `/opt/sales-bot/notes`.
+   A machine with no `gdrive` remote leaves `NOTES_SOURCE_FOLDER` and
+   `NOTES_SYNC_CMD` blank and runs not connected.
+
+6. **Restart.** `NOTES_DIR` is created if it doesn't exist. On the first sync
+   the bot **moves every file already in the notes folder** to
+   `notes/_quarantine/<timestamp>/` and logs it once — those files came from an
+   older, broader sync and are not from the sales folder. **Nothing is deleted.**
+
+`NOTES_SYNC_MINUTES` is `1440` on the server, so the timer syncs once a day. A
+note added to the folder shows up after a restart, at the next daily tick, or
+when somebody asks about a recent meeting ("the latest call", "today's
+meeting"), which forces a sync.
 
 **The command must run as the bot's user.** `rclone config` writes
 `~/.rclone.conf` for whoever ran it; a bot running under a different user (or as
@@ -193,33 +248,76 @@ a Windows service) has its own, empty one and will fail with *"didn't find
 section in config file"*. Check with:
 
 ```bash
-sudo -u <bot-user> rclone copy "gdrive:Sales Meeting Notes" /opt/sales-bot/notes
+sudo -u <bot-user> rclone sync "gdrive:Saley – Sales Notes" /opt/sales-bot/notes --exclude "/_quarantine/**" --dry-run
 ```
 
 **On Windows, a PowerShell alias for `rclone` is invisible to the subprocess** —
 put `rclone.exe` on `PATH` or write its full path into `NOTES_SYNC_CMD`
-(`C:\rclone\rclone.exe copy ...`).
+(`C:\rclone\rclone.exe sync ...`).
 
-A failing sync doesn't stop the bot. It is logged **once** at ERROR with the fix
-named, the `sales_meeting_notes` source reports **degraded**, and answers say the
-notes may be stale. Watch for it with:
+### What to look for in the log
 
 ```bash
 pm2 logs sales-bot | grep "\[notes\]"
-# healthy:  [notes] synced 72 docs, 2 loaded, 70 excluded (standups)
-# broken:   [notes] SYNC FAILED — … FIX: …
+# healthy:        [notes] source=Saley – Sales Notes state=ok on_disk=3 from_folder=3 loaded=3 standup=0 missing_tag=0 undated=0 quarantined=0
+# first sync:     [notes] moved 76 file(s) that did not come from Saley – Sales Notes to …/notes/_quarantine/20261007-101500 — nothing was deleted
+# broken sync:    [notes] SYNC FAILED — … FIX: …
+# refused config: [notes] SYNC NOT RUN — … FIX: …
 ```
 
-Every synced note is read **except** the recurring product standups, matched by
-title against `NOTES_EXCLUDE_TITLE_PATTERNS` (default `AM sync,PM sync`) — see
-[README.md](README.md#meeting-notes-the-sync-and-the-standup-exclusion).
-`synced 72 docs, 0 loaded, 72 excluded` means the patterns are catching real
-meetings: widen or clear them. `0 loaded, 0 excluded` with docs on disk means
-nothing that came down carried a parseable date, so none of it is a meeting note.
-The startup log says which case you are in.
+`on_disk` is every file at the top level of the notes folder; each one is in
+exactly one of `loaded`, `standup`, `missing_tag`, `undated` or not from the
+folder (`on_disk − from_folder`). When files came from the folder and **none**
+loaded, a WARNING names the bucket that took them and the setting to look at —
+"nothing loaded" is never silent. A failing sync doesn't stop the bot: it is
+logged **once** at ERROR with the fix named.
 
-Leave `NOTES_DIR` unset and the source simply reports *awaiting-access*, which
-the bot states plainly when asked. That is a supported state, not a broken one.
+What the team hears in the channel when there is nothing to read is one of
+three sentences, and never anything from another source:
+
+| Situation | The bot says |
+|---|---|
+| not connected (or a command it refuses to run) | Meeting notes aren't connected to me yet. |
+| the folder is reachable and holds no sales notes | There are no sales meeting notes in the Saley – Sales Notes folder yet. |
+| the folder has never been reached | I can't reach the sales notes folder right now, so I haven't checked the notes. |
+
+If the folder synced before and the latest sync fails, the bot keeps answering
+from that last good copy of the sales folder and says it may be stale.
+
+### The quarantine: inspect and clear
+
+```bash
+ls -R /opt/sales-bot/notes/_quarantine
+```
+
+shows what was moved and when (one folder per sweep, named by timestamp). **The
+bot never reads it — at any depth — and never deletes it.** A file lands there
+when it is in the notes folder but did not come from the sales folder: the
+leftovers of the old sync on the first run, everything on disk when
+`NOTES_SOURCE_FOLDER` changes, or a file somebody dropped in by hand.
+
+Once a human has looked, clear it by hand:
+
+```bash
+rm -r /opt/sales-bot/notes/_quarantine/<timestamp>
+```
+
+To put a note back, **move it into the Drive folder**, not into `notes/` — a
+file dropped into `notes/` by hand is quarantined again at the next sync.
+
+### Hidden to-do rows
+
+A row on the to-do sheet is shown only when its *Source meeting* is a sales note
+the bot can read. Rows that cite a standup, an internal meeting or nothing are
+hidden from every reply; the bot never edits or deletes them and says nothing
+about them in the channel. To list them for cleaning the sheet by hand:
+
+```bash
+cd /opt/sales-bot && python tools/list_hidden_todos.py
+```
+
+It is read-only: it never creates the sheet, never writes a cell and never runs
+the sync. See [README.md](README.md#meeting-notes-the-sales-folder-the-sync-and-the-standup-guard).
 
 ---
 
@@ -561,3 +659,178 @@ Nothing to run by hand; the first boot adds the new columns.
   an approver's yes, only if the cell is still blank, undoable.
 
 `python verify_s2.py` and `python verify_s3.py` check both offline.
+
+## Upgrading to NFT2-1065 (web search on every question, profile links)
+
+Nothing to run by hand and no schema change.
+
+**1. Four lines, in the laptop's `.env` AND the server's `/opt/sales-bot/.env`.**
+Both files SET the first two today (to 2 and 5), so the new defaults change
+nothing until the lines are edited; the last two are new:
+
+```bash
+WEB_QUESTION_MAX_SEARCHES=4
+QUERY_ENGINE_MAX_TOOL_ITERATIONS=7
+WEB_QUESTION_EXTENDED_SEARCHES=6
+QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS=9
+```
+
+Restart (`pm2 restart sales-bot`). The startup log must show
+
+```
+[config] one question: up to 4 web search(es) and 7 tool round(s); one extension to 6 and 9.
+```
+
+and no `… is below … + 3` warning. A question that goes past four searches logs
+one `[engine] msg=… LIMIT EXTENDED ONCE` line, and never a second.
+
+**2. Check SearXNG answers** (section 4b: `curl` the loopback url, and the
+startup line `backend=searxng`). A question may now make up to six searches; with
+SearXNG down every one of them is a DuckDuckGo scrape, which is rate-limited
+and sometimes empty. If the log shows `backend=ddg` on question searches, fix
+SearXNG before relying on profile lookups.
+
+**3. The add offer.** `SHEET_ROW_ADDITIONS_ENABLED=true` and `outreach_pocs` in
+`SHEET_APPENDABLE_TABS` are what let Saley ask "Want me to add … to Outreach
+PoCs?". The offer and the write are ON (`bot.POC_ROW_ADD_WRITE_WIRED = True`).
+**An approver's yes writes the REAL sheet, in test mode too** when
+`SHEET_WRITES_ENABLED=true`: one new row with the serial number, Name, Company
+and — only when a search returned a `linkedin.com/in` link — the LinkedIn URL,
+with Saley's note on the Name cell. No existing row is touched. Two things in
+code still await the human's answer, each one line: whether the serial number
+is written (`bot.POC_ROW_ADD_FILL_SERIAL`, `True` today) and what the note's
+"source link" is (`approvals.ROW_SIGNATURE`, which carries the approval link
+and the LinkedIn link today). Vaishnavi confirms the offer wording before
+deploy. To switch the whole feature off without a code change, set
+`SHEET_ROW_ADDITIONS_ENABLED=false` or take `outreach_pocs` out of
+`SHEET_APPENDABLE_TABS`.
+
+**4. Live-channel checklist** (record the `SALES_TEST_MODE` it ran under; test
+mode and live behave the same, the `[TEST…]` tag aside):
+
+1. "@Saley LinkedIn and research profile links for Janajit Bagchi and Suryansh
+   Shukla (ARTPARK India)" → it searches on the first ask; a per-person answer;
+   every link opens the right page; no "I don't have web search".
+2. The same question worded "…for the PoCs at ARTPARK" → still searches.
+3. "@Saley where are we with ARTPARK?" then "@Saley and their LinkedIn?" →
+   searches.
+4. A profile for someone with no public profile → "no public profile found",
+   no link.
+5. Six or more people at once → what was found, and "not checked yet" for
+   the rest; no mention of a limit; exactly one `LIMIT EXTENDED ONCE` line in
+   the log for that message.
+6. The offer appears as its own message, in the confirmed wording. Vaishnavi
+   confirms it reads clearly.
+7. A non-approver replies "yes" → the polite no; the sheet is unchanged.
+8. An approver replies "no" → "Nothing has changed in the sheet."; check the
+   sheet.
+9. Only if a real row is wanted (this writes the real sheet): an approver
+   replies "yes" → the row appears at the bottom of Outreach PoCs with the
+   serial number, Name, Company and LinkedIn URL only, and the Name cell
+   carries a note: "Added by Saley · approved by <approver> · <date> IST",
+   the link to the approver's message, and (when there is a LinkedIn URL)
+   "LinkedIn link found by web search: …". The reply ends "with my note on
+   the Name cell." No existing row is touched. Delete the row by hand
+   afterwards if it was a test. (With `SHEET_WRITES_ENABLED=true` this writes the REAL sheet in test
+   mode too.)
+10. "@Saley what do we need to do today?" → the to-do sheet answer, as after
+    NFT2-1062.
+11. "@Saley what can you do?" → mentions web search.
+12. "@Saley what did you cost today" → search requests and tokens are in line
+    with docs/plans/NFT2-1065.md, section 3.
+
+`python verify_profile_lookup.py` and `python verify_replay_oct6.py` check it
+offline.
+
+## Upgrading to NFT2-1064 (answers that read like a teammate)
+
+Nothing to run by hand, no schema change, and **no line is required** in
+either `.env`. The one new variable, `ANSWER_GUARD_ENABLED`, defaults to on.
+
+**1. Recommended, in the laptop's `.env` AND the server's `/opt/sales-bot/.env`.**
+`SALEY_EMOJI=medium` is not a valid value (none / light / expressive); it
+already falls back to `light` and logs a warning on every start. Behaviour
+does not change; the warning goes.
+
+```bash
+SALEY_EMOJI=light
+# optional, only to make the default explicit
+ANSWER_GUARD_ENABLED=true
+```
+
+`SALEY_HUMOUR`'s default is now `light` in `.env.example` as well as in the
+code. Both `.env` files SET `SALEY_HUMOUR=off`, so nothing changes until that
+line is edited: set `SALEY_HUMOUR=light` in both only if proactive messages
+should use the new default.
+
+Also recommended in both files: `ROSTER_DISPLAY_NAMES` with one entry per id
+in `SALES_APPROVER_IDS`. Three refusal lines now name who may approve from
+that setting; today only one approver id has a name there, so they read
+"Vaishnavi or another approver".
+
+**2. Restart** (`pm2 restart sales-bot`) and read the boot log:
+
+```
+[boot] voice profile: EXISTS …
+```
+
+If it says `NONE`, answers run on the fixed voice rules alone until the weekly
+build (or an approver's "refresh voice"). Note which it said.
+
+**3. The samples page, only when the human says go.** It calls the real model
+20 times (hard cap 25). The key comes from the shell that runs it, never from
+`.env`:
+
+```bash
+python tools/tone_samples.py            # dry run first: no model, prints the page
+export ANTHROPIC_API_KEY=…              # in the shell, for this run only
+python tools/tone_samples.py --live-model --voice-db ./sales_bot_test.db
+```
+
+Wait for NFT2-1063 to land first. It writes `docs/tone-samples.md`, which is
+what Kushal signs off. `--voice-db` is required (or `--no-voice`): the file is
+opened read-only and copied, never written, and the page prints only the
+profile's date and counts. Exit 2: no key in the shell, or no usable profile
+in that file. Exit 3: the page is incomplete and says so in its header.
+
+**If it prints `NO-TOOLS FINAL CALL FAILED`**, the API rejected tool results
+sent without a tool list. The script carries on with the list attached and
+the page's second line says so, but tell whoever owns `query_engine.py`: the
+engine's forced final call (`query_engine.py:732`, made at the tool-round
+limit) sends the same shape and would fail the same way.
+
+**4. Live-channel checklist** (record the `SALES_TEST_MODE` it ran under; test
+mode and live behave the same, the `[TEST…]` tag aside):
+
+1. "@Saley where are we with <a company on the sheet>?" → one to three lines,
+   the status first, no "Here's", no "Based on", no list of sources.
+2. "@Saley is <company> on hold?" → "Yes/No …", and if it comes from a
+   meeting, one bracket: `(<meeting>, <date>)`. No "according to the meeting
+   notes".
+3. "@Saley what do we need to do today?" → the to-do link and the open items;
+   no line repeating the question.
+4. "@Saley who are the PoCs at <company>?" → the people list (`find_people`'s
+   own text).
+5. "@Saley LinkedIn links for <two people> (<org>)" → still the per-person
+   lines, with "not checked yet" where it applies and no mention of a limit.
+6. "@Saley top 5 AI headlines" → five bullets, nothing before them.
+7. A question it cannot fully answer (a source awaiting access) → the answer
+   it has, plus ONE plain line about what it couldn't check.
+8. "@Saley hi" → one line. Reply "thanks" to an answer → one line, no tool
+   dump (if this still dumps, that is NFT2-1063).
+9. "@Saley what can you do?" → still names what it cannot see; mentions web
+   search.
+10. A slow question → the interim line names no sheet and no notes.
+11. In the log: `grep "\[voice\]"`. Each answer has a `q_words= lines= chars=`
+    line; a `[voice] guard … rule=` line means the model still wrote a banned
+    opener and the guard removed it. Many in a day: the prompt needs another
+    pass.
+12. The same question in the test channel and a live sales channel: the same
+    reply, tag aside.
+13. Ten real replies from this list, read by Kushal, are the acceptance sample
+    once the samples page is signed off.
+
+To switch the guard off without a deploy: `ANSWER_GUARD_ENABLED=false`, restart.
+
+`python verify_answer_voice.py`, `python -m replyguard` and `python -m wording`
+check it offline.

@@ -51,6 +51,7 @@ from anthropic import Anthropic
 import config
 import persona
 import usage
+import wording
 from persona import (
     CAPABILITY_PROMPT,
     COMMITMENT_PROMPT,
@@ -455,12 +456,11 @@ class LLM:
         try:
             # The preamble probes the sources live (Sheets among them): built
             # on a thread so it cannot freeze the event loop.
-            # THE TEAM'S OWN TONE rides behind the social rules (data, never
-            # instructions — `persona.reply_style_block`); "" with no profile.
+            # THE TEAM'S OWN TONE rides in the cached policy block (data,
+            # never instructions — `persona.reply_style_block`); it is not
+            # there at all when no profile exists.
             def _blocks():
-                style = persona.reply_style_block()
-                return persona.system_blocks(
-                    tail=SOCIAL_REPLY_PROMPT + (("\n\n" + style) if style else ""))
+                return persona.system_blocks(tail=SOCIAL_REPLY_PROMPT, voice=True)
 
             blocks = await asyncio.to_thread(_blocks)
             resp = await self._create(
@@ -1107,17 +1107,11 @@ class LLM:
             )
         except Exception:
             log.exception("[llm.brief] call raised")
-            return (
-                "I could not write the brief just now — the model call failed. The "
-                "material I gathered is fine; try again in a moment."
-            )
+            return wording.BRIEF_FAILED
         text = (_text_of(resp) or "").strip()
         if not text:
             log.warning("[llm.brief] empty brief")
-            return (
-                "I gathered the material but the model returned nothing. That is a "
-                "failure on my side, not an absence of information about them."
-            )
+            return wording.BRIEF_EMPTY
         return text
 
     async def capability_reply(
@@ -1126,6 +1120,8 @@ class LLM:
         """"What can you do?" — answered from the policy and the LIVE source
         statuses, both of which `persona.system_preamble()` puts in front of the
         model. The prompt REQUIRES naming every source that's awaiting access.
+        Web search is not a source in that block, so its one-line state rides
+        in the tail (`persona.capability_tail`) — the same model call as before.
 
         On failure this falls back to `persona.fallback_capability_reply`, which
         builds the same statement from the same statuses without a model — the
@@ -1140,7 +1136,8 @@ class LLM:
         try:
             # Built on a thread — the source probe must not freeze the loop.
             blocks = await asyncio.to_thread(
-                lambda: persona.system_blocks(tail=CAPABILITY_PROMPT))
+                lambda: persona.system_blocks(tail=persona.capability_tail(),
+                                              voice=True))
             resp = await self._create(
                 system=blocks,
                 prompt=prompt,

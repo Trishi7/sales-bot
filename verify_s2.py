@@ -58,6 +58,12 @@ TMP = tempfile.mkdtemp(prefix="saley-s2-")
 os.environ["STATE_DIR"] = os.path.join(TMP, "state")
 os.environ["DB_PATH"] = os.path.join(TMP, "base_test.db")
 
+import os as _os  # noqa: E402  NFT2-1064 offline guard: canned source statuses, real Sheets/Drive calls blocked
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tests"))
+import offline_guard  # noqa: E402
+if "--live" not in _sys.argv:
+    GUARD = offline_guard.install_script()
 import config  # noqa: E402
 
 LIVE_SETTINGS = {k: getattr(config, k) for k in (

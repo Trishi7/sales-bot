@@ -982,7 +982,7 @@ def describe(db=None) -> str:
                 "examples in my policy file. Say \"refresh voice\" and I'll read the "
                 "sales channel now.")
     age = age_days(got) or 0.0
-    when = "today" if age < 1 else f"{int(age)} day(s) ago"
+    when = "today" if age < 1 else f"{int(age)} {'day' if int(age) == 1 else 'days'} ago"
     lines = [
         f"Here's how I've learned to sound — from {got.get('message_count', 0)} of "
         f"the team's messages in the sales channel over the last "
