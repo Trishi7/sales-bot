@@ -145,14 +145,13 @@ async def step_7(test_mode, fix, *, slow=False):
     with World(test_mode, pins=pins) as w:
         queries = rw.enable_web(w)
         heads = rw.seed_news(w)
-        step = ("slow", 1.0, ("say", "Here's what's come in: 5 stories.")) if slow else ("say", "Here's what's come in.")
-        w.model.script = [("use", [("todays_news", {})]), step]
+        # SINCE 8 OCT (docs/plans/NEWS-OCT8.md) a plain news question is answered by code: no model is scripted
+        # because none is called, and the stories are read off the reply itself (the bold headlines).
         r = await _ask(w, RECONSTRUCTED[7], who="member")
-        news = [res for n, res in w.model.results if n == "todays_news"]
+        listed = [h for t in r["replies"] for h in re.findall(r"^- [*][*](.+?)[*][*] [(]", t, re.M)]
         return {"replies": r["replies"], "calls": r["calls"], "offered": r["offered"], "engine": r["engine"],
                 "route": r["route"], "searches": len(queries), "headlines": heads,
-                "news_items": [i.get("title") for i in (news[0].get("items") if news else [])],
-                "routing": r["engine"]}
+                "news_items": listed, "routing": r["engine"]}
 
 
 async def oct7(test_mode):
@@ -165,34 +164,29 @@ async def oct7(test_mode):
         key = next(iter(w.proposals()))
         w.real_clock()                                         # the news window is the real day's
         rw.seed_news(w)
-        w.model.script = [("use", [("todays_news", {})]),
-                          ("slow", 1.2, ("say", "Here's what's come in since Tuesday 2 PM: 5 stories."))]
-        asked = asyncio.create_task(w.say(OCT7_Q.replace("@Saley", "").strip(), who="member", mention=True))
-        t0 = _time.monotonic()
-        interim = None
-        while _time.monotonic() - t0 < 5:
-            interim = next((m for m in w.posted if strip_tag(m.content) in wording.INTERIM_WEB + wording.INTERIM_ENGINE),
-                           None)
-            if interim is not None:
-                break
-            await asyncio.sleep(0.02)
+        # SINCE 8 OCT (docs/plans/NEWS-OCT8.md) "any AI news?" is answered by code, at once: there is no model call to
+        # be slow and so no interim line to say "sure" to. The "sure" is replied to the ANSWER instead, which is the
+        # same thing for this purpose: a bot message that asked nothing, with R3's offer still open in the channel.
+        before = len(w.posted)
+        await w.say(OCT7_Q.replace("@Saley", "").strip(), who="member", mention=True)
+        said = w.posted[before:]
+        interims = [strip_tag(m.content) for m in said
+                    if strip_tag(m.content) in wording.INTERIM_WEB + wording.INTERIM_ENGINE]
+        answer_msg = said[-1] if said else None
+        answer = [strip_tag(m.content) for m in said if strip_tag(m.content) not in interims]
         sent = len(w.posted)
         c0, r0 = w.counts(), len(w.reactions)
-        if interim is not None:
-            await w.say(OCT7_REPLY, who="approver", reply_to=interim)
+        if answer_msg is not None:
+            await w.say(OCT7_REPLY, who="approver", reply_to=answer_msg)
         c1 = w.counts()
-        await asked
-        answer = [strip_tag(m.content) for m in w.posted[sent:] if strip_tag(m.content) not in
-                  wording.INTERIM_WEB + wording.INTERIM_ENGINE]
-        news = [res for n, res in w.model.results if n == "todays_news"]
-        rec = {"interim": strip_tag(interim.content) if interim else None,
-               "interim_is_engine": (strip_tag(interim.content) in wording.INTERIM_ENGINE) if interim else None,
+        listed = [h for t in answer for h in re.findall(r"^- [*][*](.+?)[*][*] [(]", t, re.M)]
+        rec = {"interim_lines": interims,
                "sure_reactions": [e for _t, e in w.reactions[r0:]],
-               "sure_replies": [t for t in w.replies_after(sent)
-                                if t not in wording.INTERIM_WEB + wording.INTERIM_ENGINE and "5 stories" not in t],
+               "sure_replies": list(w.replies_after(sent)),
                "sure_votes": c1["votes"] - c0["votes"], "reminders_after_sure": list(w.reminders()),
                "offer_open": w.proposals()[key], "searches": len(queries),
-               "answer_has_stories": bool(news and news[0].get("items")),
+               "answer_has_stories": len(listed) == 5,
+               "answer_names_a_time": [t for t in answer if re.search(r"2 PM|already|since|scheduled", t, re.I)],
                "answer": answer, "calls": w.model.calls}
         # THE 'YES' TO R3'S POST (a Wednesday, under the pretend clock again): the reminder, named
         w.pretend_day(WED, 18, 5)
@@ -283,31 +277,34 @@ async def section(check, fix):
     # ---- step 7
     print("\nstep 7 - NFT2-1063 - 'top 5 AI headlines' over a seeded feed store (reconstructed wording)")
     live, test = await step_7(False, fix), await step_7(True, fix)
-    check("step 7: routed to the engine, group news", (live["route"], ["news" in g for _n, g in live["engine"]]),
-          (["engine"], [True]))
-    check("step 7: todays_news is offered and was called, with all five seeded headlines",
-          ("todays_news" in live["offered"][0], sorted(live["news_items"])), (True, sorted(live["headlines"])))
-    check("step 7: zero web searches (the scripted model called only todays_news)", live["searches"], 0)
-    check("step 7: two model calls, one reply", (live["calls"], len(live["replies"])), (2, 1))
+    # 8 OCT (docs/plans/NEWS-OCT8.md): a plain news question is answered by code, from the collected news.
+    check("step 7: routed to the news list, not the engine (a plain news question)",
+          (live["route"], live["engine"]), (["news"], []))
+    check("step 7: the reply lists all five seeded headlines, each a bold headline with its link",
+          sorted(live["news_items"]), sorted(live["headlines"]))
+    check("step 7: zero web searches", live["searches"], 0)
+    check("step 7: zero model calls, one reply", (live["calls"], len(live["replies"])), (0, 1))
     _same(check, "step 7", live, test, ("route", "engine", "offered", "calls", "replies", "searches", "news_items"))
     live, test = await step_7(False, fix, slow=True), await step_7(True, fix, slow=True)
     interims = [t for t in live["replies"] if t in wording.INTERIM_WEB + wording.INTERIM_ENGINE]
-    check("step 7 (slow): one interim line, in the ENGINE wording (no search ran)",
-          (len(interims), bool(interims) and interims[0] in wording.INTERIM_ENGINE), (1, True))
+    check("step 7 (interim on, tiny thresholds): no interim line of any kind — nothing is slow, no model is asked",
+          (interims, len(live["replies"])), ([], 1))
     _same(check, "step 7 slow", live, test, ("route", "calls", "replies", "searches"))
 
     # ---- the 7 Oct exchange
-    print("\nthe 7 Oct exchange (tests/fixtures/oct7_exchange.md) - R3's post, 'any AI news?', 'sure' to the interim line")
+    print("\nthe 7 Oct exchange (tests/fixtures/oct7_exchange.md) - R3's post, 'any AI news?', then 'sure' "
+          "(since 8 Oct the news is answered at once, so there is no interim line; 'sure' answers the list)")
     live, test = await oct7(False), await oct7(True)
-    check("7 Oct: the interim is an ENGINE line (todays_news answered; no web search ran)",
-          (live["interim"] is not None, live["interim_is_engine"], live["searches"]), (True, True, 0))
-    check("7 Oct: 'sure' to the interim line: one reaction, no text", (live["sure_reactions"], live["sure_replies"]),
+    check("7 Oct: no 'checking the web' and no interim line at all; no web search and no model call",
+          (live["interim_lines"], live["searches"], live["calls"]), ([], 0, 0))
+    check("7 Oct: 'sure' to what Saley said: one reaction, no text", (live["sure_reactions"], live["sure_replies"]),
           ([rc.ack_emoji()], []))
     check("7 Oct: ...no vote, no reminder scheduled, the R3 offer still open",
           (live["sure_votes"], live["reminders_after_sure"], live["offer_open"]), (0, [], "open"))
     check("7 Oct: the 'Monday' line is nowhere in what Saley said",
           [t for t in live["answer"] + live["sure_replies"] if "Monday" in t or "post these" in t], [])
-    check("7 Oct: the answer came from todays_news (5 stories)", live["answer_has_stories"], True)
+    check("7 Oct: the answer is the collected news (5 stories), and says nothing about 2 PM or what was 'already' sent",
+          (live["answer_has_stories"], live["answer_names_a_time"]), (True, []))
     check("7 Oct+: 'yes' to R3's post schedules ONE reminder for Mon 12 Oct at 14:00",
           live["yes_reminders"], [("2026-10-12", "14:00", "open")])
     check("7 Oct+: ...and says exactly what it did", live["yes_reply"], [wording.events_remind_set("Mon 12 Oct at 2 PM")])

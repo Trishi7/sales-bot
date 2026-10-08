@@ -102,11 +102,15 @@ global_rules:
     the top 2 stories about people and companies on the sheet go first,
     each marked with its sheet row. It is never held back and never rolled
     to the next day, and it always takes one of the day's 5 posts.
-    Anything worth posting that didn't fit follows at once in "More AI
-    news today", which doesn't count toward the 5. Urgent news is checked
-    for every hour, weekends included, and posts only when something is
-    major; there is no 2 PM post at the weekend, and Monday's post covers
-    it.
+    Every news message has the same shape: a bold heading with the day,
+    then at most 5 stories, each a bold headline with a link to the outlet.
+    A major story that didn't fit follows at once in "More AI News" (major
+    stories only, at most 5), which doesn't count toward the 5. Asking for
+    the news in the channel gives the 5 best stories not sent before,
+    newest first; a story is repeated only when nothing new is left.
+    Urgent news is checked for every hour, weekends included, and posts
+    only when something is major; there is no 2 PM post at the weekend,
+    and Monday's post covers it.
   # Row "Weekends". SUNDAY_RULE_IDS=R4, one post at SALES_DRIP_START.
   weekends: >-
     Saturday is silent. Sunday carries one post at most — the Deliverables
@@ -156,10 +160,17 @@ rules:
   # NEWS_OFFTOPIC_BYPASS_IMPORTANCE (4) or more skips the per-topic and
   # per-week limits; PoC stories are never held by them.
   #
-  # NOTHING USEFUL IS LOST: what qualified and did not fit goes out right after
-  # as ONE message, "More AI news today", PoC first, at most
-  # NEWS_OVERFLOW_MAX_ITEMS (8) — outside the daily cap and not a breaking
-  # message. Hourly silent checks (NEWS_CHECK_TIMES) still post only what is
+  # ONE SHAPE FOR EVERY NEWS MESSAGE (8 Oct, news.render): a bold heading with
+  # the day, then at most 5 stories, each "- **Headline** ([Outlet](<url>))"
+  # with a blank line between them. A PoC story keeps its own line.
+  #
+  # THE FOLLOW-UP CARRIES ONLY WHAT IS MAJOR: a story at or above
+  # NEWS_OVERFLOW_MIN_IMPORTANCE (5) that did not fit goes out right after as
+  # ONE message, "More AI News", PoC first, at most NEWS_OVERFLOW_MAX_ITEMS (5)
+  # — outside the daily cap and not a breaking message. What scored lower and
+  # did not fit stays unsent, and is given to whoever asks for the news. An
+  # answer in the channel gives the 5 best stories not sent before, newest
+  # first, and repeats one only when nothing new is left. Hourly silent checks (NEWS_CHECK_TIMES) still post only what is
   # major (importance 5), and a story a weekend check held because the valve
   # was full is in Monday's post. The .env settings take precedence over this
   # row.
@@ -179,10 +190,15 @@ rules:
       post (Monday's covers the weekend). First the top 2 stories about
       people on Outreach PoCs or companies on Master Pipeline / Outreach
       PoCs, each marked with its sheet row, e.g. "(Synthflow AI — on
-      Master Pipeline)"; then the best of everything else. Stories worth
-      posting that didn't fit follow straight away in one "More AI news
-      today" message (up to 8), which doesn't count toward the 5 posts a
-      day. Never held back, never rolled to the next day. Checked again
+      Master Pipeline)"; then the best of everything else. Every news
+      message looks the same: a bold heading with the day, then at most 5
+      stories, each a bold headline with a link to the outlet. Major
+      stories that didn't fit follow straight away in one "More AI News"
+      message (major stories only, at most 5), which doesn't count toward
+      the 5 posts a day. Asked for the news in the channel, Saley gives the
+      5 best stories it hasn't sent before, newest first, and repeats a
+      story only when nothing new is left. Never held back, never rolled to
+      the next day. Checked again
       every hour, weekends included, and posted straight away only when
       something is major. No 2 PM post on Saturday or Sunday. Nobody on
       the departures list is looked up.

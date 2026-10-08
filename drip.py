@@ -1143,11 +1143,13 @@ def _fill(template: str, *, name: str = "", companies: list = (), days: int = 0,
 # that forgot it cannot produce a message without one. {day} is the send day,
 # {week} that week's Monday, {company} the first company on the message.
 #
-# A LABEL A PERSON WOULD WRITE: "AI news, Tue 29 Sep", not "AI news — Tue 29
+# A LABEL A PERSON WOULD WRITE: "AI News, Tue 29 Sep", not "AI News — Tue 29
 # Sep". No dash-separated fields, no "week of" stamp.
 HEADINGS = {
-    "R1": "AI news, {day}",
-    "R1_breaking": "Breaking AI news",
+    # THE NEWS HEADINGS READ THE SAME EVERYWHERE (news.HEADING_LABELS): the
+    # daily post, the follow-up, a breaking post and an answer in the channel.
+    "R1": "AI News, {day}",
+    "R1_breaking": "Breaking AI News, {day}",
     "R2": "Companies in the news",
     "R3": "AI events & summits",
     "R4": "This week's deliverables",
@@ -1180,7 +1182,7 @@ def _day_label(day: date) -> str:
 
 
 def heading(key: str, *, day: Optional[date] = None, company: str = "") -> str:
-    """`**AI news, Tue 29 Sep**` for a HEADINGS key. "" for an unknown key."""
+    """`**AI News, Tue 29 Sep**` for a HEADINGS key. "" for an unknown key."""
     pattern = HEADINGS.get(str(key or ""))
     if not pattern:
         return ""
@@ -2521,7 +2523,7 @@ def _self_test() -> int:
     check("...and count as three facts", fact_count(three), 3)
 
     print("\nthe headings")
-    check("AI news", heading("R1", day=date(2026, 9, 29)), "**AI news, Tue 29 Sep**")
+    check("AI News", heading("R1", day=date(2026, 9, 29)), "**AI News, Tue 29 Sep**")
     check("deliverables", heading("R4", day=date(2026, 9, 29)),
           "**This week's deliverables**")
     check("new company", heading("R11"), "**New in the pipeline**")

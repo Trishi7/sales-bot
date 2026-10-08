@@ -9,7 +9,7 @@
         rotation (15 a day, least recently checked first), and a poll that tags
         an item `poc` only when it names them
   (i)   a Monday with 3 PoC + 3 industry stories -> the post shows the top 2 PoC
-        + the best 3 of the rest, and the 6th is in "More AI news today";
+        + the best 3 of the rest, and the 6th is in "More AI News";
   (v)   ...identically on the live sweep, "make it <monday>" and "simulate
         <monday>"
   (ii)  an OTHER story at importance 4 gets in past a full topic cap
@@ -87,6 +87,10 @@ SETTINGS = {
     "NEWS_POC_LOOKBACK_DAYS": 7, "NEWS_PER_TOPIC_PER_DAY": 2, "NEWS_TOPICS_PER_WEEK": 6,
     "NEWS_BREAKING_MIN_IMPORTANCE": 5, "NEWS_BREAKING_MAX_PER_DAY": 2,
     "NEWS_OFFTOPIC_BYPASS_IMPORTANCE": 4, "NEWS_OVERFLOW_ENABLED": True,
+    # THE FOLLOW-UP'S MECHANICS ARE TESTED AT AN EXPLICIT BAR OF 3 here (what
+    # qualified and did not fit goes to it, PoC first, and is never lost).
+    # The SHIPPED bar is 5 and the shipped ceiling 5 since 8 Oct; those, and
+    # "an importance-4 story never goes in", are verify_news_format.py's.
     "NEWS_OVERFLOW_MIN_IMPORTANCE": 3, "NEWS_OVERFLOW_MAX_ITEMS": 8,
     "NEWS_REPEAT_DAYS": 30, "NEWS_FEED_KEEP_DAYS": 14, "NEWS_SCORE_MAX_ITEMS": 40,
     "NEWS_CHECK_TIMES": ["11:00", "12:00", "13:00", "15:00", "16:00", "17:00", "18:00"],
@@ -422,8 +426,15 @@ def show(posts: list) -> None:
 
 def bullets(body: str) -> list:
     """The stories in a post, by headline, in the order posted."""
-    return [line[2:].split(" — ")[0].strip() for line in str(body).splitlines()
-            if line.startswith("• ")]
+    # 8 OCT: one "- " bullet per story. An industry story is "- **Headline**
+    # ([Outlet](<url>))"; a PoC story keeps "- Headline — what. (ref) [site](<url>)".
+    out = []
+    for line in str(body).splitlines():
+        if not line.startswith("- "):
+            continue
+        bold = re.match(r"^- \*\*(.+?)\*\* \(\[", line)
+        out.append(bold.group(1) if bold else line[2:].split(" — ")[0].strip())
+    return out
 
 
 # -- (p) the PoC machinery -----------------------------------------------------
@@ -656,9 +667,9 @@ async def the_monday() -> None:
     for line in [x for x in live["logs"] if "main sweep" in x and " to " in x]:
         print("   log: " + line)
 
-    check("two messages: the news post, then \"More AI news today\"",
+    check("two messages: the news post, then \"More AI News, <day>\"",
           (len(live["posts"]), live["posts"][1].splitlines()[0] if len(live["posts"]) > 1
-           else ""), (2, news.OVERFLOW_HEADING))
+           else ""), (2, news.heading(news.MODE_OVERFLOW, MON)))
     main, over = (live["posts"] + ["", ""])[:2]
     check("the post: the top 2 PoC stories first, then the best 3 of the rest",
           bullets(main), [
@@ -667,7 +678,7 @@ async def the_monday() -> None:
               "OpenAI ships a new evals suite for agents",         # 4, the newer
               "Scale AI cuts a fifth of its RLHF contractors",     # 4
               "PolyAI opens a Bengaluru office"])                  # 3: PoC beats industry
-    check("the 6th is in \"More AI news today\"", bullets(over),
+    check("the 6th is in \"More AI News\"", bullets(over),
           ["ElevenLabs adds Hindi to its voice agent platform"])
     check("the filler is in neither", "Ten prompts" in main + over, False)
     check("each PoC story carries its sheet row, in brackets",
@@ -677,9 +688,10 @@ async def the_monday() -> None:
            if ref in main], ["(Synthflow AI — on Master Pipeline)",
                              "(Priya Nair, Deepgram — on Outreach PoCs)",
                              "(PolyAI — on Master Pipeline and Outreach PoCs)"])
-    check("an industry story has none",
-          "(" in next(l for l in main.splitlines() if "OpenAI ships" in l).split(" [")[0],
+    check("an industry story has none: a bold headline and its outlet, nothing else",
+          "(" in next(l for l in main.splitlines() if "OpenAI ships" in l).split(" ([")[0],
           False)
+    check("a blank line between the stories", main.count("\n\n- "), 5)
     check("the later ticks posted nothing more", [n for _t, n in live["ticks"]], [2, 0, 0])
 
     book = ledger(live["bot"].db.path)
@@ -770,7 +782,7 @@ async def the_offtopic() -> None:
           "A court rules model weights are not copyrightable" in bullets(main), True)
     check("the OTHER story at 3 is not — the cap held it",
           "A chip startup demos an analog inference board" in bullets(main), False)
-    check("...and it is not lost: it is in \"More AI news today\"", bullets(over),
+    check("...and it is not lost: it is in \"More AI News\"", bullets(over),
           ["A chip startup demos an analog inference board"])
     check("the on-topic story got in as usual",
           "A new evals leaderboard for coding agents" in bullets(main), True)
@@ -856,14 +868,14 @@ def the_wording() -> None:
     wording = rules_mod.sheet_wording_for("R1")
     check("row 1 says both kinds, the sheet row, the overflow and the window",
           [x for x in ("our own PoCs", "(Synthflow AI — on Master Pipeline)",
-                       "More AI news today", "Monday's covers the weekend",
+                       "More AI News", "Monday's covers the weekend",
                        "departures list") if x not in wording], [])
     check("bot_rules.yaml R1 plain", r1.plain,
           "today's AI news worth reading — the industry, and our own PoCs")
     strategy = persona.load_strategy()
     check("sales_strategy.md rule 1 says the same things",
           [x for x in ("our own PoCs", "(Synthflow AI — on Master Pipeline)",
-                       "More AI news today", "Friday 2 PM to Monday 2 PM",
+                       "More AI News", "Friday 2 PM to Monday 2 PM",
                        "departures list") if x not in strategy], [])
 
 
@@ -924,7 +936,7 @@ async def the_live_run() -> None:
         overflow_min=config.NEWS_OVERFLOW_MIN_IMPORTANCE,
         overflow_max=config.NEWS_OVERFLOW_MAX_ITEMS)
     print(f"   scored: {len(stories)} worth 3 or more -> {len(picked['keep'])} in the "
-          f"post, {len(picked['overflow'])} for \"More AI news today\"")
+          f"post, {len(picked['overflow'])} for \"More AI News\"")
     print("   what today's post would be:")
     for line in news.render(picked["keep"], mode=news.MODE_MAIN).splitlines():
         print("     | " + line[:230])

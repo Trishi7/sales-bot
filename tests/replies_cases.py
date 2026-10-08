@@ -1102,7 +1102,11 @@ async def i1_interim_wording_follows_what_actually_ran(check, test_mode):
 
 @case
 async def i2_news_question_answered_from_collected_news_gets_the_engine_line(check, test_mode):
-    """THE 7 OCT INTERIM: 'any AI news?' said 'checking the web' though todays_news answered it."""
+    """THE 7 OCT INTERIM: 'any AI news?' said 'checking the web' though todays_news answered it.
+
+    SINCE 8 OCT (docs/plans/NEWS-OCT8.md) a PLAIN news question is answered by code with no model call, so it is never
+    slow enough for an interim line at all; that is asserted first. The interim wording rule itself is still exercised
+    by a news question that names a company, which goes to the engine and todays_news as before."""
     import wording
     with World(test_mode, pins={"INTERIM_ENABLED": True, "INTERIM_AFTER_SECONDS": 0.6,
                                 "INTERIM_AFTER_WEB_SECONDS": 0.2}) as w:
@@ -1111,9 +1115,16 @@ async def i2_news_question_answered_from_collected_news_gets_the_engine_line(che
         async def web_pair(*a, **k):
             return [stub_tool_named("web_search"), stub_tool_named("fetch_page")], "", ""
         w.bot._websearch_tools = web_pair
-        w.model.script = [("use", [("todays_news", {})]), ("slow", 1.0, ("say", "Here's what's come in: 5 stories."))]
         await w.say("any AI news?", who="member", mention=True)
-        lines = [strip_tag(m.content) for m in w.posted]
+        plain = [strip_tag(m.content) for m in w.posted]
+        check("I2: the plain question gets no interim line of any kind (it is answered at once, by code)",
+              [l for l in plain if l in wording.INTERIM_WEB + wording.INTERIM_ENGINE], [])
+        check("I2: ...and no model call", w.model.calls, 0)
+        before = len(w.posted)
+        w.model.script = [("use", [("todays_news", {"topic": "Acme"})]),
+                          ("slow", 1.0, ("say", "Here's what's come in: 5 stories."))]
+        await w.say("any AI news about Acme?", who="member", mention=True)
+        lines = [strip_tag(m.content) for m in w.posted[before:]]
         interims = [l for l in lines if l in wording.INTERIM_WEB + wording.INTERIM_ENGINE]
         check("I2: an interim went out", len(interims), 1)
         check("I2: it is the ENGINE wording, not 'checking the web' (no web_search ran)",

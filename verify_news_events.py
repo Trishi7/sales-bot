@@ -201,9 +201,10 @@ async def scenario_main(bot, today):
 
     check("the item is no longer waiting on research", r1["web_pending"], False,
           live_optional=True)
-    bullets = [l for l in r1["text"].splitlines() if l.startswith("• ")]
+    # 8 OCT: "- **Headline** ([Outlet](<url>))", a blank line between stories.
+    bullets = [l for l in r1["text"].splitlines() if l.startswith("- ")]
     check("every story is a bullet with a masked link and no topic tag",
-          bool(bullets) and all("](<http" in l and not l.startswith("• [")
+          bool(bullets) and all("](<http" in l and not l.startswith("- [")
                                 for l in bullets),
           live_optional=True)
     check("three stories", len(bullets), 3, live_optional=True)

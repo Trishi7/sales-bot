@@ -3870,14 +3870,18 @@ class DB:
         main post or a breaking one.
 
         NOT THE OVERFLOW POST AND NOT PoC NEWS. The per-topic limit shapes the
-        main post; "More AI news today" is where the stories it kept out go, so
+        main post; "More AI News" is where the stories it kept out go, so
         counting them would have the limit feed itself — and news about our own
         people is exempt from the limit, so it does not use it up either.
+
+        NOT AN ANSWER EITHER (kind=answer). A story given to somebody who asked
+        is remembered so it is not sent twice, but one person asking about a
+        topic in the morning must not use up that topic's place in the post.
         """
         with self.conn() as c:
             row = c.execute(
                 "SELECT COUNT(*) AS n FROM news_stories WHERE posted_on = ? "
-                "AND lower(topic) = lower(?) AND kind <> 'overflow' "
+                "AND lower(topic) = lower(?) AND kind NOT IN ('overflow', 'answer') "
                 "AND news_kind <> 'poc'", (str(on_date), str(topic or "")),
             ).fetchone()
         return int(row["n"] or 0)
@@ -3894,7 +3898,8 @@ class DB:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT DISTINCT topic FROM news_stories WHERE posted_on BETWEEN ? AND ? "
-                "AND topic <> '' AND kind <> 'overflow' AND news_kind <> 'poc'",
+                "AND topic <> '' AND kind NOT IN ('overflow', 'answer') "
+                "AND news_kind <> 'poc'",
                 (monday.isoformat(), sunday.isoformat()),
             ).fetchall()
         return [str(r["topic"]) for r in rows]

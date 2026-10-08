@@ -200,11 +200,12 @@ themselves are added in code and posted exactly as rendered)
 
 **R1 — AI news**
 
-> • Wispr Flow raises a $56M Series B — to build voice dictation for teams. [techcrunch.com](<https://techcrunch.com/...>)
-> • ElevenLabs is hiring an evals lead — a new role in its research team. [elevenlabs.io](<https://elevenlabs.io/...>)
+> - **Wispr Flow raises a $56M Series B** ([techcrunch.com](<https://techcrunch.com/...>))
 >
-> (News is posted as its stories, one per bullet, with no closing line. News
-> never asks anyone to do anything.)
+> - **ElevenLabs is hiring an evals lead** ([elevenlabs.io](<https://elevenlabs.io/...>))
+>
+> (A bold headline and its outlet, one per bullet, at most 5, no closing
+> line. News never asks anyone to do anything.)
 
 **R2 — News-company screen**
 

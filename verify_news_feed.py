@@ -218,9 +218,14 @@ async def main():
     body = items[0]["text"]
     print("   the post:")
     print("   " + "\n   ".join(body.splitlines()))
-    lines = [l for l in body.splitlines() if l.startswith("• ")]
+    # 8 OCT: one "- " bullet per story, a blank line between them (news.render).
+    lines = [l for l in body.splitlines() if l.startswith("- ")]
     check("5 lines", len(lines), 5)
-    check("no topic tag", any(re.match(r"^• \[[^\]]+\] ", l) for l in lines), False)
+    check("no topic tag", any(re.match(r"^- \[[^\]]+\] ", l) for l in lines), False)
+    check("each a bold headline and its outlet, nothing else",
+          all(re.match(r"^- \*\*[^*]+\*\* \(\[[^\]]+\]\(<https://[^>]+>\)\)$", l)
+              for l in lines), True)
+    check("a blank line between the stories", body.count("\n\n- "), 4)
     check("each with a masked link", all("](<https://" in l for l in lines))
     rows = bot.db.news_stories_on(dl.iso(TUE))
     keys = [news.headline_key(r["headline"]) for r in rows]
@@ -292,11 +297,14 @@ async def main():
     out = await bot._maybe_breaking_news()
     new = channel.sent[before_msgs:]
     check("ONE message went out", len(new), 1)
-    check("...carrying both important stories", new[0].count("• ") if new else 0, 2)
+    check("...carrying both important stories", new[0].count("\n- ") if new else 0, 2)
     # SALES_TEST_MODE: a breaking post carries the test tag, like every test send.
-    check("...opening with '[TEST] **Breaking AI news**'",
+    # 8 OCT: the heading names the day, like every news heading.
+    check("...opening with '[TEST] **Breaking AI News, <day>**'",
           new[0].splitlines()[0] if new else "",
-          f"{config.SIMULATION_PREFIX} **Breaking AI news**")
+          f"{config.SIMULATION_PREFIX} {news.heading(news.MODE_BREAKING, TUE)}")
+    check("...then a blank line, then the list",
+          (new[0].splitlines()[1:3] if new else [])[:1], [""])
     check("the importance-3 story stayed quiet", "leaderboard" in (new[0] if new else ""),
           False)
     check("it is NOT in drip_sends", bot.db.drip_sent_today(dl.iso(TUE)), [])

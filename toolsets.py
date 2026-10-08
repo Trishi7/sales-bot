@@ -162,9 +162,9 @@ ONE_LINE = {
         "search results, each with the page that names them; never guesses a "
         "name, title or email."),
     "todays_news": (
-        "The AI news already collected — what was posted today and what else "
-        "is worth knowing, most important first — optionally for one company, "
-        "person or subject; call it FIRST for any news question."),
+        "The AI news already collected, for one company, person or subject "
+        "(`topic`) or the last few days (`days`): the stories are put in your "
+        "reply for you as a finished list; call it FIRST for any news question."),
     "web_search": (
         "Search the web and get back up to 8 titles and snippets with their "
         "urls — for anything about the outside world: news, funding, launches, "

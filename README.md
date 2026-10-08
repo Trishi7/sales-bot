@@ -30,20 +30,41 @@ champions"), searches the sales channels' history, reads the meeting notes, and
 triangulates across all of them — citing the tab and the company, and saying
 plainly when a cell is empty.
 
-**News questions read the collected news first.** "What's in today's AI news?",
-"any headlines?", "anything on ElevenLabs this week?" are routed to the `news`
-tool group (`toolsets.py`), whose first tool is `todays_news`: a read of the
-same feed store the 14:00 post is built from, through R1's own code — the same
-poll, the same window (since the previous main post; `days` for longer), the
-same not-yet-posted check and the same scorer. It returns what was already
-posted today, then what else is worth a 3 or more, at most 12 stories, and the
-answer is written like the daily post. It costs a SQLite read plus at most one
-`MODEL_LIGHT` scoring call, and only when something in the window is unscored —
-those scores are written back, so the 14:00 sweep does not pay for them again.
-`web_search` is the fallback: only when the store has nothing on a company or
-topic the asker named, or they ask for more or older news. Answers never
-mention searches, quotas, budgets or tools unless asked. `python
-verify_news_question.py` checks all of it offline.
+**News questions are answered from the collected news, by code.** "Any AI
+news?", "what's in the news", "top 5 headlines" are plain news questions
+(`news.plain_question`): no company, person or subject is named, so there is
+nothing to decide and **no model is called** (`_answer_plain_news`). The answer
+is the news list in the one template every news message uses (see
+[The news template](#the-news-template-one-shape-everywhere)), read from the
+same feed store the daily post is built from.
+
+*Which stories* (`_news_answer`, `news.choose_answer`): the 5 highest-scored
+stories **not sent in the channel before**, listed newest first. Fewer than 5
+unsent: those, with no padding. A story already sent is repeated only when not
+one unsent story is left, and then the 5 highest-scored are given again.
+Candidates are everything collected since the previous daily post or in the
+last 24 hours, whichever is longer, scored 3 or more; "sent before" is the
+`news_stories` table inside `NEWS_REPEAT_DAYS`. Every story an answer gives is
+recorded there with `kind=answer` once the reply has gone, so the next answer
+and the next daily post leave it out. (An answer's stories do not use up the
+daily post's per-topic allowance.)
+
+*What it never says:* when anything is posted. No "2 PM", no "scheduled", no
+"already posted", no "since …". The old answer handed the model a window and a
+posted-first list and got back "All of today's stories were already posted at
+2 PM. Here's what ran:".
+
+A question that names something ("anything on ElevenLabs this week?") goes to
+the engine and the `todays_news` tool with the **same rendered list**: the tool
+puts it in the reply and tells the model only that it is there (the
+`todays_objectives` pattern). When `todays_news` is the only thing the model
+looked at, the list is the whole answer and the model's text beside it is not
+sent. `web_search` is the fallback: only when the store has nothing on a
+company or topic the asker named, or they ask for more or older news. It costs
+a SQLite read plus at most one `MODEL_LIGHT` scoring call, and only when
+something unsent has never been rated — those scores are written back, so the
+daily sweep does not pay for them again. `python verify_news_question.py` and
+`python verify_news_format.py` check all of it offline.
 
 **Reads one canonical tab: "Outreach PoCs".** Everything the bot says on its own
 initiative comes from that tab of the GTM Playbook, found **by name**
@@ -3351,13 +3372,48 @@ importance 5 (the big one is never hidden), **an `OTHER` story at importance
 `NEWS_OFFTOPIC_BYPASS_IMPORTANCE` (4) or more** — the topic list is seeds, not
 limits — and every PoC story. Importance 5 still interrupts as breaking.
 
-#### Nothing useful is lost: "More AI news today"
+#### The news template: one shape everywhere
 
-Every story that qualified (importance ≥ `NEWS_OVERFLOW_MIN_IMPORTANCE`, not
-already posted) but did not fit — the post was full, or a spread limit kept it
+Every news message — the daily post, the follow-up, a breaking post, an answer
+in the channel, on a real day, in `SALES_TEST_MODE`, on a test day and in a
+simulation — is rendered by `news.render` and nowhere else:
+
+```
+**AI News, Thu 8 Oct**
+
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<url>))
+
+- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<url>))
+```
+
+- **Heading:** bold, with the day. `AI News` (daily post and answers), `More AI
+  News` (follow-up), `Breaking AI News`. The daily post keeps the line that
+  tags people, between the heading and the list.
+- **An industry story** is a bold headline and a short clickable outlet name,
+  nothing else: no "— what happened" line. The headline is the feed's, cleaned
+  (`news.clean_headline`): a trailing " - Outlet" or " | Outlet" and a trailing
+  full stop come off; it is never cut. The outlet (`news.outlet`) is a Google
+  News item's `source`, a direct feed item's site (`techcrunch.com`), else the
+  host without "www.".
+- **A PoC story keeps its own line, word for word** — `Headline — what.
+  (Company — on Master Pipeline) [site](<url>)` — and takes only the "- "
+  marker, so a post carrying both reads as one list.
+- **A blank line between stories.** At most **5 stories in any news message**
+  (`news.MAX_PER_MESSAGE`), each once: the same link, the same headline key or
+  the same cleaned headline from two outlets is one story.
+- **One Discord message.** It is split only past 2,000 characters (five long
+  tracking links can be), only between stories, and every later part repeats
+  the heading with "(continued)" (`news.split_message`). A daily post once
+  arrived as two messages, the second a bare list.
+
+#### The follow-up: "More AI News" carries only what is major
+
+A story that qualified (importance ≥ `NEWS_OVERFLOW_MIN_IMPORTANCE`, not
+already sent) but did not fit — the post was full, or a spread limit kept it
 out — goes out **right after the main post as one message**, PoC first, at most
-`NEWS_OVERFLOW_MAX_ITEMS` (8). Before, those stories went to a log line and a
-cache row and nowhere a person could see.
+`NEWS_OVERFLOW_MAX_ITEMS` (5). The bar is **5** (it was 3 until 8 Oct): only
+stories scored above 4. What scored 3 or 4 and did not fit is not lost — it is
+still unsent, so whoever next asks for the news is given it.
 
 It is **outside the daily cap** (no `drip_sends` row), **not part of the
 breaking valve** (no `news_checks` row), carries no @-mentions, and each story
@@ -5220,7 +5276,8 @@ python verify_reminders.py                # one-off reminders at an exact minute
 python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
 python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
 python verify_s1.py                       # cap 5 + R8/R9, R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
-python verify_s2.py                       # AI news: PoC slots, "More AI news today", OTHER bypass, the since-last-post window
+python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window
+python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5 emails + the one A:I write, R3 weekly + the reminder offer
 python verify_rule13.py                   # the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test

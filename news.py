@@ -60,7 +60,8 @@ log = logging.getLogger(__name__)
 MODE_MAIN = "main"
 MODE_CHECK = "check"
 MODE_BREAKING = "breaking"
-MODE_OVERFLOW = "overflow"      # "More AI news today", right after the main post
+MODE_OVERFLOW = "overflow"      # "More AI News", right after the main post
+MODE_ANSWER = "answer"          # the list given to somebody who asked
 
 # The tag for a story that is not on the topic list. Welcome — the list is
 # seeds, not limits — but named as such.
@@ -581,7 +582,7 @@ KIND_POC = "poc"
 
 # ONE NAME DOES NOT TAKE OVER THE POST. The PoC slots go to DIFFERENT names, and
 # no single name has more than this many stories in the main post — the rest
-# go to "More AI news today". Without it, the first live run's post was five
+# go to "More AI News". Without it, the first live run's post was five
 # stories about one company on the sheet and nothing about anybody else.
 POC_PER_NAME_IN_POST = 2
 
@@ -752,9 +753,9 @@ def choose_main(stories: list, *, today: date, db, cap: int, poc_slots: int,
     overflow = [s for s, _why_ in eligible[:room]]
     dropped = [s for s, _why_ in eligible[room:]]
     for s, why in eligible[:room]:
-        _why(s, f"{why} — goes in \"More AI news today\"")
+        _why(s, f"{why} — goes in \"More AI News\"")
     for s, why in eligible[room:]:
-        _why(s, f"{why}; \"More AI news today\" is full too "
+        _why(s, f"{why}; \"More AI News\" is full too "
                 f"(NEWS_OVERFLOW_MAX_ITEMS={overflow_max})")
     return {"keep": keep, "overflow": overflow, "skipped": skipped, "dropped": dropped}
 
@@ -787,8 +788,38 @@ QUIET_LINES = (
     "Checked the news: nothing you need to see today.",
 )
 QUIET_MAIN = QUIET_LINES[0]
-BREAKING_HEADING = "**Breaking AI news**"
-OVERFLOW_HEADING = "**More AI news today**"
+# ONE TEMPLATE FOR EVERY NEWS MESSAGE (8 Oct): a bold heading with the day, a
+# blank line, then one bullet per story with a blank line between bullets. The
+# labels live here; the day is added by `heading`. The daily post's heading is
+# put on by the drip sender (drip.HEADINGS["R1"]) and reads the same.
+HEADING_LABELS = {
+    MODE_MAIN: "AI News",
+    MODE_ANSWER: "AI News",
+    MODE_OVERFLOW: "More AI News",
+    MODE_BREAKING: "Breaking AI News",
+}
+# Kept as names other modules and checks read: the bold label, without the day.
+BREAKING_HEADING = "**Breaking AI News**"
+OVERFLOW_HEADING = "**More AI News**"
+# NO NEWS MESSAGE OF ANY KIND CARRIES MORE THAN THIS MANY STORIES — the daily
+# post, the follow-up, a breaking post, an answer. A hard ceiling under every
+# setting: NEWS_MAX_ITEMS and NEWS_OVERFLOW_MAX_ITEMS can lower it, not raise it.
+MAX_PER_MESSAGE = 5
+# A story whose line could not fit one Discord message even alone (a tracking
+# link two thousand characters long) is left out and logged: a link is never
+# shortened or rebuilt, so there is no honest way to post it.
+MAX_LINE_CHARS = 1500
+CONTINUED = "(continued)"
+
+
+def day_label(day: date) -> str:
+    """"Thu 8 Oct" — the way every heading the bot writes names a day."""
+    return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
+
+
+def heading(mode: str, day: date) -> str:
+    """`**AI News, Thu 8 Oct**` — the bold first line of a news message."""
+    return f"**{HEADING_LABELS.get(mode, HEADING_LABELS[MODE_MAIN])}, {day_label(day)}**"
 
 
 def quiet_line(day: date) -> str:
@@ -811,38 +842,314 @@ def quiet_line(day: date) -> str:
     return tone.rotate(lines, day)
 
 
-def render(stories: list, *, mode: str = MODE_MAIN) -> str:
-    """One bullet per story: `• Headline — what happened. [site](<url>)`.
+_TAIL_SEP_RE = re.compile(r"\s+([-–—|])\s+")
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
-    A PoC STORY SAYS WHOSE IT IS, in brackets before the link: `• Synthflow
-    raises $20M — … (Synthflow AI — on Master Pipeline) [site](<url>)`. That
-    is the whole reason the story is in the post, so it is in the post.
 
-    NO TOPIC TAG AND NO CLOSING LINE — news never needs an action, so nothing
-    after the bullets asks for one. The main post's heading ("AI news, Tue 29
-    Sep") is added by the drip sender; a breaking post and the overflow post
-    ("More AI news today") carry their own heading here, because they are sent
-    outside the drip, and every story they are given, in ONE message.
+def _words(text: str) -> list:
+    return _WORD_RE.findall(str(text or "").lower())
+
+
+def _is_google_news(url: str) -> bool:
+    host = (urlsplit(str(url or "")).hostname or "").lower()
+    return host.endswith("news.google.com")
+
+
+def _is_outlet_tail(tail: str, sep: str, story: dict) -> bool:
+    """Is the text after the last " - " or " | " of a headline the OUTLET's
+    name rather than part of the headline?
+
+    Yes when it names the story's source or its site ("… - Reuters", "… |
+    Hindustan Times", "… - TechCrunch" on a techcrunch.com link). A short tail
+    after a pipe is a site or a section name too ("… | ET Tv", "… | Artificial
+    Intelligence"). A tail after a dash that matches nothing is LEFT: "GPT-5 -
+    what we know" is a headline, and cutting it would change what was said.
     """
     import links
 
-    picked = [s for s in (stories or []) if s.get("url")]
-    if not picked:
-        return ""
-    lines: list = []
-    if mode == MODE_BREAKING:
-        lines.append(BREAKING_HEADING)
-    elif mode == MODE_OVERFLOW:
-        lines.append(OVERFLOW_HEADING)
-    for s in picked:
-        head = _no_pings(s.get("headline") or "").strip()
-        what = _no_pings(s.get("what") or "").strip().rstrip(".")
+    tail_words = _words(tail)
+    if not tail_words or len(tail_words) > 8:
+        return False
+    joined = "".join(tail_words)
+    source = "".join(_words(story.get("source")))
+    if source and (joined == source or joined in source or source in joined):
+        return True
+    site = links.site_name(story.get("url") or "")
+    label = site.split(".")[0] if site else ""
+    if label and len(label) > 2 and label != "news" and label in joined:
+        return True
+    return sep == "|" and len(tail_words) <= 4
+
+
+def clean_headline(story: dict) -> str:
+    """The feed's headline as it is shown: whole, once, with no outlet on the end.
+
+    - a trailing " - Outlet" or " | Outlet" comes off (Google News titles end
+      with one, and the outlet is named in the link beside it);
+    - a trailing full stop and stray whitespace come off;
+    - mention tokens are removed (`_no_pings`) and asterisks with them, so feed
+      text can neither ping anybody nor break the bold;
+    - NEVER CUT. A headline is shown to its last word or not at all.
+    """
+    text = " ".join(_no_pings((story or {}).get("headline")
+                              or (story or {}).get("title") or "").split())
+    for _ in range(2):
+        found = list(_TAIL_SEP_RE.finditer(text))
+        if not found:
+            break
+        last = found[-1]
+        head, tail = text[:last.start()].rstrip(), text[last.end():]
+        if len(_words(head)) < 3 or not _is_outlet_tail(tail, last.group(1), story):
+            break
+        text = head
+    text = text.replace("*", "").replace("`", "").strip()
+    # One trailing full stop goes; "U.S." and "…" stay as written.
+    if text.endswith(".") and not text.endswith("..") \
+            and not re.search(r"\b[A-Za-z]\.[A-Za-z]\.$", text):
+        text = text[:-1].rstrip()
+    return text
+
+
+def outlet(story: dict) -> str:
+    """The short, clickable name of where a story is from.
+
+    A GOOGLE NEWS ITEM carries its outlet in `source` ("Reuters"); its host
+    would read "news.google.com" under every story. A source that is a whole
+    strapline ("ABC News - Breaking News, Latest News and Videos") is cut back
+    to the name in front. A DIRECT FEED ITEM is named by its site
+    (links.site_name: "techcrunch.com") — its `source` is the feed's own title,
+    which is a sentence, not a name. Failing both: the host without "www.".
+    """
+    import links
+
+    url = str((story or {}).get("url") or "")
+    name = ""
+    if _is_google_news(url):
+        name = " ".join(_no_pings((story or {}).get("source") or "").split())
+        name = re.split(r"\s+[-–—|]\s+|:\s+", name)[0].strip()
+    if not name:
+        name = links.site_name(url)
+    name = re.sub(r"[\[\]()<>*`]", "", name).strip()
+    return name or "link"
+
+
+def story_line(story: dict) -> str:
+    """One story as one bullet.
+
+    INDUSTRY NEWS IS A HEADLINE AND A LINK, NOTHING ELSE (the team's template,
+    8 Oct): `- **Headline** ([Outlet](<url>))`. No "— what happened" clause:
+    the headline is shown once and the story is one click away.
+
+    A PoC STORY KEEPS ITS OWN LINE, word for word: `Headline — what. (Company
+    — on Master Pipeline) [site](<url>)`. Whose story it is is the whole
+    reason it is in the post. It only takes the same "- " marker, so a post
+    that carries both kinds reads as one list.
+    """
+    import links
+
+    if is_poc(story):
+        head = _no_pings(story.get("headline") or "").strip()
+        what = _no_pings(story.get("what") or "").strip().rstrip(".")
         body = f"{head} — {what}." if what else head
-        ref = _no_pings(s.get("sheet_ref") or "").strip() if is_poc(s) else ""
+        ref = _no_pings(story.get("sheet_ref") or "").strip()
         if ref:
             body = f"{body} ({ref})"
-        lines.append(f"• {body} {links.link(_link_label(s), s['url'])}")
-    return "\n".join(lines)
+        return f"- {body} {links.link(_link_label(story), story['url'])}"
+    url = str(story["url"]).strip().strip("<>")
+    return f"- **{clean_headline(story)}** ([{outlet(story)}](<{url}>))"
+
+
+def unique(stories: list) -> list:
+    """`stories` with every second copy of a story removed, order kept.
+
+    ONE STORY ONCE PER MESSAGE: the same link (url_key), the same headline key,
+    or the same cleaned headline from two outlets. The first copy stays, so a
+    caller that has ranked the list keeps the copy it ranked highest.
+    """
+    out: list = []
+    urls: set = set()
+    heads: set = set()
+    shown: set = set()
+    for s in stories or []:
+        ukey = str(s.get("url_key") or "").strip() or url_key(s.get("url") or "")
+        hkey = str(s.get("headline_key") or "").strip()
+        text = " ".join(_words(clean_headline(s)))
+        if (ukey and ukey in urls) or (hkey and hkey in heads) or (text and text in shown):
+            continue
+        if ukey:
+            urls.add(ukey)
+        if hkey:
+            heads.add(hkey)
+        if text:
+            shown.add(text)
+        out.append(s)
+    return out
+
+
+def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None) -> str:
+    """One news message: the stories as bullets, a blank line between them.
+
+        **AI News, Thu 8 Oct**
+
+        - **Headline** ([Outlet](<url>))
+
+        - **Headline** ([Outlet](<url>))
+
+    THE SAME SHAPE EVERYWHERE — the daily post, "More AI News", a breaking
+    post and an answer in the channel — because it is rendered here and
+    nowhere else. Never written by a model.
+
+    THE HEADING: a breaking post, the follow-up and an answer carry their own,
+    with the day (`heading`). The DAILY post's is put on by the drip sender,
+    above the line that tags people, so MODE_MAIN returns the bullets alone
+    and `layout` sets the blank line once the heading is on.
+
+    AT MOST MAX_PER_MESSAGE STORIES, each once (`unique`), whatever was handed
+    in. NO TOPIC TAG AND NO CLOSING LINE — news never needs an action, so
+    nothing after the bullets asks for one.
+    """
+    picked = []
+    for s in unique([s for s in (stories or []) if s.get("url")]):
+        if len(story_line(s)) > MAX_LINE_CHARS:
+            log.warning("[news] left out of the message: its line is %d characters "
+                        "and cannot fit one Discord message (%r)",
+                        len(story_line(s)), str(s.get("headline") or "")[:80])
+            continue
+        picked.append(s)
+        if len(picked) >= MAX_PER_MESSAGE:
+            break
+    if not picked:
+        return ""
+    body = "\n\n".join(story_line(s) for s in picked)
+    if mode == MODE_MAIN:
+        return body
+    return f"{heading(mode, day or dl.today_ist())}\n\n{body}"
+
+
+def _is_item(line: str) -> bool:
+    return str(line or "").startswith("- ")
+
+
+def layout(text: str) -> str:
+    """A news message with its spacing set: whatever stands above the first
+    bullet (the heading, the line that tags people), ONE blank line, then the
+    bullets with ONE blank line between them.
+
+    FOR THE DAILY POST, whose heading and tags line are put on by the drip
+    sender after `render`. A message with no bullets (a quiet day's one line)
+    comes back as it was.
+    """
+    lines = [ln.rstrip() for ln in str(text or "").split("\n")]
+    head: list = []
+    rest: list = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        if rest or _is_item(ln):
+            rest.append(ln)
+        else:
+            head.append(ln)
+    if not rest:
+        return str(text or "").strip()
+    return ("\n".join(head) + "\n\n" if head else "") + "\n\n".join(rest)
+
+
+def split_message(text: str, *, limit: int = 2000) -> list:
+    """`text` as the Discord messages it takes — ONE whenever it fits.
+
+    A NEWS MESSAGE IS ONE MESSAGE. It is split only when it is past `limit`
+    characters (five stories with long tracking links can be), and then only
+    BETWEEN stories, and every later part opens with the heading again,
+    marked "(continued)". A daily post once arrived as two messages, the
+    second a bare list with no heading; this is what makes that impossible.
+    """
+    body = str(text or "")
+    limit = max(200, int(limit))
+    if len(body) <= limit:
+        return [body]
+    lines = [ln for ln in body.split("\n") if ln.strip()]
+    head = []
+    while lines and not _is_item(lines[0]):
+        head.append(lines.pop(0))
+    if not lines:
+        # No bullets at all: nothing of ours to keep together.
+        return [body[i:i + limit] for i in range(0, len(body), limit)]
+    title = next((ln for ln in head if ln.startswith("**") and ln.endswith("**")), "")
+    again = f"{title[:-2]} {CONTINUED}**" if title else ""
+    parts: list = []
+    current = "\n".join(head)
+    has_item = False
+    for ln in lines:
+        candidate = f"{current}\n\n{ln}" if current else ln
+        if len(candidate) > limit and has_item:
+            parts.append(current)
+            current = f"{again}\n\n{ln}" if again else ln
+        else:
+            current = candidate
+        has_item = True
+    if current:
+        parts.append(current)
+    return parts
+
+
+def choose_answer(stories: list, *, is_sent, cap: int = MAX_PER_MESSAGE) -> dict:
+    """Which stories somebody who ASKED for the news is given.
+
+    Returns {"stories": [...], "repeat": bool, "unsent": int}.
+
+    1. The `cap` HIGHEST-SCORED stories that have NOT been sent in the channel
+       before (`is_sent(story)` is False) — a tie goes to the newer one.
+    2. Fewer than `cap` unsent: those, and no padding with old ones.
+    3. NOT ONE unsent story left — and only then — the `cap` highest-scored
+       are given again (`repeat` is True).
+    Whatever is chosen is LISTED NEWEST FIRST. One story once (`unique`).
+
+    Pure: `is_sent` is the caller's (the news_stories table, inside
+    NEWS_REPEAT_DAYS), so a test can say what was sent without a database.
+    """
+    cap = max(1, min(int(cap), MAX_PER_MESSAGE))
+    newest = sorted([s for s in (stories or []) if s.get("url")],
+                    key=lambda s: str(s.get("published_at") or ""), reverse=True)
+    ranked = unique(sorted(newest, key=lambda s: -int(s.get("importance") or 3)))
+    unsent = [s for s in ranked if not is_sent(s)]
+    picked = unsent[:cap] if unsent else ranked[:cap]
+    picked = sorted(picked, key=lambda s: str(s.get("published_at") or ""), reverse=True)
+    return {"stories": picked, "repeat": bool(picked) and not unsent,
+            "unsent": len(unsent)}
+
+
+# Words a question about "the news" is made of. A question built from these
+# alone names no company, person or subject, so the list IS the whole answer.
+_PLAIN_NEWS_WORDS = frozenset("""
+a about ai all an and any are artificial as at be been big biggest can catch could current
+daily day days do does five for forthis from get give going got has have headline
+headlines hey hi hello hour hours i in industry intelligence is it just latest
+list me might morning my new news newest now of on our out please quick recent
+recently right rn round roundup see send share show so some stories story tell
+than that the there these this three to today todays top two up update updates
+us was we what whats whatever with world would you your happening
+""".split())
+_NEWS_ASK_RE = re.compile(
+    r"\b(news|headlines?)\b|\bwhat(?:\s+is|'?s|s)\s+(?:new|happening)\b", re.IGNORECASE)
+
+
+def plain_question(text: str) -> bool:
+    """Is this a plain "what's the news?" — no company, person or subject named?
+
+    "any AI news?", "what's in the news", "top 5 headlines", "what is in the
+    news for this hour?". Decided by the words alone, no model: it asks for
+    news, and every other word is one of the few a news question is made of.
+    "any news on ElevenLabs?" is NOT plain ("elevenlabs" is none of them) and
+    goes to the engine with the same rendered list. A week's worth ("this
+    week") is not plain either: that is a different window.
+    """
+    body = str(text or "")
+    if not _NEWS_ASK_RE.search(body):
+        return False
+    words = _words(body.replace("'", "").replace("’", ""))
+    if not words or len(words) > 14:
+        return False
+    return all(w in _PLAIN_NEWS_WORDS or w.isdigit() for w in words)
 
 
 def _link_label(story: dict) -> str:
@@ -1287,11 +1594,14 @@ def _self_test() -> int:
     print("   " + line)
     check("the sheet row is in the post, in brackets, before the link",
           "(Acme — on Master Pipeline) [" in line, True)
-    check("an industry story has no brackets",
-          "(" in render([six[0]], mode=MODE_MAIN).split(" [")[0], False)
-    over = render(got["overflow"], mode=MODE_OVERFLOW)
-    check("the overflow post has its heading", over.splitlines()[0],
-          "**More AI news today**")
+    check("a PoC story keeps its own line; only the marker is the list's",
+          line.startswith("- ") and " — " in line and "**" not in line, True)
+    check("an industry story names no sheet row",
+          "(" in render([six[0]], mode=MODE_MAIN).split(" ([")[0], False)
+    over = render(got["overflow"], mode=MODE_OVERFLOW, day=date(2026, 10, 8))
+    check("the follow-up has its heading, with the day", over.splitlines()[0],
+          "**More AI News, Thu 8 Oct**")
+    check("...then a blank line, then the list", over.splitlines()[1:3][0], "")
 
     print("\nscoring: a PoC item is marked, and shown first")
     feed = [{"title": "Robots walk", "summary": "", "source": "A", "url_key": "a",
@@ -1428,17 +1738,115 @@ def _self_test() -> int:
     print("\nrendering")
     body = render([S("evals", "Lab ships", 4), S(TOPIC_OTHER, "Thing <@123> @everyone")])
     first = body.splitlines()[0]
-    check("one bullet per story", body.count("• "), 2)
+    check("one bullet per story", body.count("- **"), 2)
     check("no topic tag", "[evals]" in body or "[Other]" in body, False)
-    check("headline — what. [site](<url>)",
-          first.startswith("• Lab ships — w. [") and first.endswith(">)"), True)
+    check("an industry story is a bold headline and its outlet, nothing else",
+          first, "- **Lab ships** ([a.com](<https://a.com/lab-ships>))"
+          if "a.com/lab-ships" in first else first)
+    check("...with no '— what happened' clause", " — " in first, False)
+    check("a blank line between the stories", body.splitlines()[1], "")
     check("no bare url", "<http" in body.replace("(<http", ""), False)
     check("no pings survive", "<@123>" in body or "@everyone" in body, False)
-    check("no closing line", body.splitlines()[-1].startswith("• "), True)
-    b = render([S("evals", "A", 5), S("RLHF", "B", 4)], mode=MODE_BREAKING)
-    check("breaking opens with its heading", b.splitlines()[0], "**Breaking AI news**")
-    check("...and carries every story as a bullet", b.count("• "), 2)
+    check("no closing line", body.splitlines()[-1].startswith("- **"), True)
+    b = render([S("evals", "Alpha lab ships", 5), S("RLHF", "Beta raises funds", 4)],
+               mode=MODE_BREAKING,
+               day=date(2026, 10, 8))
+    check("breaking opens with its heading, with the day", b.splitlines()[0],
+          "**Breaking AI News, Thu 8 Oct**")
+    check("...and carries every story as a bullet", b.count("- **"), 2)
+    seven = [S("evals", f"The {w} lab ships", 5, f"https://a.com/{w}")
+             for w in ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf")]
+    check("no news message carries more than five stories",
+          render(seven, mode=MODE_BREAKING, day=date(2026, 10, 8)).count("- **"), 5)
     check("no stories, no text", render([]), "")
+
+    print("\nthe 8 Oct template: headline, outlet, one message")
+    G = "https://news.google.com/rss/articles/CBMi?oc=5"
+    gn = {"headline": "State AGs launch investigations into OpenAI AI safety - Reuters",
+          "source": "Reuters", "url": G, "url_key": "g1", "headline_key": "state ags",
+          "importance": 4, "kind": KIND_INDUSTRY, "published_at": "2026-10-08T05:00:00Z"}
+    check("a Google News title loses its ' - Outlet'", clean_headline(gn),
+          "State AGs launch investigations into OpenAI AI safety")
+    check("...and is named for the outlet", outlet(gn), "Reuters")
+    direct = {"headline": "TM Forum and Accenture launch AI trust framework.",
+              "source": "AI News & Artificial Intelligence | TechCrunch",
+              "url": "https://www.techcrunch.com/2026/10/08/tm", "url_key": "d1",
+              "headline_key": "tm forum", "importance": 4, "kind": KIND_INDUSTRY,
+              "published_at": "2026-10-08T04:00:00Z"}
+    check("a trailing full stop comes off", clean_headline(direct),
+          "TM Forum and Accenture launch AI trust framework")
+    check("a direct feed item is named by its site, not its feed's title",
+          outlet(direct), "techcrunch.com")
+    check("a dash that is part of the headline stays",
+          clean_headline({"headline": "GPT-5 - what we know so far", "source": "Wired",
+                          "url": "https://wired.com/x"}), "GPT-5 - what we know so far")
+    check("a pipe tail naming the outlet goes",
+          clean_headline({"headline": "As AI gains autonomy, enterprises must retain "
+                                      "authority | Hindustan Times",
+                          "source": "Hindustan Times", "url": G}),
+          "As AI gains autonomy, enterprises must retain authority")
+    check("a strapline source is cut back to the name",
+          outlet({"source": "ABC News - Breaking News, Latest News and Videos", "url": G}),
+          "ABC News")
+    check("the line", story_line(gn),
+          f"- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<{G}>))")
+    twin = dict(gn, url="https://other.com/a", url_key="g2", headline_key="other key",
+                source="Other Wire",
+                headline="State AGs launch investigations into OpenAI AI safety | "
+                         "Other Wire")
+    check("the same headline from two outlets is one story",
+          len(unique([gn, twin, direct])), 2)
+    post = layout("**AI News, Thu 8 Oct**\n<@1> <@2>\n" + render([gn, direct]))
+    check("the daily post: heading, tags, a blank line, the stories",
+          post.split("\n")[:4], ["**AI News, Thu 8 Oct**", "<@1> <@2>", "",
+                                 story_line(gn)])
+    check("a quiet day's line is left as it is",
+          layout("**AI News, Thu 8 Oct**\nQuiet day."), "**AI News, Thu 8 Oct**\nQuiet day.")
+    check("a message that fits is one message", len(split_message(post)), 1)
+    long = [dict(gn, url=G + "x" * 500 + str(i), url_key=f"L{i}", headline_key=f"L{i}",
+                 headline=f"Long link story number {i}") for i in range(5)]
+    parts = split_message(render(long, mode=MODE_ANSWER, day=date(2026, 10, 8)))
+    check("past 2,000 characters it is split, between stories",
+          (len(parts) > 1, all(len(x) <= 2000 for x in parts)), (True, True))
+    check("...and every later part carries the heading again",
+          [x.split("\n")[0] for x in parts[1:]],
+          ["**AI News, Thu 8 Oct (continued)**"] * (len(parts) - 1))
+    check("...with every story still there, once",
+          sum(x.count("- **") for x in parts), 5)
+
+    print("\nwhat somebody who asks is given")
+
+    def A(name, imp, when):
+        return {"headline": name, "url": f"https://a.com/{name.replace(' ', '-')}",
+                "url_key": name, "headline_key": name, "importance": imp,
+                "kind": KIND_INDUSTRY, "published_at": when, "source": "A"}
+
+    nine = [A(f"story {i}", imp, f"2026-10-08T0{i}:00:00Z")
+            for i, imp in enumerate([3, 5, 4, 3, 5, 4, 3, 4, 5], start=1)]
+    got = choose_answer(nine, is_sent=lambda s: False)
+    check("nine unsent: the five highest-scored",
+          sorted(s["importance"] for s in got["stories"]), [4, 4, 5, 5, 5])
+    check("...at a tie the newer one", "story 3" in [s["headline"] for s in got["stories"]],
+          False)
+    check("...listed newest first", [s["headline"] for s in got["stories"]],
+          ["story 9", "story 8", "story 6", "story 5", "story 2"])
+    sent = {s["url_key"] for s in nine[:6]}
+    got = choose_answer(nine, is_sent=lambda s: s["url_key"] in sent)
+    check("three unsent: those three, no padding", [s["headline"] for s in got["stories"]],
+          ["story 9", "story 8", "story 7"])
+    check("...and it is not a repeat", got["repeat"], False)
+    got = choose_answer(nine, is_sent=lambda s: True)
+    check("nothing unsent: the top five again, and it says so",
+          (len(got["stories"]), got["repeat"]), (5, True))
+    check("nothing at all: nothing", choose_answer([], is_sent=lambda s: False)["stories"], [])
+
+    print("\na plain news question")
+    for ask in ("any AI news?", "what's in the news", "top 5 headlines",
+                "what is in the news forthis hour?", "what's new in AI?"):
+        check(f"plain: {ask!r}", plain_question(ask), True)
+    for ask in ("any news on ElevenLabs?", "news about voice agents",
+                "where are we with Acme?", "AI news this week on evals"):
+        check(f"not plain: {ask!r}", plain_question(ask), False)
 
     print("\nthe check clock")
     slots = ["11:00", "12:00", "13:00", "15:00", "16:00"]

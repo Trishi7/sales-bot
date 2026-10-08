@@ -948,3 +948,38 @@ To switch the guard off without a deploy: `ANSWER_GUARD_ENABLED=false`, restart.
 
 `python verify_answer_voice.py`, `python -m replyguard` and `python -m wording`
 check it offline.
+
+## Upgrading to NEWS-OCT8 (one news template; the news answer; the follow-up's bar)
+
+What changes for the team: every news message is a bold heading with the day and at most 5 bold headlines, each with
+a link to its outlet and a blank line between them; "More AI News" carries only major stories; asking for the news
+gives the 5 best stories not sent before and says nothing about when anything is posted. Plan:
+`docs/plans/NEWS-OCT8.md`. Wording for the sheet: `docs/rules-for-the-sheet-oct8.md`.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Two defaults changed. A `.env` that sets either
+line keeps its own value, so set them where they are set:
+
+```
+NEWS_OVERFLOW_MIN_IMPORTANCE=5
+NEWS_OVERFLOW_MAX_ITEMS=5
+```
+
+`NEWS_OVERFLOW_ENABLED` decides whether the follow-up is posted at all (`true` is the default). Then, on the laptop,
+`python tools/redact_env.py`. No database migration: answers are recorded in the existing `news_stories` table with
+`kind=answer`.
+
+**Check in the test channel, then the live channel**
+
+1. `@Saley any AI news?` → ONE message: `**AI News, <day>**`, a blank line, at most 5 bullets, each a bold headline
+   followed by the outlet as a link, a blank line between bullets. Nothing about 2 PM, a schedule, "already posted" or
+   "since". Every link opens the story.
+2. Ask the same again → none of the first answer's stories. Keep asking until it runs out: only then does it repeat,
+   and it gives its 5 best again.
+3. `@Saley any news on <a company on the sheet>?` → the same list shape, filtered to that company; a PoC story keeps
+   its fuller line with "(Company — on Master Pipeline)".
+4. The next 2 PM post: one message, the heading, the line that tags people, a blank line, the stories; the top PoC
+   stories first; none of the stories an answer gave earlier that day.
+5. If a "More AI News, <day>" message follows: at most 5 stories, all major. On most days there is none.
+6. A breaking post, when one comes: `**Breaking AI News, <day>**`, the same list shape, at most 5.
+7. In the log: `[query] … → the news list (a plain news question, answered without the model)` and
+   `[news] question: … giving N`.

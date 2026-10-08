@@ -1951,15 +1951,20 @@ NEWS_POC_SLOTS = _int("NEWS_POC_SLOTS", 2)
 # as breaking: NEWS_BREAKING_MIN_IMPORTANCE.)
 NEWS_OFFTOPIC_BYPASS_IMPORTANCE = _int("NEWS_OFFTOPIC_BYPASS_IMPORTANCE", 4)
 
-# NOTHING USEFUL IS LOST. Every story that qualified — at or above
-# NEWS_OVERFLOW_MIN_IMPORTANCE and not already posted — but did not fit the
-# main post goes out right after it as ONE message, "More AI news today", PoC
-# first, at most NEWS_OVERFLOW_MAX_ITEMS. It is outside the daily cap and is
-# not a breaking message (the valve does not count it); each story is recorded
-# in news_stories with kind=overflow so it never repeats.
+# THE FOLLOW-UP CARRIES ONLY WHAT IS MAJOR (8 Oct). A story that qualified —
+# at or above NEWS_OVERFLOW_MIN_IMPORTANCE and not already sent — but did not
+# fit the main post goes out right after it as ONE message, "More AI News",
+# PoC first, at most NEWS_OVERFLOW_MAX_ITEMS. The bar is 5 ("scored above 4"):
+# it used to be 3, and the follow-up was a second, longer post of middling
+# stories every day. What scores 3 or 4 and did not fit is not lost — it is
+# still unsent, so anybody who asks for the news is given it. No news message
+# of any kind carries more than 5 stories (news.MAX_PER_MESSAGE), whatever
+# this is set to. Outside the daily cap, not a breaking message (the valve
+# does not count it); each story is recorded in news_stories with
+# kind=overflow so it never repeats.
 NEWS_OVERFLOW_ENABLED = _bool("NEWS_OVERFLOW_ENABLED", default=True)
-NEWS_OVERFLOW_MIN_IMPORTANCE = _int("NEWS_OVERFLOW_MIN_IMPORTANCE", 3)
-NEWS_OVERFLOW_MAX_ITEMS = _int("NEWS_OVERFLOW_MAX_ITEMS", 8)
+NEWS_OVERFLOW_MIN_IMPORTANCE = _int("NEWS_OVERFLOW_MIN_IMPORTANCE", 5)
+NEWS_OVERFLOW_MAX_ITEMS = _int("NEWS_OVERFLOW_MAX_ITEMS", 5)
 
 # How many INDUSTRY stories on one topic may go in the main post in one day, and
 # how many distinct topics in one ISO week. Both are bypassed by a story at or

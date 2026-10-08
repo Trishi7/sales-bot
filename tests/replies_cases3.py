@@ -274,7 +274,11 @@ async def x10_a_reply_to_which_that_picks_none(check, test_mode):
 async def n1_news_content_comes_back_at_any_time_of_day(check, test_mode):
     """THE TICKET: 'a direct request for news returns the content, at any time of day.' The real clock is moved to
     11:23 (before the 14:00 post) and to 18:00 (after it) on the same day; there is no time-of-day gate on the path,
-    so what comes back is simply what had been collected by then."""
+    so what comes back is simply what had been collected by then.
+
+    SINCE 8 OCT (docs/plans/NEWS-OCT8.md) the list is chosen and written by code and a plain news question makes no
+    model call, so the stories are read off the REPLY (the bold headlines), not off a tool result the model was given."""
+    import re
     import deadlines as dl
     from datetime import datetime
     D = date(2026, 10, 7)
@@ -292,12 +296,14 @@ async def n1_news_content_comes_back_at_any_time_of_day(check, test_mode):
             w._undo.append(lambda: (setattr(dl, "real_now_ist", real_now), setattr(dl, "real_today_ist", real_today)))
             rw.enable_web(w)
             rw.seed_news(w, heads, times=times)
-            w.model.script = [("use", [("todays_news", {})]), ("say", "Here is what has come in.")]
+            w.bot.__dict__.pop("_news_tools", None)          # the real todays_news path, not the world's stand-in
             m = Mark(w)
             await w.say("top 5 AI headlines", who="member", mention=True)
-            items = [i.get("title") for n, res in w.model.results if n == "todays_news" for i in (res.get("items") or [])]
+            reply = rw.strip_tag(w.posted[-1].content) if w.posted else ""
+            items = re.findall(r"^- [*][*](.+?)[*][*] [(]", reply, re.M)
             got[label] = items
-            check(f"N1 {label}: todays_news returned the collected stories", len(items), want_n)
+            check(f"N1 {label}: the answer lists the collected stories", len(items), want_n)
+            check(f"N1 {label}: with no model call", w.model.calls, 0)
             check(f"N1 {label}: and it was answered, no reaction", (len(m.said) >= 1, m.reacted), (True, []))
     check("N1: the 18:00 answer holds everything the 11:23 one did, and more", set(got["11:23"]) < set(got["18:00"]), True)
     return {"counts": {k: len(v) for k, v in got.items()}}

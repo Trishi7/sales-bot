@@ -165,18 +165,18 @@ def assert_layouts(bodies, label):
     print(f"   headings seen ({label}):", heads)
     check(f"{label}: every message opens with a bold heading",
           all(re.match(r"^\*\*[^*]+\*\*$", h) for h in heads))
-    news_body = next((b for h, b in by_head.items() if h.startswith("**AI news, ")), "")
+    news_body = next((b for h, b in by_head.items() if h.startswith("**AI News, ")), "")
     check(f"{label}: R1 heading carries the day", bool(news_body))
-    bullets = [l for l in news_body.splitlines() if l.startswith("• ")]
+    # 8 OCT (docs/plans/NEWS-OCT8.md): "- **Headline** ([Outlet](<url>))", a blank line between stories.
+    bullets = [l for l in news_body.splitlines() if l.startswith("- ")]
     check(f"{label}: one story per bullet", len(bullets), 2)
-    check(f"{label}: no topic tags", any(re.match(r"• \[[A-Za-z]+\] ", l) for l in bullets),
+    check(f"{label}: no topic tags", any(re.match(r"- \[[A-Za-z]+\] ", l) for l in bullets),
           False)
     check(f"{label}: headline — what. [site](<url>)",
-          bullets[:1] == ["• Wispr Flow raises $30M Series B — to build voice dictation for "
-                          "teams. [techcrunch.com](<https://techcrunch.com/2026/09/29/"
-                          "wispr-flow-series-b/>)"])
+          bullets[:1] == ["- **Wispr Flow raises $30M Series B** ([techcrunch.com]"
+                          "(<https://techcrunch.com/2026/09/29/wispr-flow-series-b/>))"])
     check(f"{label}: no closing line after the stories",
-          news_body.rstrip().splitlines()[-1].startswith("• "))
+          news_body.rstrip().splitlines()[-1].startswith("- "))
     deliv = next((b for h, b in by_head.items() if h == "**This week's deliverables**"),
                  "")
     lines = deliv.splitlines()
@@ -256,7 +256,7 @@ async def main():
     day = dl.today_ist()
     check("heading, tags line, one line — nothing else",
           (re.sub(r"^\[TEST\]\s*", "", got[0]) if got else "", got[-1] if got else ""),
-          (f"**AI news, {day.strftime('%a')} {day.day} {day.strftime('%b')}**",
+          (f"**AI News, {day.strftime('%a')} {day.day} {day.strftime('%b')}**",
            news.quiet_line(day)))
     check("at most three lines (heading, tags, the line)", len(got) <= 3)
 
@@ -277,12 +277,13 @@ async def main():
     show(POSTED[0] if POSTED else "(nothing posted)")
     b = str(POSTED[0]) if POSTED else ""
     check("breaking opens with its heading",
-          re.sub(r"^\[TEST\]\s*", "", b.splitlines()[0]) if b else "", "**Breaking AI news**")
+          re.sub(r"^\[TEST\]\s*", "", b.splitlines()[0]).startswith("**Breaking AI News, ")
+          if b else False)
     check("the story is a bullet with a masked link",
-          "• OpenAI releases a new evals suite — a public benchmark for agents. "
-          "[openai.com](<https://openai.com/index/evals-suite>)" in b)
+          "- **OpenAI releases a new evals suite** "
+          "([openai.com](<https://openai.com/index/evals-suite>))" in b)
     check("never a paragraph: every line after the heading is a bullet",
-          all(l.startswith("• ") for l in b.splitlines()[1:]))
+          all(l.startswith("- ") for l in b.splitlines()[1:] if l.strip()))
     check("no bare url", links.bare_urls(b), [])
 
     print('\n(vii) "simulate tuesday" — the same layouts')

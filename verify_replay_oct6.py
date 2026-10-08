@@ -31,6 +31,11 @@ EXTEND, DON'T FORK: each ticket turns on the steps it owns in STEPS below.
            "sure" gets a reaction, a real question reaches the engine; zero sheet writes, the proposal untouched,
            no Rule 13 state moved, test mode == live. (The one-person lines are in tests/test_rule13.py, Y1-Y13.)
 
+  8 OCT  NEWS-OCT8 (docs/plans/NEWS-OCT8.md): "@Saley what is in the news forthis hour?" at 11:22 with a leftover test
+           day set to Wed 7 Oct. Answered by code with no model call: one message, the bold heading, five bold
+           headlines each with a whole link, nothing about 2 PM or what was "already posted"; asked again, none of
+           those five come back; test mode == live.  ACTIVE (tests/news_checks.py `replay`, a section of THIS harness)
+
 For NFT2-1062 step 1 runs in three arrangements:
   (a) notes NOT configured, with the real current command shape and stale sync
       files on disk;
@@ -68,6 +73,7 @@ config.INTERIM_ENABLED = False          # no timers: the fake model answers at o
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
 import offline_guard  # noqa: E402
 import replay_1063  # noqa: E402  NFT2-1063's section (steps 2, 3, 4, 6, 7 and the 7 Oct exchange)
+import news_checks  # noqa: E402  NEWS-OCT8's section (the 8 Oct 11:22 news question)
 import replies_world  # noqa: E402
 
 GUARD = offline_guard.install_script()      # canned source statuses; any real Sheets/Drive call is counted and fails the run
@@ -940,6 +946,9 @@ async def main():
     print("\nNFT2-1063 - replies and on-demand requests: 6 Oct steps 2, 3, 4, 6, 7 and the 7 Oct exchange "
           "(live, then test mode)")
     await replay_1063.section(check, FIX)
+
+    print("\nNEWS-OCT8 - the news template and the news answer: the 8 Oct 11:22 question (live, then test mode)")
+    await news_checks.replay(check)
 
     config.SALES_TEST_MODE = False
 
