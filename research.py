@@ -265,7 +265,12 @@ def gather(row: dict) -> dict:
         role: gtm_sheet.clean_cell(row.get(role))
         for role in ("poc_designation", "poc_vertical", "industry", "use_case",
                      "first_contacted", "connected", "response", "next_steps",
-                     "prospect_stage", "other_updates")
+                     "prospect_stage", "other_updates",
+                     # The 7 Oct 2026 columns: the step dropdown, the three
+                     # emails, the priority.
+                     "outreach_step", "email_1_sent", "email_1_date",
+                     "email_2_sent", "email_2_date", "email_3_sent",
+                     "email_3_date", "poc_priority")
         if gtm_sheet.clean_cell(row.get(role))
     }
 

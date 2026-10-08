@@ -718,10 +718,12 @@ async def the_monday() -> None:
     show(sim["raw"])
     check("the same two messages, word for word, on all three (apart from [TEST])",
           live["posts"] == test["posts"] == sim["posts"])
+    # NFT2-1063 (plan section 15, Q9): was the literal "[TEST]", which is red on a machine whose SIMULATION_PREFIX is
+    # "[TEST-live]". "The tag is the only difference" must hold for whatever tag is configured.
     check("the live run carries no [TEST] tag; the other two tag both messages",
-          ([p.startswith("[TEST]") for p in live["raw"]],
-           [p.startswith("[TEST]") for p in test["raw"]],
-           [p.startswith("[TEST]") for p in sim["raw"]]),
+          ([p.startswith(config.SIMULATION_PREFIX) for p in live["raw"]],
+           [p.startswith(config.SIMULATION_PREFIX) for p in test["raw"]],
+           [p.startswith(config.SIMULATION_PREFIX) for p in sim["raw"]]),
           ([False, False], [True, True], [True, True]))
     tbook = ledger(test["bot"].db.path)
     check("the test day cost the same: one MODEL_LIGHT scoring call, no search",

@@ -13,14 +13,16 @@ companies and people only (Acme AI, Globex, Ada Lovelace, ...), never real prosp
 sheet, or `_rule_tab_rows` (a script that fakes those keeps doing so). It is NOT used where the point is
 the live sheet (verify_poc_lookup, verify_layouts, verify_simulation, the live modes).
 """
-# The real tabs' headers, copied from tests/conftest.py (not imported: a script must not load pytest's conftest).
+# The real tabs' headers on 7 Oct 2026 (A-AF), copied from tests/conftest.py (not imported: a script must not load pytest's conftest).
 POCS_HEADERS = [
     "Sr No", "Company/Uni", "Industry", "Name", "Designation", "Email id",
-    "Based", "Research Paper Link", "LI Url", "First Contact",
+    "Based (Sept 2026)", "Research Paper Link", "LI Url", "First Contact",
     "First Contact Type", "First Contact Date", "Sid - LI Addition",
-    "LI Connected Date", "LI DM Sent", "LI DM Date", "Meeting Date",
-    "Meeting Status", "Next Steps/Notes", "Package", "Prospect Status",
-    "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status",
+    "LI Connected Date", "LI DM Sent", "LI DM Date", "Next Steps",
+    "1st Email Sent", "1st Email Date", "2nd Email Sent", "2nd Email Date",
+    "3rd Email Sent", "3rd Email Date", "Meeting Date", "Meeting Status",
+    "Notes/Remarks", "Package", "Prospect Status", "Closure Prob%",
+    "Estd. Deal Size (USD)", "Deal Status", "Priority",
 ]
 
 PIPELINE_HEADERS = [

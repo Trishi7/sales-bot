@@ -18,7 +18,18 @@ NOTES_DIR and STATE_DIR are throwaway. No network, no rclone, no Drive.
 EXTEND, DON'T FORK: each ticket turns on the steps it owns in STEPS below.
   step 1  NFT2-1062  "what do we need to do today?" -> AM/PM sync content.  ACTIVE
   steps 5, 8, 9  NFT2-1065  profile lookups: search first, never deny, ask before adding.  ACTIVE
-  steps 2, 3, 4, 6, 7  stubs, owned by NFT2-1063 (printed as SKIP)
+  steps 2, 3, 4, 4b, 6, 7  NFT2-1063  replies and on-demand requests: a PoCs question and "Sure." to its answer (one
+           reaction, no text, no vote), "what are the sales objectives for today?" (the day's posts, no rules or
+           schedule), the interim wording, "top 5 AI headlines" over a seeded feed store.  ACTIVE
+           (their section lives in tests/replay_1063.py, called from main(): a section of THIS harness, not a second one)
+  7 OCT  tests/fixtures/oct7_exchange.md  NFT2-1063: R3's post, "any AI news?", "sure" to the interim line, the answer,
+           then "yes" to R3's post.  ACTIVE, in both modes.
+  RULE 13  (7 Oct 2026, next steps for connected contacts)  ACTIVE, after the profile section: a Rule 13 post on a
+           stubbed 7 Oct sheet goes through the real `_send_drip_message` with SALES_TEST_MODE false then true
+           (bodies equal apart from the tag); then a "done" and a "yes" are replied to it through the real
+           `on_message` with an unrelated proposal open: "done" and "yes" ask which one (numbered, no model call),
+           "sure" gets a reaction, a real question reaches the engine; zero sheet writes, the proposal untouched,
+           no Rule 13 state moved, test mode == live. (The one-person lines are in tests/test_rule13.py, Y1-Y13.)
 
 For NFT2-1062 step 1 runs in three arrangements:
   (a) notes NOT configured, with the real current command shape and stale sync
@@ -38,6 +49,9 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")      # a FAIL line may quote Gemini-style punctuation
+
 TMP = tempfile.mkdtemp(prefix="saley-replay-")
 os.environ["DB_PATH"] = os.path.join(TMP, "sales_bot_test.db")
 os.environ["STATE_DIR"] = os.path.join(TMP, "state0")
@@ -53,6 +67,8 @@ config.INTERIM_ENABLED = False          # no timers: the fake model answers at o
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
 import offline_guard  # noqa: E402
+import replay_1063  # noqa: E402  NFT2-1063's section (steps 2, 3, 4, 6, 7 and the 7 Oct exchange)
+import replies_world  # noqa: E402
 
 GUARD = offline_guard.install_script()      # canned source statuses; any real Sheets/Drive call is counted and fails the run
 
@@ -116,7 +132,7 @@ FIX = fixture_steps()
 # step -> (owner ticket, active in this run)
 STEPS = {1: ("NFT2-1062", True)}
 for _n in range(2, 10):
-    STEPS[_n] = ("NFT2-1065", True) if _n in (5, 8, 9) else ("NFT2-1063", False)
+    STEPS[_n] = ("NFT2-1065", True) if _n in (5, 8, 9) else ("NFT2-1063", _n in (2, 3, 4, 6, 7))
 
 # The fixture has no QUOTED text for steps 5 and 8 (the wording was reconstructed from
 # screenshots), so the harness carries it here, labelled. Step 9 is verbatim in the fixture.
@@ -245,9 +261,15 @@ class FakeMessage:
         self.mentions = [SimpleNamespace(id=BOT_ID)]
         self.mention_everyone = False
 
+    async def add_reaction(self, emoji):
+        REACTIONS.append((self.content, str(emoji)))
+
     async def reply(self, text, mention_author=False):
         self.channel.sent.append(text)
         return SimpleNamespace(id=len(self.channel.sent) + 5000, jump_url="https://discord/x")
+
+
+REACTIONS = []                       # (text reacted to, emoji): what the Rule 13 section counts
 
 
 class FakeLLM:
@@ -381,7 +403,15 @@ async def replay_step1(arrangement, test_mode):
     bot = make_bot(model)
     ch = FakeChannel()
     text = FIX[1]["text"].replace("@Saley", f"<@{BOT_ID}>")
-    await bot.on_message(FakeMessage(ch, text, FIX[1]["who"]))
+    # NFT2-1063: the "today" route now also offers todays_objectives, whose answer reads the day's plan. An EMPTY
+    # offline sheet stands in (replies_world.Sheet), so the answer is the one-line nothing-today and no real Sheets call
+    # is made (the offline guard would fail the run).
+    empty_sheet = replies_world.Sheet()
+    empty_sheet.install()
+    try:
+        await bot.on_message(FakeMessage(ch, text, FIX[1]["who"]))
+    finally:
+        empty_sheet.uninstall()
     rows = bot.db.reply_latency_since("2000-01-01")
     return {
         "gate": [norm_log(m) for m in TAP.lines if m.startswith("[gate]")],
@@ -634,6 +664,212 @@ async def profile_section(wired):
         check(f"test mode == live (profile steps): {k}", test[k], live[k])
 
 
+
+# -- RULE 13 (7 Oct 2026): a Rule 13 post, and "done" / "yes" replied to it --------------------------------
+
+R13_DAY = __import__("datetime").date(2026, 10, 15)       # a Thursday
+R13_WRITES = []                                             # every cell the stand-in worksheet is asked to write
+
+
+def r13_sheet():
+    """A stubbed Outreach PoCs tab on the 7 Oct header row: made-up Connected people, the real parser."""
+    import copy
+    import time as _t
+
+    import rule13_fixtures as fx
+    rows, meta = fx.rotation_values()
+    grid = [list(fx.HEADERS_7OCT)] + [list(r) for r in rows]
+    saved = {k: getattr(gtm_sheet.SHEETS, k) for k in ("read", "cadence_tab", "_open", "_refuse_if_read_only",
+                                                       "staleness_note", "tab")}
+
+    def read(which=None, force=False, **_k):
+        tab = gtm_sheet.SHEETS._parse_values("Outreach PoCs", copy.deepcopy(grid), read_at=_t.time())
+        return {tab.kind: tab}
+
+    class Ws:
+        title = "Outreach PoCs"
+
+        def update(self, values=None, range_name="", value_input_option=""):
+            R13_WRITES.append((range_name, values[0][0] if values else None))
+
+        def batch_update(self, *a, **k):
+            R13_WRITES.append(("batch_update", a))
+
+    gtm_sheet.SHEETS.read = read
+    gtm_sheet.SHEETS.cadence_tab = lambda *a, **k: (read().get(gtm_sheet.POCS), "fixture")
+    gtm_sheet.SHEETS.tab = lambda kind, which=None: read().get(kind)
+    gtm_sheet.SHEETS._open = lambda *a, **k: SimpleNamespace(worksheet=lambda t: Ws(),
+                                                              batch_update=lambda *a, **k: R13_WRITES.append(("ss", a)))
+    gtm_sheet.SHEETS._refuse_if_read_only = lambda *a, **k: ""
+    gtm_sheet.SHEETS.staleness_note = lambda *a, **k: ""
+    return meta, saved, rows
+
+
+def r13_restore(saved):
+    for k, v in saved.items():
+        setattr(gtm_sheet.SHEETS, k, v)
+
+
+class ExtractsNothing(FakeLLM):
+    """The sheet-update extractor says 'not an update' (as it does for 'done'): the reply falls to the engine."""
+
+    async def extract_sheet_update(self, **_kw):
+        return {"intent": "none"}
+
+
+def db_dump(bot):
+    with bot.db.conn() as c:
+        out = []
+        for t in ("next_step_followups", "next_step_posts"):
+            try:
+                out.append([tuple(r) for r in c.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()])
+            except Exception:
+                out.append(["(no such table)"])
+        return out
+
+
+async def replay_rule13(test_mode):
+    import deadlines as dl
+    config.SALES_TEST_MODE = test_mode
+    config.SALES_TEST_CHANNEL_ID = 4242
+    config.SIMULATION_PREFIX = "[TEST]"
+    config.EMAIL_WRITE_ALLOWED = True
+    config.SHEET_WRITES_ENABLED = True
+    config.SALES_APPROVER_IDS = [7]
+    config.TEAM_ROSTER_IDS = [7, 8]
+    w = build_world("b")
+    meta, saved, rows = r13_sheet()
+    R13_WRITES.clear()
+    try:
+        model = Model()
+        bot = make_bot(model)
+        bot.llm = ExtractsNothing()
+        real_apply = SalesBot._maybe_apply_sheet_update
+        bot._maybe_apply_sheet_update = real_apply.__get__(bot)          # the REAL reply path, not the harness stub
+        bot._split_active = lambda rows_, why: (list(rows_), [])
+
+        async def nobody_away(*_a, **_k):
+            return {}
+
+        import leave
+        leave.who_is_away = nobody_away
+        ch = FakeChannel()
+        planned = await bot._plan_drip(today=R13_DAY, already=[])
+        msg = next((m for m in planned["messages"] if m["type"] == "next_step_followups"), None)
+        rec = {"planned": msg is not None}
+        if msg is None:
+            return rec
+        rec["at"], rec["pinned"], rec["counts"] = msg["send_at_hhmm"], msg["pinned"], msg["counts_toward_cap"]
+        await bot._send_drip_message(ch, msg, marker=dl.iso(R13_DAY), channel_id=4242)
+        rec["post"] = [strip_tag(t) for t in ch.sent]
+        rec["tagged"] = [t.startswith("[TEST") for t in ch.sent]
+        rec["model_calls_for_the_post"] = model.calls
+        rec["state_after_send"] = db_dump(bot)
+        with bot.db.conn() as c:
+            got = c.execute("SELECT message_id FROM drip_sends WHERE action_type='next_step_followups'").fetchone()
+        post_id = int(got[0]) if got and got[0] else None
+        rec["post_id"] = bool(post_id)
+
+        # an UNRELATED open proposal that a stray "yes" could apply (F2): a Meeting Date cell on another person
+        target = next(r for r in rows if r[3] == meta["dated"][2])
+        sheet_row = rows.index(target) + 2
+        import sheetwrite
+        tab_ = gtm_sheet.SHEETS.read()[gtm_sheet.POCS]
+        row_ = next(r for r in tab_.rows if r.get("_row") == sheet_row)
+        plan_ = sheetwrite.plan_writes(tab=tab_, row=row_, fields=[{"role": "meeting_date", "value": "21-10-2026",
+                                                                  "supersedes": False, "quote": "met them"}],
+                                       trigger=sheetwrite.TRIGGER_REPLY, reply_text="met them")
+        bot.db.open_proposal(
+            proposal_key="pOther", kind="cell_update", tab="Outreach PoCs", sheet_row=sheet_row,
+            row_key=f"{target[1].lower()}|{target[3].lower()}", company=target[1], poc=target[3],
+            payload={"writes": plan_["writes"], "applied": plan_["applied"], "asks": plan_["asks"],
+                     "skipped": plan_["skipped"]},
+            reply_text="met them", trigger="reply", proposed_text="Set Meeting Date? Reply yes.",
+            requested_by="Kushal", channel_id=4242, message_id="m-other", created_at="2026-10-15T14:00:00")
+        before = db_dump(bot)
+        R13_WRITES.clear()
+        parent = SimpleNamespace(id=post_id, author=SimpleNamespace(id=BOT_ID))
+        rec["replies"] = {}
+        for key, text in (("done", "done"), ("yes", "yes"), ("sure", "sure"),
+                          ("question", "which email template should I use for Priya?")):
+            model.calls, model.offered = 0, []
+            n0, r0 = len(ch.sent), len(REACTIONS)
+            m = FakeMessage(ch, text, "Kushal")
+            m.mentions = []
+            m.reference = SimpleNamespace(message_id=post_id, cached_message=parent, resolved=None)
+            TAP.lines.clear()
+            await bot.on_message(m)
+            rec["replies"][key] = {"sent": [stable(strip_tag(t), w) for t in ch.sent[n0:]],
+                                   "calls": model.calls, "reactions": len(REACTIONS) - r0,
+                                   "offered": list(model.offered),
+                                   "gate": [norm_log(x) for x in TAP.lines if x.startswith("[gate]")],
+                                   "voted": any("[approvals]" in x and "vote" in x.lower() and "not a vote" not in x
+                                                for x in TAP.lines)}
+        rec["writes"] = list(R13_WRITES)
+        rec["proposal"] = bot.db.proposal("pOther")["status"]
+        rec["votes"] = len(bot.db.proposal("pOther")["votes"] or [])
+        rec["state_unchanged"] = db_dump(bot) == before
+
+        # THE CONTROL: an approver's "yes" replied to the PROPOSAL'S OWN message does vote on it, so the zeros above
+        # are not a broken setup (an approver, an open proposal, a reply path that reaches the vote). The F2 fallback
+        # (a "yes" to a message with no proposal falling back to the newest open one) is pinned in verify_rule13.py
+        # (G1), which calls the vote path directly; through on_message NFT2-1063's reply hook now answers a bare
+        # "yes" to an unrelated message with an ack before that fallback is reached.
+        ctrl_parent = SimpleNamespace(id="m-other", author=SimpleNamespace(id=BOT_ID))
+        c = FakeMessage(ch, "yes", "Kushal")
+        c.mentions = []
+        c.reference = SimpleNamespace(message_id="m-other", cached_message=ctrl_parent, resolved=None)
+        await bot.on_message(c)
+        rec["control_votes"] = len(bot.db.proposal("pOther")["votes"] or [])
+        rec["control_status"] = bot.db.proposal("pOther")["status"]
+        return rec
+    finally:
+        r13_restore(saved)
+
+
+async def rule13_section():
+    live = await replay_rule13(False)
+    test = await replay_rule13(True)
+    check("rule 13: the post was planned (a weekday, the 7 Oct sheet)", (live["planned"], test["planned"]), (True, True))
+    if not live["planned"]:
+        return
+    check("rule 13: planned at 15:00, pinned, outside the cap", (live["at"], live["pinned"], live["counts"]),
+          ("15:00", True, False))
+    check("rule 13: live post is not tagged; test-mode post is", (live["tagged"], test["tagged"]), ([False], [True]))
+    check("rule 13: live == test mode: the same post apart from the tag", test["post"], live["post"])
+    check("rule 13: the post made no model call (verbatim)", (live["model_calls_for_the_post"],
+                                                               test["model_calls_for_the_post"]), (0, 0))
+    check("rule 13: five people recorded after the send, plus one posts row",
+          (len(live["state_after_send"][0]), len(live["state_after_send"][1])), (5, 1))
+    check("rule 13: the post's message id is on the drip row (what a reply finds it by)", live["post_id"], True)
+    for key in ("done", "yes", "sure", "question"):
+        check(f"rule 13: a {key!r} reply to the post casts no vote", live["replies"][key]["voted"], False)
+    for key in ("done", "yes"):
+        r = live["replies"][key]
+        check(f"rule 13: {key!r} under a five-person post asks which one (numbered), with no model call",
+              (len(r["sent"]) == 1 and r["sent"][0].startswith("Which one?" + chr(10) + "1. "), r["calls"], r["reactions"]),
+              (True, 0, 0))
+    check("rule 13: 'sure' gets one reaction, no text, no model call",
+          (live["replies"]["sure"]["sent"], live["replies"]["sure"]["reactions"], live["replies"]["sure"]["calls"]),
+          ([], 1, 0))
+    check("rule 13: a real question reaches the engine and is answered",
+          (live["replies"]["question"]["calls"] > 0, bool(live["replies"]["question"]["sent"])), (True, True))
+    check("rule 13: zero sheet writes from the four replies", live["writes"], [])
+    check("rule 13: the unrelated open proposal was not voted on or applied by a reply to the post",
+          (live["proposal"], live["votes"]), ("open", 0))
+    check("rule 13: no Rule 13 state changed by the replies", live["state_unchanged"], True)
+    check("rule 13 control: a 'yes' replied to the proposal's own message DOES vote on it (the setup is live)",
+          live["control_votes"] >= 1, True)
+    for key in ("done", "yes", "sure", "question"):
+        for k in ("sent", "calls", "offered", "gate", "reactions"):
+            check(f"rule 13: test mode == live: reply {key!r} {k}", test["replies"][key][k], live["replies"][key][k])
+    check("rule 13: test mode == live: writes, proposal, votes", (test["writes"], test["proposal"], test["votes"]),
+          (live["writes"], live["proposal"], live["votes"]))
+    print("      rule 13 post (live): " + " / ".join(live["post"][0].splitlines()[:3]))
+    print("      reply 'done' (live): " + " | ".join(t.replace(chr(10), " / ")[:120] for t in live["replies"]["done"]["sent"]))
+
+
+
 async def main():
     print("fixture steps parsed:", sorted(FIX))
     check("step 1 is the AM/PM sync question", FIX.get(1, {}).get("text"), "@Saley what do we need to do today?")
@@ -650,8 +886,11 @@ async def main():
         check("the gate said yes (mentioned)", [("responded" in m and "mentioned" in m) for m in live["gate"]],
               [True])
         check("routed to the engine", live["route"], ["engine"])
-        check("the tools OFFERED are exactly show_todos", live["tools_offered"], ["show_todos"])
-        check("the routing line says today / 1 tool", any("tools=1 (today)" in m for m in live["engine"]), True)
+        # NFT2-1063: was exactly ["show_todos"] and "tools=1 (today)". The today group offers the to-do sheet AND the
+        # objectives answer; cadence_preview (the rules and the schedule) is still not offered.
+        check("the tools OFFERED are exactly show_todos and todays_objectives", live["tools_offered"],
+              ["show_todos", "todays_objectives"])
+        check("the routing line says today / 2 tools", any("tools=2 (today)" in m for m in live["engine"]), True)
         check("two model calls (one tool round, one answer)", live["model_calls"], 2)
         check("exactly one reply, not empty", (len(live["reply"]), bool(live["reply"] and live["reply"][0])),
               (1, True))
@@ -694,6 +933,13 @@ async def main():
         print("  (reconstructed wording for 5 and 8; step 9 verbatim from the fixture)")
         await profile_section(wired)
     botmodule.POC_ROW_ADD_WRITE_WIRED = shipped
+
+    print("\nRULE 13 - 7 Oct 2026 - next steps for connected contacts (7 Oct sheet layout, a post, then replies)")
+    await rule13_section()
+
+    print("\nNFT2-1063 - replies and on-demand requests: 6 Oct steps 2, 3, 4, 6, 7 and the 7 Oct exchange "
+          "(live, then test mode)")
+    await replay_1063.section(check, FIX)
 
     config.SALES_TEST_MODE = False
 

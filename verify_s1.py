@@ -119,6 +119,33 @@ import tone  # noqa: E402
 import voice  # noqa: E402
 from db import DB  # noqa: E402
 
+
+def _shipped_rules_with_r7_on() -> str:
+    """A TEMP COPY of bot_rules.yaml with R7 switched on, and nothing else changed.
+
+    WHY (RULE 13, 7 Oct 2026): rule 13 replaced rule 7 ("rule 13 supercedes this"), so the shipped file has
+    `enabled: false` on R7 and a Monday now has one counted group fewer. This script proves the CAP MECHANICS on a
+    Monday with six countable groups, a roll for the cap and an R8 and an R9 outside it. That needs six, so the
+    scenario runs against a copy of the real file with R7 on (the evaluator is kept; one word brings the rule back).
+    Check (i) also runs the same Monday against the shipped file and says what it does now: seven groups, five
+    counted, nothing rolled, no R7.
+    """
+    src = open(os.path.join(HERE, "bot_rules.yaml"), encoding="utf-8").read()
+    start = src.index("  - id: R7" + chr(10))
+    end = src.index("  - id: R8" + chr(10))
+    block = src[start:end]
+    assert "enabled: false" in block, "R7 is expected to be disabled in the shipped file"
+    path = os.path.join(TMP, "bot_rules_r7_on.yaml")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src[:start] + block.replace("enabled: false", "enabled: true") + src[end:])
+    return path
+
+
+SHIPPED_RULES_FILE = config.BOT_RULES_FILE
+R7_ON_RULES_FILE = _shipped_rules_with_r7_on()
+config.BOT_RULES_FILE = R7_ON_RULES_FILE
+rules_mod.reload()
+
 simulation.pace_seconds = lambda **_k: 0.0
 
 failures = 0
@@ -623,10 +650,26 @@ async def the_monday() -> None:
             print(f"     {name}: " + ", ".join(k for k, _p in run["sent"]))
     check("the same cap decisions: who goes, who counts, who rolls, who is held",
           live["decisions"] == test["decisions"] == sim["decisions"])
+
+    # THE SAME MONDAY AS SHIPPED: R7 is off (replaced by rule 13), so one counted group fewer and nothing to roll.
+    config.BOT_RULES_FILE = SHIPPED_RULES_FILE
+    rules_mod.reload()
+    monday_sheet(MON)
+    shipped = await live_path(MON)
+    sd = shipped["decisions"]
+    check("as shipped (R7 off): the same Monday has 7 groups, no R7, nothing rolled, nothing held",
+          (len(sd["go"]) + len(sd["rolled"]) + len(sd["held"]), any(g[0] == "R7" for g in sd["go"]),
+           sd["rolled"], sd["held"]), (7, False, [], []))
+    check("as shipped: 5 counted posts, plus the R8 and the R9 outside the cap",
+          (sum(1 for x in shipped["raw"] if x["counted"]),
+           sorted(x["rule"] for x in shipped["raw"] if not x["counted"])), (5, ["R8", "R9"]))
+    config.BOT_RULES_FILE = R7_ON_RULES_FILE
+    rules_mod.reload()
+    monday_sheet(MON)
     check("the live run carries no [TEST] tag; the other two tag every message",
-          (any(p.startswith("[TEST]") for s in live["raw"] for p in s["posts"]),
-           all(p.startswith("[TEST]") for s in test["raw"] for p in s["posts"]),
-           all(p.startswith("[TEST]") for s in sim["raw"] for p in s["posts"])),
+          (any(p.startswith(config.SIMULATION_PREFIX) for s in live["raw"] for p in s["posts"]),
+           all(p.startswith(config.SIMULATION_PREFIX) for s in test["raw"] for p in s["posts"]),
+           all(p.startswith(config.SIMULATION_PREFIX) for s in sim["raw"] for p in s["posts"])),
           (False, True, True))
     check("the approvals sweep rode the first post once on each path (and took "
           "no slot)", (live["sweeps"], test["sweeps"], sim["sweeps"]),
@@ -1072,8 +1115,8 @@ def the_wording() -> None:
     cap_row = rules_mod.global_rule("daily_cap")
     print("\n   Global Rules tab — row \"Daily cap\":")
     print("     " + cap_row)
-    check("the Global Rules row is the agreed sentence", cap_row,
-          "Max 5 posts a day; meeting prep, meeting follow-ups, reminders, urgent "
+    check("the Global Rules row is the agreed sentence (rule 13 added next-step follow-ups on 7 Oct 2026)", cap_row,
+          "Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent "
           "news and answers to questions don't count.")
     for key, label in (("ai_news", "AI news"), ("weekends", "Weekends"),
                        ("reminders", "Reminders")):

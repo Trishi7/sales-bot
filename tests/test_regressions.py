@@ -383,7 +383,7 @@ class TestAppendDuplicateRefusal:
         ) is None
 
     def test_the_commercial_block_is_refused_on_a_new_row(self, pocs_tab, monkeypatch):
-        """A:I is writable on a NEW row; S-X never is, on any row."""
+        """A:I is writable on a NEW row; Q-W and Z-AE (the step and commercial blocks) never are, on any row (7 Oct layout)."""
         import gtm_sheet
         from types import SimpleNamespace
 
@@ -663,4 +663,4 @@ class TestRuleIdsNeverReachAPerson:
         import rules
         words = {r.id: r.plain for r in rules.safe_load()}
         assert words.get("R6") == "people connected on LinkedIn with no DM yet"
-        assert len(words) == 12
+        assert len(words) == 13   # R13 added 7 Oct 2026 (was 12); ids are never renumbered

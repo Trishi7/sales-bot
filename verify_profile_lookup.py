@@ -90,6 +90,7 @@ import search_backend  # noqa: E402
 import state  # noqa: E402
 import toolsets  # noqa: E402
 import usage  # noqa: E402
+import wording  # noqa: E402
 from bot import SalesBot  # noqa: E402
 from db import DB  # noqa: E402
 
@@ -546,6 +547,15 @@ def make_bot(model, *, votes=False):
     bot._strategy_tools = lambda: []
     bot._people_tools = lambda sink=None: []
     bot._news_tools = lambda: []
+    # NFT2-1063: `todays_objectives` is stubbed with the other tools above (it is in GROUPS, so STUB_NAMES has it), so
+    # the real tool is not added a second time; and the objectives answer itself reads the sheet, which this script
+    # never does: it checks routing and the tools offered, not that answer (verify_replies.py and the replay do).
+    bot._objectives_tools = lambda *, sink=None: []
+
+    async def no_objectives():
+        return wording.NOTHING_TODAY
+
+    bot._todays_objectives = no_objectives
 
     async def no_companies():
         return []
@@ -786,7 +796,8 @@ async def t4():
 
     r = await both("T4", scenario)
     check("T4 today routes to ['today']", r["g1"], ["today"])
-    check("T4 the offered tools are exactly show_todos", r["off1"], ["show_todos"])
+    check("T4 the offered tools are exactly show_todos and todays_objectives (NFT2-1063; was show_todos alone)",
+          r["off1"], ["show_todos", "todays_objectives"])
     check("T4 no web rules in the prompt on the today route", "WHEN TO SEARCH" in r["sys1"], False)
     check("T4 a follow-up inheriting today has no web pair",
           bool({"web_search", "fetch_page"} & set(r["off2"])), False)
@@ -1210,9 +1221,36 @@ async def t11_to_t18():
              all(p in post for p in PEOPLE8) and bool(re.search(r"row \d+", post)), True)
 
     r = await both("T13 a non-reply '@Saley yes'", lambda tm: yes_scenario(tm, as_reply=False))
-    check("T13 a non-reply yes from an approver answers the newest open proposal", [p["status"] for p in proposals(r["bot"])],
-          ["applied"])
+    # NFT2-1063: same RESULT as before, renamed. A bare yes that is not a reply used to answer the newest open proposal
+    # ANYWHERE, of any age; it now answers the ONE open proposal in this channel, and only inside
+    # PROPOSAL_BARE_YES_MINUTES (default 30; this offer is seconds old).
+    check("T13 a non-reply yes from an approver answers the one open proposal in the channel, inside the window",
+          [p["status"] for p in proposals(r["bot"])], ["applied"])
     q1_check("T13 ...and writes both rows", len(r["sh"].appends), 2)
+
+    # NFT2-1063, added beside it: with a SECOND proposal open in the channel, a bare yes asks which and applies neither.
+    async def two_open_scenario(tm):
+        import deadlines as _dl
+        model = Model(profile_brain(PEOPLE8, offer=offer_both))
+        bot, ch, s, sh = fresh(tm, model=model, votes=True)
+        await ask(bot, ch, STEP8, uid=ASKER, who="Asker")
+        bot.db.open_proposal(
+            proposal_key="t13-other", kind="events_remind", tab="x", sheet_row=0, row_key="", company="", poc="",
+            payload={"on": "2026-10-12", "word": "Monday", "time": "14:00", "lines": ["an event"]}, reply_text="",
+            trigger="R3", proposed_text="remind again Monday", requested_by="R3", channel_id=ch.id,
+            message_id="not-this-one", created_at=_dl.now_ist().isoformat(timespec="seconds"))
+        before = len(ch.log)
+        await ask(bot, ch, "yes", uid=APPROVER, who="Vaishnavi", mention=True)
+        return {"ch": ch, "bot": bot, "sh": sh, "before": before,
+                "snap": snap(bot, ch, model, s, sh, groups_logged())}
+
+    r = await both("T13 a non-reply '@Saley yes' with TWO proposals open", two_open_scenario)
+    check("T13 two open: neither is applied, both stay open", sorted(p["status"] for p in proposals(r["bot"])),
+          ["open", "open"])
+    check("T13 two open: it asks which, numbered, naming both",
+          (lambda t: ("Which one do you mean?" in t, "1. " in t, "2. " in t))(
+              r["ch"].sent[-1] if r["ch"].sent else ""), (True, True, True))
+    check("T13 two open: nothing was written", r["sh"].appends, [])
 
     r = await both("T13 'yes for Janajit'", lambda tm: yes_scenario(tm, reply_text="yes for Janajit"))
     q1_check("T13 'yes for Janajit' adds only Janajit",

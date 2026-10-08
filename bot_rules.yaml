@@ -6,12 +6,13 @@
 #   Google Sheet "Sales Bot_membrane", tab "Bot Rules"
 #   Drive file id: 1sVsqPLxkBBBUQJGPDx-3AydRjHIRO9WGT-kkULgdtpo
 #   + Vaishnavi 21 Sep
+#   + Vaishnavi 7 Oct (rule 13 added; it replaces rule 7)
 #
 # This file is that tab, in a form the engine can read. It is loaded ONCE AT
 # STARTUP by rules.py. Editing it changes what the bot does after a restart,
 # with no code change — which is the whole point of it being a file.
 #
-# WHY A FILE AND NOT CODE. The twelve rules below are a product decision that
+# WHY A FILE AND NOT CODE. The thirteen rules below are a product decision that
 # Vaishnavi and Sid own. Encoding them as Python meant every change to a
 # weekday, a cap or a destination was a developer's afternoon; encoding them
 # here means it is an edit and a restart. What stays in code is HOW a rule
@@ -20,10 +21,13 @@
 #
 # WHAT EACH FIELD MEANS
 #
-#   id                  stable identifier, R1..R12. NEVER renumber one: it is
+#   id                  stable identifier, R1..R13. NEVER renumber one: it is
 #                       the key the dedup ledger, the preview and the SQLite
 #                       state are all written against. Retire an id rather than
-#                       reusing it.
+#                       reusing it. THE ORDER OF THE ENTRIES MATTERS and is
+#                       not the order of the numbers: one contact is named at
+#                       most once a day, and the rule listed FIRST keeps them
+#                       (which is why R13 sits between R4 and R5).
 #   name                what a human calls it. Shown in `cadence preview` and
 #                       in the "why" line of every item the rule produces.
 #   plain               OPTIONAL. The rule in words somebody outside the team
@@ -58,7 +62,10 @@
 #                       (5) counted posts. R8 and R9 are false: a meeting is
 #                       time-critical and must not be crowded out by a Monday
 #                       chase. The code holds those two outside the cap whatever
-#                       this says (drip.NEVER_COUNTED); every sent post records
+#                       this says (drip.NEVER_COUNTED). R13 is false too, and
+#                       for R13 THIS FILE DECIDES: set it true and the
+#                       next-steps post takes one of the day's five. Every sent
+#                       post records
 #                       its own answer in drip_sends.counts_toward_cap, and
 #                       drip.counted_today is the one function that adds them up
 #                       — on a real day, a test day and a simulation alike.
@@ -77,7 +84,7 @@ source:
   sheet: "Sales Bot_membrane"
   tab: "Bot Rules"
   drive_file_id: "1sVsqPLxkBBBUQJGPDx-3AydRjHIRO9WGT-kkULgdtpo"
-  amended: "Vaishnavi 21 Sep"
+  amended: "Vaishnavi 21 Sep; Vaishnavi 7 Oct (rule 13, replacing rule 7)"
 
 # THE GLOBAL RULES TAB, the rows this file carries. `voice` is the wording for
 # the "Voice" row — the same sentence as sales_strategy.md §9, so the sheet,
@@ -86,8 +93,8 @@ global_rules:
   # Row "Daily cap". DAILY_MESSAGE_CAP=5, the same on every weekday; the old
   # per-day table (DAILY_MESSAGE_CAP_BY_DAY) is retired.
   daily_cap: >-
-    Max 5 posts a day; meeting prep, meeting follow-ups, reminders, urgent news
-    and answers to questions don't count.
+    Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups,
+    reminders, urgent news and answers to questions don't count.
   # Row "AI news". R1 is new content every day, so the re-ask clock does not
   # apply to it; it is planned first so the cap cannot push it out.
   ai_news: >-
@@ -286,6 +293,93 @@ rules:
     counts_toward_cap: true
     enabled: true
 
+  # ---------------------------------------------------------------- R13
+  # NEXT STEPS FOR CONNECTED CONTACTS (added by Vaishnavi, 7 Oct 2026).
+  #
+  # LISTED HERE, BEFORE R5, ON PURPOSE. One contact is named once a day and the
+  # earlier rule keeps them; R13 names 5 people and R6 selects every connected
+  # contact, so R13 goes first. Listed after R6 it would lose almost everyone
+  # it picked every Tuesday and Friday. The consequence: on a day R13 names
+  # somebody, R5, R6 and R10 skip that person. Ids are not renumbered.
+  #
+  # WHO: Outreach PoCs rows where "Sid - LI Addition" is Connected
+  # (NEXT_STEP_CONNECTED_MARKERS) and LI Connected Date holds a date. A
+  # connected row with no readable date is skipped, logged, and listed in
+  # `cadence preview`. Prospect Status "Unresponsive" (or any stop marker)
+  # takes a row out, as it does for every rule.
+  #
+  # WHAT EACH PERSON IS ASKED, from Next Steps (Q) and that step's cells:
+  #   Next Steps          also                     due                               asks
+  #   blank                                        LI Connected + NEXT_STEP_FIRST_DAYS (2)
+  #                                                                                  what's the next step
+  #   Research the PoC                             the same                          researched? then "Send email 1"
+  #   Send email N        Nth Email Sent not yes   previous date +
+  #                                                NEXT_STEP_AFTER_PREVIOUS_DAYS (2) has it gone out
+  #   Send email N        sent, date logged        Nth Email Date +
+  #                                                NEXT_STEP_AFTER_EMAIL_DAYS (7)    set the next step
+  #   Send email N        sent, no date            now                               log the date
+  #   Reach by LI DM      no LI DM Date            3rd Email Date +
+  #                                                NEXT_STEP_AFTER_PREVIOUS_DAYS     has the DM gone out
+  #   Reach by LI DM /    LI DM Date, no meeting   LI DM Date +
+  #   Call the PoC                                 NEXT_STEP_CALL_AFTER_DM_DAYS (7),
+  #                                                then every
+  #                                                NEXT_STEP_CALL_EVERY_DAYS (3) until
+  #                                                + NEXT_STEP_CALL_UNTIL_DAYS (21)  time to call
+  #   after that                                   once                              set Prospect Status to
+  #                                                                                  Unresponsive; never again
+  # "Previous date" is LI Connected Date for email 1 and the (N-1)th Email Date
+  # for emails 2 and 3; blank means due now, and the line asks for it too.
+  #
+  # THE ROTATION: up to max_items_per_post people a post. Call reminders that
+  # are due go first; then whoever R13 named least recently, never-named people
+  # first, ties in sheet order. So it walks the Connected list top to bottom and
+  # starts again from the top. A person whose step changed is treated as new.
+  #
+  # AWAITING VAISHNAVI (built as defaults; each is changed here or in .env):
+  #   a. weekdays only, 15:00 IST           -> `weekdays` below; NEXT_STEP_TIME
+  #   b. outside the daily cap              -> `counts_toward_cap` below
+  #   c. remind only; never writes Q to W   -> RESTRICTED_COLUMN_RANGES (no switch)
+  #   d. a "done" from any teammate counts  -> replies arrive with NFT2-1063
+  #   e. sheet order; Priority is read, not used for the order
+  #   f. LI DM Sent "Replied": no call chase, asks about the meeting
+  #                                         -> NEXT_STEP_DM_REPLIED_MARKERS
+  #   g. a meeting booked for today or later pauses the rule for that person;
+  #      a Completed meeting ends it (R9 takes over)
+  #                                         -> NEXT_STEP_PAUSE_FOR_BOOKED_MEETING
+  #
+  # The post time is NEXT_STEP_TIME until NFT2-1069 adds `fixed_time`. Never
+  # held by the re-ask clock (drip.NEVER_HELD): the rule has its own.
+  - id: R13
+    name: Next steps for connected contacts
+    plain: next steps for the people we're connected with
+    # The Bot Rules tab, rule 13, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Next steps for the people we're connected with. Monday to Friday at
+      3 PM: Outreach PoCs rows where Sid - LI Addition is Connected and LI
+      Connected Date is filled. One post naming up to 5 people, taken from
+      the top of the sheet down and then from the top again; someone whose
+      call reminder is due goes first. One line each, saying what to do
+      next according to Next Steps: if it is blank, asks what the next
+      step is (2 days after connecting); "Research the PoC", asks whether
+      they have been researched and to set Next Steps to "Send email 1";
+      "Send email 1/2/3", asks whether that email has gone out and to mark
+      its Sent cell and date (2 days after the previous step), and a week
+      after the email's date asks to move Next Steps on (after email 3, to
+      "Reach by LI DM"); "Reach by LI DM", asks whether the DM has gone
+      out. A week after the LI DM Date with no meeting, reminds to call
+      them, again every 3 days until 3 weeks after the DM; then asks once
+      to set Prospect Status to "Unresponsive" and stops for that person.
+      If LI DM Sent says Replied, asks whether a meeting is being set up
+      instead. A booked meeting pauses it; a Completed meeting ends it.
+      Saley only reminds; it never fills these cells. Doesn't count toward
+      the 5 posts a day.
+    weekdays: [mon, tue, wed, thu, fri]
+    trigger: next_step_followups
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: false
+    enabled: true
+
   # ---------------------------------------------------------------- R5
   # Outreach PoCs rows where First Contact is FALSE or blank. Five contacts a
   # post, in the role order founders > CXO > chief scientist > research. Two
@@ -334,6 +428,13 @@ rules:
   # LinkedIn connected, no DM after 3 days. Says whether an email is on file;
   # if not, the research layer will look for a verified public one and say
   # where it was found, or that none was.
+  #
+  # 7 OCT 2026: THIS IS THE EMAIL CHECK (Vaishnavi: "Bot to find whether a
+  # verified email ID exists for the contact"). Its trigger, days and lookup
+  # are unchanged; its item line no longer says "no DM logged", because in the
+  # sequence the sheet now follows the DM comes after three emails and R13 owns
+  # the step reminders. The name, `plain` and the post's heading still say "no
+  # DM" and wait for wording from Vaishnavi.
   - id: R6
     name: LinkedIn connected, no DM
     plain: people connected on LinkedIn with no DM yet
@@ -352,23 +453,23 @@ rules:
   # since the DM first; ties by PROSPECT_ROLE_ORDER (founder first), then sheet
   # order. One line each: name — company — DM sent N days ago — last note.
   # Overflow: "+N more next Monday".
+  #
+  # REPLACED BY R13 on 7 Oct 2026 (Vaishnavi: "rule 13 supercedes this"). Every
+  # row with an LI DM Date is Connected, and R13's call reminders start 7 days
+  # after the DM. The evaluator is kept; `enabled: true` brings the rule back.
   - id: R7
     name: DM sent, no meeting
     plain: people we DM'd who haven't booked a meeting
     # The Bot Rules tab, rule 7, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      People we DM'd who haven't booked a meeting. Mondays: Outreach
-      PoCs rows with an LI DM Date more than 7 days ago and no Meeting
-      Date. Lists up to 5 contacts — longest since the DM first,
-      founders first on a tie — one line each: name — company — DM sent
-      N days ago — last note. If there are more, the post ends "+N more
-      next Monday".
+      Replaced by rule 13 from 7 Oct 2026. Rule 13's call reminders cover
+      the people we DM'd who haven't booked a meeting.
     weekdays: [mon]
     trigger: dm_no_meeting
     max_items_per_post: 5
     destination: channel
     counts_toward_cap: true
-    enabled: true
+    enabled: false
 
   # ---------------------------------------------------------------- R8
   # ANCHORED TO THE MEETING, NOT TO A WEEKDAY — hence the empty weekday list.
@@ -402,20 +503,24 @@ rules:
   #
   # THE LADDER CLIMBS ONE RUNG EACH TIME A FOLLOW-UP ACTUALLY GOES OUT (the
   # sender advances it, after the send) and STOPS after the last rung. It is
-  # cleared when Next Steps is filled or the meeting date changes, so the next
+  # cleared when Notes/Remarks is filled or the meeting date changes, so the next
   # stalled meeting with the same contact starts at rung 1. Outside the daily
   # cap, and on its own clock: the re-ask clock does not apply.
+  #
+  # "NEXT STEPS" HERE MEANS THE NOTES COLUMN, Z "Notes/Remarks" (Vaishnavi, 7
+  # Oct: "it means the next steps from notes; i've changed tht column name to
+  # avoid confusion"). It never reads Q, the Next Steps dropdown.
   - id: R9
     name: Meeting done, no next steps
     plain: meetings that happened with no next steps recorded
     # The Bot Rules tab, rule 9, column "What the Bot Shares / Checks".
     sheet_wording: >-
       Meetings that happened with no next steps recorded. Checks Outreach PoCs
-      for a completed meeting whose Next Steps is blank. Asks 3 days after the
-      meeting, then every 3 days, one step at a time: a channel post, then two
-      DMs, then one escalation to Sid — and then stops. Asks for the next
-      steps, the package discussed and an estimated deal size. Filling in Next
-      Steps ends it. Doesn't count toward the 5 posts a day.
+      for a completed meeting whose Notes/Remarks is blank. Asks 3 days after
+      the meeting, then every 3 days, one step at a time: a channel post, then
+      two DMs, then one escalation to Sid — and then stops. Asks for the next
+      steps, the package discussed and an estimated deal size. Filling in
+      Notes/Remarks ends it. Doesn't count toward the 5 posts a day.
     weekdays: []
     trigger: meeting_followup
     max_items_per_post: 3

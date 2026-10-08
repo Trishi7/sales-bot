@@ -560,9 +560,9 @@ async def three_ways(day: date, label: str) -> None:
            if r["action_type"] in drip.NEVER_COUNTED and r.get("counts_toward_cap")], [])
 
     check("the real run carries no [TEST] tag; the other two tag every message",
-          (any(p.startswith("[TEST]") for _s, _k, ps in real["raw"] for p in ps),
-           all(p.startswith("[TEST]") for _s, _k, ps in test["raw"] for p in ps),
-           all(p.startswith("[TEST]") for _s, _k, ps in sim["raw"] for p in ps)),
+          (any(p.startswith(config.SIMULATION_PREFIX) for _s, _k, ps in real["raw"] for p in ps),
+           all(p.startswith(config.SIMULATION_PREFIX) for _s, _k, ps in test["raw"] for p in ps),
+           all(p.startswith(config.SIMULATION_PREFIX) for _s, _k, ps in sim["raw"] for p in ps)),
           (False, True, True))
 
 
@@ -609,9 +609,9 @@ def bot_rules_wording() -> None:
     print("\n   Global Rules tab — row \"Daily cap\":")
     print("     " + rules_mod.global_rule("daily_cap"))
     print()
-    check("the Daily cap row is the agreed sentence",
+    check("the Daily cap row is the agreed sentence (rule 13 added next-step follow-ups on 7 Oct 2026)",
           rules_mod.global_rule("daily_cap"),
-          "Max 5 posts a day; meeting prep, meeting follow-ups, reminders, urgent "
+          "Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent "
           "news and answers to questions don't count.")
     check("bot_rules.yaml R4 plain", r4.plain, want)
     check("bot_rules.yaml R4 description", r4.description, want)

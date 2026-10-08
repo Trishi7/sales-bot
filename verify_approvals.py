@@ -36,11 +36,10 @@ SID, VAISHNAVI, TRISHI = 111, 222, 333
 config.TEAM_ROSTER_IDS = [SID, VAISHNAVI, TRISHI]
 config.SALES_APPROVER_IDS = [SID, VAISHNAVI]
 config.SALES_FINAL_SAY_ID = SID
-# THE RESTRICTED BANDS ARE PINNED TO THE CONTRACT (.env.example: A:I,S:X), not read from whatever this machine's
-# .env holds: on 7 Oct the laptop's value became A:I,Q:W,Z:AE, which put Meeting Date (column Q) inside a band
-# and made five checks below fail for a reason that has nothing to do with approvals.
-config.RESTRICTED_COLUMN_RANGES = "A:I,S:X"
-config.RESTRICTED_COLUMN_BANDS = config.parse_column_ranges("A:I,S:X")
+# THE RESTRICTED BANDS ARE PINNED TO THE CONTRACT (.env.example: A:I,Q:W,Z:AE since the 7 Oct 2026 layout), not
+# read from whatever this machine's .env holds. (Before 7 Oct this pinned A:I,S:X; the sheet grew columns Q-W.)
+config.RESTRICTED_COLUMN_RANGES = "A:I,Q:W,Z:AE"
+config.RESTRICTED_COLUMN_BANDS = config.parse_column_ranges("A:I,Q:W,Z:AE")
 config.RESTRICTED_COLUMN_INDEXES = frozenset(i for lo, hi in config.RESTRICTED_COLUMN_BANDS for i in range(lo, hi + 1))
 config.ROSTER_DISPLAY_NAMES = {str(SID): "Sid", str(VAISHNAVI): "Vaishnavi",
                                str(TRISHI): "Trishi"}
@@ -65,15 +64,17 @@ def fresh_db():
 
 # The sheet, as a parsed tab. Sahaj at Wispr Flow, meeting date blank.
 HEADERS = ["Sr No", "Company/Uni", "Industry", "Name", "Designation", "Email id",
-           "Based", "Research Paper Link", "LI Url", "First Contact",
+           "Based (Sept 2026)", "Research Paper Link", "LI Url", "First Contact",
            "First Contact Type", "First Contact Date", "Sid - LI Addition",
-           "LI Connected Date", "LI DM Sent", "LI DM Date", "Meeting Date",
-           "Meeting Status", "Next Steps/Notes", "Package", "Prospect Status",
-           "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status"]
+           "LI Connected Date", "LI DM Sent", "LI DM Date", "Next Steps",
+           "1st Email Sent", "1st Email Date", "2nd Email Sent", "2nd Email Date",
+           "3rd Email Sent", "3rd Email Date", "Meeting Date", "Meeting Status",
+           "Notes/Remarks", "Package", "Prospect Status", "Closure Prob%",
+           "Estd. Deal Size (USD)", "Deal Status", "Priority"]   # the 7 Oct 2026 row, A-AF
 ROWS = [HEADERS,
         ["1", "Wispr Flow", "AI Voice Agents", "Sahaj", "Chief Scientist", "", "SF",
          "", "", "TRUE", "LinkedIn", "01-09-2026", "TRUE", "05-09-2026", "TRUE",
-         "09-09-2026", "", "", "", "", "", "", "", ""]]
+         "09-09-2026"] + [""] * 16]
 
 
 def tab_and_row():

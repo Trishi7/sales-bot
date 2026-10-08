@@ -260,9 +260,49 @@ async def main():
     its = interims(ch)
     check("exactly one interim", len(its), 1)
     check("...at ~6 s", bool(its) and 5.8 <= its[0][0] <= 7.0)
-    check("...in the web voice",
-          bool(its) and its[0][1][len("reply: "):] in persona.INTERIM_LINES_WEB)
+    # NFT2-1063: was "...in the web voice". The WAIT is still the web wait (~6 s, a question that names the outside
+    # world), but the WORDING says "checking the web" only once a web_search has actually started. Here the model
+    # answers in ONE slow call and never dispatches a client web_search (the search is the server tool, invisible
+    # until the response returns), so the honest line is the engine's.
+    check("...in the ENGINE voice (no web_search had started when it went out)",
+          bool(its) and its[0][1][len("reply: "):] in persona.INTERIM_LINES_ENGINE)
     check("then the answer", any("Sarvam raised" in e for _t, e in of(ch, "reply: ")))
+
+    print("\n(iii-b) the same question, a web_search tool call FIRST, then slow (the client-side search path)")
+    import search_backend
+    import usage
+    saved = (config.SEARCH_BACKEND, search_backend.search_detail, search_backend.news_detail,
+             search_backend.available, usage.over_budget)
+    config.SEARCH_BACKEND = "searxng"          # the search is a CLIENT tool here, so its start is visible to the bot
+    search_backend.search_detail = lambda q, **k: {
+        "results": [{"title": "Sarvam raises", "url": "https://techcrunch.com/sarvam", "snippet": "Series A"}],
+        "cached": False, "backend": "fake", "requests": 1, "error": ""}
+    search_backend.news_detail = lambda q, **k: {"results": [], "cached": False, "backend": "g", "requests": 0,
+                                                "error": ""}
+    search_backend.available = lambda: (True, "")
+    usage.over_budget = lambda: False
+
+    async def _left():
+        return (100, 0, 150)
+    bot._search_left = _left
+    try:
+        SCRIPT[:] = [(0.5, SimpleNamespace(
+                         content=[SimpleNamespace(type="tool_use", id="tu_ws", name="web_search",
+                                                  input={"query": "Sarvam funding this week"})],
+                         stop_reason="tool_use",
+                         usage=SimpleNamespace(server_tool_use=SimpleNamespace(web_search_requests=0)))),
+                     (8.5, final("Sarvam raised a $41m Series A this week <https://techcrunch.com/sarvam>"))]
+        ch, total = await ask(bot, "any funding news on Sarvam this week?")
+    finally:
+        (config.SEARCH_BACKEND, search_backend.search_detail, search_backend.news_detail,
+         search_backend.available, usage.over_budget) = saved
+        del bot._search_left
+    its = interims(ch)
+    check("(iii-b) exactly one interim", len(its), 1)
+    check("(iii-b) ...at ~6 s", bool(its) and 5.8 <= its[0][0] <= 7.0)
+    check("(iii-b) ...in the WEB voice (a web_search had started)",
+          bool(its) and its[0][1][len("reply: "):] in persona.INTERIM_LINES_WEB)
+    check("(iii-b) then the answer", any("Sarvam raised" in e for _t, e in of(ch, "reply: ")))
 
     print("\n(v) the API fails AFTER the interim")
     SCRIPT[:] = [(3.0, tool_use(1, "lookup_sheet")),
@@ -280,20 +320,22 @@ async def main():
     for r in rows:
         print(f"     {r['ts']:26} {r['route']:11} {r['seconds']:7.2f} {r['used_web']:8} "
               f"{r['tool_calls']:10} {r['interim_sent']:7}")
-    check("one row per question", len(rows), 4)
-    check("routes", [r["route"] for r in rows], ["social", "engine", "engine", "engine"])
+    # NFT2-1063: (iii-b) is one more answered question, so each table has one more row, in the order asked: hi, (ii),
+    # (iii), (iii-b), (v). The four old rows keep the values that were pinned.
+    check("one row per question", len(rows), 5)
+    check("routes", [r["route"] for r in rows], ["social", "engine", "engine", "engine", "engine"])
     check("the web question is marked used_web", [r["used_web"] for r in rows],
-          [0, 0, 1, 0])
-    check("tool calls counted (3 client calls; 2 billed searches)",
-          [r["tool_calls"] for r in rows], [0, 3, 2, 1])
-    check("interims recorded", [r["interim_sent"] for r in rows], [0, 1, 1, 1])
+          [0, 0, 1, 1, 0])
+    check("tool calls counted (3 client calls; 2 billed searches; 1 client search)",
+          [r["tool_calls"] for r in rows], [0, 3, 2, 1, 1])
+    check("interims recorded", [r["interim_sent"] for r in rows], [0, 1, 1, 1, 1])
 
     print("\n(vii) \"what did you cost\" — the latency section")
     ch, _ = await ask(bot, "what did you cost?")
     body = next((e for _t, e in of(ch, "reply: ")), "")
     check("it reports p50/p90 for the engine route", "engine: p50" in body)
-    check("...and the interims", "lines sent: 3 of 4 answers" in body)
-    check("no model call for it", CALLS[0], 7)
+    check("...and the interims", "lines sent: 4 of 5 answers" in body)      # NFT2-1063: was 3 of 4 (one more answer, (iii-b))
+    check("no model call for it", CALLS[0], 9)                              # NFT2-1063: was 7 (two more calls in (iii-b))
 
     print("\n(D) the drip path")
     src = open("bot.py", encoding="utf-8").read()

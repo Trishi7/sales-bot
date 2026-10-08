@@ -84,9 +84,10 @@ def test_t3_follow_up_inheriting_sheet_has_web_search():
 
 # -- T4: today stays exclusive ----------------------------------------------------
 
-def test_t4_today_offers_exactly_show_todos():
+def test_t4_today_offers_exactly_the_two_today_tools():
     names, groups = _offered("what do we need to do today?")
-    assert names == ["show_todos"]
+    # NFT2-1063: was == ["show_todos"]; the objectives answer is the second tool of the "today" group.
+    assert names == ["show_todos", "todays_objectives"]
     assert groups == ["today"]
 
 

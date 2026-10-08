@@ -106,7 +106,8 @@ ROUTES = [
     ("what's on today", ["today"]),
     ("whats on today", ["today"]),
     ("what do we need to do today about the Acme meeting?", ["today"]),
-    ("what are the sales objectives for today?", []),
+    # NFT2-1063 (plan 8.1): was [] (no route, the model picked cadence_preview and talked about the posting rules).
+    ("what are the sales objectives for today?", ["today"]),
     ("what's the latest AI news today?", ["web", "news"]),
     ("show the to-dos", ["todos"]),
     ("what is on the to-do list", ["todos"]),
@@ -138,7 +139,8 @@ def test_the_words_to_do_alone_no_longer_mean_notes():
 
 
 def test_groups():
-    assert toolsets.GROUPS["today"] == ("show_todos",)
+    # NFT2-1063: the objectives answer joins the to-do sheet in the "today" group (was ("show_todos",) alone).
+    assert toolsets.GROUPS["today"] == ("show_todos", "todays_objectives")
     assert toolsets.GROUPS["notes"] == ("list_meeting_notes", "read_meeting_note", "meeting_facts")
     assert toolsets.GROUPS["todos"] == ("show_todos", "todo_candidates")
 
@@ -147,11 +149,12 @@ def test_today_is_exclusive():
     assert toolsets.route("what do we need to do today on the sheet and the Acme meeting?") == ["today"]
 
 
-def test_today_offers_only_show_todos():
+def test_today_offers_the_todo_sheet_and_the_objectives_answer_and_nothing_else():
     names = sorted({n for v in toolsets.GROUPS.values() for n in v} | {"cadence_preview", "x"})
     tools = [{"schema": {"name": n, "description": "d"}, "handler": None} for n in names]
     picked, groups, _why = toolsets.select(tools, "what do we need to do today?")
-    assert [t["schema"]["name"] for t in picked] == ["show_todos"]
+    # NFT2-1063: was == ["show_todos"]. Still no notes tool and no cadence_preview.
+    assert [t["schema"]["name"] for t in picked] == ["show_todos", "todays_objectives"]
 
 
 # -- 2.7 split_visible -----------------------------------------------------------

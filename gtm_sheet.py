@@ -76,12 +76,13 @@ has never heard of can still be answered. `GTM_COLUMN_MAP` overrides the match
 when wording is genuinely ambiguous.
 
 WRITES ARE DELIBERATELY TINY, AND THE RESTRICTED BANDS MAKE THEM SMALLER.
-`RESTRICTED_COLUMN_RANGES` (default "A:I,S:X") names bands of columns that no
+`RESTRICTED_COLUMN_RANGES` (default "A:I,Q:W,Z:AE") names bands of columns that no
 write path here may touch; `_refuse_if_restricted()` is checked by every one of
 them, fails closed, and refuses rather than raising. READING IS UNRESTRICTED —
 this is a write lock only. The NAMED columns inside the writable window between
-the bands are logged at startup (`log_writable_window`) so a column that has
-shifted is visible before a write lands in the wrong place.
+the bands (J:P and X:Y on the 7 Oct 2026 layout) are logged at startup
+(`log_writable_window`) so a column that has shifted is visible before a write
+lands in the wrong place.
 
 `write_cells()` is the whole write surface: individual cells in ONE row of the
 canonical tab, one `values.update` per cell, all inside the writable window.
@@ -218,7 +219,38 @@ NEXT_ACTION_ROLES = (
     "sid_li_added", "li_connected_date", "li_dm_sent", "li_dm_date",
     "meeting_date", "meeting_status", "next_steps", "package",
     "prospect_status", "closure_prob", "deal_status",
+    # THE 7 OCT 2026 COLUMNS, read by R13 (nextaction._r_next_step_followups).
+    # Here and NOT in CADENCE_ROLES: `_warn_colour_coded` warns on a CADENCE
+    # role that is nearly empty, and the email columns are nearly empty by
+    # design (an email goes out weeks after the connection).
+    "outreach_step",
+    "email_1_sent", "email_1_date", "email_2_sent", "email_2_date",
+    "email_3_sent", "email_3_date",
+    "poc_priority",
 )
+
+# TWO PAIRS THAT MUST NEVER MAP, WHATEVER THE ALIASES OR THE OVERRIDE SAY.
+# Until 7 Oct 2026 one column, "Next Steps/Notes", held free-text notes. Since
+# then Q "Next Steps" is a dropdown (the `outreach_step` role) and the notes
+# moved to Z "Notes/Remarks" (still the `next_steps` role). The alias lists
+# alone do not keep them apart: on a drifted header the substring pass tests
+# `h in key`, and "next steps" is a substring of "next steps notes". If the
+# notes role read the dropdown, R9 would see "Send email 1" as a meeting note
+# and go quiet on every completed meeting. Each test takes the NORMALISED
+# header. Checked in `_map_headers` for the canonical tab only.
+_POCS_ROLE_VETO = {
+    "next_steps":    lambda h: h in ("next steps", "next step"),
+    "outreach_step": lambda h: "note" in h or "remark" in h,
+}
+
+
+def _vetoed(kind: str, role: str, header_norm: str) -> bool:
+    """True when `role` may never be given the column headed `header_norm`."""
+    if kind != POCS:
+        return False
+    test = _POCS_ROLE_VETO.get(role)
+    return bool(test and test(header_norm))
+
 
 # THE TRACKER-ERA ROLES, RETIRED. Every one of these named a column on the tab
 # phase 2 left behind, and NONE of them exists on the canonical tab any more.
@@ -399,13 +431,15 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "icp": ("icp", "ideal customer profile", "ideal customer"),
         "business_impact": ("business impact", "impact", "value", "outcome"),
     },
-    # THE CANONICAL TAB: "Outreach PoCs", COLUMNS A-X.
+    # THE CANONICAL TAB: "Outreach PoCs", COLUMNS A-AF (the 7 Oct 2026 layout).
     #
     # ITS HEADERS ARE DISCOVERED, NOT ASSUMED — the alias tuples below are how a
     # discovered header is given a role, and GTM_COLUMN_MAP overrides any of
     # them without a code change. What IS fixed is the set of roles: these are
-    # the twenty-four facts the tab carries, and the tracker-era roles that used
-    # to sit here are retired (see RETIRED_POCS_ROLES).
+    # the thirty-two facts the tab carries, and the tracker-era roles that used
+    # to sit here are retired (see RETIRED_POCS_ROLES). The pre-7 Oct sheet had
+    # twenty-four (A-X, with "Next Steps/Notes" on S); it still maps, with the
+    # step dropdown, the email columns and the priority simply absent.
     #
     # THE FIRST ALIAS OF EACH ROLE IS THE LIVE HEADER, NORMALISED. `_map_headers`
     # runs an EXACT pass across every role before it runs a substring pass, so
@@ -446,8 +480,9 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "li_url": ("li url", "linkedin url", "linkedin", "linkedin profile",
                    "li profile", "profile link", "profile"),
 
-        # J-R: THE WRITABLE WINDOW. The only nine columns any write path can
-        # reach, and the reason RESTRICTED_COLUMN_RANGES is A:I,S:X.
+        # J-P and X-Y: THE WRITABLE WINDOWS. The only nine columns any write
+        # path can reach (J to P here, the two meeting columns further down),
+        # and the reason RESTRICTED_COLUMN_RANGES is A:I,Q:W,Z:AE.
         #
         # WHETHER first contact happened at all / who made it. Distinct from its
         # TYPE (K) and its DATE (L): "yes, by Sid, in March" is three facts in
@@ -483,6 +518,26 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
                        "message sent"),
         "li_dm_date": ("li dm date", "linkedin dm date", "dm date", "dm sent date",
                        "date dm sent", "message sent date"),
+        # Q-W: THE STEP BLOCK. Restricted from writing (Q:W): the team keeps the
+        # outreach sequence by hand, and R13 only ever REMINDS about these
+        # cells. Read freely.
+        #
+        # THE STEP DROPDOWN (Q, "Next Steps"): Research the PoC / Send email
+        # 1..3 / Reach by LI DM / Call the PoC. NOT the notes role below, which
+        # carried the header "Next Steps/Notes" until 7 Oct 2026 —
+        # `_POCS_ROLE_VETO` keeps the two from ever swapping columns.
+        "outreach_step": ("next steps", "next step", "outreach step", "next action"),
+        # WHETHER EACH EMAIL WENT OUT, and WHEN — two cells per email for the
+        # same reason the DM has two: "sent, no date" and "not sent" need
+        # different reminders.
+        "email_1_sent": ("1st email sent", "first email sent", "email 1 sent"),
+        "email_1_date": ("1st email date", "first email date", "email 1 date"),
+        "email_2_sent": ("2nd email sent", "second email sent", "email 2 sent"),
+        "email_2_date": ("2nd email date", "second email date", "email 2 date"),
+        "email_3_sent": ("3rd email sent", "third email sent", "email 3 sent"),
+        "email_3_date": ("3rd email date", "third email date", "email 3 date"),
+
+        # X-Y: THE SECOND WRITABLE WINDOW — the two meeting columns.
         "meeting_date": ("meeting date", "call date", "demo date", "meeting on",
                          "meeting"),
         # A STATE, NOT A DATE — "booked", "completed", "no-show", "rescheduled".
@@ -490,10 +545,14 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "meeting_status": ("meeting status", "meeting state", "meeting outcome",
                            "meeting done", "meeting?"),
 
-        # S-X: THE COMMERCIAL BLOCK. Restricted from writing (S:X) because these
-        # are maintained by people and by formulas. Read freely.
-        "next_steps": ("next steps notes", "next steps/notes", "next steps",
-                       "next step", "next action", "notes", "action"),
+        # Z-AE: THE COMMERCIAL BLOCK. Restricted from writing (Z:AE) because
+        # these are maintained by people and by formulas. Read freely.
+        #
+        # THE NOTES ROLE (Z, "Notes/Remarks"). The name is historical: until
+        # 7 Oct the column was 'Next Steps/Notes'. The dropdown is
+        # `outreach_step`. R9, `last_note` and `prospect_signature` read this.
+        "next_steps": ("notes remarks", "notes/remarks", "next steps notes",
+                       "next steps/notes", "notes", "remarks", "comments"),
         # WHICH PACKAGE went out. Cross-referenced against the Sales Packages
         # tab, which is what says whether that package is finished enough to send.
         "package": ("package", "package sent", "package shared", "pack", "packages"),
@@ -516,6 +575,10 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         # be 70% and parked, and those need opposite treatment.
         "deal_status": ("deal status", "deal stage", "deal state",
                         "opportunity status", "deal"),
+        # AF: P1 / P2. Outside every band and still never written: no write
+        # tier names it (sheetwrite.tier). `poc_priority`, not `priority` — an
+        # item's `priority` is its band in nextaction.
+        "poc_priority": ("priority", "poc priority", "priority level"),
     },
     # THE PIPELINE TAB. Priority Level is populated (High/Medium/Low); Lead
     # Stage and Estimated Value are blank on every row today. Nothing reads the
@@ -1614,6 +1677,10 @@ class GTMSheets:
         substring matches fill what's left — otherwise a loose alias like "date"
         could claim the column that an exact "Meeting Date" wanted. A header is
         used by at most one role, and a role by at most one header.
+
+        On the canonical tab `_POCS_ROLE_VETO` is checked at every step, the
+        operator override included: the notes role never takes the Next Steps
+        dropdown and the step role never takes a notes column.
         """
         aliases = ROLES.get(kind, {})
         norm = [normalise_header(h) for h in headers]
@@ -1625,6 +1692,16 @@ class GTMSheets:
         override = (config.GTM_COLUMN_MAP or {}).get(kind, {})
         for role, header_text in (override or {}).items():
             key = normalise_header(str(header_text))
+            if _vetoed(kind, role, key):
+                log.warning(
+                    "[gtm] GTM_COLUMN_MAP points %s.%s at %r; ignored — %s. Falling "
+                    "back to auto-detection for that role.",
+                    kind, role, header_text,
+                    "GTM_COLUMN_MAP points the notes role at the Next Steps dropdown"
+                    if role == "next_steps" else
+                    "the step role cannot read a notes column",
+                )
+                continue
             for i, h in enumerate(norm):
                 if h == key and i not in taken_cols:
                     out[role] = i
@@ -1651,6 +1728,8 @@ class GTMSheets:
                         continue
                     for i, h in enumerate(norm):
                         if i in taken_cols or not h:
+                            continue
+                        if _vetoed(kind, role, h):
                             continue
                         hit = (h == key) if exact_pass else (key in h or h in key)
                         if hit:
@@ -1930,14 +2009,14 @@ class GTMSheets:
         """Name the columns that fall INSIDE the writable window, before any write.
 
         THE POINT IS MISALIGNMENT, NOT PERMISSION. The restricted bands are
-        stated as column LETTERS (A:I, S:X) and the sheet's columns move: insert
+        stated as column LETTERS (A:I, Q:W, Z:AE) and the sheet's columns move: insert
         one column on the left and every header shifts a place, so the band that
         used to cover the identity block now covers something else and the gap
         the bot may write into now points at a column somebody is using.
 
         Nothing can detect that from the letters alone, so the NAMES in the gap
         are logged at startup. Somebody reading the boot log sees "writable
-        window J:R contains 'Next Steps', 'Owner', ..." and knows immediately
+        window J:P, X:Y holds 'First Contact', 'Meeting Date', ..." and knows immediately
         whether the bands still mean what they meant. A write that lands in the
         wrong column is discovered here, or it is discovered by the person whose
         work it overwrote.
@@ -2498,9 +2577,10 @@ class GTMSheets:
              is reported, not appended. Said out loud — a silent skip reads as
              a successful append to everybody downstream.
           3. WHICH COLUMNS. Only MAPPED roles, and on Outreach PoCs only the
-             new-row band A:R. S-X is refused on a new row exactly as it is on
-             an existing one: a bot that has just discovered a company has no
-             business stating its closure probability.
+             new-row bands A:P and X:Y. Q-W and Z-AE are refused on a new
+             row exactly as they are on an existing one: a bot that has just
+             discovered a company has no business stating its closure
+             probability, or which email has gone out.
           4. AN EMPTY ROW, CHECKED IMMEDIATELY BEFORE WRITING. Not "the row
              arithmetic said it was empty a moment ago" — re-read, because
              somebody typing into the sheet between the two is exactly the race
@@ -2606,7 +2686,7 @@ class GTMSheets:
                     "why": (
                         f"column {config.column_label(idx)} is outside "
                         f"NEW_ROW_WRITABLE_RANGES ({config.NEW_ROW_WRITABLE_RANGES}) — "
-                        "the commercial block is never written, even on a new row"
+                        "that column is not one a new row may fill"
                     ),
                 })
                 continue
@@ -2952,7 +3032,8 @@ class GTMSheets:
     # Outreach PoCs tab, ONLY inside the writable window between the restricted
     # bands. Three locks, all still here:
     #   1. `_refuse_if_read_only` — never the mapping sheet.
-    #   2. `_refuse_if_restricted` — never a column in A:I or S:X. Fails closed.
+    #   2. `_refuse_if_restricted` — never a column in A:I, Q:W or Z:AE. Fails
+    #      closed.
     #   3. the row interlock — the target row must still name the company the
     #      caller believes it does.
     # Plus one new one: every write returns the PRIOR values, so an undo can put
@@ -2982,10 +3063,10 @@ class GTMSheets:
 
         THE SECOND LOCK, unchanged since V1 and now the one that matters most:
         the bot writes into the sheet the team actually works in, so the bands
-        are the whole safety story. RESTRICTED_COLUMN_RANGES (A:I and S:X by
-        default) covers the identity block on the left and the formula block on
-        the right — both maintained by people and by formulas the bot cannot
-        see.
+        are the whole safety story. RESTRICTED_COLUMN_RANGES (A:I, Q:W and
+        Z:AE by default) covers the identity block on the left, the outreach
+        step block in the middle and the commercial block on the right — all
+        maintained by people and by formulas the bot cannot see.
 
         It is checked HERE, in the write path, on the ACTUAL column about to be
         written, and it FAILS CLOSED: an index that cannot be read as a number
@@ -3315,7 +3396,7 @@ class GTMSheets:
 
         WHY A SECOND METHOD RATHER THAN A `tab=` ARGUMENT ON THE FIRST.
         `write_cells` carries the Outreach PoCs tab's own safety furniture — the
-        restricted-band refusal (S:X is the humans' territory) and the
+        restricted-band refusal (Q:W and Z:AE are the humans' territory) and the
         company-name interlock that proves the row is still the row somebody
         approved. Neither has any meaning on the Events tab, and threading a tab
         through the original would have meant `if tab is pocs` around both, with
@@ -3329,6 +3410,11 @@ class GTMSheets:
         fact the sheet was missing and can never replace one a human typed.
 
         It is reachable only from an approved proposal, like every other write.
+
+        THE OUTREACH PoCs TAB IS REFUSED OUTRIGHT. It is on the appendable
+        list (a new row may be added to it), and this method has no band check,
+        so without the refusal a caller handing it that tab could fill a blank
+        cell in Q:W or Z:AE.
         """
         out: dict = {"ok": False, "written": [], "refused": [], "error": "",
                      "dry_run": False}
@@ -3346,6 +3432,12 @@ class GTMSheets:
 
         if tab is None:
             out["error"] = "there is no such tab to write to"
+            return out
+        if tab.kind == POCS:
+            out["error"] = (
+                f"{tab.title!r} is the Outreach PoCs tab — Outreach PoCs cells go "
+                "through write_cells, which checks the restricted bands"
+            )
             return out
         # THE SAME ALLOW-LIST THE APPEND USES. A tab nobody said could grow is
         # also a tab nobody said could be edited by the bot.

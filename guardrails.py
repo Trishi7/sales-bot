@@ -42,6 +42,9 @@ THE RULES
        checks SALES_CHANNEL_IDS alone, so there is no code path that posts
        there. That asymmetry is the whole reason reading and writing were ever
        two functions instead of one `may_use()`.
+
+       A REACTION IS A POST FOR THIS RULE. `react()` is the only way one is
+       added and it checks SALES_CHANNEL_IDS exactly as `send()` does.
     4. EVERY ACTION IS LOGGED. `send()` writes an audit record (state/audit.jsonl)
        for every message that goes out, with a timestamp and a reason. A refusal
        is logged too — a blocked send is exactly the event an operator wants to
@@ -660,3 +663,53 @@ async def send(
         **(extra or {}),
     )
     return sent
+
+
+async def react(message, emoji: str, *, reason: str) -> bool:
+    """The ONLY way this bot adds a reaction. True when it landed.
+
+    WHY A REACTION NEEDS ITS OWN GATE. It is the one thing the bot puts into
+    Discord that is not text, so it does not pass through `send()` — and a
+    reaction in a channel the bot may not post in is still the bot speaking
+    there. Same rule 3, checked the same way: `config.is_sales_channel` on the
+    message's own channel, never `may_read` (the leave channel is readable and
+    must stay untouched). A DM has no sales channel id and is refused with it.
+
+    `reason` is required and audited, like every send.
+
+    A FAILURE IS SWALLOWED AND NOTHING IS SENT INSTEAD. The reaction stands in
+    for "seen, nothing to add"; if Discord refuses it (the role lacks Add
+    Reactions, the message was deleted), a written line in its place would be
+    exactly the unasked-for message the reaction exists to avoid. The failure
+    is logged and audited so an operator can see the missing permission.
+    """
+    channel = getattr(message, "channel", None)
+    channel_id = _channel_id_of(channel) if channel is not None else None
+    message_id = str(getattr(message, "id", "") or "")
+    if channel is None or _is_dm(channel) or channel_id is None \
+            or not config.is_sales_channel(channel_id):
+        log.error(
+            "[guardrails] REFUSED: attempt to react in channel %s, which is not in "
+            "SALES_CHANNEL_IDS (reason=%s).", channel_id, reason,
+        )
+        state.audit(
+            "reaction_refused",
+            reason="hard guardrail: channel is outside SALES_CHANNEL_IDS",
+            attempted_reason=reason, channel_id=channel_id, message_id=message_id,
+        )
+        return False
+    if not str(emoji or "").strip():
+        return False
+    try:
+        await message.add_reaction(emoji)
+    except discord.DiscordException:
+        log.exception("[guardrails] Discord rejected the reaction in channel %s",
+                      channel_id)
+        state.audit("reaction_failed", reason=reason, channel_id=channel_id,
+                    message_id=message_id, error="discord rejected the reaction")
+        return False
+    log.info("[guardrails] REACTED channel=%s msg=%s reason=%s", channel_id,
+             message_id, reason)
+    state.audit("reaction_added", reason=reason, channel_id=channel_id,
+                message_id=message_id, emoji=emoji)
+    return True

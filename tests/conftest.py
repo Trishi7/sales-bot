@@ -15,8 +15,21 @@ os.environ.setdefault("DISCORD_TOKEN", "x")
 os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 
 
-# The canonical tab's real headers, A-X. Used by the append and row-key tests.
+# The canonical tab's real headers on 7 Oct 2026, A-AF (32 columns). Used by the append and row-key tests.
 POCS_HEADERS = [
+    "Sr No", "Company/Uni", "Industry", "Name", "Designation", "Email id",
+    "Based (Sept 2026)", "Research Paper Link", "LI Url", "First Contact",
+    "First Contact Type", "First Contact Date", "Sid - LI Addition",
+    "LI Connected Date", "LI DM Sent", "LI DM Date", "Next Steps",
+    "1st Email Sent", "1st Email Date", "2nd Email Sent", "2nd Email Date",
+    "3rd Email Sent", "3rd Email Date", "Meeting Date", "Meeting Status",
+    "Notes/Remarks", "Package", "Prospect Status", "Closure Prob%",
+    "Estd. Deal Size (USD)", "Deal Status", "Priority",
+]
+
+# The layout before 7 Oct 2026 (A-X, S "Next Steps/Notes"). Kept so the header-mapping tests can
+# prove the old row still maps, and the scripts that pin it (verify_s3's own row) have a copy.
+POCS_HEADERS_PRE_7OCT = [
     "Sr No", "Company/Uni", "Industry", "Name", "Designation", "Email id",
     "Based", "Research Paper Link", "LI Url", "First Contact",
     "First Contact Type", "First Contact Date", "Sid - LI Addition",
@@ -52,14 +65,13 @@ def pocs_tab():
     import deadlines as dl
     import gtm_sheet
 
-    values = [POCS_HEADERS] + [
-        ["1", "Wispr Flow", "AI Voice Agents", "Tanay Kothari", "Co-Founder",
-         "", "SF", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
-        ["2", "Wispr Flow", "AI Voice Agents", "Sahaj Garg", "CTO",
-         "", "SF", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
-        ["3", "Wispr Flow", "AI Voice Agents", "Ariya Rastrow", "Chief Scientist",
-         "", "SF", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
-    ]
+    def row(n, name, title):
+        r = [""] * len(POCS_HEADERS)  # widened to the 7 Oct layout (32 cells)
+        r[0], r[1], r[2], r[3], r[4], r[6] = n, "Wispr Flow", "AI Voice Agents", name, title, "SF"
+        return r
+
+    values = [POCS_HEADERS, row("1", "Tanay Kothari", "Co-Founder"),
+              row("2", "Sahaj Garg", "CTO"), row("3", "Ariya Rastrow", "Chief Scientist")]
     return gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=dl.real_epoch())
 
 

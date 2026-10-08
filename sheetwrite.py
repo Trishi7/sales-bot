@@ -22,8 +22,9 @@ THREE TIERS:
                    are commercial judgements. Somebody mentioning a number in
                    passing is not somebody committing it to the sheet, so they
                    need an explicit instruction.
-    NEVER          anything in a restricted band (A:I, S:X by default) — the
-                   identity block and the formula block. Refused in gtm_sheet
+    NEVER          anything in a restricted band (A:I, Q:W, Z:AE by default) —
+                   the identity block, the outreach-step block and the
+                   commercial block. Refused in gtm_sheet
                    since V1 and refused again here, because a rule enforced in
                    one place is a rule one refactor away from being enforced
                    nowhere.
@@ -86,7 +87,7 @@ TIER_NEVER = "never"
 
 # THE REPLY LOOP. What a person answering the bot can put into the sheet without
 # having to phrase it as an instruction — the facts a nudge asks about.
-# EVERY ROLE HERE LIVES IN THE WRITABLE WINDOW (J:R) EXCEPT THE LAST TWO, and
+# EVERY ROLE HERE LIVES IN THE WRITABLE WINDOWS (J:P, X:Y) EXCEPT THE LAST TWO, and
 # that is not an accident — it is the tier list and the band list agreeing. The
 # bands are still what enforce it: `plan_writes` checks the column index before
 # it checks the tier, so a role listed here by mistake is refused by the band
@@ -101,10 +102,14 @@ REPLY_ROLES: tuple = (
     "li_dm_date",
     "meeting_date",
     "meeting_status",
-    # S and U, inside the restricted right-hand band. Kept in the tier list so
-    # that the refusal names the COLUMN ("I never write to Next Steps/Notes")
+    # Z and AB, inside the restricted right-hand band. Kept in the tier list so
+    # that the refusal names the COLUMN ("I never write to Notes/Remarks")
     # instead of falling through to "I don't have a rule for that" — the second is
     # true and useless, and it reads as the bot not having listened.
+    # `next_steps` is the NOTES role (the name predates 7 Oct 2026). The Next
+    # Steps dropdown, the email columns and Priority (`outreach_step`,
+    # `email_N_sent` / `email_N_date`, `poc_priority`) are in NO tier on
+    # purpose: unknown to this list means NEVER, for a reply and for a command.
     "next_steps",
     "prospect_status",
 )
@@ -152,7 +157,7 @@ ROLE_LABELS = {
     "li_dm_date": "LinkedIn DM date",
     "meeting_date": "meeting date",
     "meeting_status": "meeting status",
-    "next_steps": "next steps / notes",
+    "next_steps": "notes / remarks",
     "package": "package",
     "prospect_status": "prospect status",
     "closure_prob": "closure probability",
@@ -773,26 +778,34 @@ def _self_test() -> int:
     print("\nplan_writes - the fill rule and the gates")
     import time as _time
 
-    # THE REAL SCHEMA, A-X. A:I identity (restricted) · J:R the writable
-    # window · S:X the commercial block (restricted).
+    # THE REAL SCHEMA, A-AF (the 7 Oct 2026 layout). A:I identity (restricted)
+    # · J:P the first writable window · Q:W the step block (restricted) · X:Y
+    # the second window · Z:AE the commercial block (restricted) · AF priority.
     #
     # NOTE WHAT THIS ARRANGEMENT COSTS: every command-only role
     # (closure_prob, deal_size, deal_status, package) sits in the RESTRICTED
-    # S:X band on the live tab, so no instruction can write one — the bands
+    # Z:AE band on the live tab, so no instruction can write one — the bands
     # outrank the tiers, and the test below asserts exactly that rather than
     # pretending otherwise with a friendlier fixture.
     headers = ["Sr No", "Company/Uni", "Industry", "Name", "Designation",
                "Email id", "Based", "Research Paper Link", "LI Url",
                "First Contact", "First Contact Type", "First Contact Date",
                "Sid - LI Addition", "LI Connected Date", "LI DM Sent",
-               "LI DM Date", "Meeting Date", "Meeting Status",
-               "Next Steps/Notes", "Package", "Prospect Status",
-               "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status"]
+               "LI DM Date",
+               "Next Steps", "1st Email Sent", "1st Email Date",
+               "2nd Email Sent", "2nd Email Date", "3rd Email Sent",
+               "3rd Email Date",
+               "Meeting Date", "Meeting Status",
+               "Notes/Remarks", "Package", "Prospect Status",
+               "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status",
+               "Priority"]
     values = [headers,
               ["1", "Acme", "Fin", "Ann", "CTO", "", "IN", "", "",
-               "TRUE", "LinkedIn", "01-09-2026", "TRUE", "05-09-2026", "", "",
+               "TRUE", "LinkedIn", "01-09-2026", "Connected", "05-09-2026", "", "",
+               "", "", "", "", "", "", "",
                "", "Booked",
-               "", "", "", "", "", ""]]
+               "", "", "", "", "", "",
+               "P1"]]
     tab = gtm_sheet.SHEETS._parse_values("Outreach PoCs", values, read_at=dl.real_epoch())
     trow = tab.rows[0]
 
@@ -800,7 +813,10 @@ def _self_test() -> int:
         return plan_writes(tab=tab, row=trow, fields=fields, trigger=trigger,
                            reply_text=text)
 
-    check("the fixture maps all 24 columns", len(tab.canonical_role_to_col), 24)
+    check("the fixture maps all 32 columns", len(tab.canonical_role_to_col), 32)
+    check("the notes role is Z, the step dropdown is Q",
+          (tab.canonical_role_to_col.get("next_steps"),
+           tab.canonical_role_to_col.get("outreach_step")), (25, 16))
     check("...and no retired role among them",
           sorted(set(gtm_sheet.RETIRED_POCS_ROLES) & set(tab.canonical_role_to_col)),
           [])
@@ -821,7 +837,7 @@ def _self_test() -> int:
     check("a reply cannot set closure_prob", p4["writes"], {})
     p5 = plan([{"role": "closure_prob", "value": "60%", "supersedes": False}],
               trigger=TRIGGER_COMMAND)
-    check("...and NEITHER CAN A COMMAND: V is inside the restricted S:X band",
+    check("...and NEITHER CAN A COMMAND: AC is inside the restricted Z:AE band",
           p5["writes"], {})
     check("...and the refusal names the column",
           any("Closure Prob" in str(sk.get("why", "")) or
@@ -844,7 +860,19 @@ def _self_test() -> int:
     check("Dead without the word is refused", p8["writes"], {})
     p9 = plan([{"role": "prospect_status", "value": "Dead", "supersedes": True}],
               text="call it, they are dead")
-    check("...and STILL refused, because U is restricted too", p9["writes"], {})
+    check("...and STILL refused, because AB is restricted too", p9["writes"], {})
+
+    # THE STEP BLOCK. R13 reminds about these cells; nothing may write them,
+    # whoever asks and however explicitly.
+    for step_role in ("outreach_step", "email_1_sent", "email_3_date", "poc_priority"):
+        check(f"{step_role} is in no tier",
+              (allowed_for(step_role, TRIGGER_REPLY),
+               allowed_for(step_role, TRIGGER_COMMAND)), (False, False))
+    p12 = plan([{"role": "outreach_step", "value": "Send email 1", "supersedes": True}],
+               trigger=TRIGGER_COMMAND, text="set next steps to Send email 1")
+    check("a command cannot set the Next Steps dropdown", p12["writes"], {})
+    p13 = plan([{"role": "next_steps", "value": "call went well", "supersedes": False}])
+    check("a reply cannot fill Notes/Remarks (Z is restricted)", p13["writes"], {})
 
     p11 = plan([{"role": "assets_shared", "value": "Yes", "supersedes": True}])
     check("a RETIRED role has no column and is refused, and named",

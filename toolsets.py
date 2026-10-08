@@ -108,10 +108,14 @@ ONE_LINE = {
         "A research brief on ONE person already on the tab — who they are, how "
         "much the role weighs, lane fit, an angle and a draft message — as copy "
         "material that is never sent and never written to the sheet."),
+    "todays_objectives": (
+        "What the team needs to do today — the day's posts, already written "
+        "out and added to your reply for you; call it for 'objectives', "
+        "'today's plan', 'what's on today' and never restate it."),
     "cadence_preview": (
-        "Today's due items from the twelve rules, grouped by rule, read-only — "
-        "for 'what needs attention' or 'what's the queue'; answer grouped by "
-        "rule."),
+        "The rule-by-rule queue, read-only — for 'cadence preview', 'what's the "
+        "queue' and 'why isn't X due'; not for 'what do we need to do today' "
+        "(that is todays_objectives)."),
     "next_action": (
         "The one next action for a named company or PoC, or the specific "
         "reason there is none (stopped, snoozed, no readable date, nothing due "
@@ -202,10 +206,12 @@ GROUPS = {
     # them here, the words "to do" in "what do we need to do today?" handed a
     # question about the day's work the notes tools and nothing else.
     "notes": ("list_meeting_notes", "read_meeting_note", "meeting_facts"),
-    # "WHAT DO WE NEED TO DO TODAY?" — the to-do sheet, and only that, until
-    # NFT2-1063 adds the objectives tool to THIS tuple. Deliberately no notes
-    # tool and no cadence_preview here.
-    "today": ("show_todos",),
+    # "WHAT DO WE NEED TO DO TODAY?" / "TODAY'S OBJECTIVES" — the day's posts
+    # as they are written (todays_objectives) and the to-do sheet, and only
+    # those two. Deliberately no notes tool and no cadence_preview: on 6 Oct
+    # the question had no route, the model picked cadence_preview, and the
+    # asker was told about the rules and when they run instead of what to do.
+    "today": ("show_todos", "todays_objectives"),
     "todos": ("show_todos", "todo_candidates"),
     "reminders": ("schedule_reminder", "list_reminders", "cancel_reminder",
                   "snooze_row", "set_deadline", "list_deadlines"),
@@ -222,10 +228,11 @@ _ROUTES = (
     ("web", re.compile(
         r"\b(news|latest|announce\w*|funding|funded|rais(e|ed|es|ing)|acqui\w+|"
         r"launch\w*|hiring|conference\w*|summit\w*|papers?|published|web|online|"
-        r"google|search|look\s+(it\s+)?up|what'?s\s+new|in\s+the\s+news|"
+        r"google|search|look\s+(it\s+)?up|what(?:\s+is|'?s)\s+new|in\s+the\s+news|"
         r"industry|market|competitors?)\b", _I)),
     ("news", re.compile(
-        r"\b(news|headlines?|what'?s\s+(new|happening)|in\s+the\s+news|latest)\b",
+        r"\b(news|headlines?|what(?:\s+is|'?s)\s+(new|happening)|in\s+the\s+news|"
+        r"latest)\b",
         _I)),
     ("people", re.compile(
         r"\b(find|get|look\s+for)\b.{0,40}\b(pocs?|people|contacts?|someone)\b|"
@@ -250,12 +257,19 @@ _ROUTES = (
         r"\bminutes\b|\bcall\s+(with|notes)\b|\bdecid\w+|\bdecisions?\b|"
         r"\bon\s+hold\b|\baction\s+items?\s+from\b|came\s+out\s+of", _I)),
     # "what do we need to do today", "what should I do today", "what's on
-    # today". It must not match "objectives" (NFT2-1063's question, which keeps
-    # the full set) or a news question that merely ends in "today".
+    # today", and since NFT2-1063 the day's objectives by any of their names:
+    # "the sales objectives for today", "today's plan / priorities / agenda /
+    # focus", "the plan for today", a bare "objectives". It must not match a
+    # news question that merely ends in "today", "our Q4 objectives" (no
+    # "today"), or "the plan for Acme" (the strategy doc's question).
     ("today", re.compile(
         r"\bwhat\s+(do|should|must)\s+(we|i)\s+(need\s+to\s+|have\s+to\s+)?do\b"
         r"[^?.!\n]{0,30}\btoday\b|"
-        r"\bwhat(\s+is|'?s)\s+on\s+(for\s+)?today\b", _I)),
+        r"\bwhat(\s+is|'?s)\s+on\s+(for\s+)?today\b|"
+        r"\bobjectives?\b[^?.!\n]{0,40}\b(today|for\s+the\s+day)\b|"
+        r"\btoday'?s\s+(?:sales\s+)?(?:objectives?|plan|priorit\w+|agenda|focus)\b|"
+        r"\b(?:objectives?|plan|priorit\w+|agenda)\s+(?:for\s+)?today\b|"
+        r"^\s*(?:the\s+)?(?:sales\s+)?objectives?\s*\??\s*$", _I)),
     # THE TO-DO SHEET, by name. "to-dos", "todo", "to-do list" — never the bare
     # words "to do", which are in half the questions anyone asks.
     ("todos", re.compile(
@@ -425,13 +439,42 @@ def _self_test() -> int:
 
     print("\nthe web pair, and the one route without it")
     got, groups = names("what do we need to do today?")
-    check("today is exclusive: the to-do sheet alone", (got, groups),
-          (["show_todos"], ["today"]))
+    check("today is exclusive: the to-do sheet and the day's objectives, alone",
+          (got, groups), (["show_todos", "todays_objectives"], ["today"]))
     got, groups = names("and tomorrow?", previous="what do we need to do today?")
     check("...a follow-up that inherits today has no web tool either",
           "web_search" in got, False)
     check("is_exclusive", (is_exclusive(["today"]), is_exclusive(["sheet"]),
                            is_exclusive([])), (True, False, False))
+
+    print("\ntoday's objectives, and what must not be mistaken for them (NFT2-1063)")
+    for ask, want in [
+        ("what are the sales objectives for today?", ["today"]),
+        ("today's plan", ["today"]),
+        ("what is the plan for today?", ["today"]),
+        ("what's on today", ["today"]),
+        ("what do we need to do today?", ["today"]),
+        ("today's priorities", ["today"]),
+        ("what are our priorities today", ["today"]),
+        ("objectives", ["today"]),
+        ("what are our Q4 objectives?", []),
+        ("what's the plan for Acme?", ["plan"]),
+        ("are we on plan?", ["plan"]),
+        ("why isn't Acme due today?", []),
+        ("any AI news today?", ["web", "news"]),
+        ("what's the queue", ["ops"]),
+        ("cadence preview", ["ops"]),
+        ("what is new in AI?", ["web", "news"]),
+        ("what's new in AI?", ["web", "news"]),
+        ("top 5 AI headlines", ["news"]),
+        ("Sure.", []),
+    ]:
+        check(f"route({ask!r})", route(ask), want)
+    got, groups = names("what are the sales objectives for today?")
+    check("the objectives question is not offered cadence_preview",
+          "cadence_preview" in got, False)
+    got, groups = names("cadence preview")
+    check("cadence_preview keeps its own route", "cadence_preview" in got, True)
 
     print("\nprofile links (the 6 Oct questions)")
     for ask in ("research profiles for Sigil Wen",

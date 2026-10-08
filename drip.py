@@ -27,6 +27,8 @@ THE VOLUME CONTRACT (plan section 8):
     meeting follow-ups, reminders, urgent news and answers do not count
     (`counted_today` is the one counter);
   - AI news (R1) is planned first, at NEWS_MAIN_TIME, never held or rolled;
+  - next-step follow-ups (R13) go at NEXT_STEP_TIME on weekdays and do not
+    count;
   - the first at about SALES_DRIP_START (10:00 IST);
   - then gaps of MESSAGE_GAP_MINUTES (90) plus or minus MESSAGE_JITTER_MINUTES
     (15), so the spacing never falls below 75 minutes at the default settings;
@@ -54,6 +56,7 @@ not touch this module at all.
 """
 import logging
 import random
+import re
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -63,6 +66,7 @@ import gtm_sheet
 import nextaction
 import rules
 import tone
+import wording
 
 log = logging.getLogger(__name__)
 
@@ -99,8 +103,10 @@ def owner_label(action: dict) -> str:
 # RULES THAT ARE ONE MESSAGE WHATEVER THE OWNERS. R4 is the week's checklist:
 # split by team it became three Monday posts about one list. Its message is
 # addressed to DELIVERABLE_DEFAULT_OWNER, who owns the checklist; each line
-# names its own team.
-RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES})
+# names its own team. R13 is one post a day about up to five people; it is
+# addressed the way the other Outreach PoCs rules are, by the tags line, and
+# has no owner of its own (see `group`).
+RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES, nextaction.R_NEXT_STEPS})
 
 
 def group_key(action: dict) -> str:
@@ -167,10 +173,15 @@ def group(actions: list) -> list:
                 (m.get("dayof_time") for m in members if m.get("dayof_time")), ""
             ),
             "type_label": nextaction.TYPE_LABELS.get(best["type"], best["type"]),
+            # THE CHECKLIST'S OWNER IS THE CHECKLIST'S ALONE. It used to be
+            # given to every rule-only group, which would have addressed R13's
+            # post about Outreach PoCs contacts to whoever owns deliverables.
             "owner_key": (gtm_sheet.normalise_header(config.DELIVERABLE_DEFAULT_OWNER)
-                          if best["type"] in RULE_ONLY_TYPES else owner_key(best)),
+                          if best["type"] == nextaction.R_DELIVERABLES
+                          else owner_key(best)),
             "owner": (config.DELIVERABLE_DEFAULT_OWNER
-                      if best["type"] in RULE_ONLY_TYPES else owner_label(best)),
+                      if best["type"] == nextaction.R_DELIVERABLES
+                      else owner_label(best)),
             "priority": best["priority"],
             "priority_label": best["priority_label"],
             "due_date": best.get("due_date"),
@@ -468,9 +479,24 @@ NEVER_COUNTED = frozenset({
 # decides when its next rung is due and what it says; the re-ask clock turned
 # its second rung into "one last nudge, then I'll leave it" with two rungs and
 # an escalation still to come.
+#
+# R13 HAS ITS OWN CLOCK TOO: who is due, and when each is named again, is the
+# rule's rotation. Under the re-ask clock a post every weekday would be held
+# every other day as "asked recently" and reworded as "one last nudge" on the
+# days it did go.
 NEVER_HELD = frozenset({
     nextaction.R_AI_NEWS, nextaction.R_MEETING_PREP, nextaction.R_MEETING_FOLLOWUP,
+    nextaction.R_NEXT_STEPS,
 })
+
+# POSTS THE CATCH-UP GUARD DOES NOT HOLD, AND THAT DO NOT HOLD OTHERS. The live
+# sender waits `min_gap_minutes()` after ANY post before sending the next, so a
+# spaced post that went at 14:31 would push a 15:00 post to the tick after
+# 15:01 — and a post that says "at 3 PM" on the Bot Rules tab would drift with
+# whatever happened to go out before it. The exemption is this one type and
+# nothing else; R1 and R8 keep exactly the behaviour they had. (NFT2-1069
+# replaces the guard with a per-message check and this constant goes.)
+ON_TIME_TYPES = frozenset({nextaction.R_NEXT_STEPS})
 
 # PLANNED BEFORE EVERYTHING ELSE, so it always holds one of the day's counted
 # posts and the cap can never push it out. Ranked by band it was last (context),
@@ -525,9 +551,11 @@ def cap_reached(already, day: date) -> bool:
 def pinned_time(group: dict, day: date) -> Optional[datetime]:
     """The fixed send time of a group that has one, else None.
 
-    R8's day-of touch (MEETING_DAYOF_TIME) and R1's main post (NEWS_MAIN_TIME)
-    are about something happening at a known time, so they sit OUTSIDE the
-    spaced window: they take no window slot and the window cannot roll them.
+    Three posts have one: R8's day-of touch (MEETING_DAYOF_TIME), R1's main
+    post (NEWS_MAIN_TIME) and R13's next-step follow-ups (NEXT_STEP_TIME). Each
+    is tied to a known time — a meeting that starts, a daily read, a time the
+    team was told — so they sit OUTSIDE the spaced window: they take no window
+    slot and the window cannot roll them.
     """
     raw = str(group.get("dayof_time") or "").strip()
     if not raw:
@@ -554,7 +582,8 @@ def earliest_send_ist() -> tuple:
     is due at any given minute; this only says when to start asking.
     """
     best = tuple(config.drip_start_ist())
-    for raw in (config.MEETING_DAYOF_TIME, config.NEWS_MAIN_TIME):
+    for raw in (config.MEETING_DAYOF_TIME, config.NEWS_MAIN_TIME,
+                config.NEXT_STEP_TIME):
         try:
             hh, mm = (int(x) for x in str(raw or "").strip().split(":")[:2])
         except (TypeError, ValueError):
@@ -1059,12 +1088,26 @@ def _voice(message: dict, slot: str, variants) -> str:
     prompt, and — for R11's opener — checked as a required line. Three random
     picks would be three different sentences and a composition that could
     never pass its own check.
+
+    `_voice_seed` ON THE MESSAGE REPLACES THE RANDOM PICK (NFT2-1063). The
+    on-demand objectives answer must show what today's post contains, word
+    for word, and it renders a post that has not gone out yet. A random
+    opener would make the answer and the post that follows disagree, and two
+    people asking in the same minute would read different words. So the
+    sender and that answer both set the same seed, worked out from the day
+    and the slot (`bot._voice_seed`), and the pick is a function of it.
+
+    A PINNED GENERATOR STILL WINS (`tone.pin`): a verify script that pins the
+    wording to assert an exact sentence gets that wording, seed or no seed. A
+    message with no seed (a preview, a reminder) is picked at random as before.
     """
     if isinstance(variants, str):
         return variants
     chosen = message.setdefault("_voice", {})
     if slot not in chosen:
-        chosen[slot] = tone.pick_index(len(variants))
+        seeded = "_voice_seed" in message and not isinstance(tone.RNG, tone._Pinned)
+        chosen[slot] = (int(message["_voice_seed"]) if seeded
+                        else tone.pick_index(len(variants)))
     return variants[chosen[slot] % len(variants)]
 
 
@@ -1116,6 +1159,7 @@ HEADINGS = {
     "R10": "Closure support",
     "R11": "New in the pipeline",
     "R12": "Sales packages",
+    "R13": "Next steps",
     "reminder": "Reminder",
     "approvals": "Waiting for your yes",
 }
@@ -1126,6 +1170,7 @@ _HEADING_BY_TYPE = {
     nextaction.R_DM_NO_MEETING: "R7", nextaction.R_MEETING_PREP: "R8",
     nextaction.R_MEETING_FOLLOWUP: "R9", nextaction.R_CLOSURE_SUPPORT: "R10",
     nextaction.R_NEW_COMPANY: "R11", nextaction.R_PACKAGES: "R12",
+    nextaction.R_NEXT_STEPS: "R13",
     nextaction.SCHEDULED_REMINDER: "reminder",
 }
 
@@ -1169,8 +1214,15 @@ def with_heading(body: str, head: str) -> str:
 # to a composer. A composer asked to keep a multi-line list intact is a
 # composer that will sometimes not. See `is_verbatim`, which also covers a
 # rule's own notice.
+#
+# R13 IS VERBATIM FOR A THIRD REASON: each line pairs one person with one step
+# and one cell to fill in. A composer that moved a step from one name to the
+# next would send somebody to update the wrong row. It also means the post
+# costs no model call, and is word for word the same live, in test mode, on a
+# test day and in a simulation.
 VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
-                            nextaction.R_EVENTS, nextaction.R_PROSPECTS})
+                            nextaction.R_EVENTS, nextaction.R_PROSPECTS,
+                            nextaction.R_NEXT_STEPS})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1653,7 +1705,15 @@ def shown_contacts(message: dict) -> list:
         return prospect_order(actions)[:cap]
     if kind == nextaction.R_DM_NO_MEETING:
         return dm_no_meeting_order(actions)[:max(1, int(config.DM_NO_MEETING_MAX_CONTACTS))]
+    if kind == nextaction.R_NEXT_STEPS:
+        return next_step_order(actions)[:cap]
     return actions[:cap]
+
+
+def next_step_order(actions: list) -> list:
+    """R13's people in the order the rule picked them (call reminders first,
+    then the rotation). `group` sorts members by due date, which is not it."""
+    return sorted(actions or [], key=lambda a: int(a.get("pick_order") or 0))
 
 
 def notice_of(message: dict) -> str:
@@ -1677,6 +1737,10 @@ def nothing_to_say(message: dict) -> bool:
     every Wednesday for the research layer, and in a week with no event close
     enough to mention and nothing new found, there is nothing to post. The
     sender then spends the slot silently rather than posting a heading."""
+    if message.get("type") == nextaction.R_NEXT_STEPS:
+        # Cannot happen (nobody due means no item, so no group); if it ever
+        # did, an opener with nobody under it must not be posted.
+        return not shown_contacts(message)
     if message.get("type") != nextaction.R_EVENTS:
         return False
     return not event_lines(message) and not research_of(message)
@@ -1759,6 +1823,18 @@ def points_of(message: dict) -> Optional[dict]:
             return None
         return {"header": _voice(message, "r3_opener", EVENT_OPENERS),
                 "lines": lines, "extra": extra, "close": offer}
+    if kind == nextaction.R_NEXT_STEPS:
+        people = shown_contacts(message)
+        if not people:
+            return None
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py: an opener chosen by the
+        # day (carried on the items, never random) and one line a person. No
+        # close: every line already ends on its own ask.
+        openers = wording.NEXT_STEP_OPENERS
+        index = int(people[0].get("opener_index") or 0) % len(openers)
+        return {"header": openers[index],
+                "lines": [f"• {a.get('text', '')}" for a in people],
+                "extra": [], "close": ""}
     if kind == nextaction.R_CLOSURE_SUPPORT:
         if notice_of(message):
             return None                    # the notice IS the message
@@ -1838,7 +1914,41 @@ def split_on_lines(body: str, *, limit: int = 1900) -> list:
     return parts or [""]
 
 
-def compose_fallback(message: dict, *, address: str = "") -> str:
+def _offer_pattern(template: str):
+    """A whole-line pattern for one offer template, its {placeholders} open."""
+    fixed = [re.escape(part) for part in re.split(r"\{[^{}]*\}", template)]
+    return re.compile("^" + ".*?".join(fixed) + "$")
+
+
+# THE TWO POSTS THAT END ON AN OFFER a "yes" answers: R3's "remind you again?"
+# and R5's "add the email I found?". Matched by their FIXED words, built from
+# the templates themselves so a reworded offer cannot drift from its matcher.
+_OFFER_LINES = (_offer_pattern(EVENTS_OFFER), _offer_pattern(EMAIL_OFFER))
+
+
+def is_offer_line(line: str) -> bool:
+    """True for one of the two closing offers, exactly as a post carries it."""
+    text = str(line or "").strip()
+    return bool(text) and any(p.match(text) for p in _OFFER_LINES)
+
+
+def without_offer(body: str) -> str:
+    """`body` without a closing offer line (EVENTS_OFFER, EMAIL_OFFER).
+
+    FOR TEXT SHOWN AGAIN OUTSIDE ITS POST. The offer under the real post has a
+    proposal behind it, keyed to that message. The same sentence quoted in an
+    on-demand answer has nothing behind it, and a "yes" under it would be a yes
+    to nothing: an offer the bot cannot honour is not repeated.
+    """
+    lines = str(body or "").rstrip().split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and is_offer_line(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
+def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -> str:
     """The message text WITHOUT the model. Always sendable.
 
     One thought, one sentence-ish, an out at the end, no headers, no bullets, no
@@ -1853,6 +1963,12 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
     the roster gate fell back to a name: two things were both naming the owner
     and neither knew about the other. There is now exactly one place a message
     says who it is for.
+
+    `offers=False` LEAVES OUT A CLOSING OFFER (R3's "remind you again?", R5's
+    "add the email I found?"). The sender never passes it. The on-demand
+    objectives answer does: it opens no proposal, so the question would have
+    nothing behind it (see `without_offer`). Done here and not in `points_of`,
+    whose `close` the real post and its required-lines check both read.
     """
     who = f"{address or message.get('owner') or ''} — " if (
         address or message.get("owner")) else ""
@@ -1873,6 +1989,8 @@ def compose_fallback(message: dict, *, address: str = "") -> str:
     if is_verbatim(message):
         who = ""
     points = points_of(message)
+    if points and not offers and is_offer_line(points.get("close") or ""):
+        points = {**points, "close": ""}
     if points and message.get("type") == nextaction.R_EVENTS:
         # R3 ENDS ON ITS OFFER. Whatever the research found (events the tab
         # lacks, missing deadlines) goes between the list and the question, so
@@ -2410,6 +2528,63 @@ def _self_test() -> int:
     check("reminder", heading("reminder"), "**Reminder**")
     check("no heading uses a dash as a separator",
           [k for k, v in HEADINGS.items() if "—" in v], [])
+    check("next steps", heading("R13"), "**Next steps**")
+
+    print("\nthe next-step follow-ups (R13): one fixed-time post, as written")
+    wed = date(2026, 9, 9)
+    steps = []
+    for i, (name, co) in enumerate((("Priya Rao", "Acme Labs"), ("Dev Shah", "Borealis"),
+                                    ("Mei Lin", "Cinder"))):
+        a = action(co, name, nextaction.R_NEXT_STEPS, "", nextaction.P_CHASE,
+                   # Due dates run AGAINST the pick order on purpose.
+                   wed - timedelta(days=i), rule_id="R13")
+        a.update(counts_toward_cap=False, dayof_time="15:00", pick_order=i,
+                 opener_index=1, ask="email_out",
+                 text=wording.next_step_line(
+                     "email_out", who=wording.next_step_who(name, co), n=1))
+        steps.append(a)
+    spaced_only = plan(seeded, day=wed, cap=0)
+    p13 = plan(seeded + steps, day=wed, cap=0)
+    m13 = [m for m in p13["messages"] if m["type"] == nextaction.R_NEXT_STEPS]
+    check("one message for the whole rule", len(m13), 1)
+    check("...at its fixed time, outside the window",
+          (m13[0]["send_at_hhmm"], m13[0]["pinned"]), ("15:00", True))
+    check("...outside the cap, so a cap of 0 does not roll it",
+          m13[0]["counts_toward_cap"], False)
+    check("...addressed by the tags line, not to the checklist's owner",
+          m13[0]["owner"], "")
+    check("...and the other posts keep their times",
+          [(m["group_key"], m["send_at_hhmm"]) for m in p13["messages"]
+           if m["type"] != nextaction.R_NEXT_STEPS],
+          [(m["group_key"], m["send_at_hhmm"]) for m in spaced_only["messages"]])
+    check("never held by the re-ask clock",
+          [m["stage"] for m in plan(
+              steps, day=wed,
+              history={m13[0]["group_key"]: {
+                  "last_nudge": dl.iso(wed - timedelta(days=1))}},
+          )["messages"]], [STAGE_NUDGE])
+    check("not planned twice in a day",
+          plan(steps, day=wed, already_sent=[{
+              "slot": 1, "group_key": m13[0]["group_key"],
+              "action_type": nextaction.R_NEXT_STEPS, "counts_toward_cap": 0,
+              "pinned": 1}])["messages"], [])
+    check("silent on a Saturday",
+          plan(steps, day=date(2026, 9, 12))["messages"], [])
+    check("posted as written, never composed", is_verbatim(m13[0]), True)
+    check("the post: an opener and one line a person, in pick order",
+          compose_fallback(m13[0]),
+          "Next steps for some of our LinkedIn connections:\n"
+          "• Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? "
+          "If so, mark 1st Email Sent and the date.\n"
+          "• Dev Shah (Borealis): Next Steps says Send email 1. Has it gone out? "
+          "If so, mark 1st Email Sent and the date.\n"
+          "• Mei Lin (Cinder): Next Steps says Send email 1. Has it gone out? "
+          "If so, mark 1st Email Sent and the date.")
+    check("the people the sender records are the people shown",
+          [a["poc"] for a in shown_contacts(m13[0])],
+          ["Priya Rao", "Dev Shah", "Mei Lin"])
+    check("R13 is the only post the catch-up guard does not hold",
+          ON_TIME_TYPES, frozenset({nextaction.R_NEXT_STEPS}))
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

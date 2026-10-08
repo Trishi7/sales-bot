@@ -1,4 +1,4 @@
-"""THE TWELVE RULES — what the bot says on its own initiative, computed.
+"""THE THIRTEEN RULES — what the bot says on its own initiative, computed.
 
 WHAT THIS REPLACES. The plan-v2 state machine that lived here produced exactly
 one action per ACTIVE row, chosen by the first of twelve ordered triggers to
@@ -7,7 +7,7 @@ this row need next?" — and seven of the twelve rules the team actually runs ar
 not about a row at all: two are about the news, one about a checklist, one about
 a package list, one about a pipeline tab, one about an events tab.
 
-WHAT REPLACED IT. `bot_rules.yaml` holds the twelve rules, and this module holds
+WHAT REPLACED IT. `bot_rules.yaml` holds the thirteen rules, and this module holds
 one evaluator per rule. The file decides WHICH rules exist, WHEN each runs, HOW
 MUCH one post may carry, WHERE it goes and whether it counts against the cap.
 This module decides only HOW a rule works out that something is due.
@@ -15,20 +15,23 @@ This module decides only HOW a rule works out that something is due.
     THE FILE IS THE SCHEDULE; THE CODE IS THE ARITHMETIC. Changing a weekday or
     a cap is an edit and a restart. That split is the whole point of the rewrite.
 
-THE TWELVE, with the trigger name the file uses:
+THE THIRTEEN, with the trigger name the file uses:
 
      R1  ai_news                weekdays            the news sweep
      R2  news_company_screen    Tue, Fri            news companies vs the pipeline
      R3  events                 alt. Wed            register / attend, until it passes
      R4  deliverables           Mon                 P1 only, due this week or passed
      R5  prospects              Tue, Thu            first contact FALSE or blank
-     R6  li_no_dm               Tue, Fri            connected > 3d, no DM
-     R7  dm_no_meeting          Mon                 DM > 7d, no meeting
+     R6  li_no_dm               Tue, Fri            connected > 3d, no DM: the email check
+     R7  dm_no_meeting          Mon                 DM > 7d, no meeting (OFF since
+                                                    7 Oct 2026: R13 replaced it)
      R8  meeting_prep           anchored            T-5, T-3, and 10:00 on the day
      R9  meeting_followup       anchored            done + 3d, no next steps, laddered
     R10  closure_support        Mon                 deal/demo/quote AND closure > 50
     R11  new_pipeline_company   weekdays            1 working day after it appears
     R12  sales_packages         Thu                 Ready? is No or blank
+    R13  next_step_followups    weekdays, 15:00     connected contacts: the next step
+                                                    on the Next Steps dropdown, 5 a post
 
 TWO GATES SURVIVE THE REWRITE, and they run before any rule sees a row:
 
@@ -57,8 +60,8 @@ before the research layer lands. Nothing is silently skipped waiting for it.
 
 THIS MODULE IS PURE, AND THAT IS LOAD-BEARING. Tabs and dicts in, dicts out. It
 reads no sheet, writes no database row and sends nothing — the snoozes, the
-new-company snapshot, the repeat counts and the R9
-ladder state are all passed IN, computed by the caller. There is no
+new-company snapshot, the repeat counts, the R9
+ladder state and R13's rotation state are all passed IN, computed by the caller. There is no
 `guardrails.send` here and there must never be one.
 
     R11's SNAPSHOT IS THE REASON THAT MATTERS. Detecting a new company in the
@@ -69,6 +72,7 @@ ladder state are all passed IN, computed by the caller. There is no
     previewing.
 """
 import logging
+import re
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
@@ -78,10 +82,11 @@ import deadlines as dl
 import gtm_sheet
 import focus as focus_mod
 import rules as rules_mod
+import wording
 
 log = logging.getLogger(__name__)
 
-# -- the twelve rule ids ------------------------------------------------------
+# -- the thirteen rule ids ------------------------------------------------------
 # The id is the stable key: the dedup ledger, the drip's group keys and the
 # SQLite state are all written against it. `bot_rules.yaml` carries the same
 # ids, and `rules.py` refuses a file whose trigger names this module does not
@@ -98,6 +103,7 @@ R_MEETING_FOLLOWUP = "meeting_followup"
 R_CLOSURE_SUPPORT = "closure_support"
 R_NEW_COMPANY = "new_pipeline_company"
 R_PACKAGES = "sales_packages"
+R_NEXT_STEPS = "next_step_followups"
 
 # The one instruction lane that is NOT a rule: a one-off somebody asked for by
 # name ("remind me about Acme on Saturday"). It is kept out of bot_rules.yaml
@@ -122,6 +128,7 @@ TYPE_LABELS = {
     R_CLOSURE_SUPPORT: "Closure support",
     R_NEW_COMPANY: "New company in the pipeline",
     R_PACKAGES: "Sales packages not ready",
+    R_NEXT_STEPS: "Next steps for connected contacts",
     SCHEDULED_REMINDER: "Reminders you asked for",
 }
 
@@ -156,6 +163,7 @@ RULE_BANDS = {
     R_DELIVERABLES: P_CHASE,
     R_PROSPECTS: P_CHASE,
     R_NEW_COMPANY: P_CHASE,
+    R_NEXT_STEPS: P_CHASE,
     R_AI_NEWS: P_CONTEXT,
     R_NEWS_SCREEN: P_CONTEXT,
     R_EVENTS: P_CONTEXT,
@@ -226,7 +234,7 @@ def stop_reason(row: dict) -> str:
 
     STOP SEMANTICS SURVIVED THE REWRITE UNCHANGED, and deliberately: it is the
     one piece of the old engine that was load-bearing rather than incidental.
-    A row that is finished produces nothing, from any of the twelve rules, ever.
+    A row that is finished produces nothing, from any of the thirteen rules, ever.
 
     THREE WAYS TO BE FINISHED, and all three are things a human wrote:
       - the DEAL STATUS names one of CLOSURE_STOP_MARKERS (Won, Lost, Dead,
@@ -285,9 +293,11 @@ def _date(row: dict, role: str) -> Optional[date]:
 def last_note(row: dict) -> str:
     """The most recent thing written against this row, for R7's line.
 
-    Next Steps first, because that is where a person records what happens next;
-    the sheet has no dated note column, so "most recent" is really "the most
-    specific thing anybody wrote".
+    The notes column (Notes/Remarks; "Next Steps/Notes" before 7 Oct 2026),
+    because that is where a person records what happens next; the sheet has no
+    dated note column, so "most recent" is really "the most specific thing
+    anybody wrote". `next_steps` is that column's role — never the Next Steps
+    dropdown, which is `outreach_step`.
     """
     return _text(row, "next_steps")
 
@@ -450,12 +460,12 @@ def row_gate(row: dict, *, today: date, snoozes: dict) -> tuple:
     return True, "", until
 
 
-# -- the twelve evaluators ----------------------------------------------------
+# -- the thirteen evaluators --------------------------------------------------
 # Each takes (rule, ctx) and returns a list of items. NONE of them sends, writes
 # or reads a sheet: everything they need is in `ctx`, assembled by the caller.
 #
 # An evaluator that raises is caught by `run()`, logged with its rule id, and
-# contributes nothing — one broken rule must not take the other eleven down.
+# contributes nothing — one broken rule must not take the other twelve down.
 
 
 def _r_ai_news(rule, ctx) -> list:
@@ -927,10 +937,15 @@ def prospect_signature(row: dict) -> str:
 def _r_li_no_dm(rule, ctx) -> list:
     """R6 — connected on LinkedIn more than LI_NO_DM_DAYS ago, still no DM.
 
-    SAYS WHETHER AN EMAIL IS ON FILE. When one is, the item carries it and the
-    ask is simply the DM. When none is, the research layer will look for a
-    verified public address and say where it found it, or that it found none —
-    hence WEB-DEPENDENT, but only for the half of the rule that needs it.
+    THIS IS THE EMAIL CHECK. It says whether an email is on file; when none
+    is, the research layer looks for a verified public address and says where
+    it found it, or that it found none — hence WEB-DEPENDENT, but only for the
+    half of the rule that needs it.
+
+    THE LINE TALKS ABOUT THE EMAIL ONLY. It used to add "no DM logged". Since
+    7 Oct 2026 the sheet's sequence puts the DM after three emails and R13
+    owns the step reminders, so a line chasing the DM here would ask for a
+    step that is not due. Who is selected has not changed.
     """
     today = ctx["today"]
     days = max(0, int(config.LI_NO_DM_DAYS))
@@ -951,7 +966,7 @@ def _r_li_no_dm(rule, ctx) -> list:
             continue
         email = _text(row, "email")
         elapsed = (today - connected).days
-        text = (f"{_describe(row)} — connected {elapsed} day(s) ago, no DM logged. "
+        text = (f"{_describe(row)} — connected {elapsed} day(s) ago. "
                 + (f"Email on file: {email}" if email else "No email on file"))
         out.append(_item(
             rule=rule, trigger=R_LI_NO_DM, today=today,
@@ -971,6 +986,9 @@ def _r_li_no_dm(rule, ctx) -> list:
 
 def _r_dm_no_meeting(rule, ctx) -> list:
     """R7 — DM sent more than DM_NO_MEETING_DAYS ago, still no meeting. Mondays.
+
+    SWITCHED OFF in bot_rules.yaml since 7 Oct 2026: R13's call reminders
+    replaced it. Kept so that `enabled: true` brings it back unchanged.
 
     SHOWS DAYS SINCE THE DM AND THE LAST NOTE LOGGED, because those two are what
     a person needs to decide whether to chase again or leave it. "No reply after
@@ -1072,6 +1090,10 @@ def _r_meeting_prep(rule, ctx) -> list:
 
 def _r_meeting_followup(rule, ctx) -> list:
     """R9 — meeting completed, no next steps. Then every 3 days, up a ladder.
+
+    "NO NEXT STEPS" IS A BLANK NOTES CELL (Notes/Remarks, the `next_steps`
+    role). It is never the Next Steps dropdown: a row whose dropdown says "Send
+    email 1" has not had its meeting written up.
 
     THE LADDER IS ONE CHANNEL POST, THEN TWO DMs, THEN ONE ESCALATION TO SID,
     THEN STOP (MEETING_FOLLOWUP_LADDER). Running off the end stops the chase
@@ -1332,6 +1354,489 @@ def _r_sales_packages(rule, ctx) -> list:
 # a name because drip.NEVER_COUNTED and the "reminder" heading still use it.
 
 
+# -- R13: next steps for connected contacts -----------------------------------
+
+# What the Next Steps dropdown (Q) says, as a code. `dm` and `call` are two
+# options on the dropdown and ONE stage of the rule: see `step_signature`.
+STEP_BLANK = "blank"
+STEP_RESEARCH = "research"
+STEP_DM = "dm"
+STEP_CALL = "call"
+STEP_UNKNOWN = "unknown"
+
+# THE COLUMNS THE RULE CANNOT RUN WITHOUT. A row parsed from the sheet carries
+# a key for every role its tab mapped, blank or not, so a role no row carries
+# is a column the bot cannot see (the pre-7 Oct layout, or a renamed header).
+NEXT_STEP_REQUIRED_ROLES = (
+    "outreach_step", "email_1_sent", "email_1_date", "email_2_sent",
+    "email_2_date", "email_3_sent", "email_3_date",
+)
+
+# WHETHER THE REMINDER TO MARK SOMEBODY UNRESPONSIVE ENDS THE RULE FOR THEM FOR
+# GOOD. True: once it has gone out the rule never names them again, whatever
+# the cells later say. False: a later change to their step reopens them.
+NEXT_STEP_CLOSED_IS_FINAL = True
+
+_EMAIL_STEP_RE = re.compile(r"send e ?mail ([123])")
+
+
+def step_code(raw) -> str:
+    """The Next Steps cell as a code: blank, research, email1..3, dm, call, or
+    unknown.
+
+    COMPARED NORMALISED, because a dropdown gets retyped: "Send Email 1" is
+    "Send email 1", and "Call PoC" is "Call the PoC". Anything else is
+    `unknown`, and the caller skips the row and SAYS SO — guessing which step
+    a free-text cell means would put a made-up ask in front of the team.
+    """
+    text = " ".join(w for w in _norm(raw).split() if w != "the")
+    if not text:
+        return STEP_BLANK
+    if text == "research poc":
+        return STEP_RESEARCH
+    m = _EMAIL_STEP_RE.fullmatch(text)
+    if m:
+        return f"email{m.group(1)}"
+    if text in ("reach by li dm", "reach by linkedin dm"):
+        return STEP_DM
+    if text == "call poc":
+        return STEP_CALL
+    return STEP_UNKNOWN
+
+
+def _email_n(code: str) -> int:
+    return int(code[-1]) if str(code).startswith("email") else 0
+
+
+def _email_sent(row: dict, n: int) -> bool:
+    return gtm_sheet.parse_flag(row.get(f"email_{n}_sent")) is True
+
+
+def _email_date(row: dict, n: int) -> Optional[date]:
+    return _date(row, f"email_{n}_date")
+
+
+def step_signature(row: dict, code: Optional[str] = None) -> str:
+    """The step a row is on, as one string: the stage and the cells it turns on.
+
+    WHEN THIS CHANGES, THE PERSON IS NEW AGAIN — their place in the rotation and
+    their call count belong to the old step. So it holds only what somebody
+    would touch to move the step on, and nothing that changes by itself.
+
+    "Reach by LI DM" AND "Call the PoC" SHARE ONE STAGE. The rule itself asks
+    people to change the first to the second once the calls start, and doing
+    what it asked must not restart the call clock.
+    """
+    code = code or step_code(row.get("outreach_step"))
+    connected = _date(row, "li_connected_date")
+    c_iso = dl.iso(connected) if connected else ""
+    if code == STEP_BLANK:
+        return f"start|{c_iso}"
+    if code == STEP_RESEARCH:
+        return f"research|{c_iso}"
+    n = _email_n(code)
+    if n:
+        when = _email_date(row, n)
+        return (f"email{n}|{'yes' if _email_sent(row, n) else ''}|"
+                f"{dl.iso(when) if when else ''}")
+    if code in (STEP_DM, STEP_CALL):
+        dm = _date(row, "li_dm_date")
+        return f"dm|{_norm(row.get('li_dm_sent'))}|{dl.iso(dm) if dm else ''}"
+    return f"unknown|{_norm(row.get('outreach_step'))}"
+
+
+def _day_month(d: date) -> str:
+    """"5 Oct" — a sheet date the way a person says it in a sentence."""
+    return f"{d.day} {d.strftime('%b')}"
+
+
+def next_step_for(row: dict, *, today: date, entry: Optional[dict] = None) -> dict:
+    """What ONE connected, dated row needs from the rule today.
+
+    Returns {"status": "due" | "waiting" | "unknown_step", "code", "signature",
+    "ask", "due", "missing", "n", "when", "set_call", "why"}. PURE: `entry` is
+    the row's stored state (or None) and is only read.
+
+    THE TABLE THIS IMPLEMENTS is in bot_rules.yaml above R13, with the setting
+    each number comes from. Two readings worth stating here:
+
+      GO BY THE DROPDOWN. When Next Steps says "Send email 2" and 1st Email
+      Sent is blank, the ask is still about email 2, and the line also asks
+      for the cell that is missing. The dropdown is what the team maintains
+      first; arguing with it would stall the row on a bookkeeping gap.
+
+      A BLANK PREVIOUS DATE MEANS DUE NOW. "Two days after the previous step"
+      cannot be counted from nothing, and waiting for a date nobody logged
+      would hide the row for good.
+    """
+    code = step_code(row.get("outreach_step"))
+    out = {"status": "unknown_step", "code": code, "signature": "", "ask": "",
+           "due": None, "missing": [], "n": 0, "when": "", "set_call": False,
+           "why": ""}
+    if code == STEP_UNKNOWN:
+        out["why"] = f"Next Steps says {_text(row, 'outreach_step')!r}"
+        return out
+    sig = step_signature(row, code)
+    out["signature"] = sig
+    connected = _date(row, "li_connected_date")
+    first = max(0, int(config.NEXT_STEP_FIRST_DAYS))
+    after_prev = max(0, int(config.NEXT_STEP_AFTER_PREVIOUS_DAYS))
+    after_email = max(0, int(config.NEXT_STEP_AFTER_EMAIL_DAYS))
+
+    def done(ask, due, why, **more):
+        out.update(ask=ask, due=due, why=why, **more)
+        out["status"] = "due" if today >= due else "waiting"
+        return out
+
+    def gaps(n: int) -> list:
+        """The cells email N's step implies and the row lacks."""
+        cells = []
+        if not _email_sent(row, n):
+            cells.append(wording.email_sent_cell(n))
+        if _email_date(row, n) is None:
+            cells.append(wording.email_date_cell(n))
+        return cells
+
+    if code in (STEP_BLANK, STEP_RESEARCH):
+        due = (connected + timedelta(days=first)) if connected else today
+        return done(
+            "ask_next" if code == STEP_BLANK else "researched", due,
+            f"Next Steps is {'blank' if code == STEP_BLANK else 'Research the PoC'}; "
+            f"LI Connected Date + NEXT_STEP_FIRST_DAYS ({first})")
+
+    n = _email_n(code)
+    if n:
+        if not _email_sent(row, n):
+            previous = connected if n == 1 else _email_date(row, n - 1)
+            due = (previous + timedelta(days=after_prev)) if previous else today
+            return done(
+                "email_out", due,
+                f"Send email {n}, {wording.email_sent_cell(n)} not yes; "
+                + (f"previous step {dl.iso(previous)} + NEXT_STEP_AFTER_PREVIOUS_DAYS "
+                   f"({after_prev})" if previous
+                   else "previous step date blank, so due now"),
+                n=n, missing=gaps(n - 1) if n >= 2 else [])
+        sent_on = _email_date(row, n)
+        if sent_on is not None:
+            return done(
+                "advance", sent_on + timedelta(days=after_email),
+                f"email {n} sent {dl.iso(sent_on)} + NEXT_STEP_AFTER_EMAIL_DAYS "
+                f"({after_email})", n=n, when=_day_month(sent_on))
+        return done("log_date", today,
+                    f"{wording.email_sent_cell(n)} is yes with no date", n=n)
+
+    # -- Reach by LI DM / Call the PoC ---------------------------------------
+    dm = _date(row, "li_dm_date")
+    if config.NEXT_STEP_DM_REPLIED_MARKERS and _matches_any(
+            row.get("li_dm_sent"), config.NEXT_STEP_DM_REPLIED_MARKERS):
+        return done("dm_replied", today,
+                    f"LI DM Sent says {_text(row, 'li_dm_sent')!r}: no call chase")
+    if dm is None:
+        if code == STEP_DM:
+            third = _email_date(row, 3)
+            due = (third + timedelta(days=after_prev)) if third else today
+            return done(
+                "dm_out", due,
+                "Reach by LI DM, no LI DM Date; "
+                + (f"3rd Email Date {dl.iso(third)} + NEXT_STEP_AFTER_PREVIOUS_DAYS "
+                   f"({after_prev})" if third else "3rd Email Date blank, so due now"),
+                missing=gaps(3))
+        return done("call_no_dm_date", today, "Call the PoC with no LI DM Date")
+
+    call_after = max(0, int(config.NEXT_STEP_CALL_AFTER_DM_DAYS))
+    call_every = max(1, int(config.NEXT_STEP_CALL_EVERY_DAYS))
+    call_until = max(0, int(config.NEXT_STEP_CALL_UNTIL_DAYS))
+    start = dm + timedelta(days=call_after)
+    end = dm + timedelta(days=call_until)
+    when = _day_month(dm)
+    if today < start:
+        return done("call", start,
+                    f"LI DM Date {dl.iso(dm)} + NEXT_STEP_CALL_AFTER_DM_DAYS "
+                    f"({call_after})", when=when)
+    if today > end:
+        return done("unresponsive", today,
+                    f"more than NEXT_STEP_CALL_UNTIL_DAYS ({call_until}) since the "
+                    f"LI DM on {dl.iso(dm)}", when=when)
+    same = bool(entry) and str(entry.get("signature") or "") == sig
+    calls = int((entry or {}).get("calls") or 0) if same else 0
+    last_call = dl.parse_date((entry or {}).get("last_call_date")) if same else None
+    due = start
+    if calls and last_call is not None:
+        due = last_call + timedelta(days=call_every)
+    return done(
+        "call", due,
+        f"LI DM {dl.iso(dm)}, {(today - dm).days}d ago; call reminder "
+        f"{calls + 1}, every NEXT_STEP_CALL_EVERY_DAYS ({call_every}) until day "
+        f"{call_until}",
+        when=when, set_call=(code == STEP_DM))
+
+
+def _next_step_order(person: dict) -> tuple:
+    """THE ROTATION'S ORDER, in one place: least recently named first, then
+    sheet order.
+
+    Never named sorts first ("" is before every ISO date), so the list is
+    walked top to bottom and then from the top again. Sheet order is what
+    Vaishnavi asked for; Priority (AF) is read and shown in the preview and
+    deliberately not used here.
+    """
+    return (person["last_date"], person["row"].get("_row") or 0)
+
+
+def _r_next_step_followups(rule, ctx) -> list:
+    """R13 — the next step for people we are connected with. Weekdays, one post.
+
+    WHO IS IN: rows whose "Sid - LI Addition" says Connected and whose LI
+    Connected Date reads as a date, that the stop and snooze gates let through.
+    A connected row with no date is skipped, logged and listed in the report,
+    because "connected, but when?" is a gap somebody can fix in ten seconds
+    and cannot fix if nobody tells them.
+
+    WHO IS PICKED: at most `max_items_per_post`. Call reminders that are due
+    go first — that clock is counted from a date and runs out — then the
+    people named least recently (`_next_step_order`).
+
+    THE EVALUATOR PICKS, NOT THE DRIP. Every other rule hands over everything
+    that qualified and lets the post take what fits. Here the five ARE the
+    rule; handing over thirty would let the cross-rule dedup and the post's
+    own ordering choose a different five from the ones the rotation meant.
+
+    `ctx["next_step_state"]` is {row_key: {...}} from the caller. NONE MEANS
+    UNREADABLE, AND THEN NOTHING IS PRODUCED: with no state the rotation would
+    restart and people already closed would be chased again. Nothing is
+    written here; the sender records a mention after a real send.
+
+    A STORED ENTRY WHOSE SIGNATURE DIFFERS FROM THE ROW'S IS IGNORED — that is
+    all "the state for the old step clears" needs, and it means a preview
+    never has to write. The one thing that survives a step change is `closed`.
+
+    ONCE TODAY'S POST HAS GONE, TODAY'S PEOPLE STAY TODAY'S PEOPLE. The queue
+    is recomputed on every sweep tick. Without this, the tick after the post
+    would pick the NEXT five (the first five now read "named today"), and the
+    one-mention-a-day dedup would take those five away from R5 and R6 for a
+    post that is never going to be sent, while freeing the five who really
+    were named. So anyone the state says was named today is returned as-is and
+    nobody else is; the drip does not send the group twice in a day.
+    """
+    today = ctx["today"]
+    rule_id = getattr(rule, "id", "") or "R13"
+    report = {"connected": 0, "due": 0, "picked": [], "queued": [], "waiting": 0,
+              "no_date": [], "unknown_step": [], "paused": [], "completed": 0,
+              "closed": [], "state": "ok"}
+    ctx.setdefault("reports", {})[rule_id] = report
+    state = ctx.get("next_step_state")
+    if state is None:
+        report["state"] = "unreadable"
+        log.info("[rules] %s: the rotation state was not supplied or could not be "
+                 "read, so nobody is named", rule_id)
+        return []
+
+    markers = {gtm_sheet.normalise_header(str(m))
+               for m in (config.NEXT_STEP_CONNECTED_MARKERS or []) if str(m).strip()}
+    snoozes = ctx.get("snoozes") or {}
+    # Every row, not only the "active" ones, for the reason R5 gives: a row
+    # marked Connected with no date may not have passed the activation gate.
+    source = ctx.get("prospect_rows")
+    due_people: list = []
+    named_today: list = []
+    today_iso = dl.iso(today)
+
+    def entry_of(row, detail=""):
+        return {"sheet_row": row.get("_row"), "poc": _text(row, "name"),
+                "company": _text(row, "company"), "detail": detail,
+                "poc_priority": _text(row, "poc_priority")}
+
+    in_sheet_order = sorted(
+        (source if source is not None else ctx.get("rows")) or (),
+        key=lambda r: r.get("_row") or 0)
+    # A COLUMN THE BOT CANNOT SEE IS NOT A BLANK CELL. Without this, a sheet
+    # with no Next Steps column would have every connected contact reported as
+    # "Next Steps is blank", which states something about the sheet that the
+    # bot has not read. Nothing is posted and the report names the columns.
+    seen_roles = set().union(*(r.keys() for r in in_sheet_order)) if in_sheet_order else set()
+    absent = [role for role in NEXT_STEP_REQUIRED_ROLES if role not in seen_roles]
+    if in_sheet_order and absent:
+        report["state"] = "no_step_column"
+        report["missing_columns"] = absent
+        log.warning(
+            "[rules] %s: the Outreach PoCs tab has no column mapped to %s, so "
+            "nobody is named. Check the header row (Next Steps, 1st/2nd/3rd Email "
+            "Sent and Date) or GTM_COLUMN_MAP.", rule_id, ", ".join(absent))
+        return []
+    for row in in_sheet_order:
+        if _norm(row.get("sid_li_added")) not in markers:
+            continue
+        report["connected"] += 1
+        if "outreach_step" not in row:
+            # This one row has no Next Steps cell to read (the others do), so
+            # it is skipped rather than reported as blank.
+            continue
+        ok, _reason, _until = row_gate(row, today=today, snoozes=snoozes)
+        if not ok:
+            continue
+        named =state.get(_contact_key(row)) or {}
+        if str(named.get("last_date") or "") == today_iso:
+            named_today.append({
+                "row": row, "key": _contact_key(row), "last_date": today_iso,
+                "found": next_step_for(row, today=today, entry=named),
+            })
+            continue
+        if _date(row, "li_connected_date") is None:
+            raw = _text(row, "li_connected_date")
+            report["no_date"].append(entry_of(
+                row, f"LI Connected Date reads {raw!r}" if raw
+                else "LI Connected Date is blank"))
+            log.info("[rules] %s: row %s (%s) is Connected with no readable LI "
+                     "Connected Date (%r) — skipped", rule_id, row.get("_row"),
+                     _describe(row), raw)
+            continue
+        key = _contact_key(row)
+        stored = state.get(key) or None
+        if stored and stored.get("closed") and (
+                NEXT_STEP_CLOSED_IS_FINAL
+                or str(stored.get("signature") or "") == step_signature(row)):
+            report["closed"].append(entry_of(
+                row, "asked to mark Unresponsive on "
+                     f"{stored.get('closed_date') or 'an earlier day'}"))
+            continue
+        if gtm_sheet.is_meeting_completed(row.get("meeting_status")):
+            report["completed"] += 1
+            continue
+        meeting = _date(row, "meeting_date")
+        if (config.NEXT_STEP_PAUSE_FOR_BOOKED_MEETING and meeting is not None
+                and meeting >= today):
+            report["paused"].append(entry_of(
+                row, f"meeting on {dl.format_date(meeting)}"))
+            continue
+        found = next_step_for(row, today=today, entry=stored)
+        if found["status"] == "unknown_step":
+            raw = _text(row, "outreach_step")
+            report["unknown_step"].append(entry_of(row, f"Next Steps says {raw!r}"))
+            log.info("[rules] %s: row %s (%s) has a Next Steps value I don't know "
+                     "(%r) — skipped", rule_id, row.get("_row"), _describe(row), raw)
+            continue
+        if found["status"] == "waiting":
+            report["waiting"] += 1
+            continue
+        same = bool(stored) and str(stored.get("signature") or "") == found["signature"]
+        due_people.append({
+            "row": row, "key": key, "found": found,
+            "last_date": str(stored.get("last_date") or "") if same else "",
+        })
+
+    report["due"] = len(due_people)
+    calls = sorted((p for p in due_people if p["found"]["ask"] == "call"),
+                   key=_next_step_order)
+    others = sorted((p for p in due_people if p["found"]["ask"] != "call"),
+                    key=_next_step_order)
+    limit = max(1, int(getattr(rule, "max_items_per_post", 5) or 5))
+    ranked = calls + others
+    picked, queued = ranked[:limit], ranked[limit:]
+    if named_today:
+        picked, queued = named_today, ranked
+        report["posted_today"] = True
+
+    out = []
+    for position, person in enumerate(picked):
+        row, found = person["row"], person["found"]
+        n = found["n"]
+        label = {
+            STEP_BLANK: "", STEP_RESEARCH: wording.STEP_RESEARCH,
+            STEP_DM: wording.STEP_DM, STEP_CALL: wording.STEP_CALL,
+        }.get(found["code"], wording.STEP_EMAILS[n - 1] if n else "")
+        who = wording.next_step_who(_text(row, "name"), _text(row, "company"))
+        line = wording.next_step_line(
+            found["ask"], who=who, step_label=label, n=n, when=found["when"],
+            missing=found["missing"], set_call=found["set_call"],
+        ) or f"{who}: named in today's post"
+        report["picked"].append({**entry_of(row, found["ask"]), "line": line})
+        out.append(_item(
+            rule=rule, trigger=R_NEXT_STEPS, today=today, due=found["due"] or today,
+            why=("R13: already named in today's post" if named_today else
+                 f"R13: {found['why']}; {position + 1} of {len(picked)} in today's "
+                 f"post, {len(queued)} more due and waiting their turn"),
+            text=line, company=_text(row, "company"), poc=_text(row, "name"),
+            designation=_text(row, "designation"), sheet_row=row.get("_row"),
+            row_key=person["key"], contact_key=person["key"],
+            extra={
+                # A FIXED TIME, read by drip.pinned_time like R8's day-of touch.
+                "dayof_time": config.NEXT_STEP_TIME,
+                "step": found["code"], "step_label": label, "ask": found["ask"],
+                "signature": found["signature"], "missing": list(found["missing"]),
+                "pick_order": position,
+                # THE OPENER IS A FUNCTION OF THE DAY, never random: the same
+                # queue has to give the same post live, in test mode and in a
+                # simulation.
+                "opener_index": today.toordinal() % len(wording.NEXT_STEP_OPENERS),
+                "poc_priority": _text(row, "poc_priority"),
+                "email_n": n,
+            },
+        ))
+    for person in queued:
+        report["queued"].append(entry_of(person["row"], person["found"]["ask"]))
+
+    log.info(
+        "[rules] %s: %d connected, %d due -> %d picked, %d queued; %d waiting, %d "
+        "with no date, %d unknown step, %d paused for a meeting, %d completed, %d "
+        "closed", rule_id, report["connected"], report["due"], len(picked),
+        len(queued), report["waiting"], len(report["no_date"]),
+        len(report["unknown_step"]), len(report["paused"]), report["completed"],
+        len(report["closed"]),
+    )
+    return out
+
+
+def next_step_report_lines(report: Optional[dict], rule_id: str = "R13") -> list:
+    """The preview block that says who R13 did NOT name today, and why.
+
+    A rule that names five people out of thirty looks, from the post alone,
+    exactly like a rule that only found five. This is where the other
+    twenty-five are accounted for — above all the connected rows with no date,
+    which nothing else would ever mention.
+    """
+    if not report:
+        return []
+    if report.get("state") == "unreadable":
+        return [f"**{rule_id} · next steps** — the rotation state could not be "
+                "read, so nobody is named today."]
+    if report.get("state") == "no_step_column":
+        return [f"**{rule_id} · next steps** — the tab has no column mapped to "
+                f"{', '.join(report.get('missing_columns') or [])}, so nobody is "
+                "named today."]
+
+    def names(entries, limit=12):
+        shown = [
+            f"{e.get('poc') or e.get('company') or '(unnamed)'} (row {e.get('sheet_row')}"
+            + (f", {e['detail']}" if e.get("detail") else "") + ")"
+            for e in entries[:limit]
+        ]
+        more = len(entries) - len(shown)
+        return ", ".join(shown) + (f", and {more} more" if more > 0 else "")
+
+    lines = []
+    if report.get("posted_today"):
+        lines.append(f"**{rule_id} · today's post has gone** — the people above "
+                     "are the ones it named.")
+    lines += [
+        f"**{rule_id} · who is not in today's post** — "
+        f"{report.get('connected', 0)} connected, {report.get('due', 0)} due, "
+        f"{len(report.get('picked') or [])} picked, "
+        f"{report.get('waiting', 0)} not due yet, "
+        f"{report.get('completed', 0)} with a completed meeting"
+    ]
+    for key, label in (
+        ("queued", "Due, waiting their turn"),
+        ("no_date", "Connected with no LI Connected Date (skipped)"),
+        ("unknown_step", "Next Steps value I don't recognise (skipped)"),
+        ("paused", "Paused for a booked meeting"),
+        ("closed", "Closed after the Unresponsive reminder"),
+    ):
+        entries = list(report.get(key) or [])
+        if entries:
+            lines.append(f"  • {label}: {names(entries)}")
+    return lines
+
+
 # TRIGGER NAME -> EVALUATOR. `rules.py` refuses a rules file naming anything not
 # in `rules.KNOWN_TRIGGERS`, and the self-test asserts these two lists agree —
 # so a rule can never be configured, listed in the preview, and silently
@@ -1349,6 +1854,7 @@ EVALUATORS = {
     R_CLOSURE_SUPPORT: _r_closure_support,
     R_NEW_COMPANY: _r_new_pipeline_company,
     R_PACKAGES: _r_sales_packages,
+    R_NEXT_STEPS: _r_next_step_followups,
 }
 
 
@@ -1378,8 +1884,9 @@ def run(
     focus: Optional[dict] = None,
     inactive: int = 0, day_rules: Optional[list] = None,
     prospect_rows: Optional[list] = None, events_unclear_seen=None,
+    next_step_state: Optional[dict] = None,
 ) -> dict:
-    """THE QUEUE. Everything the twelve rules make due today, deduped and ranked.
+    """THE QUEUE. Everything the thirteen rules make due today, deduped and ranked.
 
     Returns:
         {"actions": [...],        ranked, deduped, ready for the drip
@@ -1391,9 +1898,16 @@ def run(
          "silent": {reason: n},   why rows produced nothing
          "stopped": [...], "snoozed": [...],
          "web_pending": int,      items waiting on the research layer
+         "reports": {id: {...}},  what a rule has to say about who it left out
+                                  (R13: the rotation, the rows with no date)
          "rows": int, "inactive": int, "today": date}
 
     IT SENDS NOTHING AND WRITES NOTHING. Everything it needs was passed in.
+
+    `next_step_state` is R13's rotation state from `db.next_step_state()`.
+    LEFT AT None, R13 NAMES NOBODY: None is what an unreadable table returns,
+    and a caller that has no state to give must not be handed a rotation that
+    starts from the top. Pass {} to say "nobody has been named yet".
     """
     today = today or dl.today_ist()
     rows = list(rows or [])
@@ -1412,6 +1926,11 @@ def run(
         "prospect_rows": list(prospect_rows) if prospect_rows is not None else None,
         # Events whose unreadable date has already been listed once.
         "events_unclear_seen": set(events_unclear_seen or ()),
+        # R13's ROTATION STATE. None (unreadable) is kept as None on purpose.
+        "next_step_state": (dict(next_step_state)
+                            if next_step_state is not None else None),
+        # What an evaluator wants the preview to say about the rows it left out.
+        "reports": {},
         # THE LIVE FOCUS, or None. Read by R5 only — a focus is about who to
         # CONTACT NEXT, and applying it to the meeting rules would silence prep
         # for a meeting that is happening tomorrow because the company is off
@@ -1559,6 +2078,7 @@ def run(
         "stopped": stopped,
         "snoozed": snoozed,
         "web_pending": web_pending,
+        "reports": ctx["reports"],
         "rows": len(rows),
         "inactive": max(0, int(inactive or 0)),
         "today": today,
@@ -1643,6 +2163,14 @@ def preview_text(result: dict, *, max_lines: Optional[int] = None) -> str:
                 lines.append(f"    _why: {item.get('why', '')}_")
             lines.append("")
 
+    # WHO R13 LEFT OUT, AND WHY — printed even when it named nobody, because the
+    # rows with no LI Connected Date are never mentioned anywhere else.
+    for rule_id, report in sorted((result.get("reports") or {}).items()):
+        block = next_step_report_lines(report, rule_id)
+        if block:
+            lines.extend(block)
+            lines.append("")
+
     deduped = list(result.get("deduped") or [])
     if deduped:
         lines.append(f"**Deduped — {len(deduped)} item(s), one contact named once a day**")
@@ -1702,7 +2230,7 @@ def _silent_summary(result: dict) -> str:
 
 
 def _self_test() -> int:
-    """`python -m nextaction` — the twelve rules, on rows built here."""
+    """`python -m nextaction` — the thirteen rules, on rows built here."""
     logging.basicConfig(level=logging.WARNING, format="%(levelname)-7s %(name)s: %(message)s")
     failures = 0
 
@@ -1778,6 +2306,13 @@ def _self_test() -> int:
     r6c = row(li_connected_date="15-09-2026", li_dm_sent="TRUE")
     check("DM already sent -> not due",
           len(run(today=MON, rows=[r6c], day_rules=[rules_mod.by_id("R6")])["actions"]), 0)
+    check("R6's line is about the email, not the DM",
+          "no DM logged" in run(today=MON, rows=[r6],
+                                day_rules=[rules_mod.by_id("R6")])["actions"][0]["text"],
+          False)
+    check("R7 is switched off in the shipped file (R13 replaced it)",
+          "R7" in [r.id for r in rules_mod.for_day(MON)], False)
+    # The evaluator is kept, so it is still exercised by naming the rule.
     r7 = row(li_dm_date="10-09-2026", next_steps="waiting on legal")
     got = run(today=MON, rows=[r7], day_rules=[rules_mod.by_id("R7")])["actions"]
     check("DM 11d ago, no meeting -> due", len(got), 1)
@@ -1818,6 +2353,188 @@ def _self_test() -> int:
                                        meeting_status="Completed",
                                        next_steps="sending the deck")],
                   day_rules=[rules_mod.by_id("R9")])["actions"]), 0)
+
+    check("the Next Steps DROPDOWN is not a note: R9 still follows up",
+          len(run(today=MON, rows=[row(meeting_date="15-09-2026",
+                                       meeting_status="Completed",
+                                       outreach_step="Send email 1")],
+                  day_rules=[rules_mod.by_id("R9")])["actions"]), 1)
+
+    print("\nR13 next steps — reading the dropdown")
+    for raw, want in (("", STEP_BLANK), ("Research the PoC", STEP_RESEARCH),
+                      ("Send Email 1", "email1"), ("send e-mail 3", "email3"),
+                      ("Reach by LI DM", STEP_DM), ("Call PoC", STEP_CALL),
+                      ("Call the PoC", STEP_CALL), ("ping them", STEP_UNKNOWN),
+                      ("Send email 4", STEP_UNKNOWN)):
+        check(f"step_code({raw!r})", step_code(raw), want)
+
+    print("\nR13 next steps — the timing table (the defaults)")
+    saved13 = {k: getattr(config, k) for k in (
+        "NEXT_STEP_FIRST_DAYS", "NEXT_STEP_AFTER_PREVIOUS_DAYS",
+        "NEXT_STEP_AFTER_EMAIL_DAYS", "NEXT_STEP_CALL_AFTER_DM_DAYS",
+        "NEXT_STEP_CALL_EVERY_DAYS", "NEXT_STEP_CALL_UNTIL_DAYS",
+        "NEXT_STEP_DM_REPLIED_MARKERS", "NEXT_STEP_PAUSE_FOR_BOOKED_MEETING",
+        "NEXT_STEP_CONNECTED_MARKERS", "NEXT_STEP_TIME")}
+    config.NEXT_STEP_FIRST_DAYS = config.NEXT_STEP_AFTER_PREVIOUS_DAYS = 2
+    config.NEXT_STEP_AFTER_EMAIL_DAYS = config.NEXT_STEP_CALL_AFTER_DM_DAYS = 7
+    config.NEXT_STEP_CALL_EVERY_DAYS, config.NEXT_STEP_CALL_UNTIL_DAYS = 3, 21
+    config.NEXT_STEP_DM_REPLIED_MARKERS = ["replied", "responded"]
+    config.NEXT_STEP_PAUSE_FOR_BOOKED_MEETING = True
+    config.NEXT_STEP_CONNECTED_MARKERS = ["connected"]
+    config.NEXT_STEP_TIME = "15:00"
+    r13 = rules_mod.by_id("R13")
+
+    def conn(**kw):
+        base = dict(sid_li_added="Connected", li_connected_date="15-09-2026",
+                    **{role: "" for role in NEXT_STEP_REQUIRED_ROLES})
+        base.update(kw)
+        return row(**base)
+
+    def step(r, today=MON, entry=None):
+        f = next_step_for(r, today=today, entry=entry)
+        return (f["status"], f["ask"], f["due"], f["missing"])
+
+    check("blank: due 2 days after connecting",
+          step(conn()), ("due", "ask_next", date(2026, 9, 17), []))
+    check("blank: not yet", step(conn(li_connected_date="20-09-2026"))[0], "waiting")
+    check("research", step(conn(outreach_step="Research the PoC"))[:2],
+          ("due", "researched"))
+    check("email 1 not sent: connected + 2",
+          step(conn(outreach_step="Send email 1")),
+          ("due", "email_out", date(2026, 9, 17), []))
+    check("email 1 sent and dated: +7, not yet",
+          step(conn(outreach_step="Send email 1", email_1_sent="yes",
+                    email_1_date="16.09.2026"))[:3],
+          ("waiting", "advance", date(2026, 9, 23)))
+    check("email 1 sent and dated: due at +7",
+          step(conn(outreach_step="Send email 1", email_1_sent="Yes",
+                    email_1_date="14.09.2026"))[:2], ("due", "advance"))
+    check("email 1 sent, no date: due now",
+          step(conn(outreach_step="Send email 1", email_1_sent="yes")),
+          ("due", "log_date", MON, []))
+    check("email 2, email 1 cells blank: due now, and both are asked for",
+          step(conn(outreach_step="Send email 2")),
+          ("due", "email_out", MON, ["1st Email Sent", "1st Email Date"]))
+    check("email 2 counts from the 1st email's date",
+          step(conn(outreach_step="Send email 2", email_1_sent="yes",
+                    email_1_date="20-09-2026")),
+          ("waiting", "email_out", date(2026, 9, 22), []))
+    check("DM step, no DM date: counts from the 3rd email",
+          step(conn(outreach_step="Reach by LI DM", email_3_sent="yes",
+                    email_3_date="18-09-2026")),
+          ("due", "dm_out", date(2026, 9, 20), []))
+    check("Call the PoC with no DM date",
+          step(conn(outreach_step="Call the PoC"))[:2], ("due", "call_no_dm_date"))
+    check("a replied DM is not chased with calls",
+          step(conn(outreach_step="Reach by LI DM", li_dm_sent="Replied",
+                    li_dm_date="01-09-2026"))[:2], ("due", "dm_replied"))
+    dm_row = conn(outreach_step="Reach by LI DM", li_dm_sent="Sent",
+                  li_dm_date="14-09-2026")                 # a Monday
+    check("DM 6 days ago: waiting",
+          step(dm_row, today=date(2026, 9, 20))[:2], ("waiting", "call"))
+    check("DM 7 days ago: the first call reminder",
+          step(dm_row, today=MON)[:3], ("due", "call", MON))
+    sig13 = step_signature(dm_row)
+    called = {"signature": sig13, "calls": 1, "last_call_date": "2026-09-21"}
+    check("...not again the next day",
+          step(dm_row, today=TUE, entry=called)[0], "waiting")
+    check("...again 3 days later",
+          step(dm_row, today=THU, entry=called)[:3], ("due", "call", THU))
+    check("changing Q to Call the PoC keeps the signature",
+          step_signature(conn(outreach_step="Call the PoC", li_dm_sent="Sent",
+                              li_dm_date="14-09-2026")), sig13)
+    check("day 21 is still a call",
+          step(dm_row, today=date(2026, 10, 5), entry={
+              "signature": sig13, "calls": 4, "last_call_date": "2026-10-01"})[:2],
+          ("due", "call"))
+    check("day 22 asks for Unresponsive",
+          step(dm_row, today=date(2026, 10, 6))[:2], ("due", "unresponsive"))
+    check("an unknown Next Steps value is not guessed at",
+          step(conn(outreach_step="ping them"))[0], "unknown_step")
+
+    print("\nR13 next steps — who is in, the pick and the rotation")
+
+    def r13_run(rows_, today=MON, state=None, **kw):
+        return run(today=today, rows=rows_, day_rules=[r13],
+                   next_step_state={} if state is None else state, **kw)
+
+    people = [conn(_row=10 + i, company=f"Co{i}", name=f"P{i}",
+                   outreach_step="Send email 1") for i in range(8)]
+    out13 = r13_run(people)
+    check("five per post", len(out13["actions"]), 5)
+    picked = sorted(out13["actions"], key=lambda a: a["pick_order"])
+    check("top of the sheet first", [a["poc"] for a in picked],
+          ["P0", "P1", "P2", "P3", "P4"])
+    check("the rest are queued, and counted",
+          (out13["reports"]["R13"]["due"], len(out13["reports"]["R13"]["queued"])),
+          (8, 3))
+    check("every item carries the fixed time",
+          {a["dayof_time"] for a in picked}, {"15:00"})
+    check("...and is outside the cap", {a["counts_toward_cap"] for a in picked}, {False})
+    check("the line names the person, the company and the cell",
+          picked[0]["text"],
+          "P0 (Co0): Next Steps says Send email 1. Has it gone out? If so, mark "
+          "1st Email Sent and the date.")
+    state13 = {a["contact_key"]: {"signature": a["signature"],
+                                  "last_date": "2026-09-21"} for a in picked}
+    day2 = sorted(r13_run(people, today=TUE, state=state13)["actions"],
+                  key=lambda a: a["pick_order"])
+    check("the next day: the never-named first, then it wraps to the top",
+          [a["poc"] for a in day2], ["P5", "P6", "P7", "P0", "P1"])
+    people[1]["outreach_step"] = "Send email 2"
+    day2b = sorted(r13_run(people, today=TUE, state=state13)["actions"],
+                   key=lambda a: a["pick_order"])
+    check("a changed step makes the person new again",
+          [a["poc"] for a in day2b][:2], ["P1", "P5"])
+    people[1]["outreach_step"] = "Send email 1"
+    caller = conn(_row=40, company="Zeta", name="Zed", outreach_step="Call the PoC",
+                  li_dm_date="14-09-2026")
+    check("a call reminder that is due goes first",
+          sorted(r13_run(people + [caller])["actions"],
+                 key=lambda a: a["pick_order"])[0]["poc"], "Zed")
+    check("no state (unreadable) -> nobody is named",
+          (len(run(today=MON, rows=people, day_rules=[r13])["actions"]),
+           run(today=MON, rows=people, day_rules=[r13])["reports"]["R13"]["state"]),
+          (0, "unreadable"))
+    check("nobody due -> no items",
+          r13_run([conn(li_connected_date="20-09-2026")])["actions"], [])
+    after_post = r13_run(people, state=state13)
+    check("after today's post, the same five and nobody new",
+          sorted(a["poc"] for a in after_post["actions"]),
+          ["P0", "P1", "P2", "P3", "P4"])
+    check("...and the preview says the post has gone",
+          "today's post has gone" in preview_text(after_post), True)
+    nodate = conn(_row=50, name="Nod", li_connected_date="")
+    rep13 = r13_run([nodate, row(_row=51, name="Stranger", sid_li_added="Requested",
+                                 li_connected_date="15-09-2026")])["reports"]["R13"]
+    check("Connected with no date: skipped and listed",
+          ([e["poc"] for e in rep13["no_date"]], rep13["connected"]), (["Nod"], 1))
+    check("Prospect Status Unresponsive stops it",
+          r13_run([conn(prospect_status="Unresponsive")])["actions"], [])
+    check("a meeting booked ahead pauses it",
+          len(r13_run([conn(meeting_date="25-09-2026")])["reports"]["R13"]["paused"]), 1)
+    check("a past meeting, not completed, does not",
+          len(r13_run([conn(meeting_date="10-09-2026")])["actions"]), 1)
+    check("a completed meeting ends it",
+          r13_run([conn(meeting_date="10-09-2026", meeting_status="Completed")])["actions"],
+          [])
+    closed_key = activation.row_key(dm_row)
+    check("once the Unresponsive reminder has gone, never again",
+          r13_run([dm_row], today=date(2026, 10, 7),
+                  state={closed_key: {"signature": "anything", "closed": True,
+                                      "closed_date": "2026-10-06"}})["actions"], [])
+    old_layout = {k: v for k, v in conn().items()
+                  if k not in NEXT_STEP_REQUIRED_ROLES}
+    no_col = r13_run([old_layout])
+    check("no Next Steps column on the tab: nobody is told a cell is blank",
+          (no_col["actions"], no_col["reports"]["R13"]["state"]),
+          ([], "no_step_column"))
+    check("the preview says who was left out",
+          "who is not in today's post" in preview_text(r13_run(people + [nodate])), True)
+    check("...and names the row with no date",
+          "Nod (row 50" in preview_text(r13_run(people + [nodate])), True)
+    for k13, v13 in saved13.items():
+        setattr(config, k13, v13)
 
     print("\nR10 closure support — exactly 50 is excluded")
     other = row(_row=9, company="Other", name="Olu", prospect_status="Lead",

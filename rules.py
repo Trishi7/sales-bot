@@ -59,6 +59,7 @@ KNOWN_TRIGGERS = (
     "closure_support",
     "new_pipeline_company",
     "sales_packages",
+    "next_step_followups",
 )
 
 # Triggers that cannot finish their item without web research. They still
@@ -125,10 +126,11 @@ PLAIN_BY_TRIGGER = {
     "closure_support": "deals close enough to push over the line",
     "new_pipeline_company": "new companies in the pipeline — asks before looking up PoCs",
     "sales_packages": "sales packages that aren't ready yet",
+    "next_step_followups": "next steps for the people we're connected with",
 }
 
 # A rule id as it appears in text: R1 to R99. Two digits, because the schedule
-# is twelve rules today and a hard limit of nine would be an odd thing to build
+# is thirteen rules today and a hard limit of nine would be an odd thing to build
 # in.
 _RULE_ID_RE = re.compile(r"\bR(\d{1,2})\b")
 
@@ -645,9 +647,11 @@ def _self_test() -> int:
 
     rules = reload()
     print("loading")
-    check("twelve rules load", len(rules), 12)
-    check("ids are R1..R12", [r.id for r in rules],
-          [f"R{i}" for i in range(1, 13)])
+    check("thirteen rules load", len(rules), 13)
+    # FILE ORDER IS NOT NUMBER ORDER: R13 sits before R5 so the one-mention-a-
+    # day dedup keeps R13's five people rather than handing them to R6.
+    check("ids, in file order", [r.id for r in rules],
+          ["R1", "R2", "R3", "R4", "R13"] + [f"R{i}" for i in range(5, 13)])
     check("every trigger is implemented",
           sorted({r.trigger for r in rules}) == sorted(set(KNOWN_TRIGGERS)), True)
 
@@ -675,6 +679,17 @@ def _self_test() -> int:
     check("R8 is outside the cap", by_id("R8").counts_toward_cap, False)
     check("R9 is outside the cap", by_id("R9").counts_toward_cap, False)
 
+    print("\nthe next-step follow-ups, and the rule they replaced")
+    check("R13 runs Monday to Friday",
+          [by_id("R13").runs_on(d) for d in (mon, tue, wed, thu, fri)], [True] * 5)
+    check("R13 does not run at the weekend",
+          (by_id("R13").runs_on(date(2026, 9, 26)),
+           by_id("R13").runs_on(date(2026, 9, 27))), (False, False))
+    check("R13 is outside the cap", by_id("R13").counts_toward_cap, False)
+    check("R13 carries 5 per post", by_id("R13").max_items_per_post, 5)
+    check("R13 needs no web", by_id("R13").needs_web, False)
+    check("R7 is switched off", by_id("R7").enabled, False)
+
     print("\ncaps and destinations")
     check("R4 carries the week's list, 20 per post", by_id("R4").max_items_per_post, 20)
     check("R5 carries 5 per post", by_id("R5").max_items_per_post, 5)
@@ -689,9 +704,9 @@ def _self_test() -> int:
 
     print("\nfor_day")
     check("Monday's rules", [r.id for r in for_day(mon)],
-          ["R1", "R4", "R7", "R8", "R9", "R10", "R11"])
+          ["R1", "R4", "R13", "R8", "R9", "R10", "R11"])
     check("Thursday's rules", [r.id for r in for_day(thu)],
-          ["R1", "R5", "R8", "R9", "R11", "R12"])
+          ["R1", "R13", "R5", "R8", "R9", "R11", "R12"])
     check("Saturday's rules are the anchored ones only",
           [r.id for r in for_day(date(2026, 9, 26))], ["R8", "R9"])
 

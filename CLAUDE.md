@@ -8,13 +8,17 @@ config.py helpers reading .env. Separate process from the PM/triage bot.
 - Never read, print, copy or commit .env, *-write.json or any key file. Use .env.example
   for variable names.
 - The bot never contacts anyone outside the team's sales channels.
-- Outreach PoCs columns A–I and S–X of an EXISTING row are read-only. Two exceptions:
-  (1) the Email cell, via an email_write proposal, after an approver's yes, only if still
-  blank, behind EMAIL_WRITE_ALLOWED; (2) a NEW row, via a row_add proposal, after an
-  approver's yes: Name, Company, and the LinkedIn URL only if a search returned a
-  linkedin.com/in link. Every row the bot adds carries a visible signature ("Added by
-  Saley · approved by <approver> · <date IST>" plus the source link) in a cell note on
-  the Name cell, never in a data column. Never add a column without asking the human.
+- On an EXISTING Outreach PoCs row, columns A–I, Q–W and Z–AE are read-only
+  (RESTRICTED_COLUMN_RANGES; in the 7 Oct 2026 layout Q is the Next Steps dropdown, R–W
+  the three email Sent/Date pairs, Z–AE Notes/Remarks through Deal Status). Writes may be
+  proposed only in J–P and X–Y. Two exceptions, each after an approver's yes: (1) the
+  Email cell (F), via an email_write proposal, only if still blank, behind
+  EMAIL_WRITE_ALLOWED; (2) a NEW row, via a row_add proposal, which may fill only A–P and
+  X–Y (NEW_ROW_WRITABLE_RANGES): Name, Company, and the LinkedIn URL only if a search
+  returned a linkedin.com/in link. Every row the bot adds carries a visible signature
+  ("Added by Saley · approved by <approver> · <date IST>" plus the source link) in a cell
+  note on the Name cell, never in a data column. Never add a column without asking the
+  human. Rule 13 never writes: it asks people to update Q–W themselves.
 - Every sheet add or edit goes through an approval proposal. Nothing writes on its own.
 - LinkedIn: public search for a profile link is in scope. Never fetch linkedin.com,
   never pull content from inside a profile, never send connection requests.

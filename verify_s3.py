@@ -573,8 +573,32 @@ def monday_sheet() -> None:
     )
 
 
+def shipped_rules_with_r7_on() -> str:
+    """A TEMP COPY of bot_rules.yaml with R7 switched on, for check (ii) only.
+
+    WHY (RULE 13, 7 Oct 2026): Vaishnavi decided "rule 13 supercedes" rule 7, so the shipped file now has
+    `enabled: false` on R7. The evaluator, the renderer and the overflow line are KEPT (switching the rule back on is
+    one word), and this check still proves they work — against a copy of the real file with exactly that one word
+    changed. The shipped file is untouched, and the check after it proves R7 posts nothing as shipped.
+    """
+    src = open(os.path.join(HERE, "bot_rules.yaml"), encoding="utf-8").read()
+    start = src.index("  - id: R7\n")
+    end = src.index("  - id: R8\n")
+    block = src[start:end]
+    assert "enabled: false" in block, "R7 is expected to be disabled in the shipped file"
+    path = os.path.join(TMP, "bot_rules_r7_on.yaml")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src[:start] + block.replace("enabled: false", "enabled: true") + src[end:])
+    return path
+
+
 async def the_monday() -> None:
     say(f"(i) (ii) (iii) A MONDAY — {MON:%A %d %b %Y}: R4, R7 and R10")
+    shipped_file = config.BOT_RULES_FILE
+    config.BOT_RULES_FILE = shipped_rules_with_r7_on()
+    rules_mod.reload()
+    check("(ii) is run against a copy of the shipped rules with ONLY R7 switched on",
+          (rules_mod.by_id("R7").enabled, "R7" in [r.id for r in rules_mod.for_day(MON)]), (True, True))
     RULES.clear()
     RULES.update({"R4", "R7", "R10"})
     ACTIVE[0] = True
@@ -634,6 +658,21 @@ async def the_monday() -> None:
     check("the overflow line", "(+2 more next Monday)" in body, True)
     check("the DM sent 3 days ago is not chased", "Hal Iyer" in body, False)
     same("R7", live, test, sim)
+
+    # BACK TO THE SHIPPED FILE. As shipped, R7 is off (replaced by rule 13 on 7 Oct 2026): the same Monday, the same
+    # seven eligible contacts, and the live sweep posts nothing for R7.
+    config.BOT_RULES_FILE = shipped_file
+    rules_mod.reload()
+    check("as shipped, R7 is off and is not one of Monday's rules",
+          (rules_mod.by_id("R7").enabled, "R7" in [r.id for r in rules_mod.for_day(MON)]), (False, False))
+    RULES.clear()
+    RULES.add("R7")
+    monday_sheet()
+    shipped_run = await live_path(MON)
+    check("as shipped, a Monday with seven eligible DM'd contacts posts no R7 at all",
+          shipped_run["posts"].get("R7"), None)
+    RULES.clear()
+    RULES.update({"R4", "R7", "R10"})
 
     print("\n   (iii) R10 — CLOSURE SUPPORT, as posted by the live sweep:")
     show(live, "R10")
@@ -949,7 +988,7 @@ async def the_wednesday() -> None:
 def the_wording() -> None:
     say("(w) THE WORDING FOR THE SHEET — printed from the rules the bot loads")
     rules_mod.reload()
-    for rid in ("R3", "R4", "R5", "R7", "R10"):
+    for rid in ("R3", "R4", "R5", "R7", "R10"):      # R7's is now the one-line "replaced by rule 13" sentence
         text = rules_mod.sheet_wording_for(rid)
         print(f"\n   Bot Rules tab — rule {rid[1:]}, column \"What the Bot Shares / "
               "Checks\":")
@@ -959,10 +998,13 @@ def the_wording() -> None:
     print()
     check("R3 runs on Wednesdays", rules_mod.by_id("R3").weekdays, (2,))
     strategy = persona.load_strategy()
-    check("sales_strategy.md says the same for rules 3, 4, 5, 7 and 10",
+    check("sales_strategy.md says the same for rules 3, 4, 5 and 10",
           [x for x in ("every Wednesday", "Team:", "no public email found",
-                       "+N more next Monday", "No closure support this week")
+                       "No closure support this week")
            if x not in strategy], [])
+    # RULE 7 WAS REPLACED BY RULE 13 ON 7 OCT 2026: its overflow phrase ("+N more next Monday") left the strategy with it.
+    check("...and for rule 7: replaced by rule 13, no longer describing the Monday list",
+          ("Replaced by rule 13" in strategy, "+N more next Monday" in strategy), (True, False))
     check("...and no longer says \"every other Wednesday\"",
           "every other Wednesday" in strategy, False)
 

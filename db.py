@@ -623,7 +623,7 @@ CREATE TABLE IF NOT EXISTS focus (
 
 -- RULE 9's ANSWERS, which the bot may NOT put in the sheet.
 --
--- Next steps, package and deal size live in S-X, the restricted commercial
+-- Notes, package and deal size live in Z-AE, the restricted commercial
 -- block. R9 asks for them; when somebody answers, the answer is recorded HERE
 -- and in the audit log, and the bot says plainly that a human has to put it in
 -- the sheet. Recording it is not a substitute for the sheet and is not
@@ -725,6 +725,45 @@ CREATE TABLE IF NOT EXISTS meeting_followups (
     last_date   TEXT NOT NULL DEFAULT '',
     meeting_date TEXT NOT NULL DEFAULT '',
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- R13: WHERE EACH CONNECTED CONTACT STANDS IN THE NEXT-STEP REMINDERS.
+--
+-- One row per contact Rule 13 has named, keyed like every other per-row ledger
+-- (activation.row_key). `signature` is the step the row was on when it was
+-- named (the Next Steps value and that step's cells); `mentions`, `calls` and
+-- `last_call_date` belong to THAT signature and start again when it changes,
+-- which is what "a person keeps coming back until their step changes" means.
+-- `last_date` orders the rotation: least recently named goes first.
+--
+-- `closed` IS NEVER RESET BY A STEP CHANGE. It is set when the reminder to mark
+-- the contact Unresponsive goes out, and from then on the rule never names
+-- them, whatever the cells later say.
+--
+-- WRITTEN ONLY BY THE SENDER, after a real send. The evaluator is handed a
+-- copy and writes nothing, so a preview cannot move the rotation.
+CREATE TABLE IF NOT EXISTS next_step_followups (
+    row_key        TEXT PRIMARY KEY,
+    signature      TEXT NOT NULL DEFAULT '',
+    last_date      TEXT NOT NULL DEFAULT '',
+    mentions       INTEGER NOT NULL DEFAULT 0,
+    calls          INTEGER NOT NULL DEFAULT 0,
+    last_call_date TEXT NOT NULL DEFAULT '',
+    last_ask       TEXT NOT NULL DEFAULT '',
+    closed         INTEGER NOT NULL DEFAULT 0,
+    closed_date    TEXT NOT NULL DEFAULT '',
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- R13: WHAT EACH POST SAID, by Discord message id. A reply to the post ("done")
+-- has to be matched to a person and a step, and the post's text is not a
+-- reliable place to read those back from. `people` is a JSON list in post
+-- order. Read by the reply handling (NFT2-1063); written with the state above.
+CREATE TABLE IF NOT EXISTS next_step_posts (
+    message_id TEXT PRIMARY KEY,
+    on_date    TEXT NOT NULL,
+    channel_id TEXT NOT NULL DEFAULT '',
+    people     TEXT NOT NULL DEFAULT '[]'
 );
 
 -- R1: WHOSE TURN IT IS — the PoC news rotation (S2).
@@ -999,6 +1038,16 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # take no place in the spaced window, so the planner must not count them
     # when it works out which window time the next post gets. NULL on older rows.
     ("drip_sends", "pinned", "INTEGER"),
+    # WHAT WAS POSTED, AND EVERY MESSAGE IT BECAME (NFT2-1063). `body` is the
+    # post as it went out, heading included, WITHOUT the tags line and the test
+    # tag: "what are today's objectives?" after a post has gone must show that
+    # post word for word, and re-composing it would give different words (and
+    # ping the people it tags a second time). `part_ids` is a JSON list of the
+    # id of every Discord message a long post was split into: the offer a "yes"
+    # answers is the LAST line, so a reply to the last part has to find the
+    # same post as a reply to the first. Empty on rows from before this.
+    ("drip_sends", "body", "TEXT NOT NULL DEFAULT ''"),
+    ("drip_sends", "part_ids", "TEXT NOT NULL DEFAULT '[]'"),
     # THE TOPIC FEED. R1 became an AI industry feed on a topic list (24/29 Sep),
     # and a posted story now carries its topic (for the spread rules), its
     # headline key (for the no-repeats check across outlets), the importance
@@ -1990,11 +2039,28 @@ class DB:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT slot, group_key, action_type, owner_key, owner_label, "
-                "companies, stage, planned_at, sent_at, counts_toward_cap, pinned "
+                "companies, stage, planned_at, sent_at, counts_toward_cap, pinned, "
+                "body, message_id, channel_id, part_ids "
                 "FROM drip_sends WHERE on_date = ? ORDER BY slot ASC",
                 (str(on_date),),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._drip_row(r) for r in rows]
+
+    @staticmethod
+    def _drip_row(row) -> dict:
+        """One drip_sends row as a dict, with `part_ids` as a list of strings.
+        Stored as JSON; a row from before the column, or one somebody edited
+        by hand, reads as [] rather than failing the lookup it is part of."""
+        import json as _json
+        out = dict(row)
+        if "part_ids" in out:
+            try:
+                parts = _json.loads(out.get("part_ids") or "[]")
+            except (ValueError, TypeError):
+                parts = []
+            out["part_ids"] = [str(p) for p in parts if str(p or "").strip()] \
+                if isinstance(parts, list) else []
+        return out
 
     def record_drip_send(
         self, *, on_date: str, slot: int, group_key: str, action_type: str,
@@ -2078,19 +2144,36 @@ class DB:
             entry["last_sent"] = max(entry["last_sent"], when)
         return out
 
-    def attach_drip_message_id(self, *, on_date: str, slot: int, message_id) -> bool:
-        """Record which Discord message a drip slot became.
+    def attach_drip_message_id(self, *, on_date: str, slot: int, message_id,
+                               body: str = "", part_ids=()) -> bool:
+        """Record which Discord message a drip slot became, what it said and
+        every part it was split into.
 
         The slot row is written BEFORE the send (that is what claims it against
         a racing tick), so the message id can only be filled in afterwards. It
         matters because a REPLY to a drip message is one of the two things that
         may write to the sheet, and `find_drip_by_message_id` is how the reply
         finds out which companies that nudge was about.
+
+        `body` is the post as it went out, without the tags line and the test
+        tag — what the on-demand objectives answer shows once the post has gone
+        (NFT2-1063). `part_ids` is every Discord message the post became, so a
+        reply to its last part resolves to the same row. Both are optional and
+        a caller that passes neither leaves those columns as they were.
         """
+        import json as _json
+        parts = [str(p) for p in (part_ids or ()) if str(p or "").strip()]
+        sets, args = ["message_id = ?"], [str(message_id)]
+        if str(body or "").strip():
+            sets.append("body = ?")
+            args.append(str(body))
+        if parts:
+            sets.append("part_ids = ?")
+            args.append(_json.dumps(parts))
         with self.conn() as c:
             cur = c.execute(
-                "UPDATE drip_sends SET message_id = ? WHERE on_date = ? AND slot = ?",
-                (str(message_id), str(on_date), int(slot)),
+                f"UPDATE drip_sends SET {', '.join(sets)} WHERE on_date = ? AND slot = ?",
+                (*args, str(on_date), int(slot)),
             )
         return bool(cur.rowcount)
 
@@ -2101,18 +2184,35 @@ class DB:
         column; the nudge it answers names both, and this is the lookup that
         connects them. None simply means the reply was to something else the bot
         said, and the extractor works from the reply alone.
+
+        A LATER PART OF A SPLIT POST FINDS THE SAME ROW (NFT2-1063). A long
+        post goes out as several Discord messages and the offer a "yes" answers
+        is its last line. The row's `message_id` is always the FIRST part's id
+        — the one every proposal is keyed to — whichever part was replied to.
         """
+        mid = str(message_id or "").strip()
+        if not mid:
+            return None
+        cols = ("on_date, slot, group_key, action_type, owner_label, companies, "
+                "stage, offer, body, message_id, channel_id, part_ids")
         try:
             with self.conn() as c:
                 row = c.execute(
-                    "SELECT on_date, slot, group_key, action_type, owner_label, "
-                    "companies, stage, offer FROM drip_sends WHERE message_id = ?",
-                    (str(message_id),),
+                    f"SELECT {cols} FROM drip_sends WHERE message_id = ?", (mid,),
                 ).fetchone()
+                if row is None:
+                    # The id sits inside a JSON list of strings, so the quoted
+                    # form is matched; the Python check below is the real test.
+                    maybe = c.execute(
+                        f"SELECT {cols} FROM drip_sends WHERE part_ids LIKE ? "
+                        "ORDER BY id DESC", (f'%"{mid}"%',),
+                    ).fetchall()
+                    row = next((r for r in maybe
+                                if mid in self._drip_row(r)["part_ids"]), None)
         except Exception:
             log.exception("[db] could not look up the drip message %r", message_id)
             return None
-        return dict(row) if row else None
+        return self._drip_row(row) if row else None
 
     def list_drip_sends(self, limit: int = 50) -> list[dict]:
         """The most recent drip messages, newest first. For the audit answer."""
@@ -2473,6 +2573,133 @@ class DB:
         with self.conn() as c:
             c.execute("DELETE FROM meeting_followups WHERE row_key = ?", (key,))
 
+    # -- R13: the next-step reminders ---------------------------------------
+
+    def next_step_state(self) -> Optional[dict]:
+        """{row_key: {signature, last_date, mentions, calls, last_call_date,
+        last_ask, closed, closed_date}} for R13, or None when it cannot be read.
+
+        FAILS CLOSED, AND NOT THE WAY R9's LADDER DOES. An empty dict here would
+        mean "nobody has ever been named": the rotation would start again from
+        the top of the sheet and every contact already closed as Unresponsive
+        would be chased again. None means "unknown", and the evaluator posts
+        nothing on it.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT row_key, signature, last_date, mentions, calls, "
+                    "last_call_date, last_ask, closed, closed_date "
+                    "FROM next_step_followups"
+                ).fetchall()
+            return {
+                r["row_key"]: {
+                    "signature": str(r["signature"] or ""),
+                    "last_date": str(r["last_date"] or ""),
+                    "mentions": int(r["mentions"] or 0),
+                    "calls": int(r["calls"] or 0),
+                    "last_call_date": str(r["last_call_date"] or ""),
+                    "last_ask": str(r["last_ask"] or ""),
+                    "closed": bool(r["closed"]),
+                    "closed_date": str(r["closed_date"] or ""),
+                }
+                for r in rows
+            }
+        except Exception:
+            log.exception(
+                "[db] the next-step reminder state could not be read. R13 posts "
+                "nothing until it can: guessing would restart the rotation and "
+                "chase people it has already closed."
+            )
+            return None
+
+    def record_next_step_mention(self, row_key: str, *, signature: str,
+                                 on_date: str, ask: str) -> None:
+        """R13 named this contact in a post that really went out.
+
+        CALLED BY THE SENDER, NEVER BY THE ENGINE, for the same reason as
+        `advance_meeting_followup`: a preview that recorded a mention would
+        change the rotation it was previewing.
+
+        A different stored signature means the step changed since the last
+        mention, so the counts for the old step are dropped first. `closed`
+        survives that on purpose.
+        """
+        key = str(row_key or "").strip()
+        if not key:
+            return
+        sig = str(signature or "")
+        day = str(on_date or "")
+        what = str(ask or "")
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT signature, mentions, calls, last_call_date, closed, closed_date "
+                "FROM next_step_followups WHERE row_key = ?", (key,)
+            ).fetchone()
+            same = bool(row) and str(row["signature"] or "") == sig
+            mentions = (int(row["mentions"] or 0) if same else 0) + 1
+            calls = int(row["calls"] or 0) if same else 0
+            last_call = str(row["last_call_date"] or "") if same else ""
+            closed = int(row["closed"] or 0) if row else 0
+            closed_date = str(row["closed_date"] or "") if row else ""
+            if what == "call":
+                calls += 1
+                last_call = day
+            if what == "unresponsive":
+                closed, closed_date = 1, day
+            c.execute(
+                "INSERT INTO next_step_followups (row_key, signature, last_date, "
+                "mentions, calls, last_call_date, last_ask, closed, closed_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(row_key) DO UPDATE SET "
+                "signature = excluded.signature, last_date = excluded.last_date, "
+                "mentions = excluded.mentions, calls = excluded.calls, "
+                "last_call_date = excluded.last_call_date, last_ask = excluded.last_ask, "
+                "closed = excluded.closed, closed_date = excluded.closed_date, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (key, sig, day, mentions, calls, last_call, what, closed, closed_date),
+            )
+
+    def record_next_step_post(self, message_id, *, on_date: str, channel_id="",
+                              people=None) -> None:
+        """Remember who an R13 post named, and what each was asked."""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        with self.conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO next_step_posts (message_id, on_date, "
+                "channel_id, people) VALUES (?, ?, ?, ?)",
+                (mid, str(on_date or ""), str(channel_id or ""),
+                 json.dumps(list(people or []), ensure_ascii=False)),
+            )
+
+    def next_step_post(self, message_id) -> Optional[dict]:
+        """{message_id, on_date, channel_id, people} for one R13 post, or None."""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return None
+        try:
+            with self.conn() as c:
+                row = c.execute(
+                    "SELECT message_id, on_date, channel_id, people "
+                    "FROM next_step_posts WHERE message_id = ?", (mid,)
+                ).fetchone()
+        except Exception:
+            log.exception("[db] next_step_posts could not be read")
+            return None
+        if row is None:
+            return None
+        try:
+            people = json.loads(row["people"] or "[]")
+        except ValueError:
+            people = []
+        return {
+            "message_id": str(row["message_id"]),
+            "on_date": str(row["on_date"] or ""),
+            "channel_id": str(row["channel_id"] or ""),
+            "people": people if isinstance(people, list) else [],
+        }
+
     # -- permission before every write: proposals ---------------------------
 
     def open_proposal(self, *, proposal_key: str, kind: str, tab: str,
@@ -2586,13 +2813,72 @@ class DB:
         out = [self.proposal(r["proposal_key"]) for r in rows]
         return [p for p in out if p]
 
+    def proposals_for_message(self, message_id: str) -> list[dict]:
+        """EVERY proposal keyed to one message, open or not, oldest first.
+
+        So a second "yes" under an offer that was already answered (or that
+        lapsed) can be told so, by name, instead of being read as a fresh
+        request. `open_proposals_for_message` is the one a vote uses.
+        """
+        mid = str(message_id or "").strip()
+        if not mid:
+            return []
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT proposal_key FROM write_proposals "
+                "WHERE message_id = ? ORDER BY created_at, rowid", (mid,),
+            ).fetchall()
+        out = [self.proposal(r["proposal_key"]) for r in rows]
+        return [p for p in out if p]
+
+    def open_proposals_in_channel(self, channel_id) -> list[dict]:
+        """Every open proposal made in one channel, oldest first.
+
+        FOR A BARE "YES" THAT IS NOT A REPLY, and only for that. The channel is
+        the widest a yes may reach: a proposal made in another sales channel is
+        not what somebody typing here is answering. The caller applies the age
+        window and asks "which one?" when this returns more than one.
+        """
+        try:
+            cid = int(channel_id)
+        except (TypeError, ValueError):
+            return []
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT proposal_key FROM write_proposals "
+                "WHERE status = 'open' AND CAST(channel_id AS INTEGER) = ? "
+                "ORDER BY id", (cid,),
+            ).fetchall()
+        out = [self.proposal(r["proposal_key"]) for r in rows]
+        return [p for p in out if p]
+
+    def open_nudged_proposals(self) -> list[dict]:
+        """Every open proposal that has had its one nudge, oldest first.
+
+        WHAT THE "WAITING FOR YOUR YES" POST LISTED. That post is one message
+        for several proposals and none of them is keyed to it, so a "yes"
+        replied to it finds them here: a proposal is nudged once and dropped at
+        the next sweep, so the open-and-nudged ones are exactly the last
+        list's. From the table, not from memory, so it survives a restart.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT proposal_key FROM write_proposals "
+                "WHERE status = 'open' AND nudged_on != '' ORDER BY id",
+            ).fetchall()
+        out = [self.proposal(r["proposal_key"]) for r in rows]
+        return [p for p in out if p]
+
     def latest_open_proposal(self, *, company: str = "") -> Optional[dict]:
         """The newest open proposal, optionally for one company.
 
-        For a bare "yes" that is not a reply to anything. The NEWEST, because
-        that is the one the person is almost certainly answering — and the echo
-        names what was applied, so a wrong guess is visible immediately rather
-        than silent.
+        NOTHING ANSWERS A MESSAGE WITH THIS SINCE NFT2-1063. It was the lookup
+        for a "yes" that named no proposal, and it has no channel and no age:
+        on 7 Oct a "sure" under an unrelated line reached an offer made hours
+        earlier and scheduled a reminder nobody asked for. A reply now votes
+        only on the proposals of the message it replies to, and a bare yes goes
+        through `open_proposals_in_channel` and an age window. Kept for
+        operator and test use; do not put it back on the reply path.
         """
         sql = "SELECT proposal_key FROM write_proposals WHERE status = 'open'"
         args: list = []
@@ -2778,7 +3064,7 @@ class DB:
         """Record what somebody said came out of a meeting.
 
         THIS IS NOT THE SHEET AND IS NEVER PRESENTED AS IT. Next steps, package
-        and deal size live in S-X, the restricted commercial block, and the bot
+        and deal size live in Z-AE, the restricted commercial block, and the bot
         does not write there — on any row, with any approval. What this table is
         for is that the answer is not LOST between being given in a channel and
         being typed into the sheet by a person. `in_sheet` stays 0 until

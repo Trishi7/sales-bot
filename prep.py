@@ -347,6 +347,7 @@ def build(
     # Where we are
     lines.append(f"**Where we are** — {_history_line(row, today=today)}")
     lines.append(f"**Assets shared** — {_or_not_recorded(row.get('assets_shared'))}")
+    # `next_steps` is the NOTES column (Notes/Remarks), not the step dropdown.
     lines.append(f"**Next steps on file** — {_or_not_recorded(row.get('next_steps'))}")
 
     # The pitch

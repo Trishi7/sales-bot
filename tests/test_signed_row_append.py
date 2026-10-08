@@ -106,7 +106,7 @@ def world(monkeypatch, pocs_tab):
     monkeypatch.setattr(gtm_sheet.SHEETS, "_open", lambda which=None: sh)
     monkeypatch.setattr(config, "SHEET_WRITES_ENABLED", True)
     monkeypatch.setattr(config, "SHEET_APPENDABLE_TABS", ["outreach_pocs"])
-    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", "A:R")
+    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", "A:P,X:Y")
     return pocs_tab, ws, sh
 
 

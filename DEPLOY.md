@@ -660,6 +660,49 @@ Nothing to run by hand; the first boot adds the new columns.
 
 `python verify_s2.py` and `python verify_s3.py` check both offline.
 
+## Upgrading to RULE 13 (next steps for connected contacts, and the 7 Oct sheet layout)
+
+The Outreach PoCs tab changed shape on 7 Oct 2026: 32 columns, A to AF, with
+the Next Steps dropdown on Q, the three emails on R to W, the meeting columns
+on X and Y, and Notes/Remarks on Z. The column bands are letters, so they must
+match.
+
+1. **Set three lines in `/opt/sales-bot/.env`** (and in the laptop's `.env`):
+
+   ```
+   RESTRICTED_COLUMN_RANGES=A:I,Q:W,Z:AE
+   NEW_ROW_WRITABLE_RANGES=A:P,X:Y
+   GTM_COLUMN_MAP=
+   ```
+
+   `GTM_COLUMN_MAP` goes blank: the header aliases now put the notes role on
+   "Notes/Remarks" and the step role on "Next Steps" by themselves. A leftover
+   `{"outreach_pocs":{"next_steps":"Notes/Remarks"}}` is harmless; an entry
+   pointing `next_steps` at "Next Steps" is ignored with a warning.
+2. **Check `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` is 15 or unset.** Rule 13
+   posts on the first sweep at or after `NEXT_STEP_TIME` (15:00), so the
+   interval is how late it can be.
+3. **Restart**, then read the boot log:
+   - `[gtm.window]` says `restricted A:I, Q:W, Z:AE` and `Writable window J:P,
+     X:Y holds 9 named column(s)`, ending with `X='Meeting Date'` and
+     `Y='Meeting Status'`;
+   - the role report shows `outreach_step` on 'Next Steps', the six
+     `email_N_sent` / `email_N_date` roles, `next_steps` on 'Notes/Remarks' and
+     `poc_priority` on 'Priority';
+   - there is **no** `NEW_ROW_WRITABLE_RANGES=… reaches into restricted
+     column(s)` warning;
+   - the `[rules]` block lists 13 rules, R7 DISABLED, and R13 on Mon to Fri,
+     5 a post, outside the cap.
+4. Nothing to run by hand: the two new tables (`next_step_followups`,
+   `next_step_posts`) are created on boot. The ten `NEXT_STEP_*` settings are
+   optional; the defaults in `.env.example` apply without them.
+5. **Try it in the test channel first** (`SALES_TEST_MODE=true` and a
+   `DB_PATH` ending in `_test.db`). Test mode records rule 13's rotation in
+   `DB_PATH` like every other ledger; a "make it Monday" test day records it
+   only on a `*_test.db`.
+
+`python verify_rule13.py` checks all of it offline.
+
 ## Upgrading to NFT2-1065 (web search on every question, profile links)
 
 Nothing to run by hand and no schema change.
@@ -742,6 +785,77 @@ mode and live behave the same, the `[TEST…]` tag aside):
 `python verify_profile_lookup.py` and `python verify_replay_oct6.py` check it
 offline.
 
+## Upgrading to NFT2-1063 (replies read as replies, objectives on demand)
+
+**1. Discord, before the restart.** Give the bot's role **Add Reactions** in
+every sales channel (and the test channel). "Sure" or "thanks" under a message
+that asked nothing now gets one 👍 and no text. Without the permission nothing
+is said instead; the log shows `[guardrails] Discord rejected the reaction`
+and the audit a `reaction_failed`.
+
+**2. `.env`, on the laptop AND in `/opt/sales-bot/.env`.** No line is
+required; the default applies without it. To make it explicit:
+
+```bash
+PROPOSAL_BARE_YES_MINUTES=30
+```
+
+A bare "@Saley yes" that is not a reply answers the one open proposal in that
+channel only if it is younger than this many minutes; otherwise Saley asks
+which. `0` = always ask. While in the server's file, check the values that
+change what the checklist shows: `SALES_APPROVER_IDS` (who can say yes),
+`SALES_FINAL_SAY_ID`, `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` (15 or unset: the
+scheduled posts go out on a sweep tick, so a large value makes the 2pm post
+late), `SALES_TEST_MODE` and `SIMULATION_PREFIX`. On the laptop, re-run
+`python tools/redact_env.py` after any change.
+
+**3. Restart** (`pm2 restart sales-bot`). Two columns are added to
+`drip_sends` on boot (`body`, `part_ids`); nothing to run by hand.
+
+**4. The day of the restart only.** Posts sent before the restart have no
+stored text, so that day's "what are today's objectives?" shows only what is
+still to come. From the next day it shows everything.
+
+**5. One thing to undo by hand.** The 7 Oct "sure" scheduled a reminder for
+Mon 12 Oct 14:00 that nobody asked for. Unless the team wants it:
+"@Saley list reminders", then cancel it.
+
+**6. Live-channel checklist** (test channel first, then a live sales channel;
+record the `SALES_TEST_MODE` it ran under):
+
+1. "@Saley any AI news?" The interim line, if one appears, says nothing about
+   the web unless a search really runs. The stories come back.
+2. Reply "sure" to the interim line (or to the answer) while an offer is open
+   elsewhere in the channel. One 👍, no message, no new reminder
+   ("@Saley list reminders"), the offer still open.
+3. Reply "ok", "thanks", "got it" to three different bot messages. One 👍
+   each, nothing else.
+4. On a Wednesday, reply "yes" to the events post. "I'll post the AI events
+   list again on Mon … at 2 PM." Reply "yes" again: "… was already answered
+   …", and still one reminder.
+5. Tell Saley an update ("met Sahaj today"). It proposes. A non-approver
+   replies "sure" to THAT message: the polite no. An approver replies "yes"
+   to it: applied.
+6. With two offers open, an approver types "@Saley yes" (not a reply). "Which
+   one do you mean?" with both named. Reply "2" to that: the second is
+   applied.
+7. Reply to an answer with a real question ("and for Globex?"). A normal
+   answer that understands what "and" refers to.
+8. At about 11:00, "@Saley what are the sales objectives for today?" The day's
+   items, laid out as the posts are, then the to-do sheet. No times, no rules,
+   no schedule. Ask again from a second account at once: the same text.
+9. Ask at 13:58 and at 14:05. The 2pm post still appears once, at its time,
+   with its tags.
+10. On a day with nothing due: "Nothing's due today."
+11. "@Saley cadence preview" still gives the rule-by-rule queue.
+12. Next morning: the previous day's `drip_sends` has one row per post and no
+    extras, and the audit has no `proposal_vote` that was not a reply to its
+    own proposal or a bare yes inside the window:
+    `grep '"event": "proposal_vote"' state/audit.jsonl | tail`.
+
+**To confirm what happened on 6 and 7 Oct**, the greps to run in
+`/opt/sales-bot` are in `docs/plans/NFT2-1063.md`, section 3.4.
+
 ## Upgrading to NFT2-1064 (answers that read like a teammate)
 
 Nothing to run by hand, no schema change, and **no line is required** in
@@ -816,8 +930,8 @@ mode and live behave the same, the `[TEST…]` tag aside):
 6. "@Saley top 5 AI headlines" → five bullets, nothing before them.
 7. A question it cannot fully answer (a source awaiting access) → the answer
    it has, plus ONE plain line about what it couldn't check.
-8. "@Saley hi" → one line. Reply "thanks" to an answer → one line, no tool
-   dump (if this still dumps, that is NFT2-1063).
+8. "@Saley hi" → one line. Reply "thanks" to an answer → one 👍 reaction and
+   no text (NFT2-1063).
 9. "@Saley what can you do?" → still names what it cannot see; mentions web
    search.
 10. A slow question → the interim line names no sheet and no notes.

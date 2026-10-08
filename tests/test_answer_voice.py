@@ -889,7 +889,10 @@ class TestPlanTextsExact:
         assert wording.FOUND_NOTHING == ("I looked and couldn't find anything concrete on that. Give me a company, "
                                          "a person, or a date and I'll go again.")
         assert wording.SOURCES_HEADING == "Sources:"
-        assert wording.HOLDING == "Noted — holding until someone can approve it."
+        # NFT2-1063 section 9/10: HOLDING became holding(label) so the line names what is waiting (was the constant
+        # "Noted — holding until someone can approve it."). Every other line in this test is unchanged.
+        assert wording.holding("the update to Acme") == (
+            "Noted. The update to Acme stays open until someone who can approve it says yes.")
         assert wording.CONNECTED == "Connected: " and wording.WAITING_ON == "Still waiting on access to: "
         assert wording.UNTIL_THEN == "Until then I can't answer anything that depends on those."
         assert wording.POLICY_MISSING == "My policy file is also missing, so I'm working from defaults."
@@ -976,7 +979,11 @@ class TestBaselineIsFrozen:
 
         want = json.load(open(vc.SHA_BEFORE))
         h = lambda s: hashlib.sha256(s.encode("utf-8")).hexdigest()
-        every = sorted({n for names in toolsets.GROUPS.values() for n in names})
+        # NFT2-1063 adds ONE tool (todays_objectives) that did not exist when these hashes were taken. The prompt TEXT
+        # must still be byte-identical (the plan adds none), so the set of tool names is the pre-NFT2-1063 one: was
+        # every name in GROUPS. Counting the new name would change the hash for a reason that is not a text edit.
+        every = sorted({n for names in toolsets.GROUPS.values() for n in names} - {"todays_objectives"})
+        assert "todays_objectives" in {n for names in toolsets.GROUPS.values() for n in names}
         assert h(tb.cos_persona("Saley")) == want["persona"]
         assert h(tb.CITATION_RULE) == want["citation_rule"]
         assert h(tb._engine_text(requester_name="Kushal", today="2026-10-07", tool_names=[])) == want["engine_none"]

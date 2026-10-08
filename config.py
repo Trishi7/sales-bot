@@ -874,8 +874,8 @@ GTM_SHEET_ORIGINAL_ID = (
 # WHAT REPLACES IT, per Vaishnavi's walkthrough: the bot writes into the REAL
 # "Outreach PoCs" tab, into the columns the team actually keeps, and ONLY inside
 # the WRITABLE WINDOW between the restricted bands (RESTRICTED_COLUMN_RANGES,
-# default A:I and S:X — the identity block and the formula block are still
-# untouchable, enforced in code since V1). There is no copy and no "which sheet"
+# default A:I, Q:W and Z:AE — the identity block, the outreach-step block and
+# the commercial block are untouchable, enforced in code since V1). There is no copy and no "which sheet"
 # question left to get wrong.
 #
 # WHAT DID NOT CHANGE: SQLite is still the brain. Deadlines, snoozes, scheduled
@@ -954,6 +954,17 @@ PROPOSAL_DROP_AFTER_DAYS = _int(
 )
 PROPOSAL_DROP_AFTER_WORKING_DAYS = PROPOSAL_DROP_AFTER_DAYS
 
+# HOW OLD A PROPOSAL MAY BE for a bare "yes" that is NOT a reply to answer it.
+# A yes replied to the message that asked always counts, whatever its age. A
+# yes typed into the channel on its own ("@Saley yes") is only safe to read as
+# "yes to that" when exactly one proposal is open in that channel and it was
+# made minutes ago; on 7 Oct a "sure" was taken as a yes to an offer made hours
+# earlier on a different post and scheduled a reminder nobody asked for
+# (NFT2-1063). Older than this, or more than one open, and Saley asks which.
+#
+# 0 = a bare yes never answers anything by itself; Saley always asks.
+PROPOSAL_BARE_YES_MINUTES = _int("PROPOSAL_BARE_YES_MINUTES", 30)
+
 # -- ROW ADDITIONS ------------------------------------------------------------
 # A NEW ROW MAY BE APPENDED — never edited into existence, never silently. R2
 # (news-company screen), R3 (events) and R11 (new pipeline company) can each
@@ -966,9 +977,11 @@ PROPOSAL_DROP_AFTER_WORKING_DAYS = PROPOSAL_DROP_AFTER_DAYS
 # the row did not exist a second ago — so filling A-I of a brand-new row
 # destroys nothing and is the only way an appended row is any use at all.
 #
-# S-X OF A NEW ROW IS STILL REFUSED. Those are commercial judgements and a
-# formula block; a bot that has just discovered a company has no business
-# stating its closure probability.
+# Q-W AND Z-AE OF A NEW ROW ARE STILL REFUSED. Q-W is the outreach sequence the
+# team keeps by hand (the Next Steps dropdown and the three emails); Z-AE is
+# commercial judgement and a formula block. A bot that has just discovered a
+# company has no business stating its closure probability or which email went
+# out.
 SHEET_ROW_ADDITIONS_ENABLED = _bool("SHEET_ROW_ADDITIONS_ENABLED", default=True)
 
 # Which tabs may receive an appended row. A tab not named here is refused even
@@ -979,11 +992,13 @@ SHEET_APPENDABLE_TABS: list[str] = _str_list(
 )
 
 # The columns the bot may fill on a NEW Outreach PoCs row. A:I is the identity
-# block; J:R is the writable window, which it could write anyway. S:X is absent
-# on purpose — see above.
+# block; J:P and X:Y are the writable windows, which it could write anyway.
+# Q:W and Z:AE are absent on purpose — see above. (Until the 7 Oct 2026 layout
+# this was A:R; on today's sheet that would reach the Next Steps dropdown and
+# 1st Email Sent, and startup warns if it still does.)
 NEW_ROW_WRITABLE_RANGES = (
     os.getenv("NEW_ROW_WRITABLE_RANGES", "") or ""
-).strip() or "A:R"
+).strip() or "A:P,X:Y"
 
 # PARSED ON FIRST USE, not at import: `parse_column_ranges` is defined further
 # down this file with the other band helpers, and moving either one to sit
@@ -1000,6 +1015,31 @@ def new_row_writable_indexes() -> frozenset:
             for i in range(lo, hi + 1)
         )
     return _NEW_ROW_INDEXES
+
+
+def new_row_locked_overlap() -> str:
+    """The columns NEW_ROW_WRITABLE_RANGES opens that a restricted band locks, as
+    "Q:R". "" when there are none.
+
+    Checked against the CONFIGURED bands, not a literal: the sheet's layout
+    moved on 7 Oct 2026 and a warning that still tested "S:X" stayed silent
+    while a new row was allowed to fill the Next Steps dropdown. The FIRST band
+    is left out — it is the identity block, the one a new row exists to fill.
+    """
+    locked = frozenset(
+        i for lo, hi in RESTRICTED_COLUMN_BANDS[1:] for i in range(lo, hi + 1)
+    )
+    cols = sorted(new_row_writable_indexes() & locked)
+    runs: list = []
+    for i in cols:
+        if runs and i == runs[-1][1] + 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    return ", ".join(
+        f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
+        for lo, hi in runs
+    )
 
 
 def may_write_new_row_column(index0) -> bool:
@@ -1577,7 +1617,8 @@ GTM_READ_HIDDEN_TABS = _bool("GTM_READ_HIDDEN_TABS", default=True)
 GTM_LOG_FULL_SCHEMA = _bool("GTM_LOG_FULL_SCHEMA", default=True)
 
 # -- RESTRICTED COLUMN BANDS: WHERE THE BOT MAY NEVER WRITE -------------------
-# Comma-separated A1 column ranges ("A:I,S:X") or bare single columns ("A,C").
+# Comma-separated A1 column ranges ("A:I,Q:W,Z:AE") or bare single columns
+# ("A,C").
 # Every column inside a band is DENIED to every write path in code, resolved to
 # column INDEXES once at import so a band cannot mean one thing in one code path
 # and something else in another.
@@ -1588,12 +1629,17 @@ GTM_LOG_FULL_SCHEMA = _bool("GTM_LOG_FULL_SCHEMA", default=True)
 # right-hand formula block are maintained by people and by formulas, and a bot
 # writing into either would destroy work it cannot see.
 #
+# THE 7 OCT 2026 LAYOUT HAS THREE BANDS. A:I is the identity block, Q:W the
+# outreach steps (the Next Steps dropdown and the three emails' sent/date
+# cells, which R13 reminds about and never fills) and Z:AE the commercial
+# block. Before that date it was two, A:I and S:X.
+#
 # The columns BETWEEN the bands are the WRITABLE WINDOW, and the NAMED columns
 # inside it are logged at startup — so a shifted column is visible before any
 # write, rather than after one has landed in the wrong place.
 RESTRICTED_COLUMN_RANGES = (
     os.getenv("RESTRICTED_COLUMN_RANGES", "") or ""
-).strip() or "A:I,S:X"
+).strip() or "A:I,Q:W,Z:AE"
 
 
 def _column_index(label: str):
@@ -1618,7 +1664,7 @@ def column_label(index0) -> str:
 
 
 def parse_column_ranges(spec: str) -> list:
-    """"A:I,S:X" -> [(0, 8), (18, 23)] — inclusive, 0-based pairs.
+    """"A:I,Q:W" -> [(0, 8), (16, 22)] — inclusive, 0-based pairs.
 
     An unparseable fragment is dropped WITH A WARNING NAMING IT rather than
     raising: a typo here must not take the bot down. It must not silently WIDEN
@@ -1677,7 +1723,8 @@ def restricted_band_label(index0) -> str:
 def writable_windows() -> list:
     """The contiguous unrestricted runs BETWEEN the restricted bands.
 
-    With bands A:I and S:X that is [(9, 17)] — columns J..R.
+    With bands A:I, Q:W and Z:AE that is [(9, 15), (23, 24)] — columns J..P
+    and X..Y.
 
     Columns to the RIGHT of the last band are unrestricted too, but they are not
     "between" the bands and are deliberately not reported as the window: the
@@ -1697,7 +1744,7 @@ def writable_windows() -> list:
 
 
 def writable_window_label() -> str:
-    """The writable window as "J:R". "" when the bands leave no gap between them."""
+    """The writable window as "J:P, X:Y". "" when the bands leave no gap between them."""
     return ", ".join(
         f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
         for lo, hi in writable_windows()
@@ -1806,7 +1853,7 @@ CADENCE_FULL_LIST_MAX = _int("CADENCE_FULL_LIST_MAX", 200)
 NEXT_ACTION_ENABLED = _bool("NEXT_ACTION_ENABLED", default=True)
 
 # -- THE TWELVE RULES ---------------------------------------------------------
-# What the bot does on its own initiative is the twelve rules in
+# What the bot does on its own initiative is the thirteen rules in
 # `bot_rules.yaml`. WHICH DAY each runs, HOW MANY items a post may carry, WHERE
 # it goes and WHETHER it counts against the cap all live in that file.
 #
@@ -2059,12 +2106,86 @@ PROSPECT_ROLE_ORDER: list[str] = _str_list(
 # R6 — LinkedIn connected, no DM after this many days.
 LI_NO_DM_DAYS = _int("LI_NO_DM_DAYS", 3)
 
-# R7 — DM sent, no meeting after this many days.
+# R7 — DM sent, no meeting after this many days. R7 IS SWITCHED OFF in
+# bot_rules.yaml since 7 Oct 2026 (R13's call reminders replaced it); the
+# evaluator is kept, so these two are still read if somebody re-enables it.
 DM_NO_MEETING_DAYS = _int("DM_NO_MEETING_DAYS", 7)
 # ...and the most CONTACTS one R7 post lists (contacts, not companies): the
 # ones waiting longest, founders first on a tie. The rest are counted in one
 # closing line, "+N more next Monday".
 DM_NO_MEETING_MAX_CONTACTS = _int("DM_NO_MEETING_MAX_CONTACTS", 5)
+
+# -- R13 — NEXT STEPS FOR CONNECTED CONTACTS ----------------------------------
+# One post each weekday naming up to five connected contacts and the one thing
+# to do next for each, read off the Next Steps dropdown (Q) and the cells that
+# step depends on. Saley only REMINDS: Q:W is a restricted band, so there is no
+# switch here that makes it write those cells.
+#
+# EVERY NUMBER IN THE RULE'S TIMING TABLE IS ONE OF THESE, because the rule as
+# written on the Bot Rules tab leaves several of them open and the answers are
+# still coming in. Calendar days throughout: the sheet's dates are calendar
+# dates, and "a week after the email" means seven days to the person reading it.
+
+
+def _hhmm(name: str, value, default: str) -> str:
+    """An "HH:MM" setting, falling back to the default WITH a warning.
+
+    A post pinned to an unreadable time would never be planned, and a rule that
+    silently stopped posting looks exactly like a day with nobody due.
+    """
+    raw = str(value or "").strip() or default
+    try:
+        hh, sep, mm = raw.partition(":")
+        if sep and len(mm) == 2 and 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59:
+            return f"{int(hh):02d}:{int(mm):02d}"
+    except ValueError:
+        pass
+    log.warning("%s=%r is not a time like 15:00; using %s instead", name, raw, default)
+    return default
+
+
+# WHEN THE POST GOES OUT, IST. A fixed time like R1's news and R8's day-of
+# touch: it takes no slot in the posting window and the window cannot move it.
+# (NFT2-1069 will move this to a `fixed_time` field on the rule.)
+NEXT_STEP_TIME = _hhmm("NEXT_STEP_TIME", os.getenv("NEXT_STEP_TIME", "15:00"), "15:00")
+
+# WHICH "Sid - LI Addition" VALUES MEAN CONNECTED. Compared after normalising
+# (case, spaces, punctuation), exactly — "Not connected" is not "connected".
+NEXT_STEP_CONNECTED_MARKERS: list[str] = _str_list(
+    "NEXT_STEP_CONNECTED_MARKERS", "connected",
+)
+
+# Days after LI Connected Date before the first ask, while Next Steps is blank
+# or says "Research the PoC".
+NEXT_STEP_FIRST_DAYS = _int("NEXT_STEP_FIRST_DAYS", 2)
+# Days after the PREVIOUS step's date before asking whether this email (or the
+# DM) has gone out. A blank previous date means "due now", and the line asks
+# for the missing date too.
+NEXT_STEP_AFTER_PREVIOUS_DAYS = _int("NEXT_STEP_AFTER_PREVIOUS_DAYS", 2)
+# Days after an email's logged date before asking to move Next Steps on.
+NEXT_STEP_AFTER_EMAIL_DAYS = _int("NEXT_STEP_AFTER_EMAIL_DAYS", 7)
+# THE CALL CLOCK, all counted from LI DM Date: the first call reminder, how
+# often it repeats, and the last day it may. The day after that the bot asks,
+# once, for Prospect Status to be set to Unresponsive and then never names the
+# person again — a chase with no last step is how a bot gets muted.
+NEXT_STEP_CALL_AFTER_DM_DAYS = _int("NEXT_STEP_CALL_AFTER_DM_DAYS", 7)
+NEXT_STEP_CALL_EVERY_DAYS = _int("NEXT_STEP_CALL_EVERY_DAYS", 3)
+NEXT_STEP_CALL_UNTIL_DAYS = _int("NEXT_STEP_CALL_UNTIL_DAYS", 21)
+
+# "LI DM Sent" VALUES THAT MEAN THE PERSON ANSWERED. Such a contact is not
+# chased with calls; the line asks whether a meeting is being set up. Empty =
+# treat a replied DM like any other DM (the call clock runs).
+NEXT_STEP_DM_REPLIED_MARKERS: list[str] = _str_list(
+    "NEXT_STEP_DM_REPLIED_MARKERS", "replied,responded",
+)
+
+# A MEETING DATED TODAY OR LATER, not marked Completed, pauses the rule for
+# that person: reminding somebody to call a contact they are meeting on Friday
+# is noise. false = a booked meeting changes nothing. (A Completed meeting
+# always ends the rule for them — R9 takes over — whatever this says.)
+NEXT_STEP_PAUSE_FOR_BOOKED_MEETING = _bool(
+    "NEXT_STEP_PAUSE_FOR_BOOKED_MEETING", default=True,
+)
 
 # R5 / R6 — LOOKING UP A MISSING EMAIL. For a contact in the post whose Email
 # cell is blank the bot runs ONE search ('"<name>" "<company>" email'), has
@@ -2882,7 +3003,7 @@ def validate() -> list[str]:
     if not RESTRICTED_COLUMN_BANDS:
         log.warning(
             "RESTRICTED_COLUMN_RANGES=%r resolved to NO bands — no column is denied to "
-            "the write paths. That is almost certainly a typo: the default is 'A:I,S:X'. "
+            "the write paths. That is almost certainly a typo: the default is 'A:I,Q:W,Z:AE'. "
             "Reading is unrestricted either way.",
             RESTRICTED_COLUMN_RANGES,
         )
@@ -3155,7 +3276,7 @@ def validate() -> list[str]:
                 name, value,
             )
 
-    # -- the twelve rules ---------------------------------------------------
+    # -- the thirteen rules -------------------------------------------------
     # Nothing here is fatal: a rule that is quieter than intended is
     # recoverable. What IS worth a line at boot is a setting that makes a rule
     # UNREACHABLE — that failure is silent by nature, and the whole point of the
@@ -3167,7 +3288,7 @@ def validate() -> list[str]:
     # the check would give two places to disagree about one answer.
     if NEXT_ACTION_ENABLED:
         log.info(
-            "[config] the twelve rules are ON (computation only — the engine has no "
+            "[config] the thirteen rules are ON (computation only — the engine has no "
             "send path). rules_file=%s deliverables<=%dd prospects=%d co/week "
             "ask_at=%d li_no_dm=%dd dm_no_meeting=%dd prep=%s+day-of@%s "
             "followup=%dd/every %dd ladder=%s closure>%d%% new_company=+%dwd "
@@ -3180,6 +3301,29 @@ def validate() -> list[str]:
             CLOSURE_SUPPORT_MIN, NEW_COMPANY_AFTER_WORKING_DAYS,
             NEW_COMPANY_WINDOW_DAYS, NEXT_ACTION_WEEKEND_SHIFT,
         )
+        log.info(
+            "[config] R13 next steps: post at %s IST; first ask +%dd, after the "
+            "previous step +%dd, after an email +%dd; calls from DM +%dd every %dd "
+            "until +%dd; connected=%s replied=%s pause_for_booked_meeting=%s",
+            NEXT_STEP_TIME, NEXT_STEP_FIRST_DAYS, NEXT_STEP_AFTER_PREVIOUS_DAYS,
+            NEXT_STEP_AFTER_EMAIL_DAYS, NEXT_STEP_CALL_AFTER_DM_DAYS,
+            NEXT_STEP_CALL_EVERY_DAYS, NEXT_STEP_CALL_UNTIL_DAYS,
+            ",".join(NEXT_STEP_CONNECTED_MARKERS) or "(none)",
+            ",".join(NEXT_STEP_DM_REPLIED_MARKERS) or "(none)",
+            NEXT_STEP_PAUSE_FOR_BOOKED_MEETING,
+        )
+        if NEXT_STEP_CALL_UNTIL_DAYS < NEXT_STEP_CALL_AFTER_DM_DAYS:
+            log.warning(
+                "NEXT_STEP_CALL_UNTIL_DAYS=%d is below NEXT_STEP_CALL_AFTER_DM_DAYS=%d, "
+                "so R13 never sends a call reminder: it goes straight to asking for "
+                "Prospect Status 'Unresponsive'. The defaults are 21 and 7.",
+                NEXT_STEP_CALL_UNTIL_DAYS, NEXT_STEP_CALL_AFTER_DM_DAYS,
+            )
+        if not NEXT_STEP_CONNECTED_MARKERS:
+            log.warning(
+                "NEXT_STEP_CONNECTED_MARKERS is empty, so R13 selects nobody. The "
+                "default is 'connected'."
+            )
         if not MEETING_FOLLOWUP_LADDER:
             log.warning(
                 "MEETING_FOLLOWUP_LADDER is empty, so R9 has no rungs and a finished "
@@ -3486,19 +3630,19 @@ def validate() -> list[str]:
     if SHEET_ROW_ADDITIONS_ENABLED:
         log.info(
             "[config] row additions ON for %s. A new Outreach PoCs row may have its "
-            "identity columns (%s) filled by the bot; an EXISTING row's A:I and S:X "
-            "stay locked.",
+            "identity columns (%s) filled by the bot; an EXISTING row's restricted "
+            "bands (%s) stay locked.",
             ", ".join(SHEET_APPENDABLE_TABS) or "(no tabs — nothing can be appended)",
-            NEW_ROW_WRITABLE_RANGES,
+            NEW_ROW_WRITABLE_RANGES, RESTRICTED_COLUMN_RANGES,
         )
-        overlap = new_row_writable_indexes() & frozenset(
-            i for lo, hi in parse_column_ranges("S:X") for i in range(lo, hi + 1)
-        )
+        overlap = new_row_locked_overlap()
         if overlap:
             log.warning(
-                "NEW_ROW_WRITABLE_RANGES=%r reaches into the commercial block (S:X). A "
-                "bot that has just discovered a company has no business stating its "
-                "closure probability. The default is A:R.", NEW_ROW_WRITABLE_RANGES,
+                "NEW_ROW_WRITABLE_RANGES=%r reaches into restricted column(s) %s "
+                "(RESTRICTED_COLUMN_RANGES=%r). A bot that has just discovered a "
+                "company has no business stating which email went out or its closure "
+                "probability. The default is A:P,X:Y.",
+                NEW_ROW_WRITABLE_RANGES, overlap, RESTRICTED_COLUMN_RANGES,
             )
     else:
         log.info(

@@ -715,7 +715,8 @@ ROUTES = [
     ("what's on today", ["today"]),
     ("whats on today", ["today"]),
     ("what do we need to do today about the Acme meeting?", ["today"]),
-    ("what are the sales objectives for today?", []),
+    # NFT2-1063 (plan 8.1): was [] (no route, so the model picked cadence_preview and talked about the posting rules).
+    ("what are the sales objectives for today?", ["today"]),
     ("what's the latest AI news today?", ["web", "news"]),
     ("show the to-dos", ["todos"]),
     ("what is on the to-do list", ["todos"]),
@@ -750,17 +751,18 @@ check("'what did we decide in yesterday's meeting?' has notes",
 g = rt[False]["action items from the Acme call"]
 check("'action items from the Acme call' has notes and no todos", ("notes" in g, "todos" in g), (True, False))
 check("PAR  E9 routes identical with SALES_TEST_MODE on and off", rt[True], rt[False])
-check("the groups: today == (show_todos,), notes has no todo tool",
+check("the groups: today == (show_todos, todays_objectives) [NFT2-1063; was (show_todos,)], notes has no todo tool",
       (toolsets.GROUPS.get("today"), "show_todos" in toolsets.GROUPS.get("notes", ()),
        "todo_candidates" in toolsets.GROUPS.get("notes", ()), toolsets.GROUPS.get("todos")),
-      (("show_todos",), False, False, ("show_todos", "todo_candidates")))
+      (("show_todos", "todays_objectives"), False, False, ("show_todos", "todo_candidates")))
 all_names = sorted({n for names in toolsets.GROUPS.values() for n in names} | {"cadence_preview", "mystery"})
 fake_tools = [{"schema": {"name": n, "description": "d"}, "handler": None} for n in all_names]
 for mode in (False, True):
     config.SALES_TEST_MODE = mode
     picked, groups, _why = toolsets.select(fake_tools, "what do we need to do today?")
-    check(f"select('what do we need to do today?') offers exactly show_todos [test_mode={mode}]",
-          [t["schema"]["name"] for t in picked], ["show_todos"])
+    check(f"select('what do we need to do today?') offers exactly show_todos and todays_objectives [test_mode={mode}] "
+          "(NFT2-1063; was show_todos alone)",
+          [t["schema"]["name"] for t in picked], ["show_todos", "todays_objectives"])
 config.SALES_TEST_MODE = False
 check("today is EXCLUSIVE even when other groups also match",
       toolsets.route("what do we need to do today about the Acme meeting and the sheet?"), ["today"])

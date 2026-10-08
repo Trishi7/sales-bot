@@ -54,7 +54,7 @@ chased or counted. Ask about one by name and it still answers in full. See
 [Row activation](#row-activation--which-rows-the-bot-may-raise-unprompted).
 
 **Never writes outside a narrow window.** `RESTRICTED_COLUMN_RANGES` (default
-`A:I,S:X`) names bands of columns denied to every write path in the code; the
+`A:I,Q:W,Z:AE`) names bands of columns denied to every write path in the code; the
 named columns in the writable window between them are logged at startup so a
 shifted column is visible before a write lands in the wrong place. Reading is
 unrestricted. See [Writes](#writes--deliberately-tiny-and-locked-to-a-window).
@@ -80,7 +80,7 @@ is not an action type on it.
 a reason. Positive replies jump the queue, closed rows stop for good, snoozes are
 honoured, and no due date lands on a weekend. It **sends nothing**: read it by
 asking for `cadence preview`. See
-[The twelve rules](#the-twelve-rules).
+[The thirteen rules](#the-thirteen-rules).
 
 **Maps buyers to accounts.** The third sheet says *who* to pitch inside an
 account, with the tier, the confidence, the ICP lane and the hook — and enforces
@@ -493,14 +493,24 @@ The engine lines name no source: the bot does not know which ones the model
 will read, and the old "going through the sheet and the notes" went out on
 questions routed to neither.
 
-**What counts as a web turn.** Web search is attached to nearly every engine
-turn (whenever it is on and the budget has room), so "attached" alone would put
-every question on the 6 s clock and have Saley say "checking the web" while it
-reads the sheet. A web turn is attached **and** either a search has already run
-this turn or the question plainly asks about the outside world
-(`bot._WEB_HINT_RE`: news, funding, raised, acquisitions, launches, papers,
-conferences, "look it up"…). Words that are as often about our own sheet —
-"today", "this week" — are left out on purpose.
+**The wait and the wording are decided separately (NFT2-1063).** Web search is
+attached to nearly every engine turn (whenever it is on and the budget has
+room), so "attached" alone would put every question on the 6 s clock.
+
+- **The wait** is the shorter one when the web tools are attached and the
+  question plainly asks about the outside world (`bot._WEB_HINT_RE`: news,
+  funding, raised, acquisitions, launches, papers, conferences, "look it up",
+  "what is new"…). Words that are as often about our own sheet — "today",
+  "this week" — are left out on purpose.
+- **The web wording** goes out only once a `web_search` has actually started:
+  the engine has dispatched the call, or the search tool has run one, by the
+  time the line is sent. The question's words never choose it. On 7 Oct "any
+  AI news?" got "I'm checking the web for this" and was then answered from the
+  news already collected; no search ever ran. A question answered from
+  `todays_news`, the sheet or the notes now gets an engine line. With
+  `SEARCH_BACKEND=anthropic` the search runs inside the model call and cannot
+  be seen until it returns, so that backend gets the engine line too, which is
+  still true.
 
 **Honest failure still wins.** If the model fails after the interim went out,
 the `model_failure_reply` sentence follows it exactly as it would have without
@@ -512,7 +522,7 @@ they get neither the typing indicator nor an interim line.
 #### The latency log — tune the thresholds from data
 
 Every answered question writes one `reply_latency` row: `ts`, `route`
-(`social` | `capability` | `engine` | `sheet_update`), `seconds` (from the gate's
+(`social` | `capability` | `engine` | `sheet_update` | `ack`), `seconds` (from the gate's
 yes to the answer's first chunk — the interim line does not stop the clock),
 `used_web`, `tool_calls` (client tools dispatched + searches billed) and
 `interim_sent`. The log line is
@@ -536,6 +546,135 @@ and the latency log will show it.
 
 `python verify_interim.py` drives the real question path and the real engine
 loop with the model faked (it sleeps for real) and prints wall-clock timelines.
+
+### Replies — read against the message they answer (NFT2-1063)
+
+Two live exchanges produced this section. On 6 Oct a "Sure." under an answer
+was treated as a new request and came back as an unrelated answer from the
+sheet. On 7 Oct a "sure" under "I'm checking the web for this" was taken as a
+yes to an offer made hours earlier on a different post, and a reminder nobody
+asked for was scheduled. Both read the message alone. A reply is now read
+against the message it replies to, before anything is looked up or voted on.
+
+**The reply context** (`bot._reply_context`, built once per message):
+
+- **The walk.** Hop 1 is the message replied to. If Saley wrote it, stop.
+  Otherwise (Saley was @-mentioned in a reply to a person) follow that
+  message's own reference, at most three hops (`bot.REPLY_WALK_MAX_HOPS`), in
+  the same channel and only where the bot may read. The first message Saley
+  wrote is "its message"; the people's messages on the way are kept for the
+  model.
+- **What is known about that message** comes from records, not from the
+  conversation memory: `drip_sends` (which post it was, found by its first
+  message id or the id of any later part of a split post), `write_proposals`
+  (what is attached to it, open and closed), and an in-memory note of what
+  kind of line it was (an answer and the question it answered, an interim
+  line, a "which one?"). After a restart an interim line is still recognised
+  by its text.
+- **When the parent cannot be read** (deleted, another channel, nothing of
+  Saley's within three hops): the message is answered without it, and no vote
+  of any kind is taken. One exception: if the id is one of Saley's own
+  recorded messages, the id is enough.
+
+**What happens, in order** (`replies.py` holds the judgements; it is pure and
+calls no model):
+
+| The message | Under | Saley does |
+|---|---|---|
+| "sure", "ok", "thanks", "got it", "noted", "cool", 👍 | a message that asked nothing: an interim line, an answer, a quiet-day line, a post with no offer | **one 👍 reaction, no text.** No model call, no sheet read, no vote, nothing remembered (`bot._maybe_acknowledge`, before the typing indicator) |
+| "yes" / "no" (not "sure" / "ok") | a message that asked something ("Did you mean Acme AI?") | an answer: handled normally, with that message as context |
+| yes / no words, no question mark | a message with an open proposal ON IT | a vote on that proposal (below) |
+| "thanks", "noted" | a message with an open proposal on it | a reaction; the proposal stays open |
+| "sure" | a message that ENDED on an offer ("Want me to…?", "Shall I…?", "Would you like…?") | a read offer runs as the question, with the message as context; an offer to change the sheet is **proposed** and waits for an approver's separate yes. Nothing is written on a "sure" |
+| "yes" | an offer already answered or lapsed | one line saying so; nothing runs twice |
+| a real question | anything | answered normally; the engine is handed the message it replies to, quoted and marked as data. Routing, the reply guard and the memory keep the person's own words |
+| "@Saley thanks", not a reply | (nothing open in the channel) | a reaction (`bot.ACK_NON_REPLY_GETS_REACTION`) |
+
+**A vote counts only for what the replied-to message asked.** There is no
+"newest open proposal" any more: that lookup had no channel, no age and no
+kind, and it is how the 7 Oct reminder was set.
+
+- A **direct reply** to a message with open proposals on it: a vote when the
+  words say so (`approvals.read_vote`) and there is no question mark ("what's
+  the right contact there?" used to count as a yes). One post can carry
+  several; the reply says which, as before.
+- **Any other reply is never a vote**, whatever is open anywhere.
+- **A bare "@Saley yes" that is not a reply** counts only when the message is
+  nothing but a vote word, exactly ONE proposal is open in that channel, and it
+  is younger than `PROPOSAL_BARE_YES_MINUTES` (30). Otherwise Saley asks
+  "Which one do you mean?", naming and numbering them (or "Is that a yes to
+  …?" for a single older one), and records nothing. A reply of "2" or "the
+  second one" to that question picks it. `0` means it always asks.
+- **The "Waiting for your yes" post** lists proposals that are keyed to other
+  messages. A yes replied to it answers the one it listed, or gets the same
+  "which one?" when it listed several.
+- A non-approver's yes still gets the polite no, and the proposal stays open.
+
+**Every proposal is keyed to Saley's own message.** A cell update used to be
+recorded against the ASKER's message (the reply helper returned nothing), so a
+"yes" replied to "Shall I set …? Reply yes." only ever worked through the
+fallback that is now gone. It is keyed to the question itself, and no proposal
+is opened when the question could not be posted. A post split into several
+Discord messages records every part (`drip_sends.part_ids`), so a "yes" under
+its last part, where the offer is, finds it.
+
+**Every confirmation names what it did** (`wording.py`, "replies and
+approvals"): "I'll post the AI events list again on Mon 12 Oct at 2 PM", never
+"I'll post these again". Each proposal has a short label
+(`wording.proposal_label`) used by the confirmation, the refusal, "which one?"
+and "was already answered".
+
+**Add Reactions.** The acknowledgement needs the bot's role to have Add
+Reactions in every sales channel. Without it nothing is said instead: the
+failure is logged and audited (`reaction_failed`). `guardrails.react` is the
+only way a reaction is added, and it refuses any channel outside
+`SALES_CHANNEL_IDS`.
+
+**Rule 13's replies.** `bot._maybe_next_step_reply` is the hook for a reply to
+the next-steps post ("done"); it is a stub that changes nothing until
+RULE13.md section 14 is built.
+
+`python verify_replies.py` runs the decision table through the real
+`on_message`, in live and test mode.
+
+### Today's objectives, on demand (NFT2-1063)
+
+"What are the sales objectives for today?", "today's plan", "what's on today",
+"what do we need to do today?", "today's priorities" route to the `today` group:
+`todays_objectives` and `show_todos`, and nothing else. The reply is the
+objectives, a blank line, then the to-do sheet.
+
+**The objectives are what today's posts contain** (`bot._todays_objectives`),
+at any time of day:
+
+| Post | What the answer shows |
+|---|---|
+| already gone out today | the text that was posted, word for word, from `drip_sends.body` |
+| still to come | the same plan the sender uses (`_plan_drip`), each post rendered by the composer's own template with its heading and source links |
+| the AI news | left out (`bot.OBJECTIVES_EXCLUDED_TYPES`); "any AI news?" is its own answer |
+
+It makes **no model call**, so two people asking in the same minute read the
+same words. It leaves out the tags line and every ping, a closing offer
+(`bot.OBJECTIVES_SHOW_OFFERS`: no proposal stands behind a repeated one),
+anything only a search at send time would add, a post meant for a DM, and
+groups the plan holds back or rolls to another day.
+
+**It claims nothing.** No slot, no send record, nothing toward the cap, no
+proposal, no research: the scheduled post still goes once, at its own time.
+And it says nothing about when: no times, no rules, no schedule. A day with
+nothing is "Nothing's due today."
+
+The text is put into the reply by code. The model is told only that it has
+been added and writes the to-do part; on a question that routes to `today`
+the objectives are added whether or not the model called the tool, and they
+still go out if the model call failed.
+
+**So the two match, a post's opener and close are picked from the day and the
+slot** (`drip._voice`, `_voice_seed`), by the sender and by the on-demand
+answer alike, instead of at random.
+
+`cadence_preview` stays for "cadence preview", "what's the queue" and "why
+isn't X due"; it is no longer offered for "what do we need to do today".
 
 ---
 
@@ -860,11 +999,12 @@ every tab** is logged at startup (`GTM_LOG_FULL_SCHEMA`, on by default), and the
 canonical tab's schema is printed again in the boot report with each column's
 letter, header, role and whether it falls inside a restricted band.
 
-#### Its columns: A-X
+#### Its columns: A-AF
 
-The tab carries twenty-four columns, and each one maps to exactly one role.
-Columns **J-R** are the [writable window](#writes--into-the-real-sheet-now-inside-one-window);
-A-I and S-X are locked.
+The tab carries thirty-two columns (the layout Vaishnavi set on 7 Oct 2026),
+and each one maps to exactly one role. Columns **J-P and X-Y** are the
+[writable windows](#writes--into-the-real-sheet-now-inside-one-window);
+A-I, Q-W and Z-AE are locked.
 
 | Col | Header | Role | |
 |---|---|---|---|
@@ -884,14 +1024,39 @@ A-I and S-X are locked.
 | N | LI Connected Date | `li_connected_date` | **activation column** |
 | O | LI DM Sent | `li_dm_sent` | |
 | P | LI DM Date | `li_dm_date` | |
-| Q | Meeting Date | `meeting_date` | |
-| R | Meeting Status | `meeting_status` | |
-| S | Next Steps/Notes | `next_steps` | commercial block — **never written** |
-| T | Package | `package` | |
-| U | Prospect Status | `prospect_status` | |
-| V | Closure Prob% | `closure_prob` | |
-| W | Estd. Deal Size (USD) | `deal_size` | |
-| X | Deal Status | `deal_status` | |
+| Q | Next Steps | `outreach_step` | step block — **never written**. The dropdown: Research the PoC · Send email 1/2/3 · Reach by LI DM · Call the PoC |
+| R | 1st Email Sent | `email_1_sent` | |
+| S | 1st Email Date | `email_1_date` | |
+| T | 2nd Email Sent | `email_2_sent` | |
+| U | 2nd Email Date | `email_2_date` | |
+| V | 3rd Email Sent | `email_3_sent` | |
+| W | 3rd Email Date | `email_3_date` | |
+| X | Meeting Date | `meeting_date` | **writable window** |
+| Y | Meeting Status | `meeting_status` | |
+| Z | Notes/Remarks | `next_steps` | commercial block — **never written**. THE NOTES ROLE |
+| AA | Package | `package` | |
+| AB | Prospect Status | `prospect_status` | |
+| AC | Closure Prob% | `closure_prob` | |
+| AD | Estd. Deal Size (USD) | `deal_size` | |
+| AE | Deal Status | `deal_status` | |
+| AF | Priority | `poc_priority` | outside every band; no write path names it |
+
+**`next_steps` is the notes role, and the name is historical.** Until 7 Oct the
+sheet had one column, "Next Steps/Notes" (S), holding free text. It is now two:
+Q "Next Steps" is a dropdown (`outreach_step`, read by rule 13) and Z
+"Notes/Remarks" is the free text (`next_steps`, read by rule 9, the last-note
+line and the prospect signature). The role was not renamed because twenty-odd
+readers use it and a meeting note's action list is also called `next_steps`.
+
+**The two can never swap.** `gtm_sheet._POCS_ROLE_VETO` is checked on every
+pass of the header mapping and on `GTM_COLUMN_MAP`: a header "Next Steps" is
+never given the notes role, and a header containing "note" or "remark" is never
+given the step role. An override that tries is ignored with a warning. With the
+aliases as shipped, `GTM_COLUMN_MAP` needs no entry for either layout.
+
+**The pre-7 Oct sheet still maps** (24 columns, "Next Steps/Notes" on S): the
+dropdown, the six email columns and Priority are simply absent, and rule 13
+finds nobody.
 
 **Three columns for first contact, not one**, and the same for the LinkedIn DM.
 *"I emailed her on Tuesday"* is three facts — that it happened, that it was
@@ -1204,7 +1369,7 @@ tabs_found        24 tabs, 12 read, 12 not read
                   'Q4-OND2026-Goal Setting'   5 rows  GOAL SETTING (read-only context)
                   'Outreach Updates'        886 rows  not read — matches no known kind
                   …
-writable_window   J:R
+writable_window   J:P, X:Y
 ```
 
 **Every tab, including the ones it does not read.** A tab reported as *not read*
@@ -1299,6 +1464,7 @@ polite no that says who can, and the proposal stays open.
 | Who may approve | `SALES_APPROVER_IDS` — Sid and Vaishnavi |
 | Who wins a disagreement | `SALES_FINAL_SAY_ID` — Sid |
 | No reply | one nudge after `PROPOSAL_NUDGE_AFTER_WORKING_DAYS` (1), then dropped and logged |
+| A yes that is not a reply | counts only for the ONE proposal open in that channel, and only if it is younger than `PROPOSAL_BARE_YES_MINUTES` (30); otherwise Saley asks which. A yes REPLIED to the question always counts. See "Replies" |
 | Echo + undo | **unchanged** — `SHEET_WRITE_UNDO_HOURS` (24), and any team member may undo any write |
 
 **When Sid and Vaishnavi disagree, Sid wins** — whether his answer came first or
@@ -1308,9 +1474,9 @@ written anything at 14:02. `approvals.decide()` is recomputed from *all* the
 votes every time one lands, and a decision that reverses an earlier one says so:
 
 ```
-bot:     Not doing that one: Sid said no — Vaishnavi said yes, and the final
-         say outranks that. (Vaishnavi had said yes, so to be clear — the sheet
-         is unchanged.)
+bot:     Not doing the update to Sahaj (Wispr Flow): Sid said no — Vaishnavi
+         said yes, and the final say outranks that. (Vaishnavi had said yes,
+         so to be clear — the sheet is unchanged.)
 ```
 
 Silence there would leave Vaishnavi believing the sheet had changed.
@@ -1351,11 +1517,11 @@ proposed something unless a proposal exists.
 
 | Who answers | What happens |
 |---|---|
-| An approver says yes (a reply to the offer, or a bare "@Saley yes") | the same vote flow as every other proposal; "yes for Janajit" narrows it to the people named |
-| An approver says no | "Leaving that one then — … Nothing has changed in the sheet." |
+| An approver says yes (a reply to the offer, or a bare "@Saley yes" while it is the one open proposal in the channel and under `PROPOSAL_BARE_YES_MINUTES` old) | the same vote flow as every other proposal; "yes for Janajit" narrows it to the people named |
+| An approver says no | "Adding Janajit Bagchi and Suryansh Shukla to Outreach PoCs is off — … Nothing has changed in the sheet." |
 | Someone who is not an approver says yes | the polite no that names who can approve; the proposal stays open, nothing is written |
 | Nobody answers | one nudge the next working day, then dropped, like a cell update |
-| "Sure." as a reply to a *different* bot message | not a vote on the add offer |
+| "Sure." as a reply to a *different* bot message | not a vote on the add offer, or on anything else (true of every kind of proposal since NFT2-1063) |
 
 Offered only when `SHEET_ROW_ADDITIONS_ENABLED` is on and `outreach_pocs` is in
 `SHEET_APPENDABLE_TABS`.
@@ -1408,8 +1574,11 @@ R2 (news-company screen), R3 (events) and R11 (new pipeline company) may each
 An approver's yes appends it; nothing is appended silently.
 
 **On a NEW Outreach PoCs row the bot may fill the identity columns A–I**
-(`NEW_ROW_WRITABLE_RANGES`, default `A:R`). **On an existing row A–I stays as
-locked as it has always been.**
+(`NEW_ROW_WRITABLE_RANGES`, default `A:P,X:Y`). **On an existing row A–I stays
+as locked as it has always been.** Q–W (the outreach steps) and Z–AE (the
+commercial block) are refused on a new row too, and the boot log warns, naming
+the columns, if the setting reaches into either. (It was `A:R` until the 7 Oct
+2026 layout; on today's sheet that reaches the Next Steps dropdown.)
 
 That asymmetry is the point. A:I on an existing row holds work somebody did, and
 the restricted bands exist to protect exactly that. A row the bot is *creating*
@@ -1542,9 +1711,9 @@ enforces that nothing without it can overwrite.
 
 | Tier | Roles |
 |---|---|
-| **Reply-loop** | `first_contact` · `first_contact_type` · `first_contact_date` · `sid_li_added` · `li_connected_date` · `li_dm_sent` · `li_dm_date` · `meeting_date` · `meeting_status` — all nine of them columns **J-R**, the writable window. Plus `next_steps` and `prospect_status`, which are *inside* a restricted band: they are listed so the refusal can name the column rather than falling through to "I have no rule for that" |
+| **Reply-loop** | `first_contact` · `first_contact_type` · `first_contact_date` · `sid_li_added` · `li_connected_date` · `li_dm_sent` · `li_dm_date` · `meeting_date` · `meeting_status` — all nine of them columns **J-P and X-Y**, the writable windows. Plus `next_steps` and `prospect_status`, which are *inside* a restricted band: they are listed so the refusal can name the column rather than falling through to "I have no rule for that" |
 | **Command-only** | `closure_prob` · `deal_size` · `deal_status` · `package` |
-| **Never** | anything in a restricted band (`A:I`, `S:X`) |
+| **Never** | anything in a restricted band (`A:I`, `Q:W`, `Z:AE`), and the roles in no tier at all: `outreach_step`, `email_1_sent` … `email_3_date`, `poc_priority` |
 
 That the reply-loop tier and the writable window contain the same nine columns
 is not a coincidence — it is the tier list and the band list agreeing. The bands
@@ -1617,7 +1786,7 @@ correction.
 ### The three locks, still
 
 1. **Read-only sheet ids** — never the mapping sheet, whatever the config says.
-2. **Restricted bands** — never a column in `A:I` or `S:X`. Fails closed: a
+2. **Restricted bands** — never a column in `A:I`, `Q:W` or `Z:AE`. Fails closed: a
    column index that cannot be read as a number is refused.
 3. **The row interlock** — the target row must still name the company the caller
    believes it does. Rows get sorted and inserted between a read and a write, and
@@ -1901,12 +2070,12 @@ a product question rather than a config one.
 
 ---
 
-## The twelve rules
+## The thirteen rules
 
-**What the bot says on its own initiative is twelve rules, and they live in a
+**What the bot says on its own initiative is thirteen rules, and they live in a
 file.** `bot_rules.yaml` at the repo root is the machine copy of the **Bot
 Rules** tab of *Sales Bot_membrane* (Drive id `1sVsqPLxkBBBUQJGPDx-3AydRjHIRO9WGT-kkULgdtpo`,
-amended by Vaishnavi on 21 Sep).
+amended by Vaishnavi on 21 Sep, and on 7 Oct when she added rule 13).
 
 > **The file is the schedule; the code is the arithmetic.** The YAML decides
 > *which* rules exist, *when* each runs, *how much* one post may carry, *where*
@@ -1969,7 +2138,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 - **The engine is still pure.** Tabs and dicts in, dicts out. No sheet read, no
   database write, no send path. See [Purity](#purity-and-the-one-write-that-isnt-in-it).
 
-### The twelve
+### The thirteen
 
 | | Rule | Runs | Trigger | Per post | Cap? |
 |---|---|---|---|---|---|
@@ -1978,18 +2147,152 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R3** | AI events & summits | alternate Wed | `events` | 5 | yes |
 | **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
-| **R6** | LinkedIn connected, no DM | Tue, Fri | `li_no_dm` | 5 | yes |
-| **R7** | DM sent, no meeting | Mon | `dm_no_meeting` | 5 | yes |
+| **R6** | LinkedIn connected, no DM (the email check) | Tue, Fri | `li_no_dm` | 5 | yes |
+| **R7** | DM sent, no meeting | **off** — replaced by R13 on 7 Oct 2026 | `dm_no_meeting` | 5 | yes |
 | **R8** | Meeting preparation | **anchored** | `meeting_prep` | 3 | **no** |
 | **R9** | Meeting done, no next steps | **anchored** | `meeting_followup` | 3 | **no** |
 | **R10** | Closure support | Mon | `closure_support` | 5 | yes |
 | **R11** | New company in Master Pipeline | weekdays | `new_pipeline_company` | 3 | yes |
 | **R12** | Sales packages | Thu | `sales_packages` | 5 | yes |
+| **R13** | Next steps for connected contacts | weekdays, 15:00 | `next_step_followups` | 5 | **no** |
 
 **"Anchored" means an empty weekday list** — R8 and R9 key off a meeting date on
 the sheet, not off the calendar, so they always get to look. Both sit **outside
 the daily cap**: a meeting is time-critical and must not be crowded out by a
 Monday chase.
+
+**The order of the entries in the file is not the order of the numbers.** R13
+is listed between R4 and R5. One contact is named at most once a day and the
+rule listed first keeps them; R13 names five people and R6 selects every
+connected contact, so listed after R6 it would lose almost everyone it picked
+every Tuesday and Friday. The consequence: on a day R13 names somebody, R5, R6
+and R10 skip that person.
+
+### Rule 13: next steps for connected contacts
+
+Added by Vaishnavi on 7 Oct 2026. It **replaces rule 7** (`enabled: false` in
+the file; the evaluator is kept) and leaves rule 6 as the email check, whose
+line no longer says "no DM logged".
+
+**Who is in.** Outreach PoCs rows where *Sid - LI Addition* is Connected
+(`NEXT_STEP_CONNECTED_MARKERS`) and *LI Connected Date* reads as a date, that
+the stop and snooze gates let through. A Connected row with no readable date is
+skipped, logged, and listed in `cadence preview`. Prospect Status
+"Unresponsive" stops a row, as for every rule.
+
+**What each person is asked**, from the Next Steps dropdown (Q) and the cells
+that step turns on. Every number is a setting; calendar days.
+
+| Next Steps (Q) | Also | Due | Saley asks |
+|---|---|---|---|
+| blank | | LI Connected + `NEXT_STEP_FIRST_DAYS` (2) | what the next step is |
+| Research the PoC | | the same | have they been researched? then set Next Steps to "Send email 1" |
+| Send email N | Nth Email Sent not yes | previous date + `NEXT_STEP_AFTER_PREVIOUS_DAYS` (2) | has it gone out? then mark Nth Email Sent and the date |
+| Send email N | sent, date logged | Nth Email Date + `NEXT_STEP_AFTER_EMAIL_DAYS` (7) | set Next Steps to "Send email N+1" (after 3: "Reach by LI DM") |
+| Send email N | sent, no date | now | log the date |
+| Reach by LI DM | no LI DM Date | 3rd Email Date + `NEXT_STEP_AFTER_PREVIOUS_DAYS` | has the DM gone out? |
+| Call the PoC | no LI DM Date | now | have they been called? and log the LI DM Date |
+| Reach by LI DM / Call the PoC | LI DM Sent says Replied (`NEXT_STEP_DM_REPLIED_MARKERS`) | now | is a meeting being set up? No call reminders |
+| Reach by LI DM / Call the PoC | LI DM Date, no meeting | LI DM Date + `NEXT_STEP_CALL_AFTER_DM_DAYS` (7), then every `NEXT_STEP_CALL_EVERY_DAYS` (3) until + `NEXT_STEP_CALL_UNTIL_DAYS` (21) | time to call them |
+| after that | | once | set Prospect Status to "Unresponsive"; then never again for that person |
+
+"Previous date" is LI Connected Date for email 1 and the (N-1)th Email Date for
+emails 2 and 3. **A blank previous date means due now**, and the line asks for
+the missing cell as well. **When the dropdown and the cells disagree** (Next
+Steps says "Send email 2", 1st Email Sent is blank) the rule goes by the
+dropdown and also asks for the missing cell. The dropdown is compared
+normalised ("Send Email 1" is "Send email 1"; "Call PoC" is "Call the PoC");
+any other value is skipped, logged and listed in the preview. A meeting dated
+today or later pauses the rule for that person
+(`NEXT_STEP_PAUSE_FOR_BOOKED_MEETING`); a Completed meeting ends it and rule 9
+takes over.
+
+**Who is picked: a rotation.** Up to `max_items_per_post` (5) people a post.
+Call reminders that are due go first, because that clock runs out; then the
+people named least recently, never-named first, ties in sheet order. So it
+walks the Connected list from the top down and starts again from the top.
+There is no per-person "every two days": a person comes back when the rotation
+reaches them, and keeps coming back until their step changes. Priority (AF) is
+read and shown in the preview and is not used for the order. The evaluator
+picks the five itself (every other rule hands over everything and lets the post
+take what fits), so the cross-rule dedup cannot choose a different five.
+
+**State: two tables, written only after a real send.** `next_step_followups`
+holds each person's step signature, the last day they were named, the
+call-reminder count and whether the Unresponsive reminder went out.
+`next_step_posts` holds, per Discord message id, who the post named and what
+each was asked. The evaluator is pure: it is handed the state and writes
+nothing. A step that changed is handled by ignoring the stale entry, so
+`cadence preview` and every question leave both tables untouched. If the state
+cannot be read the rule names nobody (an empty state would restart the
+rotation and chase people already closed). Once today's post has gone, the
+queue keeps returning the same people for the rest of the day, so the tick
+after the post cannot pick five more and dedup them out of rules 5 and 6. The
+preview then shows the people already named, and a line may read "named in
+today's post" (a call reminder recomputes as waiting once it is recorded);
+someone whose Unresponsive reminder went out today is still listed today and
+drops out tomorrow. If the tab has no Next Steps or email columns mapped (the
+pre-7 Oct layout, a renamed header), the rule names nobody, logs a warning and
+the preview says which columns are missing: a column the bot cannot see is not
+a blank cell.
+
+| Path | Where the rotation is recorded |
+|---|---|
+| `cadence preview`, `--dry-run-drip`, any question | nowhere: read only |
+| live | `DB_PATH` |
+| `SALES_TEST_MODE=true` | `DB_PATH`, like every other ledger: point it at a `*_test.db` first |
+| a simulation | the sandbox copy, which is discarded |
+| a test day ("make it Monday") | `DB_PATH` only when it ends in `_test.db`. On any other database the post goes out and the log says `[rules] R13: test day on a live database; rotation not recorded` |
+
+The last row is stricter than rule 9's ladder on purpose: a rehearsal on a live
+database must not move who the next real post names.
+
+**The post.** One message for the whole rule, headed "Next steps", addressed by
+the tags line like the other Outreach PoCs rules (no owner, no hard-coded id).
+It is fixed text from `wording.py` — an opener chosen by the day and one line a
+person: name, company, the one thing to do — and is **never composed by the
+model**, so it costs no model call and no search, and is word for word the same
+live, in test mode, on a test day and in a simulation. No rule number, no
+schedule talk.
+
+```
+**Next steps**
+@Vaishnavi
+A few next steps on people we're connected with:
+• Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+```
+
+**Timing.** Weekdays at `NEXT_STEP_TIME` (15:00 IST), a fixed-time post like
+R1's news: no window slot, outside the cap (`counts_toward_cap: false` in the
+file), never held by the re-ask clock (`drip.NEVER_HELD`). The live sender
+posts on a sweep tick, so "15:00" means the first tick at or after 15:00: keep
+`COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` at 15. The catch-up guard that spaces
+posts does not hold this one, and this one does not delay the next spaced post
+(`drip.ON_TIME_TYPES`).
+
+**Saley only reminds.** Q to W are a restricted band and the new roles are in
+no write tier, so no reply, command or approval can make the bot fill them.
+
+**What a reply to the post does today.** The reply handling ("done" → "Nice,
+can you set Next Steps for Priya to Send email 1?") arrives with NFT2-1063.
+Until then a reply goes down the ordinary path: it may get an ordinary answer,
+or a "which company?" question. Nothing is written and no rule 13 state
+changes. One guard is in place now: an approver's "yes" replied to a next-steps
+post is **not** read as a yes to whatever proposal happens to be open
+(`[approvals] … replies to a next-steps post — not a vote`).
+
+**Awaiting Vaishnavi** (built as defaults; each changes without a code change
+unless marked):
+
+| | Default built | Where it changes |
+|---|---|---|
+| a | Weekdays only, 15:00 IST | `bot_rules.yaml` R13 `weekdays`; `NEXT_STEP_TIME` |
+| b | Outside the daily cap | `bot_rules.yaml` R13 `counts_toward_cap` |
+| c | Remind only; never writes Q to W | `RESTRICTED_COLUMN_RANGES` holds the lock; there is no switch |
+| d | A "done" from any teammate counts | nothing built yet (NFT2-1063) |
+| e | Sheet order; Priority read, not used | `nextaction._next_step_order` (code) |
+| f | LI DM Sent "Replied": no call chase, asks about the meeting | `NEXT_STEP_DM_REPLIED_MARKERS` (empty = treat like any DM) |
+| g | A booked meeting pauses; a Completed one ends | `NEXT_STEP_PAUSE_FOR_BOOKED_MEETING` |
 
 ### The rules that need saying out loud
 
@@ -2194,6 +2497,11 @@ showing** — the preview would change the thing it previewed.
 you: @bot cadence preview
 ```
 
+It is for the rule-by-rule queue: "cadence preview", "what's the queue", "why
+isn't X due". It is NOT the answer to "what do we need to do today?" or
+"today's objectives" any more; those get the day's posts themselves
+(`todays_objectives`, NFT2-1063), with no rules and no schedule in them.
+
 **Grouped by rule**, which is the change that matters. Each section names the
 rule and prints the reason line its evaluator wrote, so the output can be
 checked against `bot_rules.yaml` line by line without opening the code:
@@ -2231,7 +2539,9 @@ the same thing and neither should get an empty list.
 | Explicit activations | `row_activations` | see [Row activation](#row-activation--which-rows-the-bot-may-raise-unprompted) |
 | **R5 repeat counts** | `prospect_mentions` | a changed row signature resets the count |
 | **R5 week companies** | `prospect_week` | keyed on the ISO week, so the two-a-week promise spans days |
-| **R9 ladder** | `meeting_followups` | advanced by the sender; cleared when next steps arrive |
+| **R9 ladder** | `meeting_followups` | advanced by the sender; cleared when Notes/Remarks is filled |
+| **R13 rotation** | `next_step_followups` | written by the sender after a real send; a changed step signature starts the person again; `closed` is never reset |
+| **R13 posts** | `next_step_posts` | who each post named and what each was asked, by message id |
 | **R11 snapshot** | `pipeline_companies` | normalised name, `first_seen`, and a `seeded` flag |
 | Deadlines the bot announced | `deadlines` | unchanged |
 | Sheet-health dedup | `quality_flags` | unchanged |
@@ -2327,10 +2637,10 @@ strip to tidy up after it. Both halves are tested —
 
 ```bash
 python rules.py          # the YAML parses and means what it says
-python nextaction.py     # the twelve rules on fixtures: no sheet, no network, no database
+python nextaction.py     # the thirteen rules on fixtures: no sheet, no network, no database
 ```
 
-`rules.py` asserts that twelve rules load with ids R1–R12, that every trigger
+`rules.py` asserts that thirteen rules load (R13 listed before R5), that R7 is off, that every trigger
 they name is implemented, that each runs on the right weekdays and no others,
 that the anchored rules always get to look, and that Saturday yields only those
 two.
@@ -2496,7 +2806,7 @@ Every proactive output path, and what feeds it now:
 | Digest cadence sections | rules a–j on the tracker tab | sheet-health lines on the **Outreach PoCs** tab, **active rows only** |
 | UPDATE-TRACKER asks | `fill_in_gaps` + `crosscheck` | removed; sheet-health only |
 | Cold-cohort summary line | rule (c)'s ceiling | removed |
-| HOT / STALLED / DEAD-DEAL flags | all tracker rows | **retired** — replaced by [the twelve rules](#the-twelve-rules), which send nothing |
+| HOT / STALLED / DEAD-DEAL flags | all tracker rows | **retired** — replaced by [the thirteen rules](#the-thirteen-rules), which send nothing |
 | Next-action queue | — | **active rows only**, and it has **no proactive outlet**: `cadence preview` and the startup log |
 | Weekly funnel numbers | all tracker rows | **active rows only** |
 | Outreach-vs-plan check | all tracker rows | **active rows only** |
@@ -2567,17 +2877,18 @@ Four things fail silently on a live sheet, and all four are in this one report:
 
 ```
 [sheet.world] CANONICAL TAB: 'Outreach PoCs'   (found by NAME, from GTM_POCS_TAB_TITLES)
-[sheet.world]   rows: 500   columns: 24   header row: 1
+[sheet.world]   rows: 500   columns: 32   header row: 1
 [sheet.world]   discovered schema:
 [sheet.world]       A  Sr No                  -> sr_no             [RESTRICTED]
 [sheet.world]       B  Company/Uni            -> company           [RESTRICTED]
 [sheet.world]       J  First Contact          -> first_contact
 [sheet.world]       K  First Contact Type     -> first_contact_type
-[sheet.world]       S  Next Steps/Notes       -> next_steps        [RESTRICTED]
+[sheet.world]       Q  Next Steps             -> outreach_step     [RESTRICTED]
+[sheet.world]       Z  Notes/Remarks          -> next_steps        [RESTRICTED]
 [sheet.world]
 [sheet.world] WRITE LOCK
-[sheet.world]   restricted (never written): 'A:I,S:X'  -> A:I, S:X
-[sheet.world]   writable window between the bands: J:R
+[sheet.world]   restricted (never written): 'A:I,Q:W,Z:AE'  -> A:I, Q:W, Z:AE
+[sheet.world]   writable window between the bands: J:P, X:Y
 [sheet.world]   reading is UNRESTRICTED — this is a write lock only.
 [sheet.world]   named columns inside the window (9):
 [sheet.world]     J='First Contact' [first_contact]
@@ -2823,9 +3134,9 @@ only after an approver's yes.
    duplicate is **said out loud** — a silent skip reads as a successful append
    to everybody downstream.
 3. **Which columns**: mapped roles only, and on Outreach PoCs only the new-row
-   band `A:R`. **S–X is refused on a new row exactly as on an existing one** — a
-   bot that has just discovered a company has no business stating its closure
-   probability. `Sr No` is filled with **max + 1**, not count + 1: a tab
+   bands `A:P,X:Y`. **Q–W and Z–AE are refused on a new row exactly as on an
+   existing one** — a bot that has just discovered a company has no business
+   stating which email went out or its closure probability. `Sr No` is filled with **max + 1**, not count + 1: a tab
    somebody has deleted rows from would otherwise reissue a number.
 4. **The row must be empty, re-read immediately before writing** — not "the
    arithmetic said so a moment ago". Somebody typing into the sheet between the
@@ -2937,7 +3248,12 @@ spaced window, so the window cannot roll it either. R8 and R9 are never held by
 the re-ask clock for a related reason: they run on their own clocks (R8's
 touches belong to exact dates, R9 has its ladder).
 
-**Fixed-time posts do not shift the others.** R1 and R8's day-of touch take no
+**The next-step follow-ups (R13) are outside the cap and never held.** One post
+each weekday at `NEXT_STEP_TIME` (15:00), fixed-time like R1; the rule has its
+own rotation, so the re-ask clock does not apply. Whether it counts is the
+file's decision (`counts_toward_cap: false` on R13), not the code's.
+
+**Fixed-time posts do not shift the others.** R1, R13 and R8's day-of touch take no
 place in the spaced window (`drip_sends.pinned`), so a 14:00 news post going
 out mid-afternoon no longer pushes every later post one gap further on. The
 live sweep starts looking at the earliest time anything can be due
@@ -3332,7 +3648,11 @@ schedule, which is what makes the restart guard work:
 drip_sends  (on_date, slot) UNIQUE
 ```
 
-One row per message that actually went out. A redeploy at 11:40 recomputes the
+One row per message that actually went out. Since NFT2-1063 the row also keeps
+`body` (the post as it went out, with its heading and without the tags line or
+the test tag: what "today's objectives" shows once the post has gone) and
+`part_ids` (every Discord message a long post was split into, so a reply to
+any part finds the post). A redeploy at 11:40 recomputes the
 same times, sees slots 1 and 2 in SQLite, and resumes at slot 3. It replaces the
 digest's single `sales_digest_date` marker, which only had to answer *"did
 today's one message go out"*. `UNIQUE (on_date, slot)` also means two ticks
@@ -3566,10 +3886,10 @@ Sonnet writes). The token log records the model per call:
   mapping tools; a meeting question (`notes`) → the three notes tools; a to-do
   question (`todos`) → `show_todos` and `todo_candidates`; reminders → the
   reminder tools; the full set only when the question is unclear. **"What do
-  we need to do today?" (`today`) → `show_todos` and nothing else** — an
-  exclusive group, so not the notes tools and not `cadence_preview` even when
-  the question also mentions a meeting. That is the interim answer until
-  NFT2-1063 adds the objectives tool to the same group. The words "to do",
+  we need to do today?" / "today's objectives" (`today`) → `todays_objectives`
+  and `show_todos`, and nothing else** — an exclusive group, so not the notes
+  tools and not `cadence_preview` even when the question also mentions a
+  meeting (NFT2-1063; see "Today's objectives, on demand"). The words "to do",
   "sync" and "standup" no longer route to the notes tools. **`web_search` and
   `fetch_page` ride with every route except `today`** (`toolsets.ALWAYS`,
   NFT2-1065): a question routed to the sheet tools used to get no web tool,
@@ -4894,12 +5214,15 @@ python verify_testday_talk.py             # progress lines, stale-send clear, on
 python clock.py                           # the pretend clock's arithmetic
 python verify_news_feed.py                # R1's main sweep + hourly checks, valve, ledgers
 python verify_interim.py                  # typing indicator, interim line, latency log (real timings)
+python verify_replies.py                  # replies, acknowledgements, votes, offers and on-demand objectives (NFT2-1063)
+python -m replies                         # the pure judgements: is it an ack, a bare yes, an offer
 python verify_reminders.py                # one-off reminders at an exact minute (real 60 s loop)
 python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
 python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
 python verify_s1.py                       # cap 5 + R8/R9, R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI news today", OTHER bypass, the since-last-post window
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5 emails + the one A:I write, R3 weekly + the reminder offer
+python verify_rule13.py                   # the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test
 python verify_voice_profile.py --offline  # the parts that need neither Discord nor the model
 python verify_llm_audit.py                # every API call site, measured (system size, caching, tools)
@@ -5347,7 +5670,7 @@ guardrails forbid.
 | `drip.py` | **the drip scheduler**: grouping by (type × owner), the deterministic schedule, the re-ask clock, the fallback message text, the preview and the volume-contract report. Pure — it sends nothing |
 | `cadence.py` | **the phase-1 rules (a–j) are removed from here** — what is left is exclusion, the sheet-health flags, priority, the two caps, and the boot report. `evaluate_row()` returns `[]` and is the single place a phase-2 rule set plugs in. Pure: rows in, dicts out — no sheet reads, no writes, no Discord |
 | `activation.py` | **the activation rule**: a row is active only with a first-contact or connection date; the mention-request matcher; the split every proactive path goes through. Pure — the persisted activations are passed in |
-| `nextaction.py` | **the twelve rules**: one evaluator per rule, the STOP and snooze gates, the priority bands, the dedup, the weekend shift, and the `cadence preview` renderer. Pure: tabs and dicts in, dicts out — no sheet reads, no writes, no Discord, **no send path** |
+| `nextaction.py` | **the thirteen rules**: one evaluator per rule, the STOP and snooze gates, the priority bands, the dedup, the weekend shift, and the `cadence preview` renderer. Pure: tabs and dicts in, dicts out — no sheet reads, no writes, no Discord, **no send path** |
 | `rules.py` | **`bot_rules.yaml`, loaded and validated once at startup**: which rules exist, when each runs, its per-post cap, destination and whether it counts against the daily cap. A broken file loads NO rules, loudly |
 | `bot_rules.yaml` | the machine copy of the **Bot Rules** tab of *Sales Bot_membrane*. Edit it, restart, behaviour changes — no code change |
 | `prep.py` | the meeting-prep brief: tracker row + mapping (with caveats) + positioning + **cited** notes, an opening hold line when a meeting parked the account, and the explicit "no web research **in this brief**" section — the bot has web search, the brief does not use it |

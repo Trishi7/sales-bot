@@ -87,6 +87,7 @@ import notes
 import persona
 import prep
 import query
+import replies
 import replyguard
 import research
 import search_backend
@@ -105,6 +106,12 @@ from db import DB
 from llm import LLM
 from memory import ConversationMemory
 from query_engine import QueryEngine, QuestionLimits
+
+# R13 ON A TEST DAY. A test day ("make it Monday") sends through the real
+# sender with the real database. False: on a database that is not a *_test.db
+# the post goes out and R13's rotation is NOT recorded, so a rehearsal cannot
+# move who the next real post names. True: record it, as R9's ladder does.
+NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB = False
 
 log = logging.getLogger(__name__)
 
@@ -172,18 +179,35 @@ _UNDO_RE = re.compile(r"\b(undo|revert|put\s+it\s+back|roll\s+(it\s+)?back)\b",
 
 # A QUESTION THAT PLAINLY WANTS THE OUTSIDE WORLD. Web search is attached to
 # almost every engine turn (whenever it is on and the budget has room), so
-# "attached" alone cannot tell a slow web turn from a sheet lookup. This, or a
-# search the engine has already run, is what makes a turn a WEB turn for the
-# interim line: the shorter wait, and the "checking the web" wording. Words
-# that are just as often about our own sheet ("today", "this week") are left
-# out on purpose — saying "checking the web" while reading the sheet would be
-# the interim line lying.
+# "attached" alone cannot tell a slow web turn from a sheet lookup. This picks
+# the interim line's WAIT and nothing else: a question worded like this gets
+# the shorter one. IT NO LONGER PICKS THE WORDING (NFT2-1063). On 7 Oct "any AI
+# news?" matched "news", the bot said "I'm checking the web for this", and the
+# answer then came from the news already collected: no search ever ran, so the
+# line was untrue. The web wording now goes out only once a web_search has
+# actually started (`_answer_with_engine`).
 _WEB_HINT_RE = re.compile(
     r"\b(news|latest|announce\w*|funding|funded|rais(e|ed|es|ing)|acqui\w+|"
     r"launch\w*|hiring|conference\w*|summit\w*|papers?|published|web|online|"
-    r"google|search|look\s+(it\s+)?up|what'?s\s+new|in\s+the\s+news)\b",
+    r"google|search|look\s+(it\s+)?up|what(?:\s+is|'?s)\s+new|in\s+the\s+news)\b",
     re.IGNORECASE,
 )
+
+# -- NFT2-1063: THE DEFAULTS STILL WAITING ON THE HUMAN'S ANSWER -----------------
+# Each is one line here, so the answer is a one-line change.
+#
+# How far up a reply-to-a-reply chain the bot looks for its own message.
+REPLY_WALK_MAX_HOPS = 3
+# "@Saley thanks" that is NOT a reply: a reaction and no text (True), or the
+# model-written social line it used to get (False).
+ACK_NON_REPLY_GETS_REACTION = True
+# What "today's objectives" leaves out: the AI news, which has its own
+# on-demand answer ("any AI news?"). An empty set puts the news post back in.
+OBJECTIVES_EXCLUDED_TYPES = frozenset({nextaction.R_AI_NEWS})
+# Whether the on-demand objectives repeat a post's closing offer ("Want me to
+# remind you again on Monday?"). No proposal stands behind the repeated line,
+# so a "yes" under it would be a yes to nothing: off.
+OBJECTIVES_SHOW_OFFERS = False
 
 # Every url in a piece of text — the question, an earlier answer — for the
 # "only links a tool returned" check on a profile turn (`_only_found_links`).
@@ -358,6 +382,20 @@ class SalesBot(discord.Client):
         # question, ever" — an edited message re-fires the same question, and
         # it must not get a second "one moment". Bounded; see `_send_interim`.
         self._interim_sent: set = set()
+        # WHAT THE BOT SAID, by its own message id: {"kind": "answer" |
+        # "interim" | "which" | "objectives", "question": what it answered,
+        # "which": [proposal keys a "which one?" listed]}. So a reply can be
+        # read against the message it answers. In memory and bounded
+        # (`_remember_said`); after a restart an interim line is still known by
+        # its text and a post or a proposal by its row.
+        self._said: dict = {}
+        # THE REPLY CONTEXT OF THE MESSAGE BEING ANSWERED, by message id, alive
+        # only while it is answered (`_handle_query` pops it). One build, read
+        # by the acknowledgement, the vote, the offer and the engine alike.
+        self._reply_ctx: dict = {}
+        # The message each message replies to, fetched at most once: the gate
+        # and the reply context both need it.
+        self._parents: dict = {}
         # The last `todos.ensure()` result: whether the sheet exists, its link,
         # and which addresses it actually reached. Held so the digest can carry
         # the link and so "@bot show the to-dos" can explain a failed share
@@ -1062,32 +1100,346 @@ class SalesBot(discord.Client):
                 return True
         return False
 
+    async def _referenced_message(self, message):
+        """The message `message` replies to, or None when it replies to nothing
+        or the parent cannot be read (deleted, another channel, no access).
+
+        ONE LOOKUP FOR THE GATE AND THE REPLY CONTEXT. The parent comes from
+        what Discord already sent along where possible and is fetched
+        otherwise; the result is kept by message id so the second caller does
+        not fetch again.
+
+        NEVER OUTSIDE THE CHANNEL THE MESSAGE IS IN, and only where the bot may
+        read (`guardrails.may_read`): walking a reply chain must not become a
+        way to read a channel the bot has no business in.
+        """
+        ref = getattr(message, "reference", None)
+        if ref is None:
+            return None
+        key = getattr(message, "id", None)
+        if key is not None and key in self._parents:
+            return self._parents[key]
+        parent = None
+        for candidate in (getattr(ref, "resolved", None),
+                          getattr(ref, "cached_message", None)):
+            # A deleted parent resolves to an object with no author.
+            if getattr(candidate, "author", None) is not None:
+                parent = candidate
+                break
+        ref_id = getattr(ref, "message_id", None)
+        if parent is None and ref_id:
+            here = getattr(getattr(message, "channel", None), "id", None)
+            there = getattr(ref, "channel_id", None)
+            if there is not None and here is not None and str(there) != str(here):
+                log.debug("[reply] msg=%s replies into another channel — not read", key)
+            elif not guardrails.may_read(here):
+                log.debug("[reply] msg=%s is in a channel I do not read", key)
+            else:
+                try:
+                    parent = await message.channel.fetch_message(ref_id)
+                except Exception:
+                    log.debug("[reply] msg=%s replies to %s, which could not be read",
+                              key, ref_id)
+                    parent = None
+        if key is not None:
+            self._parents[key] = parent
+            if len(self._parents) > 300:
+                for old in list(self._parents)[:150]:
+                    self._parents.pop(old, None)
+        return parent
+
     async def _is_reply_to_self(self, message: discord.Message) -> bool:
         """True when the message is a direct reply to one of the BOT's own
         messages — its answer, the digest, a deadline announcement. Replying is
         how you talk to it without typing its name, and it is what the
         deadline chasing has always run on.
 
-        The parent comes from what Discord already sent along where possible and
-        is fetched otherwise; a deleted or unreadable parent is not a trigger."""
+        A deleted or unreadable parent is not a trigger. The lookup is
+        `_referenced_message`, shared with the reply context."""
         me = getattr(self.user, "id", None)
-        ref = message.reference
-        if me is None or ref is None:
+        if me is None or getattr(message, "reference", None) is None:
             return False
-        resolved = getattr(ref, "resolved", None)
-        parent = resolved if isinstance(resolved, discord.Message) else ref.cached_message
-        if parent is None:
-            if not ref.message_id:
-                return False
+        parent = await self._referenced_message(message)
+        return parent is not None and \
+            getattr(getattr(parent, "author", None), "id", None) == me
+
+    @staticmethod
+    def _bot_names() -> tuple:
+        """What the bot is called in a one-word answer ("thanks Saley")."""
+        return (str(config.COS_NAME or "").strip().lower(),)
+
+    def _remember_said(self, sent, **info) -> None:
+        """Note what one of the bot's own messages was (`self._said`). Bounded:
+        the oldest half goes at 500, and message ids are time-ordered."""
+        mid = str(getattr(sent, "id", "") or "")
+        if not mid:
+            return
+        self._said[mid] = info
+        if len(self._said) > 500:
+            for old in list(self._said)[:250]:
+                self._said.pop(old, None)
+
+    async def _reply_context(self, message) -> dict:
+        """What this message is a reply TO — the situation, read once.
+
+        THE BUG THIS EXISTS FOR (NFT2-1063). "Sure." was read with nothing
+        above it: on 6 Oct as a new request, on 7 Oct as a yes to the newest
+        open proposal anywhere. Everything that decides what to do with a
+        reply now starts from the message it answers.
+
+        THE WALK. Hop 1 is the message replied to. If the bot wrote it, stop.
+        Otherwise (the bot was @-mentioned in a reply to a person) follow that
+        message's own reference, at most REPLY_WALK_MAX_HOPS in all, in this
+        channel only. The first message the bot wrote is "the bot's message";
+        the people's messages passed on the way are kept for the model.
+
+        WHAT IS KNOWN ABOUT THE BOT'S MESSAGE comes from records, never from
+        conversation memory (which is keyed by channel and holds no post, no
+        interim line and no proposal): `drip_sends` says which post it was (by
+        its first id OR the id of a later part of a split post, and gives the
+        FIRST id back as `root_id`); `write_proposals` says what is attached
+        to it, open and closed; `self._said` says what kind of line it was.
+
+        WHEN THE PARENT CANNOT BE READ. If its id is one of the bot's own
+        records (a post, a proposal's message, something in `_said`), the id
+        is enough: the reply is to that message, and its text is simply
+        unknown. Otherwise `parent_id` stays "" and `why_missing` says why —
+        and because `is_reply` is still True, no vote of any kind is taken.
+
+        NEVER RAISES. A reply whose context could not be built is answered
+        without one.
+        """
+        ctx = {"is_reply": getattr(message, "reference", None) is not None,
+               "direct_is_bot": False, "parent_id": "", "root_id": "",
+               "parent_text": "", "hops": 0, "chain": [], "drip": None,
+               "proposals": [], "closed": [], "listed": [], "offer": None,
+               "said": None, "why_missing": ""}
+        if not ctx["is_reply"]:
+            return ctx
+        me = getattr(self.user, "id", None)
+        mid = getattr(message, "id", "?")
+        bot_message = None
+        try:
+            node, chain = message, []
+            why = "no bot message within %d hops" % REPLY_WALK_MAX_HOPS
+            for hop in range(1, REPLY_WALK_MAX_HOPS + 1):
+                if getattr(node, "reference", None) is None:
+                    break
+                parent = await self._referenced_message(node)
+                if parent is None:
+                    ref = node.reference
+                    here = getattr(getattr(node, "channel", None), "id", None)
+                    there = getattr(ref, "channel_id", None)
+                    why = ("outside the sales channels"
+                           if (there is not None and here is not None
+                               and str(there) != str(here))
+                           or not guardrails.may_read(here) else "deleted")
+                    if hop == 1:
+                        known = str(getattr(ref, "message_id", "") or "")
+                        record = await self._my_record_of(known) if known else ""
+                        if record:
+                            log.info("[reply] msg=%s the parent %s could not be read; "
+                                     "known as mine from %s", mid, known, record)
+                            ctx.update(parent_id=known, hops=1, direct_is_bot=True)
+                    break
+                is_bot = me is not None and \
+                    getattr(getattr(parent, "author", None), "id", None) == me
+                try:
+                    author = config.COS_NAME if is_bot else _display(parent.author)
+                except Exception:
+                    author = ""
+                chain.append({"author": str(author or ""), "is_bot": is_bot,
+                              "text": str(getattr(parent, "content", "") or "")})
+                if is_bot:
+                    bot_message = parent
+                    ctx.update(parent_id=str(getattr(parent, "id", "") or ""),
+                               hops=hop, direct_is_bot=(hop == 1), chain=chain,
+                               parent_text=replies.strip_tag(
+                                   chain[-1]["text"], config.SIMULATION_PREFIX))
+                    break
+                node = parent
+            if not ctx["parent_id"]:
+                ctx["why_missing"] = why
+                log.info("[reply] msg=%s no parent: %s", mid, why)
+                return ctx
+
+            parent_id = ctx["parent_id"]
+            ctx["said"] = self._said.get(parent_id)
+            row = await asyncio.to_thread(self.db.find_drip_by_message_id, parent_id)
+            ctx["drip"] = row or None
+            ctx["root_id"] = str((row or {}).get("message_id") or parent_id)
+            attached = await asyncio.to_thread(
+                self.db.proposals_for_message, ctx["root_id"])
+            ctx["proposals"] = [q for q in attached if q.get("status") == "open"]
+            ctx["closed"] = [q for q in attached if q.get("status") != "open"]
+            ctx["offer"] = replies.ends_on_offer(ctx["parent_text"])
+            # THE "WAITING FOR YOUR YES" POST lists proposals none of which is
+            # keyed to it. Known by its heading, so it survives a restart.
+            #
+            # ONLY WHAT THAT POST LISTED. A yes under LAST WEEK's list must not
+            # reach a proposal nudged since: the ones kept are those this post
+            # is remembered to have listed (`_said`), or, after a restart,
+            # those nudged on the day the post was made. A day that cannot be
+            # worked out lists nothing. And only the ones made in THIS
+            # channel: a yes typed here never reaches a proposal made elsewhere.
+            if drip.heading("approvals") in ctx["parent_text"]:
+                here = str(getattr(getattr(message, "channel", None), "id", "") or "")
+                nudged = await asyncio.to_thread(self.db.open_nudged_proposals)
+                said = ctx["said"] or {}
+                if said.get("kind") == "pending":
+                    keys = set(said.get("which") or [])
+                    nudged = [q for q in nudged if q.get("proposal_key") in keys]
+                else:
+                    day = self._posted_on(bot_message, parent_id)
+                    nudged = [q for q in nudged
+                              if day and str(q.get("nudged_on") or "") == day]
+                ctx["listed"] = [q for q in nudged
+                                 if str(q.get("channel_id") or "") == here]
+        except Exception:
+            log.exception("[reply] msg=%s the reply context could not be built; "
+                          "answering without one", mid)
+            ctx.update(direct_is_bot=False, parent_id="", root_id="", proposals=[],
+                       closed=[], listed=[], offer=None, drip=None, chain=[],
+                       why_missing="the context could not be built")
+        return ctx
+
+    @staticmethod
+    def _posted_on(sent, message_id: str) -> str:
+        """The IST date (YYYY-MM-DD) a Discord message was posted, or "".
+        From the message's own `created_at` when it was read, else from its id:
+        a snowflake's top bits are milliseconds since Discord's epoch. "" for
+        anything that does not yield a plausible date, and the caller then
+        assumes nothing."""
+        when = getattr(sent, "created_at", None)
+        if not isinstance(when, datetime):
             try:
-                parent = await message.channel.fetch_message(ref.message_id)
-            except discord.DiscordException:
-                log.debug(
-                    "[bot] msg=%s replies to %s, which could not be read — not "
-                    "treating it as a reply to me", message.id, ref.message_id,
-                )
+                millis = (int(message_id) >> 22) + 1420070400000
+            except (TypeError, ValueError):
+                return ""
+            if int(message_id) < (1 << 22):
+                return ""               # not a snowflake: no date in it
+            when = datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return dl.iso(when.astimezone(dl.IST).date())
+
+    async def _my_record_of(self, message_id: str) -> str:
+        """Which of the bot's OWN records knows this message id, or "" when
+        none does: "what I said", "drip_sends" (a post, or a part of one) or
+        "write_proposals" (a message a proposal is keyed to). For a parent
+        Discord would not hand over; the answer is logged."""
+        if message_id in self._said:
+            return "what I said"
+        try:
+            if await asyncio.to_thread(self.db.find_drip_by_message_id, message_id):
+                return "drip_sends"
+            if await asyncio.to_thread(self.db.proposals_for_message, message_id):
+                return "write_proposals"
+        except Exception:
+            log.debug("[reply] could not check %s against my records", message_id,
+                      exc_info=True)
+        return ""
+
+    async def _ctx_for(self, message) -> dict:
+        """The reply context of `message`: the one `_handle_query` built, or a
+        fresh one for a caller that came in another way. Kept by message id so
+        the vote, the offer and the engine all read the same one."""
+        key = getattr(message, "id", None)
+        ctx = self._reply_ctx.get(key)
+        if ctx is None:
+            ctx = await self._reply_context(message)
+            if key is not None:
+                self._reply_ctx[key] = ctx
+                if len(self._reply_ctx) > 200:
+                    for old in list(self._reply_ctx)[:100]:
+                        self._reply_ctx.pop(old, None)
+        return ctx
+
+    async def _react(self, message, *, reason: str) -> None:
+        """One acknowledgement reaction. Never raises and never falls back to
+        text: the reaction stands in for "seen, nothing to add"."""
+        try:
+            await guardrails.react(message, replies.ACK_EMOJI, reason=reason)
+        except Exception:
+            log.exception("[ack] msg=%s the reaction could not be added",
+                          getattr(message, "id", "?"))
+
+    async def _maybe_acknowledge(self, message, text: str, ctx: dict) -> bool:
+        """"Sure", "ok", "thanks", a thumbs-up — under a message that asked
+        nothing. ONE REACTION, NO TEXT, and nothing else runs.
+
+        ZERO MODEL CALLS, ZERO SHEET READS, ZERO VOTES. This returns before
+        the router, the extractor, the prefilter (which reads the sheet), the
+        vote and the engine. On 6 Oct a "Sure." went through all of them and
+        came back as an unrelated answer from the sheet.
+
+        IT FIRES ONLY WHEN THE MESSAGE IS NOTHING BUT an acknowledgement or a
+        bare yes / no (`replies.is_ack`, `replies.is_bare_vote`), and the
+        message it answers left nothing open:
+
+          a reply to a bot message with no open proposal on it, no stored
+            record-offer, no closing offer, and that is not a "which one?";
+          ...where a bare "yes" / "no" (not "sure" / "ok") additionally needs
+            the bot's message to have asked NOTHING: "yes" to "Did you mean
+            Acme AI?" is an answer, and goes on with that message as context;
+          a reply whose parent cannot be found, or that reaches the bot's
+            message only through somebody else's (no vote is possible there);
+          "thanks" / "noted" under a message that DOES carry an open proposal:
+            a reaction, and the proposal stays open;
+          not a reply at all, with no proposal open in the channel.
+
+        Everything else returns False and is handled as before.
+        """
+        names = self._bot_names()
+        ack = replies.is_ack(text, names)
+        vote = replies.is_bare_vote(text, names)
+        if not ack and not vote:
+            return False
+        said_no_vote = ack and not approvals.read_vote(text)   # "thanks", "noted"
+        why = ""
+        if not ctx["is_reply"]:
+            if not ACK_NON_REPLY_GETS_REACTION:
                 return False
-        return getattr(parent.author, "id", None) == me
+            if said_no_vote:
+                why = "an acknowledgement that is not a reply"
+            else:
+                channel_id = getattr(getattr(message, "channel", None), "id", 0)
+                try:
+                    open_here = await asyncio.to_thread(
+                        self.db.open_proposals_in_channel, channel_id)
+                except Exception:
+                    log.exception("[ack] could not read the open proposals")
+                    return False
+                if open_here:
+                    return False              # a bare yes with something open: the vote
+                why = "not a reply, and nothing is open in this channel"
+        elif not ctx["parent_id"]:
+            why = f"a reply with no parent ({ctx['why_missing'] or 'not found'})"
+        elif not ctx["direct_is_bot"]:
+            why = "a reply to somebody else's message"
+        elif (ctx.get("said") or {}).get("kind") == "which":
+            return False                      # an answer to "which one?"
+        elif ctx["proposals"] or ctx["listed"]:
+            if not said_no_vote:
+                return False                  # a yes or a no to what is open
+            why = "an acknowledgement under an open proposal; it stays open"
+        elif (ctx.get("drip") or {}).get("offer") or ctx["offer"] or ctx["closed"]:
+            if vote == approvals.VOTE_YES:
+                return False                  # "sure" to an offer: do that thing
+            why = "an acknowledgement or a no under an offer"
+        elif ack:
+            why = "an acknowledgement of a message that asked nothing"
+        elif replies.asks(ctx["parent_text"]) and not replies.is_interim(
+                ctx["parent_text"], wording.INTERIM_WEB + wording.INTERIM_ENGINE):
+            return False                      # "yes" to a question: an answer
+        else:
+            why = "a yes or a no to a message that asked nothing"
+
+        log.info("[ack] msg=%s %r — %s: one reaction, no text", message.id,
+                 (text or "")[:40], why)
+        self._mark_route(message, "ack")
+        await self._react(message, reason=f"acknowledged: {why}")
+        return True
 
     def _is_self_mentioned_explicitly(self, message: discord.Message) -> bool:
         """True when the bot is EXPLICITLY @-mentioned.
@@ -1125,6 +1477,8 @@ class SalesBot(discord.Client):
         """Route and answer a message addressed to the bot.
 
         Order, with the boilerplate last:
+          - "sure" / "ok" / "thanks" under a message that asked nothing → one
+            reaction and no text (`_maybe_acknowledge`), before anything else;
           - a bare @-mention → a greeting, not a malformed query;
           - a CAPABILITY question → the honest answer, from the policy and the
             live source statuses (this is checked BEFORE the model router, so it
@@ -1166,10 +1520,25 @@ class SalesBot(discord.Client):
                   "used_web": False, "tool_calls": 0, "interim": False}
         self._qstate[message.id] = timing
         try:
+            # READ THE SITUATION FIRST: what, if anything, this message is a
+            # reply to. Then the acknowledgement, BEFORE the typing indicator:
+            # "typing…" followed by nothing would be its own small lie.
+            ctx = await self._reply_context(message)
+            self._reply_ctx[message.id] = ctx
+            # A REPLY TO THE NEXT-STEPS POST IS READ FIRST. "Yes" and "done"
+            # there answer the post's own question, so they must reach its
+            # reader before the acknowledgement path and before the vote.
+            if self._is_next_step_reply(ctx) \
+                    and await self._maybe_next_step_reply(message, text, ctx):
+                return True
+            if await self._maybe_acknowledge(message, text, ctx):
+                return True
             async with self._typing(message.channel):
                 return await self._route_query(message, text, requester)
         finally:
             self._qstate.pop(message.id, None)
+            self._reply_ctx.pop(message.id, None)
+            self._parents.pop(message.id, None)
             await self._record_latency(message, timing, loop.time())
 
     @contextlib.asynccontextmanager
@@ -1955,7 +2324,8 @@ class SalesBot(discord.Client):
             guidance, tail
 
     async def _answer_with_engine(
-        self, message: discord.Message, text: str, *, history: Optional[list[dict]] = None
+        self, message: discord.Message, text: str, *,
+        history: Optional[list[dict]] = None, ask: str = "",
     ) -> bool:
         """Answer via the read-only tool-use engine. Returns False only when the
         engine produced nothing at all — an honest "I couldn't find anything" IS
@@ -1971,12 +2341,38 @@ class SalesBot(discord.Client):
         not finished within the threshold, ONE deterministic line goes to the
         asker ("One sec — pulling this together.") and the answer follows it.
         The threshold is INTERIM_AFTER_WEB_SECONDS on a web turn — web tools
-        attached AND (a search already ran, or the question plainly wants the
-        outside world, `_WEB_HINT_RE`) — and INTERIM_AFTER_SECONDS otherwise.
+        attached AND the question plainly wants the outside world
+        (`_WEB_HINT_RE`) — and INTERIM_AFTER_SECONDS otherwise.
         The engine finishing first cancels the timer; nothing is sent. The line
         is never edited or deleted, and a failure after it still gets the
         honest failure sentence below — the interim changes nothing about that.
+
+        THE WEB WORDING ONLY ONCE A SEARCH HAS STARTED. The question's words
+        pick the wait; they never pick the wording. "I'm checking the web" is
+        said only when a web_search has been dispatched by the time the line
+        goes out. A question answered from the collected news, the sheet or the
+        notes gets the wording that names no source (NFT2-1063).
+
+        A REPLY IS ANSWERED IN THE CONTEXT OF WHAT IT REPLIES TO. When the
+        message answers one of the bot's own messages, the engine's question
+        carries that message quoted above it, marked as data
+        (`replies.with_parent`). ONLY THE ENGINE SEES THAT: routing, the reply
+        guard, the link check and the memory all keep the person's own words.
+        And a reply inherits the tools of the question ITS PARENT answered,
+        never of whatever was asked last in the channel.
+
+        `ask` REPLACES `text` AS THE QUESTION: the action of an offer somebody
+        said "sure" to (`_maybe_accept_offer`). "Want me to pull the full
+        list?" + "sure" runs "pull the full list".
+
+        TODAY'S OBJECTIVES ARE ADDED BY CODE, word for word
+        (`_todays_objectives`). The model is told they are in the reply and
+        writes only the to-do part; on a question that routes to "today" they
+        are added whether or not the model called the tool, and they still go
+        out if the model call failed.
         """
+        q = ask or text
+        ctx = await self._ctx_for(message)
         outcome: dict = {}
         # find_people's replies, collected so they are posted VERBATIM — the
         # model reformatted them (bold names, bare urls, its own commentary).
@@ -2003,23 +2399,31 @@ class SalesBot(discord.Client):
         # description (toolsets.py). The full set goes only when the question
         # is unclear. A follow-up is routed with the question before it.
         previous = ""
-        for turn in reversed(history or []):
-            previous = str((turn or {}).get("question") or "")
-            if previous:
-                break
+        if ctx["is_reply"]:
+            # A REPLY FOLLOWS ITS PARENT, not the channel. Unknown (a restart,
+            # a post, an unreadable parent) is "", and the full set.
+            previous = str((ctx.get("said") or {}).get("question") or "")
+        else:
+            for turn in reversed(history or []):
+                previous = str((turn or {}).get("question") or "")
+                if previous:
+                    break
+        # The day's objectives as the tool rendered them; posted by code below.
+        objectives_out: list = []
         tools, groups, routed_by = toolsets.select(
             self._discord_tools(message)
-            + self._notes_tools(text)
+            + self._notes_tools(q)
             + self._sheet_tools(message)
             + self._mapping_tools()
             + self._todo_tools()
+            + self._objectives_tools(sink=objectives_out)
             + self._strategy_tools()
             + self._people_tools(sink=people_out)
             + self._news_tools()
             + web_tools
             + self._poc_add_tools(message, text, history, sink=offer_out,
                                   web_out=web_out),
-            text, previous=previous,
+            q, previous=previous,
         )
         tools = toolsets.slim(tools)
         names = {t["schema"]["name"] for t in tools}
@@ -2037,13 +2441,17 @@ class SalesBot(discord.Client):
         # A PROFILE TURN is one that asks for somebody's public link — by this
         # question's words or the route it inherited. Only then are the reply's
         # links checked against what the tools returned (`_only_found_links`).
-        profile_turn = "profile" in groups or "profile" in toolsets.route(text)
+        profile_turn = "profile" in groups or "profile" in toolsets.route(q)
+        # What the ENGINE is asked: the person's words, under the message(s)
+        # they reply to when there is one.
+        engine_question = (replies.with_parent(q, ctx["chain"], bot_name=config.COS_NAME)
+                           if ctx["parent_id"] else q)
         log.info("[engine] msg=%s tools=%d (%s) routed by %s", message.id, len(tools),
                  ", ".join(groups) or "full set", routed_by)
         task = None
         try:
             task = asyncio.create_task(self.query_engine.answer(
-                question=text,
+                question=engine_question,
                 requester_name=_display(message.author),
                 tools=tools,
                 history=history,
@@ -2052,16 +2460,20 @@ class SalesBot(discord.Client):
                 outcome=outcome,
                 limits=limits,
             ))
-            web_turn = has_web and bool(_WEB_HINT_RE.search(text or ""))
+            web_turn = has_web and bool(_WEB_HINT_RE.search(q or ""))
             wait = float(config.INTERIM_AFTER_WEB_SECONDS if web_turn
                          else config.INTERIM_AFTER_SECONDS)
             if config.INTERIM_ENABLED and message.id not in self._interim_sent:
                 done, _pending = await asyncio.wait({task}, timeout=max(0.0, wait))
                 if not done:
-                    searched = bool(outcome.get("searches")) or \
-                        "web_search" in (outcome.get("tools_used") or [])
-                    await self._send_interim(message, web=web_turn or searched,
-                                             after=wait)
+                    # HAS A SEARCH ACTUALLY STARTED? The engine notes the tool
+                    # the moment it dispatches the call and the client tool
+                    # counts each search it runs; either is "started".
+                    searched = int(web_out.get("searches") or 0) > 0 \
+                        or "web_search" in (outcome.get("tools_used") or []) \
+                        or bool(outcome.get("searches"))
+                    await self._send_interim(message, web=searched, after=wait,
+                                             question=q)
             reply = await task
         except Exception as e:
             log.error("[query] the engine raised %s: %s",
@@ -2092,14 +2504,32 @@ class SalesBot(discord.Client):
         # ledger has to agree with the invoice.
         await self._bank_searches(outcome)
 
+        # THE OBJECTIVES DO NOT DEPEND ON THE MODEL CHOOSING THE TOOL. A
+        # question whose own words ask for today gets them regardless.
+        if not objectives_out and "today" in toolsets.route(q):
+            objectives_out.append(await self._todays_objectives())
+        objectives = str(objectives_out[0] if objectives_out else "").strip()
+
         if people_out:
             # THE TOOL'S TEXT IS THE ANSWER, exactly as rendered: every name,
             # title and link is one the search returned, and a model rewrite is
             # the one place that guarantee could be lost.
             log.info("[query] msg=%s answered with find_people's text verbatim "
                      "(%d block(s))", message.id, len(people_out))
-            await self._reply(message, "\n\n".join(people_out),
-                              reason="find_people answer, posted verbatim")
+            sent = await self._reply(message, "\n\n".join(people_out),
+                                     reason="find_people answer, posted verbatim")
+            self._remember_said(sent, kind="answer", question=q)
+            return True
+
+        if not reply and objectives:
+            # The model had nothing to add (or failed): the objectives are the
+            # answer and they still come through.
+            log.info("[query] msg=%s the objectives go out without a to-do part "
+                     "(%s)", message.id, outcome.get("model_error") or "no model text")
+            sent = await self._reply(message, objectives,
+                                     reason="today's objectives, on demand")
+            self._remember_said(sent, kind="objectives", question=q)
+            self.memory.record(message.channel.id, text, objectives)
             return True
 
         if not reply:
@@ -2121,7 +2551,7 @@ class SalesBot(discord.Client):
         if profile_turn:
             allowed = list(outcome.get("result_urls") or [])
             allowed += [s.get("url") for s in outcome.get("sources") or []]
-            allowed += _URL_RE.findall(text or "")
+            allowed += _URL_RE.findall(text or "") + _URL_RE.findall(ask or "")
             for turn in history or []:
                 allowed += _URL_RE.findall(str((turn or {}).get("answer") or ""))
             reply = self._only_found_links(reply, allowed)
@@ -2135,20 +2565,29 @@ class SalesBot(discord.Client):
                  len([line for line in reply.splitlines() if line.strip()]),
                  len(reply), ",".join(f["rule"] for f in fired) or "none")
         people = list(offer_out.get("people") or [])
-        if not reply.strip() and not people:
+        if not reply.strip() and not people and not objectives:
             # The model's whole answer was a claim it could not back.
             reply = "Nothing has been added or sent for approval."
 
         if reply.strip():
             reply = self._with_sources(reply, outcome)
+        if objectives:
+            # THE OBJECTIVES FIRST, AS RENDERED, then whatever the model wrote
+            # (the to-do part). They are never passed through the model or the
+            # opener guard: they are the posts' own text.
+            reply = objectives + ("\n\n" + reply.strip() if reply.strip() else "")
 
+        if reply.strip():
             # RULE IDS NEVER REACH A PERSON — unless they asked for the preview,
             # in which case the ids ARE the answer. See rules.render_for_user.
-            await self._reply(
+            sent = await self._reply(
                 message, reply,
                 reason="answered a question in the sales channel",
                 keep_rule_ids="cadence_preview" in (outcome.get("tools_used") or []),
             )
+            # WHAT THIS MESSAGE ANSWERED, so a reply to it is routed with it.
+            self._remember_said(sent, kind="objectives" if objectives else "answer",
+                                question=q)
         offer = await self._offer_poc_add(message, text, offer_out) if people else ""
         # Remember the exchange so the next question here can build on it —
         # with the offer, so "yes, add them" is read against what was asked.
@@ -2274,8 +2713,13 @@ class SalesBot(discord.Client):
         return body
 
     async def _send_interim(self, message: discord.Message, *, web: bool,
-                            after: float) -> None:
-        """The one "on it" line for a slow answer. At most once per message."""
+                            after: float, question: str = "") -> None:
+        """The one "on it" line for a slow answer. At most once per message.
+
+        `web` is True ONLY when a web_search has actually started; it chooses
+        the wording. The line is remembered as an interim line (`_said`) so a
+        "sure" replied to it is an acknowledgement of nothing, not an answer
+        to anything."""
         if message.id in self._interim_sent:
             return
         self._interim_sent.add(message.id)
@@ -2289,9 +2733,10 @@ class SalesBot(discord.Client):
             timing["interim"] = True
         log.info("[interim] msg=%s still working after %.0fs — sending one %s line",
                  message.id, after, "web" if web else "engine")
-        await self._reply(message, persona.interim_line(web=web),
-                          reason="interim line: the answer is taking a while",
-                          interim=True)
+        sent = await self._reply(message, persona.interim_line(web=web),
+                                 reason="interim line: the answer is taking a while",
+                                 interim=True)
+        self._remember_said(sent, kind="interim", question=question)
 
     async def _cost_lines(self, label: str, *, since_ts: str, from_day: str,
                           to_day: str) -> tuple:
@@ -2553,8 +2998,14 @@ class SalesBot(discord.Client):
         return self._voiced_detail(message, reply, question)[0]
 
     async def _reply(self, message: discord.Message, body: str, *, reason: str,
-                     keep_rule_ids: bool = False, interim: bool = False) -> None:
-        """Reply in the same channel, no @-ping on the author.
+                     keep_rule_ids: bool = False, interim: bool = False):
+        """Reply in the same channel, no @-ping on the author. Returns the
+        FIRST message sent, or None when the send was refused or failed.
+
+        THE RETURN VALUE IS WHAT A PROPOSAL IS KEYED TO. It used to return
+        nothing, so "Shall I set …? Reply yes." was recorded against the
+        ASKER's message, and a "yes" replied to the bot's own question found
+        nothing attached to it (NFT2-1063).
 
         Discord drops anything past ~2000 chars, so a long answer is split on
         line boundaries and sent in order: the first as a reply, the rest as
@@ -2581,6 +3032,7 @@ class SalesBot(discord.Client):
                 last = last[: config.QUERY_REPLY_CHUNK - len(note)]
             chunks[-1] = last + note
 
+        first = None
         for i, chunk in enumerate(chunks):
             sent = await guardrails.send(
                 message.channel,
@@ -2594,11 +3046,14 @@ class SalesBot(discord.Client):
             if sent is None:
                 # Refused or failed: stop rather than posting a partial answer
                 # out of order.
-                return
+                return first
+            if i == 0:
+                first = sent
             if i == 0 and not interim:
                 timing = self._qstate.get(getattr(message, "id", None))
                 if timing is not None and timing["first_reply"] is None:
                     timing["first_reply"] = asyncio.get_running_loop().time()
+        return first
 
     async def _send_social(self, message: discord.Message, kind: str, text: str = "") -> None:
         """A non-answer reply — greeting or "I couldn't follow that" — in the
@@ -3112,6 +3567,146 @@ class SalesBot(discord.Client):
         ]
 
     # -- tools: the to-do sheet --------------------------------------------
+
+    def _objectives_tools(self, *, sink: list) -> list[dict]:
+        """"What are today's objectives?" — the day's posts, as they are written.
+
+        THE TEXT IS RENDERED BY CODE AND POSTED BY CODE. The handler puts it
+        in `sink` and tells the model only that it has been added to the
+        reply: a model handed the posts would summarise them, reorder them or
+        explain when each goes out, and the 6 Oct answer was exactly that kind
+        of explanation. `_answer_with_engine` puts the sink's text at the top
+        of the reply, unchanged (the `propose_poc_add` pattern).
+        """
+
+        async def _todays_objectives_tool(_inp: dict) -> dict:
+            if not sink:
+                sink.append(await self._todays_objectives())
+            return {
+                "added_to_reply": True,
+                "note": ("The day's objectives are added to your reply as they are. "
+                         "Do not repeat, summarise or introduce them. Add only what "
+                         "show_todos returned."),
+            }
+
+        return [{
+            "schema": {
+                "name": "todays_objectives",
+                "description": (
+                    "WHAT THE TEAM NEEDS TO DO TODAY: the day's posts, already "
+                    "written out. Use this for 'objectives', 'today's objectives', "
+                    "'today's plan', 'what's on today', 'what do we need to do "
+                    "today', 'today's priorities'. The text is ADDED TO YOUR REPLY "
+                    "FOR YOU, word for word; you are not shown it and must not "
+                    "restate, summarise or introduce it. Never say when anything "
+                    "is posted, and never mention rules or a schedule. Call "
+                    "show_todos as well and write only its part."
+                ),
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            "handler": _todays_objectives_tool,
+        }]
+
+    @staticmethod
+    def _without_pings(text: str) -> str:
+        """`text` with every mention token turned into the person's first
+        name (or dropped when the roster has no name for it). An answer that
+        quotes a post must not ping the people that post tagged a second time."""
+        def _name(match) -> str:
+            known = str(config.ROSTER_DISPLAY_NAMES.get(str(match.group(1))) or "").strip()
+            return known.split()[0] if known else ""
+
+        return _MENTION_TOKEN_RE.sub(_name, str(text or ""))
+
+    async def _todays_objectives(self) -> str:
+        """Today's objectives, on demand: what today's posts contain, at any
+        time of day. READ-ONLY.
+
+        KUSHAL, 6 OCT: "I asked for the objectives for today. It needs to come
+        through. 2:00 would be whatever it needs to post, but when we ask for
+        it, it needs to just reply through." He had been told about the
+        posting rules instead.
+
+        THE SAME PLANNER AND THE SAME RENDERER AS THE SENDER, read at two
+        points:
+
+          a post that HAS gone out today  → the text that was posted, from
+            `drip_sends.body`, word for word (no tags line was ever stored);
+          a post still to come            → `_plan_drip` with the same two
+            inputs the sender gives it, each message rendered by the
+            composer's own template (`drip.compose_fallback`), with its source
+            links and its heading, as the sender builds it.
+
+        WHAT IT LEAVES OUT, each a constant at the top of this file or a line
+        here: the AI news (OBJECTIVES_EXCLUDED_TYPES — "any AI news?" is its
+        own answer); a closing offer (OBJECTIVES_SHOW_OFFERS — no proposal
+        stands behind a repeated one); the tags line and every ping; anything
+        only a search at send time would add; a post meant for a DM; groups
+        the plan holds back or rolls to another day (they are not today's).
+
+        NO MODEL CALL. A post the model would write at send time is shown from
+        its template, so two people asking in the same minute read the same
+        words (`_voice_seed`) and asking costs nothing.
+
+        IT CLAIMS NOTHING. No slot is recorded, no send, nothing counts
+        toward the cap, no proposal is opened, no research runs and no leave
+        check: the scheduled post still goes once, at its own time, exactly as
+        it would have.
+
+        IT SAYS NOTHING ABOUT WHEN: no times, no "posted" or "coming up", no
+        rule, no schedule. Nothing today is one line (`wording.NOTHING_TODAY`).
+        If what has gone out cannot be read it says so rather than guess.
+        """
+        today = dl.today_ist()
+        marker = dl.iso(today)
+        try:
+            already = await asyncio.to_thread(self.db.drip_sent_today, marker)
+        except Exception:
+            log.exception("[objectives] could not read today's sent posts")
+            return wording.OBJECTIVES_UNREADABLE
+
+        blocks: list = []
+        for row in already or []:
+            if str(row.get("action_type") or "") in OBJECTIVES_EXCLUDED_TYPES:
+                continue
+            body = str(row.get("body") or "").strip()
+            if not body:
+                continue                # sent before the text was kept, or a DM
+            if not OBJECTIVES_SHOW_OFFERS:
+                body = drip.without_offer(body)
+            blocks.append(self._without_pings(body).strip())
+
+        planned = None
+        if drip.is_sending_day(today):
+            try:
+                planned = await self._plan_drip(today=today, already=already)
+            except Exception:
+                log.exception("[objectives] today's plan could not be built")
+                return wording.OBJECTIVES_UNREADABLE
+        for planned_message in (planned or {}).get("messages") or []:
+            if planned_message.get("type") in OBJECTIVES_EXCLUDED_TYPES:
+                continue
+            if str(planned_message.get("destination") or "") in ("dm", "escalation"):
+                continue
+            if drip.nothing_to_say(planned_message):
+                continue
+            # A COPY: the wording picked here must not leak onto the message
+            # the sender will compose later.
+            copy = dict(planned_message)
+            copy["_voice"] = {}
+            copy["_voice_seed"] = self._voice_seed(marker, planned_message)
+            body = drip.compose_fallback(copy, address="",
+                                         offers=OBJECTIVES_SHOW_OFFERS)
+            body = drip.with_sources(body, copy)
+            body = drip.with_heading(body, drip.heading_for(copy, day=today))
+            body = body.replace(f" [{rules.WEB_PENDING}]", "")
+            if body.strip():
+                blocks.append(self._without_pings(body).strip())
+
+        blocks = [b for b in blocks if b]
+        log.info("[objectives] %s: %d block(s) (%d already posted)", marker,
+                 len(blocks), len(already or []))
+        return "\n\n".join(blocks) if blocks else wording.NOTHING_TODAY
 
     def _todo_tools(self) -> list[dict]:
         """"@bot show the to-dos" — ALWAYS the link plus the open items.
@@ -4782,8 +5377,10 @@ class SalesBot(discord.Client):
                     "description": (
                         "TODAY'S DUE ITEMS FROM THE TWELVE RULES, grouped by rule. Use "
                         "this for 'cadence preview', 'rules preview', 'what's the queue', "
-                        "'what needs doing today', 'what needs attention', 'what's "
-                        "slipping', 'anything urgent', 'what would you chase'. NOTHING IS "
+                        "'why isn't X due', 'what needs attention', 'what's "
+                        "slipping', 'anything urgent', 'what would you chase'. NOT for "
+                        "'what do we need to do today' or 'today's objectives' (that is "
+                        "todays_objectives). NOTHING IS "
                         "SENT by this: it is a read-only preview. ANSWER GROUPED BY RULE "
                         "— name each rule ('R5 Prospects to contact: 5 items') and give "
                         "each line's reason, which names the cells that produced it, so "
@@ -4807,7 +5404,8 @@ class SalesBot(discord.Client):
                                     "ai_news, news_company_screen, events, deliverables, "
                                     "prospects, li_no_dm, dm_no_meeting, meeting_prep, "
                                     "meeting_followup, closure_support, "
-                                    "new_pipeline_company, sales_packages."
+                                    "new_pipeline_company, sales_packages, "
+                                    "next_step_followups."
                                 ),
                             },
                             "owner": {
@@ -5297,6 +5895,14 @@ class SalesBot(discord.Client):
                             "response": r.get("response", ""),
                             "last_followed_up": r.get("last_followed_up", ""),
                             "next_steps": r.get("next_steps", ""),
+                            # THE 7 OCT COLUMNS, only where filled: the step
+                            # dropdown, the three emails and the priority, so
+                            # an answer can quote them.
+                            **{role: r.get(role) for role in (
+                                "outreach_step", "email_1_sent", "email_1_date",
+                                "email_2_sent", "email_2_date", "email_3_sent",
+                                "email_3_date", "poc_priority")
+                               if str(r.get(role) or "").strip()},
                             "sheet_row": r.get("_row"),
                         }
                         for r in matches[:3]
@@ -6175,6 +6781,12 @@ class SalesBot(discord.Client):
         Returns True when it was handled (and answered). False means "this is
         not a write" and the caller carries on to the question engine — which is
         the common case, because most things said to the bot are questions.
+
+        THE ORDER, each step reading the same reply context (`_ctx_for`): the
+        focus command; a yes or no to a proposal ON THE MESSAGE REPLIED TO
+        (`_maybe_vote_on_proposal`); a "sure" to an offer that message ended
+        on (`_maybe_accept_offer`); the next-steps reply hook; then the
+        record-offer, the prefilter and the extractor as before.
         """
         # A FOCUS COMMAND, BEFORE ANYTHING ELSE. "Prioritise only AI Voice
         # Agents" is not an update and must not be fed to the extractor, which
@@ -6189,7 +6801,20 @@ class SalesBot(discord.Client):
         if await self._maybe_vote_on_proposal(message, text):
             return True
 
-        is_reply = await self._is_reply_to_self(message)
+        ctx = await self._ctx_for(message)
+
+        # "SURE" TO AN OFFER THE BOT'S MESSAGE ENDED ON. After the vote, so an
+        # offer with a proposal behind it has already been answered there.
+        if await self._maybe_accept_offer(message, text, ctx):
+            return True
+
+        # A REPLY TO THE NEXT-STEPS POST has its own reader (RULE13 section 14).
+        # It already ran in `_handle_query`; here it returns the same False.
+        if (ctx.get("drip") or {}).get("action_type") == nextaction.R_NEXT_STEPS \
+                and await self._maybe_next_step_reply(message, text, ctx):
+            return True
+
+        is_reply = bool(ctx["direct_is_bot"])
         trigger = sheetwrite.TRIGGER_REPLY if is_reply else sheetwrite.TRIGGER_COMMAND
 
         # CONTEXT FROM THE MESSAGE THEY REPLIED TO. "Sent this morning" names no
@@ -6286,20 +6911,14 @@ class SalesBot(discord.Client):
     async def _drip_context_for(self, message: discord.Message) -> dict:
         """What the message being replied to was about.
 
-        Looks the parent Discord message id up in `drip_sends`, which records
-        the companies and the action type of every drip message. A reply to
-        something else the bot said (an answer, an echo) simply has no context
-        and the extractor works from the reply alone.
+        The drip row of the bot's message this is a direct reply to, from the
+        reply context (`_ctx_for`), which finds it by the post's first id or
+        the id of any later part. A reply to something else the bot said (an
+        answer, an echo) simply has no context and the extractor works from the
+        reply alone.
         """
-        ref = message.reference
-        parent_id = getattr(ref, "message_id", None) if ref else None
-        if not parent_id:
-            return {}
-        try:
-            row = await asyncio.to_thread(self.db.find_drip_by_message_id, str(parent_id))
-        except Exception:
-            log.debug("[sheetwrite] could not look up the drip context", exc_info=True)
-            return {}
+        ctx = await self._ctx_for(message)
+        row = ctx.get("drip") if ctx.get("direct_is_bot") else None
         if not row:
             return {}
         return {
@@ -6314,47 +6933,197 @@ class SalesBot(discord.Client):
     ) -> bool:
         """Is this message a yes or a no to a proposal? Handle it if so.
 
-        FINDS THE PROPOSAL TWO WAYS, in order of confidence: the message it
-        REPLIES to, then the newest open one. A reply is unambiguous; a bare
-        "yes" in the channel is a guess, and the echo names what was applied so
-        a wrong guess is visible at once rather than silent. ONE GUESS IS NOT
-        MADE: a reply to a different message is never read as a yes to an
-        open row_add offer.
+        A VOTE COUNTS ONLY FOR WHAT THE MESSAGE IT REPLIES TO ASKED. There is
+        no "newest open proposal" any more. On 7 Oct a "sure" under "I'm
+        checking the web for this" was taken as a yes to an offer made hours
+        earlier on a different post, and scheduled a reminder nobody asked
+        for; the lookup that made that possible had no channel, no age and no
+        kind. The four cases:
+
+          a DIRECT REPLY to a bot message with open proposals on it: a vote
+            when the words say so (`approvals.read_vote`) and there is no
+            question mark. One post can carry several; `_pick_proposal`
+            chooses, as before.
+          ANY OTHER REPLY is never a vote, whatever is open anywhere. That
+            includes a reply whose parent could not be found.
+          NOT A REPLY ("@Saley yes"): only a message that is nothing but a
+            vote word (`replies.is_bare_vote`), and only when exactly ONE
+            proposal is open in this channel and it is younger than
+            PROPOSAL_BARE_YES_MINUTES. Otherwise the bot asks which, naming
+            them, and records no vote.
+          A REPLY TO THAT "which one?" picks by number (`_answer_which`).
+
+        The "Waiting for your yes" post lists proposals keyed to other
+        messages; a yes replied to it answers the one it listed, or asks which
+        when it listed several.
 
         A NON-APPROVER GETS A POLITE NO AND THE PROPOSAL STAYS OPEN. They were
-        trying to help; the answer is that this particular thing needs Sid or
-        Vaishnavi, not that they did something wrong.
+        trying to help; the answer is that this particular thing needs an
+        approver, not that they did something wrong.
         """
-        vote = approvals.read_vote(text)
+        ctx = await self._ctx_for(message)
+        if ctx["is_reply"]:
+            if not ctx["direct_is_bot"]:
+                return False
+            if (ctx.get("said") or {}).get("kind") == "which":
+                return await self._answer_which(message, text, ctx)
+            if not ctx["proposals"] and not ctx["listed"]:
+                if approvals.read_vote(text):
+                    log.info("[approvals] msg=%s replies to a message with no open "
+                             "proposal on it — not a vote", message.id)
+                return False
+            # A QUESTION IS NOT A VOTE. "what's the right contact there?"
+            # contains "right", and used to count as a yes.
+            if "?" in (text or ""):
+                return False
+            vote = approvals.read_vote(text)
+            if not vote:
+                return False
+            if ctx["proposals"]:
+                # ONE POST CAN CARRY SEVERAL OFFERS; the reply says which, and
+                # a bare yes answers the one the post ended on.
+                proposal = self._pick_proposal(ctx["proposals"], text)
+                return await self._cast_vote(message, proposal, vote)
+            return await self._vote_among(message, ctx["listed"], vote, window=False)
+
+        vote = replies.is_bare_vote(text, self._bot_names())
         if not vote:
             return False
-
-        proposal = None
-        ref = getattr(getattr(message, "reference", None), "message_id", None)
-        if ref:
-            # ONE POST CAN CARRY SEVERAL OFFERS; the reply says which, and a
-            # bare yes answers the one the post ended on (`_pick_proposal`).
-            several = await asyncio.to_thread(
-                self.db.open_proposals_for_message, str(ref)
-            )
-            proposal = self._pick_proposal(several, text)
-        guessed = proposal is None
-        if proposal is None:
-            proposal = await asyncio.to_thread(self.db.latest_open_proposal)
-        if proposal is None:
+        channel_id = getattr(getattr(message, "channel", None), "id", 0)
+        open_here = await asyncio.to_thread(self.db.open_proposals_in_channel, channel_id)
+        if not open_here:
             return False
-        # A REPLY TO SOME OTHER MESSAGE IS NOT A YES TO AN ADD. The newest-open
-        # fallback exists for a bare "yes" said to nobody; "Sure." replied to
-        # an unrelated answer (it happened on 6 Oct) must not add people to
-        # the sheet because an add offer happened to be open. Only for this
-        # kind: it is the one whose own message is known (`_offer_poc_add`).
-        if guessed and ref and proposal.get("kind") == "row_add" \
-                and str(ref) != str(proposal.get("message_id") or ""):
-            log.info("[approvals] msg=%s is a reply to another message, not to "
-                     "the add offer %s — not a vote", message.id,
-                     proposal["proposal_key"])
-            return False
+        return await self._vote_among(message, open_here, vote, window=True)
 
+    @staticmethod
+    def _inside_bare_yes_window(proposal: dict) -> bool:
+        """Was this proposal made recently enough for a bare "yes" that is not
+        a reply to be about it? PROPOSAL_BARE_YES_MINUTES on the bot's own
+        clock, so a pretended day behaves like a real one. 0, or a creation
+        time that cannot be read, is "no": the bot asks instead of guessing."""
+        minutes = int(getattr(config, "PROPOSAL_BARE_YES_MINUTES", 0) or 0)
+        if minutes <= 0:
+            return False
+        try:
+            made = datetime.fromisoformat(str(proposal.get("created_at") or ""))
+        except ValueError:
+            return False
+        now = dl.now_ist()
+        if made.tzinfo is None:
+            now = now.replace(tzinfo=None)
+        age = (now - made).total_seconds() / 60.0
+        return 0 <= age < minutes
+
+    async def _vote_among(self, message, candidates: list, vote: str, *,
+                          window: bool) -> bool:
+        """A yes or no that names no proposal, with `candidates` it could mean.
+
+        ONE CANDIDATE (and, for a message that is not a reply, one made inside
+        the window): the vote is on it. ANYTHING ELSE: a yes is asked "which
+        one?" and nothing is recorded; a no gets a reaction and nothing is
+        declined, because declining the wrong thing on a guess is as wrong as
+        approving it.
+        """
+        candidates = [c for c in (candidates or []) if c]
+        if len(candidates) == 1 and (not window
+                                     or self._inside_bare_yes_window(candidates[0])):
+            return await self._cast_vote(message, candidates[0], vote)
+        if not candidates:
+            return False
+        if vote != approvals.VOTE_YES:
+            log.info("[approvals] msg=%s said no with %d proposal(s) it could mean — "
+                     "nothing declined", message.id, len(candidates))
+            await self._react(message, reason="a no that names no proposal")
+            return True
+        await self._ask_which(message, candidates)
+        return True
+
+    def _proposal_label(self, proposal: dict) -> str:
+        """What this proposal IS, in a few words (`wording.proposal_label`),
+        read from its own row and payload. Every line about a proposal names
+        it with this, so no reply says "these" or "that one"."""
+        proposal = proposal or {}
+        payload = proposal.get("payload") or {}
+        kind = str(proposal.get("kind") or "cell_update")
+        if kind == "email_write":
+            emails = list(payload.get("emails") or [])
+            one = emails[0] if len(emails) == 1 else {}
+            return wording.proposal_label(
+                kind, poc=str(one.get("poc") or ""), email=str(one.get("email") or ""),
+                count=len(emails))
+        if kind == "row_add":
+            return wording.proposal_label(
+                kind, names=[q.get("name") for q in (payload.get("people") or [])],
+                tab=str(proposal.get("tab") or ""))
+        if kind == "event_append":
+            return wording.proposal_label(
+                kind, names=[e.get("name") for e in (payload.get("events") or [])])
+        if kind == "event_deadline":
+            return wording.proposal_label(
+                kind, names=[d.get("name") for d in (payload.get("deadlines") or [])])
+        if kind == "events_remind":
+            on = dl.parse_date(payload.get("on"))
+            return wording.proposal_label(
+                kind, when=f"{on:%a} {on.day} {on:%b}" if on else "")
+        if kind == "poc_lookup":
+            return wording.proposal_label(kind, names=payload.get("companies") or [])
+        return wording.proposal_label(
+            kind, company=str(proposal.get("company") or ""),
+            poc=str(proposal.get("poc") or ""))
+
+    async def _ask_which(self, message, candidates: list) -> None:
+        """"Which one do you mean?" — every candidate named and numbered, or
+        "Is that a yes to …?" for one that was asked too long ago to assume.
+
+        NO VOTE IS RECORDED. The question's own message is remembered
+        (`_said`, kind "which") with the candidates in the order shown, so a
+        reply of "2" or "yes" to it is read against exactly this list.
+        """
+        shown = candidates[:9]
+        labels = [self._proposal_label(c) for c in shown]
+        body = (wording.confirm_proposal(labels[0]) if len(shown) == 1
+                else wording.which_proposal(labels))
+        sent = await self._reply(message, body,
+                                 reason="a bare yes with more than one thing it could mean")
+        self._remember_said(sent, kind="which",
+                            which=[c["proposal_key"] for c in shown])
+        log.info("[approvals] msg=%s said yes without saying to what — asked which "
+                 "of %d", message.id, len(shown))
+
+    async def _answer_which(self, message, text: str, ctx: dict) -> bool:
+        """A reply to "which one?": a number or an ordinal picks from the list
+        that question showed; a bare yes or no answers it when it showed one.
+
+        A real question is handed on (False) and answered normally. Anything
+        else gets one reaction and nothing is recorded.
+        """
+        keys = list((ctx.get("said") or {}).get("which") or [])
+        if "?" in (text or ""):
+            return False
+        vote, key = "", ""
+        pick = replies.pick_numbered(text, len(keys))
+        if pick:
+            vote, key = approvals.VOTE_YES, keys[pick - 1]
+        elif len(keys) == 1:
+            vote, key = replies.is_bare_vote(text, self._bot_names()), keys[0]
+        if not vote or not key:
+            await self._react(message, reason="an answer to 'which one?' that picks none")
+            return True
+        proposal = await asyncio.to_thread(self.db.proposal, key)
+        if not proposal or proposal.get("status") != "open":
+            await self._reply(
+                message, wording.offer_closed(self._proposal_label(proposal or {})),
+                reason="the proposal picked was already answered")
+            return True
+        return await self._cast_vote(message, proposal, vote)
+
+    async def _cast_vote(self, message, proposal: dict, vote: str) -> bool:
+        """Record one person's yes or no on ONE proposal and act on the
+        decision. Everything after "which proposal" — the approver check, the
+        stored vote, the tie-break, the apply — is here and unchanged."""
+        if not proposal:
+            return False
+        label = self._proposal_label(proposal)
         author = _display(message.author)
         if not config.is_approver(getattr(message.author, "id", 0)):
             await self._reply(
@@ -6386,7 +7155,7 @@ class SalesBot(discord.Client):
         )
 
         if decision == approvals.WAIT:
-            await self._reply(message, wording.HOLDING,
+            await self._reply(message, wording.holding(label),
                               reason="vote recorded, still waiting")
             return True
 
@@ -6415,7 +7184,7 @@ class SalesBot(discord.Client):
                 if v.get("vote") == approvals.VOTE_YES
                 and str(v.get("voter_label")) != str(decided_by)
             ]
-            line = wording.declined(why, [o.get("voter_label") for o in others])
+            line = wording.declined(why, [o.get("voter_label") for o in others], label)
             await self._reply(message, line, reason="a proposal was declined")
             log.info("[approvals] %s DECLINED — %s",
                      proposal["proposal_key"], why)
@@ -6424,6 +7193,185 @@ class SalesBot(discord.Client):
         await self._apply_approved_write(
             message, fresh or proposal, decided_by=decided_by or author, why=why,
         )
+        return True
+
+    async def _maybe_accept_offer(self, message, text: str, ctx: dict) -> bool:
+        """"Sure" to an offer the bot's message ended on: do that thing.
+
+        ONLY FOR A DIRECT REPLY THAT IS NOTHING BUT A YES, and only when no
+        open proposal is attached (the vote has already taken that case):
+
+          the offer on this message was ALREADY ANSWERED or lapsed → one fixed
+            line saying so; nothing runs twice;
+          the post carries a stored record-offer → `_apply_pending_offer`, as
+            before (which itself proposes and waits);
+          the message ended on an offer to CHANGE THE SHEET → the offered
+            action goes to the extractor as if it had been typed, and what
+            comes back is PROPOSED: the cells are named and an approver's
+            separate yes is still needed. Nothing is ever written on the
+            "sure". When the offer did not say what to change, the bot asks;
+          the message ended on an offer to LOOK SOMETHING UP → the engine
+            runs it, with the bot's message as context.
+        """
+        if not ctx["direct_is_bot"] or ctx["proposals"] or ctx["listed"]:
+            return False
+        if "?" in (text or ""):
+            return False
+        if replies.is_bare_vote(text, self._bot_names()) != approvals.VOTE_YES \
+                and not sheetwrite.is_affirmative(text):
+            return False
+
+        if ctx["closed"]:
+            label = self._proposal_label(ctx["closed"][-1])
+            log.info("[offer] msg=%s said yes to %s, which was already answered",
+                     message.id, ctx["closed"][-1].get("proposal_key"))
+            await self._reply(message, wording.offer_closed(label),
+                              reason="a yes to an offer that was already answered")
+            return True
+
+        context = await self._drip_context_for(message)
+        if context.get("offer"):
+            return await self._apply_pending_offer(message, context, text)
+
+        offer = ctx.get("offer")
+        if not offer:
+            return False
+        act = str(offer.get("act") or "")
+        log.info("[offer] msg=%s said yes to the offer %r (%s)", message.id, act[:120],
+                 "a sheet change: to be proposed" if offer.get("write") else "a lookup")
+        state.audit("offer_accepted",
+                    reason=f"{_display(message.author)} said yes to an offer the "
+                           "bot's message ended on",
+                    offered=act[:200], write=bool(offer.get("write")),
+                    reply=(text or "")[:200])
+        if offer.get("write"):
+            parsed = None
+            try:
+                parsed = await self.llm.extract_sheet_update(
+                    text=act, today=dl.iso(dl.today_ist()),
+                    company_hint=context.get("companies", ""),
+                    poc_hint=context.get("poc", ""),
+                    asked_about=context.get("asked_about", ""),
+                    requester=_display(message.author),
+                )
+            except Exception:
+                log.exception("[offer] extraction of the offered change raised")
+            if parsed is None or parsed.get("intent") != "update":
+                await self._reply(message, wording.OFFER_NEEDS_DETAIL,
+                                  reason="a yes to an offer that named no change")
+                return True
+            # `text` — the person's own "sure" — is what the terminal-word gate
+            # reads, never the bot's wording of the offer: the bot must not be
+            # able to talk itself into marking a row dead.
+            return await self._apply_sheet_update(
+                message, text, parsed, context, sheetwrite.TRIGGER_REPLY)
+
+        timing = self._qstate.get(getattr(message, "id", None))
+        if timing is not None:
+            timing["route"] = "engine"
+        history = self.memory.recent(message.channel.id)
+        if not await self._answer_with_engine(message, text, history=history, ask=act):
+            await self._engine_no_progress_reply(message, text=act, history=history)
+        return True
+
+    @staticmethod
+    def _is_next_step_reply(ctx: dict) -> bool:
+        """Is this a direct reply to a next-steps post, or to the "Which one?"
+        line the bot asked under one?"""
+        if not ctx.get("direct_is_bot"):
+            return False
+        return ((ctx.get("drip") or {}).get("action_type") == nextaction.R_NEXT_STEPS
+                or (ctx.get("said") or {}).get("kind") == "next_step_which")
+
+    async def _maybe_next_step_reply(self, message, text: str, ctx: dict) -> bool:
+        """A reply to the next-steps post ("done", "researched", "sent").
+
+        SOMEBODY SAYING THE STEP IS DONE GETS ONE FIXED LINE asking for the
+        sheet update that step needs ("Nice, can you set Next Steps for Priya
+        to Send email 1?"). Anyone on the team may say it: all it triggers is a
+        reminder.
+
+        IT WRITES NOTHING AND DECIDES NOTHING. No sheet write, no proposal, no
+        vote, no model call, no sheet read, no change to rule 13's state: the
+        person comes back by rotation until the cell itself changes. The line
+        is built from what the post recorded (`db.next_step_post`), so the
+        person and the step are the ones the post named, never a guess from
+        its text.
+
+        WHO IT IS ABOUT: whoever the reply names; otherwise the only person in
+        the post whose line the word can answer; otherwise it asks "Which
+        one?" and remembers the list, so "2" or a name answers it.
+
+        "SURE", "OK", "THANKS", "NOT YET" GET ONE REACTION AND NOTHING ELSE.
+        They are not a "done". Anything else — a question, a sentence with
+        facts in it — returns False and is handled as any reply is, with the
+        post as its context.
+        """
+        if not self._is_next_step_reply(ctx):
+            return False
+        said = ctx.get("said") or {}
+        answering_which = said.get("kind") == "next_step_which"
+        root = str((said.get("root_id") if answering_which else ctx.get("root_id")) or "")
+        post = await asyncio.to_thread(self.db.next_step_post, root) if root else None
+        people = list((post or {}).get("people") or [])
+        if not people:
+            # No record: a test day on a live database keeps none.
+            return False
+        shorts = replies.next_step_shorts(people)
+
+        picked: list = []
+        if answering_which:
+            keys = [str(k) for k in (said.get("which") or [])]
+            listed = [i for k in keys for i, p in enumerate(people)
+                      if str(p.get("row_key")) == k]
+            number = replies.pick_numbered(text, len(listed))
+            if number:
+                picked = [listed[number - 1]]
+            else:
+                named = [i for i in replies.next_step_named(text, people) if i in listed]
+                picked = named or (listed if replies.next_step_all(text) else [])
+            if not picked:
+                return False
+        else:
+            kind = replies.next_step_done(text)
+            if not kind:
+                names = self._bot_names()
+                if replies.is_ack(text, names) or replies.is_bare_vote(text, names):
+                    self._mark_route(message, "next_step_reply")
+                    await self._react(
+                        message, reason="an acknowledgement under a next-steps post")
+                    return True
+                return False
+            picked = replies.next_step_named(text, people) \
+                or replies.next_step_candidates(kind, people)
+            if len(picked) > 1 and not replies.next_step_named(text, people):
+                self._mark_route(message, "next_step_reply")
+                sent = await self._reply(
+                    message,
+                    wording.next_step_which([
+                        wording.next_step_who(people[i].get("poc"),
+                                              people[i].get("company"))
+                        for i in picked]),
+                    reason="a done under a next-steps post that names nobody")
+                self._remember_said(
+                    sent, kind="next_step_which", root_id=root,
+                    which=[str(people[i].get("row_key")) for i in picked])
+                return True
+
+        lines = [
+            wording.next_step_done_line(
+                str(people[i].get("ask") or ""), short=shorts[i],
+                n=int(people[i].get("email_n") or 0))
+            for i in picked
+        ]
+        lines = [line for line in lines if line]
+        if not lines:
+            return False
+        self._mark_route(message, "next_step_reply")
+        await self._reply(message, "\n".join(lines), reason="next-steps reply")
+        log.info("[rules] R13 reply: msg=%s answered about %s; nothing written",
+                 getattr(message, "id", "?"),
+                 ", ".join(str(people[i].get("row_key")) for i in picked))
         return True
 
     async def _maybe_focus_command(
@@ -6655,6 +7603,16 @@ class SalesBot(discord.Client):
         body = f"{proposed} ({approvals.who_can_approve()}.){extra}"
 
         sent = await self._reply(message, body, reason="proposing a sheet write")
+        if sent is None:
+            # NOBODY SAW THE QUESTION, SO THERE IS NOTHING TO SAY YES TO. A
+            # proposal with no message is one a reply can never be attached to.
+            log.warning("[approvals] the proposal for %s could not be posted; "
+                        "nothing is recorded and nothing is written", company)
+            state.audit("write_proposal_not_posted",
+                        reason="the question could not be sent, so no proposal "
+                               "was opened",
+                        company=company, poc=poc, trigger=trigger)
+            return True
         key = f"prop:{message.id}"
         opened = await asyncio.to_thread(
             lambda: self.db.open_proposal(
@@ -6666,7 +7624,9 @@ class SalesBot(discord.Client):
                 reply_text=reply_text, trigger=trigger, proposed_text=proposed,
                 requested_by=_display(message.author),
                 channel_id=int(getattr(message.channel, "id", 0) or 0),
-                message_id=str(getattr(sent, "id", "") or message.id),
+                # THE BOT'S OWN QUESTION, not the asker's message: a "yes"
+                # replied to "Shall I set …? Reply yes." must find this.
+                message_id=str(sent.id),
                 created_at=dl.now_ist().isoformat(timespec="seconds"),
             )
         )
@@ -6695,7 +7655,8 @@ class SalesBot(discord.Client):
         """
         events = (proposal.get("payload") or {}).get("events") or []
         if not events:
-            await self._reply(message, wording.NOTHING_TO_ADD,
+            await self._reply(message,
+                              wording.nothing_left(self._proposal_label(proposal)),
                               reason="approved append had no events")
             return
 
@@ -6760,7 +7721,8 @@ class SalesBot(discord.Client):
         """
         rows = (proposal.get("payload") or {}).get("deadlines") or []
         if not rows:
-            await self._reply(message, wording.NOTHING_TO_WRITE,
+            await self._reply(message,
+                              wording.nothing_left(self._proposal_label(proposal)),
                               reason="approved backfill had no cells")
             return
 
@@ -6852,7 +7814,7 @@ class SalesBot(discord.Client):
         log.info("[approvals] %s said yes to the PoC lookup for %s%s", decided_by,
                  ", ".join(chosen), " (narrowed by the reply)" if named else "")
         if not chosen:
-            await self._reply(message, "There was no company on that one to look up.",
+            await self._reply(message, wording.POC_LOOKUP_EMPTY,
                               reason="poc lookup had no companies")
             return
         for company in chosen:
@@ -7505,7 +8467,8 @@ class SalesBot(discord.Client):
         company = proposal.get("company") or ""
         poc = proposal.get("poc") or ""
         if not writes:
-            await self._reply(message, wording.NOTHING_TO_WRITE,
+            await self._reply(message,
+                              wording.nothing_left(self._proposal_label(proposal)),
                               reason="approved proposal had no cells")
             return
 
@@ -7840,12 +8803,17 @@ class SalesBot(discord.Client):
         # consecutive sweep ticks, which is precisely what the spacing exists to
         # prevent. So the gap is measured from the LAST ACTUAL SEND, not from
         # the planned time, and a backlog drains at the drip's own pace.
+        #
+        # ONE EXEMPTION, AND IT IS NARROW: a post whose type is in
+        # `drip.ON_TIME_TYPES` (the next-step follow-ups) is not held by the
+        # guard, so the hold is remembered here and applied to the due list
+        # below instead of returning. Every other post is held exactly as before.
         floor = drip.min_gap_minutes()
         last_sent = self._last_drip_sent_at(already)
+        gap_held = False
         if last_sent is not None:
             waited = (now - last_sent).total_seconds() / 60.0
-            if waited < floor:
-                return
+            gap_held = waited < floor
 
         # THE KILL SWITCH. Same name, same live read, same line in the log as
         # the digest used — see config.digest_enabled().
@@ -7860,6 +8828,8 @@ class SalesBot(discord.Client):
             return
 
         due = [m for m in planned["messages"] if m["send_at"] <= now]
+        if gap_held:
+            due = [m for m in due if m.get("type") in drip.ON_TIME_TYPES]
         if not due:
             return
 
@@ -7962,9 +8932,15 @@ class SalesBot(discord.Client):
         Reads the recorded `sent_at`, not the planned time: the guard above is
         about how long ago the channel last heard from this bot, which is a fact
         about the clock rather than about the schedule.
+
+        A post in `drip.ON_TIME_TYPES` is skipped: it goes at its own fixed
+        time whatever the spacing, so it must not push the spaced posts back
+        either.
         """
         best = None
         for row in already or []:
+            if (row or {}).get("action_type") in drip.ON_TIME_TYPES:
+                continue
             raw = str((row or {}).get("sent_at") or "").strip()
             if not raw:
                 continue
@@ -8192,6 +9168,14 @@ class SalesBot(discord.Client):
         # aware of the other.
         address = self._drip_mention(message)
 
+        # THE WORDING IS A FUNCTION OF THE DAY AND THE SLOT, not of chance
+        # (NFT2-1063): "what are today's objectives?" renders this same post
+        # before it goes out and must show the opener and the close it will
+        # carry. Anything picked while the plan was being built is dropped so
+        # the seed decides. See `drip._voice`.
+        message["_voice_seed"] = self._voice_seed(marker, message)
+        message["_voice"] = {}
+
         # SUPPRESS-OR-CONVERT, immediately before the send and not before. The
         # queue is planned hours ahead; the evidence has to be as fresh as the
         # message, or the bot would chase something the team recorded at 11am
@@ -8302,6 +9286,9 @@ class SalesBot(discord.Client):
         # one away; "never post a story with no source link" cannot depend on
         # the model choosing to obey. See `drip.with_sources`.
         body = drip.with_sources(body, message)
+        # THE POST AS IT READS, before the tags line goes on: what "today's
+        # objectives" shows once this has gone out (`_todays_objectives`).
+        posted_text = body
         body = drip.with_tags(
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
@@ -8316,6 +9303,12 @@ class SalesBot(discord.Client):
         except ValueError:
             send_day = dl.today_ist()
         body = drip.with_heading(body, drip.heading_for(message, day=send_day))
+        # Stored with its heading, WITHOUT the tags line and the test tag, so
+        # the same text is shown live and in test mode. A post meant for one
+        # person's DM is not kept: it is not the channel's to be shown.
+        stored_body = "" if str(message.get("destination") or "") in (
+            "dm", "escalation") else drip.with_heading(
+                posted_text, drip.heading_for(message, day=send_day))
 
         # IN TEST MODE, OR DURING A TEST RUN, A DM IS SHOWN, NOT SENT. The
         # "[TEST]" tag goes on each Discord message below, after the split, so
@@ -8349,6 +9342,9 @@ class SalesBot(discord.Client):
         room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
         parts = drip.split_on_lines(body, limit=int(config.QUERY_REPLY_CHUNK) - room)
         sent = None
+        # EVERY PART'S ID, so a reply to the last part of a split post (where
+        # the offer is) finds the same post as a reply to the first.
+        part_ids: list = []
         for i, part in enumerate(parts):
             got = await guardrails.send(
                 channel, self._tag_test(part),
@@ -8367,6 +9363,7 @@ class SalesBot(discord.Client):
                 sent = got
             if got is None:
                 break
+            part_ids.append(str(got.id))
         if sent is None:
             log.warning(
                 "[drip] slot %d for %s was refused or failed to send. The slot is "
@@ -8394,6 +9391,7 @@ class SalesBot(discord.Client):
         await asyncio.to_thread(
             lambda: self.db.attach_drip_message_id(
                 on_date=marker, slot=int(message["slot"]), message_id=sent.id,
+                body=stored_body, part_ids=part_ids,
             )
         )
 
@@ -8852,14 +9850,12 @@ class SalesBot(discord.Client):
         hhmm = str(payload.get("time") or "14:00")
         today = dl.today_ist()
         if when is None or not lines:
-            await self._reply(message, "There was nothing on that one to remind you of.",
+            await self._reply(message, wording.EVENTS_REMIND_EMPTY,
                               reason="events reminder had nothing on it")
             return
         if when <= today:
-            await self._reply(
-                message, "That day has already come — ask me for the events list any "
-                         "time and I'll post it.",
-                reason="events reminder date already passed")
+            await self._reply(message, wording.EVENTS_REMIND_PAST,
+                              reason="events reminder date already passed")
             return
         what = "these AI events are coming up:\n" + "\n".join(f"• {x}" for x in lines)
         channel_id = str(proposal.get("channel_id") or
@@ -8877,9 +9873,11 @@ class SalesBot(discord.Client):
         log.info("[approvals] %s said yes to R3's offer — reminder #%s on %s at %s "
                  "for %d event(s); it does not count toward the cap", decided_by, rid,
                  dl.iso(when), hhmm, len(lines))
+        # NAMES WHAT WILL BE POSTED AND WHEN. It used to say "I'll post these
+        # again", and on 7 Oct nobody could tell what "these" were.
         await self._reply(
-            message, f"Will do — I'll post these again on "
-                     f"{sheetwrite.reminder_moment_words(when, hhmm)}.",
+            message, wording.events_remind_set(
+                f"{when:%a} {when.day} {when:%b} at {wording.clock_12h(hhmm)}"),
             reason="confirming R3's reminder")
 
     @staticmethod
@@ -8918,6 +9916,10 @@ class SalesBot(discord.Client):
         R3 — an event listed as "date unclear" is recorded, which is what
         makes that line appear once.
 
+        R13 — each person the post named is recorded, which is what moves the
+        rotation on, counts the call reminders and closes a contact after the
+        Unresponsive reminder (`_record_next_steps`).
+
         After the send, like every other ledger here: a post that was refused
         must not count as a mention.
         """
@@ -8953,6 +9955,70 @@ class SalesBot(discord.Client):
                 log.info("[rules] R3: %r listed once as \"date unclear\"; it is not "
                          "listed again until the sheet's date can be read",
                          action.get("company"))
+        elif kind == nextaction.R_NEXT_STEPS:
+            await self._record_next_steps(message, sent=sent, marker=marker)
+
+    async def _record_next_steps(self, message: dict, *, sent, marker: str) -> int:
+        """Record who an R13 post named. How many people were recorded.
+
+        ONLY AFTER A REAL SEND — `_after_send` is not reached when the send was
+        refused — and only for the people the post SHOWED. Two things are
+        written: each person's place in the rotation (`next_step_followups`),
+        and the post itself with what each person was asked
+        (`next_step_posts`), so a reply to it can be matched to a person and a
+        step without parsing the post's text.
+
+        WHERE IT WRITES, BY PATH:
+          live, and SALES_TEST_MODE     DB_PATH (test mode is live with another
+                                        audience, like every other ledger)
+          a simulation                  the sandbox copy, which is discarded
+          a test day ("make it Monday") DB_PATH only when it is a *_test.db
+
+        THE TEST DAY IS STRICTER THAN R9's LADDER, ON PURPOSE. A test day sends
+        through this same path with the real database. On a live database a
+        "make it Monday" would otherwise move the real rotation: five people
+        would be skipped in the next real post because a rehearsal had named
+        them. The post itself is identical either way.
+        """
+        if (clock.pretending() and not simulation.in_simulation()
+                and not NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB
+                and not str(config.DB_PATH or "").endswith("_test.db")):
+            log.info("[rules] R13: test day on a live database; rotation not recorded")
+            return 0
+        people = []
+        for action in drip.shown_contacts(message):
+            key = str(action.get("row_key") or "").strip()
+            if not key:
+                continue
+            await asyncio.to_thread(
+                lambda k=key, a=action: self.db.record_next_step_mention(
+                    k, signature=str(a.get("signature") or ""), on_date=marker,
+                    ask=str(a.get("ask") or "")))
+            people.append({
+                "row_key": key, "sheet_row": action.get("sheet_row"),
+                "poc": action.get("poc", ""), "company": action.get("company", ""),
+                "step": action.get("step", ""),
+                "step_label": action.get("step_label", ""),
+                "ask": action.get("ask", ""), "email_n": action.get("email_n", 0),
+                "signature": action.get("signature", ""),
+                "line": action.get("text", ""),
+            })
+            if action.get("ask") == "unresponsive":
+                log.info("[rules] R13: %s was asked to be marked Unresponsive; I "
+                         "stop asking about them", key)
+        if not people:
+            return 0
+        await asyncio.to_thread(
+            lambda: self.db.record_next_step_post(
+                str(getattr(sent, "id", "") or ""), on_date=marker,
+                channel_id=str(getattr(getattr(sent, "channel", None), "id", "") or ""),
+                people=people))
+        log.info("[rules] R13: recorded %d person(s) named on %s (%s)", len(people),
+                 marker, ", ".join(p["row_key"] for p in people))
+        state.audit("next_step_post", reason="one R13 post went out", date=marker,
+                    people=[p["row_key"] for p in people],
+                    asks=[p["ask"] for p in people])
+        return len(people)
 
     async def _advance_meeting_ladder(self, message: dict, *, marker: str) -> int:
         """Move every meeting this R9 post asked about up one rung. How many.
@@ -8995,10 +10061,11 @@ class SalesBot(discord.Client):
         return climbed
 
     async def _reset_answered_ladders(self, rows: list, ladder: dict) -> dict:
-        """Clear R9's ladder for every row whose Next Steps is now filled, or
+        """Clear R9's ladder for every row whose Notes/Remarks is now filled, or
         whose meeting date has moved. Returns the ladder without them.
 
-        NEXT STEPS ARRIVED — the chase is over. Left alone, the row would stay
+        THE NOTES ARRIVED (the `next_steps` role is the Notes/Remarks column,
+        never the Next Steps dropdown) — the chase is over. Left alone, the row would stay
         at the rung it reached, and the next stalled meeting with the same
         contact would open at the escalation. A NEW MEETING DATE is a new
         meeting and starts at rung 1 for the same reason.
@@ -9017,7 +10084,7 @@ class SalesBot(discord.Client):
                 continue
             why = ""
             if gtm_sheet.clean_cell(row.get("next_steps")):
-                why = "Next Steps is filled"
+                why = "Notes/Remarks is filled"
             else:
                 met = dl.parse_date(gtm_sheet.clean_cell(row.get("meeting_date")))
                 was = dl.parse_date(entry.get("meeting") or "")
@@ -9298,7 +10365,11 @@ class SalesBot(discord.Client):
         read here: the exact-minute loop is their only sender.)
 
         ITS TWO WRITES ARE BOTH IDEMPOTENT: R11's pipeline snapshot, and
-        clearing R9's ladder for a row whose Next Steps has been filled.
+        clearing R9's ladder for a row whose Notes/Remarks has been filled.
+
+        R13's ROTATION STATE IS ONLY READ. A step that changed is handled by
+        the evaluator ignoring the stale entry, so there is nothing to clear
+        here and a preview leaves both of R13's tables exactly as they were.
         """
         if not config.NEXT_ACTION_ENABLED:
             log.info(
@@ -9318,11 +10389,11 @@ class SalesBot(discord.Client):
             return None
 
         active, inactive = await asyncio.to_thread(
-            self._split_active, tab.rows, "the twelve rules"
+            self._split_active, tab.rows, "the thirteen rules"
         )
         snoozes = await asyncio.to_thread(self.db.snoozes)
 
-        # THE OTHER FOUR TABS. Seven of the twelve rules are not about an
+        # THE OTHER FOUR TABS. Seven of the thirteen rules are not about an
         # Outreach PoCs row at all — R4 reads the checklist, R12 the packages,
         # R3 the events tab, R2 and R11 the Master Pipeline. All four are
         # read-only and all four are read here rather than inside the engine,
@@ -9373,6 +10444,14 @@ class SalesBot(discord.Client):
                 active, meeting_followups)
         except Exception:
             log.exception("[rules] R9's ladder could not be reset")
+        # R13's ROTATION. None when it cannot be read, and the evaluator then
+        # names nobody: an empty dict would restart the rotation from the top
+        # and chase people it has already closed.
+        try:
+            next_step_state = await asyncio.to_thread(self.db.next_step_state)
+        except Exception:
+            log.exception("[rules] R13's rotation state could not be read")
+            next_step_state = None
 
         result = await asyncio.to_thread(
             lambda: nextaction.run(
@@ -9386,6 +10465,7 @@ class SalesBot(discord.Client):
                 # gate has not let through yet.
                 prospect_rows=list(tab.rows),
                 events_unclear_seen=unclear_seen,
+                next_step_state=next_step_state,
             )
         )
         result["tab"] = tab
@@ -10933,6 +12013,10 @@ class SalesBot(discord.Client):
                     p["proposal_key"], on_date=marker
                 )
             )
+        # WHAT THIS POST LISTED, so a yes replied to it reaches these and no
+        # others (`_reply_context`).
+        self._remember_said(sent, kind="pending",
+                            which=[p["proposal_key"] for p in pending])
         state.audit(
             "proposals_nudged",
             reason="one combined nudge for everything awaiting approval",

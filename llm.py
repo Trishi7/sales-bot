@@ -247,7 +247,7 @@ use these names exactly, and never invent one:
   li_dm_date          the date that DM went out
   meeting_date        the date of the meeting
   meeting_status      Booked / Completed / No-show / Rescheduled / Cancelled
-  next_steps          the next action, in their words, short
+  next_steps          a note or remark for the row, in their words, short
   package             which package went to them
   prospect_status     Lead / Demo / Quote / Dead / Unresponsive
   closure_prob        a closure probability, as a percentage
