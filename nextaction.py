@@ -1834,10 +1834,10 @@ def _r_next_step_followups(rule, ctx) -> list:
                 "step": found["code"], "step_label": label, "ask": found["ask"],
                 "signature": found["signature"], "missing": list(found["missing"]),
                 "pick_order": position,
-                # THE OPENER IS A FUNCTION OF THE DAY, never random: the same
-                # queue has to give the same post live, in test mode and in a
-                # simulation.
-                "opener_index": today.toordinal() % len(wording.NEXT_STEP_OPENERS),
+                # WHAT THE GROUPED POST NEEDS: who they are, and what is
+                # personal to them (`wording.next_step_post`).
+                "who": who, "when": found["when"],
+                "set_call": bool(found["set_call"]),
                 "poc_priority": _text(row, "poc_priority"),
                 "email_n": n,
             },

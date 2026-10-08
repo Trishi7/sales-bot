@@ -137,9 +137,11 @@ async def c2_confirmations_name_what_they_did(check, test_mode):
 
 @case
 async def e3b_an_already_sent_post_comes_back_from_the_stored_body(check, test_mode):
-    """'If the 2pm post already went out, return what was posted.' Proved by changing the sheet AFTER the send: the
-    plan would now say something else, but the answer still shows the post that actually went out."""
+    """'If the 2pm post already went out, return what was posted.' SINCE 8 OCT the answer no longer pastes a post; it
+    says in one line what the day's posts cover. A post that has ALREADY GONE OUT is still one of today's, read from
+    the record of what was sent: proved by emptying the sheet after the send, when the plan would have nothing."""
     import deadlines as dl
+    import wording
     w, fx = _objectives_world(test_mode, hh=14, mm=5, rules=("R3",))
     with w:
         await _stock_sheet(w, fx)
@@ -154,8 +156,12 @@ async def e3b_an_already_sent_post_comes_back_from_the_stored_body(check, test_m
               (bool(stored), "[TEST" in stored), (True, False))
         w.sheet.set(events=[])                              # the plan would now have nothing for R3
         after = await w.bot._todays_objectives()
-        check("E3b: the answer still shows the post that went out, from the stored body (the variant it drew)",
-              (rc.norm_openers(after), rc._without_offer_line(stored.strip()) in after),
-              (rc.norm_openers(before), True))
-        check("E3b: and still has no closing offer line", "Want me to remind you" in after, False)
+        line = ["- My posts today cover AI events and summits."]
+        check("E3b: before the send the summary names the events post (from the plan)",
+              rc.today_group(before, wording.TODAY_ALSO), line)
+        check("E3b: after the send, with the sheet emptied, it still does (from what was sent)",
+              rc.today_group(after, wording.TODAY_ALSO), line)
+        check("E3b: the post's own text is not pasted, and there is no closing offer line",
+              ([l for l in stored.splitlines()[1:] if l.strip() and l in after],
+               "Want me to remind you" in after), ([], False))
         return {"text": after}

@@ -146,6 +146,15 @@ class Chan:
     def typing(self):
         return Typing()
 
+    def history(self, **_kw):
+        """An EMPTY history. The world's messages reach the bot through `on_message`; nothing here stands in for
+        scrolling back through the channel, so a history read finds nothing rather than failing. A scenario that
+        needs channel history puts its own stand-in on `query.channel_recent_activity`."""
+        async def nothing():
+            return
+            yield
+        return nothing()
+
     async def send(self, text, **_kw):
         return BotMsg(self.world, self, text)
 

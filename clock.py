@@ -23,6 +23,15 @@ pretend start + elapsed, which left the clock standing at a test day's 14:00
 stop for the rest of the afternoon — a tester at 13:17 was told 1:17 PM "has
 already passed".)
 
+A PRETEND DAY ENDS WHEN THE REAL DAY CHANGES (8 Oct 2026). On 8 Oct the bot
+still thought it was Wed 7 Oct: somebody had said "make it Wednesday" the day
+before and nobody said "back to today", and because the clock is stored it
+survived the night and the restart. Every answer that morning was a day out.
+So the stored clock remembers the real date it was set on (`real_start`), and
+the first read on a later real date clears it, logs that once, and carries on
+with the real date. Within one real day nothing changes: "make it …", "next
+day" and a test day all work as before, and a restart still keeps the day.
+
 THE ONE EXCEPTION IS TEMPORARY. A test day has to live through its 10:00 and
 14:00 stops, so `set_time_of_day` sets an IN-MEMORY override (moving with real
 time from the stop) that `_run_test_day` clears in a `finally`. It is never
@@ -130,7 +139,7 @@ def _load() -> dict:
     global _loaded
     with _lock:
         if _loaded:
-            return dict(_state)
+            return {} if _expired() else dict(_state)
         _loaded = True
         try:
             with _connect() as c:
@@ -152,12 +161,40 @@ def _load() -> dict:
             "pretend_start": pretend, "real_start": real,
             "set_by": str(row["set_by"] or ""),
         })
+        if _expired():
+            return {}
         log.warning(
             "[clock] A PRETEND CLOCK IS SET: the bot thinks it is %s. Set by %s. "
             "Say 'back to today' in the test channel to clear it.",
             describe(), _state["set_by"] or "somebody",
         )
         return dict(_state)
+
+
+def _expired() -> bool:
+    """Was the pretend day set on an EARLIER real date? If so it is over: clear
+    it (memory and storage), say so once, and answer True.
+
+    Called with `_lock` held, on every read, so a bot left running overnight
+    drops yesterday's pretend day at the first thing it does after midnight,
+    and a bot restarted the next morning drops it as it loads.
+    """
+    if not _state:
+        return False
+    set_on = _state["real_start"].astimezone(IST).date()
+    today = real_today_ist()
+    if set_on >= today:
+        return False
+    was = _state["pretend_start"].date()
+    by = _state.get("set_by") or "somebody"
+    _override.clear()
+    _clear()
+    log.warning(
+        "[clock] the pretend day (%s, set on %s by %s) has ended because the real "
+        "day changed; the clock is the real one again: %s.",
+        was.isoformat(), set_on.isoformat(), by, today.isoformat(),
+    )
+    return True
 
 
 def _save(pretend_start: datetime, *, by: str) -> None:
@@ -449,6 +486,34 @@ def _self_test() -> int:
         check("no longer pretending", pretending(), False)
         check("saying it twice is harmless", back_to_today()[0], True)
         check("the real clock says (IST)", describe().endswith("(IST)"), True)
+
+        print("\na pretend day ends when the real day changes")
+        set_day(date(2026, 9, 28), by="tester")
+        check("set today: it stays", (pretending(), today_ist()), (True, date(2026, 9, 28)))
+        forget()
+        check("...across a restart on the same real day",
+              (pretending(), today_ist()), (True, date(2026, 9, 28)))
+        yesterday = (real_now_ist() - timedelta(days=1)).isoformat()
+        with _connect() as c:
+            c.execute("UPDATE test_clock SET real_start = ? WHERE id = 1", (yesterday,))
+            c.commit()
+        forget()
+        check("set yesterday: gone on today's first read",
+              (pretending(), today_ist()), (False, real_today_ist()))
+        with _connect() as c:
+            left = c.execute("SELECT COUNT(*) FROM test_clock").fetchone()[0]
+        check("...and cleared from storage, so it does not come back", left, 0)
+        set_day(date(2026, 9, 28), by="tester")
+        with _lock:
+            _state["real_start"] = real_now_ist() - timedelta(days=1)
+        check("a bot left running overnight drops it too, without a restart",
+              (today_ist(), pretending()), (real_today_ist(), False))
+        ok, _line = set_day(date(2026, 9, 28), by="tester")
+        check("a new pretend day can be set straight away", (ok, today_ist()),
+              (True, date(2026, 9, 28)))
+        next_day(by="tester")
+        check("...and 'next day' still moves it", today_ist(), date(2026, 9, 29))
+        back_to_today()
 
         print("\na stop never rolls into the next day")
         set_day(date(2026, 9, 28), by="tester")

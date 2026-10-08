@@ -97,7 +97,8 @@ async def o6_a_dm_bound_post_is_not_in_the_answer(check, test_mode):
         w.bot._plan_drip = dm_plan
         import wording
         text = await w.bot._todays_objectives()
-        check("O6: a DM-bound post is left out: the one-line nothing-today", text, wording.NOTHING_TODAY)
+        check("O6: a DM-bound post is left out of the summary: there is no posts line",
+              (rc.today_group(text, wording.TODAY_ALSO), "AI events" in text), ([], False))
         return {"text": text}
 
 

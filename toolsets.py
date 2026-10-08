@@ -206,11 +206,15 @@ GROUPS = {
     # them here, the words "to do" in "what do we need to do today?" handed a
     # question about the day's work the notes tools and nothing else.
     "notes": ("list_meeting_notes", "read_meeting_note", "meeting_facts"),
-    # "WHAT DO WE NEED TO DO TODAY?" / "TODAY'S OBJECTIVES" — the day's posts
-    # as they are written (todays_objectives) and the to-do sheet, and only
-    # those two. Deliberately no notes tool and no cadence_preview: on 6 Oct
-    # the question had no route, the model picked cadence_preview, and the
-    # asker was told about the rules and when they run instead of what to do.
+    # "WHAT DO WE NEED TO DO TODAY?" / "TODAY'S OBJECTIVES". A question whose
+    # own words ask this is answered BY CODE before any tool is chosen
+    # (`bot._answer_today`, since 8 Oct): today's meeting notes, what is due
+    # soon, what the channel said, a line on the day's posts. These two tools
+    # are what a model gets if it reaches the subject another way;
+    # todays_objectives puts that same code-built answer in the reply.
+    # Deliberately no cadence_preview: on 6 Oct the question had no route, the
+    # model picked cadence_preview, and the asker was told about the rules and
+    # when they run instead of what to do.
     "today": ("show_todos", "todays_objectives"),
     "todos": ("show_todos", "todo_candidates"),
     "reminders": ("schedule_reminder", "list_reminders", "cancel_reminder",
@@ -262,9 +266,22 @@ _ROUTES = (
     # focus", "the plan for today", a bare "objectives". It must not match a
     # news question that merely ends in "today", "our Q4 objectives" (no
     # "today"), or "the plan for Acme" (the strategy doc's question).
+    # SINCE 8 OCT ALSO the ways people actually asked it: "what are we supposed
+    # to do today", "what is the team working on today", "what are we doing
+    # today", "what do we have today". Still never a question that only ends
+    # in "today" ("any AI news today?", "who replied today?").
     ("today", re.compile(
         r"\bwhat\s+(do|should|must)\s+(we|i)\s+(need\s+to\s+|have\s+to\s+)?do\b"
         r"[^?.!\n]{0,30}\btoday\b|"
+        r"\bwhat\s+(?:are|is|am)\s+(?:we|i|the\s+team|everyone|everybody)\s+"
+        r"(?:supposed\s+to\s+|meant\s+to\s+|going\s+to\s+|expected\s+to\s+)?"
+        r"(?:do|doing|be\s+doing|working\s+on|work\s+on|up\s+to)\b"
+        r"[^?.!\n]{0,30}\btoday\b|"
+        r"\bwhat(?:\s+is|'?s)\s+(?:the\s+team|everyone|everybody)\s+"
+        r"(?:working\s+on|doing|up\s+to)\b[^?.!\n]{0,30}\btoday\b|"
+        r"\bwhat\s+(?:do|does)\s+(?:we|i|the\s+team)\s+have\s+(?:on\s+|planned\s+)?"
+        r"(?:for\s+)?today\b|"
+        r"\bwhat(?:\s+is|'?s)\s+(?:there\s+)?(?:to\s+do|to\s+be\s+done)\s+today\b|"
         r"\bwhat(\s+is|'?s)\s+on\s+(for\s+)?today\b|"
         r"\bobjectives?\b[^?.!\n]{0,40}\b(today|for\s+the\s+day)\b|"
         r"\btoday'?s\s+(?:sales\s+)?(?:objectives?|plan|priorit\w+|agenda|focus)\b|"

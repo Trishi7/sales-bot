@@ -35,9 +35,21 @@ The other cells on the rule 13 row:
 
 What a post looks like:
 
+(Changed on 8 Oct: the post is grouped. Each ask is written once and the people it
+applies to are listed under it; a date that belongs to one person goes on that
+person's line after a colon. The opener line is gone.)
+
 > **Next steps**
-> A few next steps on people we're connected with:
-> • Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+> @Vaishnavi
+> Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+> - Arjun Aryaa (Gnani.ai)
+> - Oliver Shoulson (PolyAI)
+>
+> Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date.
+> - Ariya Rastrow (Wisprflow.ai)
+>
+> Email 1 has gone out. Time to set Next Steps to Send email 2.
+> - Priya Rao (Acme Labs): sent 5 Oct
 
 ## 2. Bot Rules tab, rule 7, "What the Bot Shares / Checks"
 

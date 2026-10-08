@@ -575,13 +575,22 @@ async def the_post_four_ways() -> dict:
     live = runs["live"]
     check("live: exactly one Rule 13 post", len(live["posts"].get("R13") or []), 1)
     body = (live["posts"].get("R13") or [""])[0]
-    bullets = [ln for ln in body.splitlines() if ln.startswith("• ")]
-    check("live: five bullets, the first five dated people in sheet order",
-          [b.split(" (")[0].replace("• ", "") for b in bullets], want)
-    check("live: each bullet names the person's company",
-          all(f"Acme Labs {n.split()[-1]}" in b for n, b in zip(want, bullets)), True)
-    check("live: the opener is the day's (a function of the date, never random)",
-          any(o in body for o in __import__("wording").NEXT_STEP_OPENERS), True)
+    bullets = [ln for ln in body.splitlines() if ln.startswith("- ")]
+    # GROUPED BY ASK since 8 Oct (REPLIES-OCT8): the same five people, each once, under the ask they share. Inside a
+    # group they keep sheet order; the groups open where their first person stands.
+    named = [b[2:].split(" (")[0] for b in bullets]
+    check("live: five names, the first five dated people on the sheet, each once",
+          (sorted(named), len(named)), (sorted(want), 5))
+    check("live: each name carries the person's company",
+          all(f"({n.replace('Person', 'Acme Labs')})" in b for n, b in zip(named, bullets)), True)
+    asks = [ln for ln in body.splitlines()[2:] if ln and not ln.startswith("- ")]
+    check("live: every ask is written once, and each is one of wording's group asks",
+          (len(asks) == len(set(asks)),
+           all(any(a == __import__("wording").next_step_group(k, n=n, set_call=c)
+                   for k in __import__("wording").NEXT_STEP_ASKS for n in (0, 1, 2, 3)
+                   for c in (False, True)) for a in asks)), (True, True))
+    check("live: the first group holds the first person the rule picked, and no opener line stands above it",
+          (named[0], body.splitlines()[2] in asks), (want[0], True))
     check("live: a 'Next steps' heading and the tags line (Vaishnavi) and no other mention",
           ("Next steps" in body, body.count("@Vaishnavi")), (True, 1))
     check("live: no rule number, no schedule talk, no URL, no setting name",

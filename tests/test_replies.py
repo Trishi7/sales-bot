@@ -44,7 +44,7 @@ ACKS = ["sure", "Sure.", "ok", "OK", "okay", "k", "kk", "thanks", "Thanks!", "th
         "sounds good", "will do", "np", "👍", "👍🏽", "🙏", "👌", "✅", "🙌", "ok thanks", "sure, thanks saley",
         "thanks Saley!", "ok 👍", "got it, thanks", "<@999> thanks", "<@!999> sure", "sure sure", "great, thanks!"]
 NOT_ACKS = ["", "   ", "sure?", "ok?", "what's the right contact?", "ok, and what about Globex?",
-            "thanks for the list of PoCs at Acme AI", "sure sure sure sure sure sure", "no", "nope",
+            "thanks for the list of PoCs at Acme AI", "sure sure sure sure sure sure sure sure sure", "no", "nope",
             "ok but can you check Globex", "yes and add the rest", "thanks, can you also check the sheet",
             "who are the PoCs at Acme AI?", "👍 what about Globex?", "sure thing, send me the full list please"]
 
@@ -309,7 +309,11 @@ def test_new_lines_are_registered_and_pass_the_register_check():
 def test_exact_texts():
     """Section 10, word for word. (The wording is Q8: held as written until the human says otherwise.)"""
     import wording
-    assert wording.NOTHING_TODAY == "Nothing's due today."
+    # Changed on 8 Oct (REPLIES-OCT8): the answer reads more than the day's posts now, and says so.
+    assert wording.NOTHING_TODAY == ("Nothing on for today that I can see: no meeting notes, nothing due in the "
+                                     "next couple of days and nothing to pick up from the channel.")
+    assert wording.today_unread(["my own posts for today"]) == (
+        "I couldn't read my own posts for today just now, so that part is missing.")
     assert wording.OBJECTIVES_UNREADABLE == "I couldn't read what's gone out today, so I can't list it. Try me again in a minute."
     assert wording.which_proposal(["A", "B"]) == ("Which one do you mean?\n1. A\n2. B\n"
                                                   "Reply to that message with yes, or give me the number.")

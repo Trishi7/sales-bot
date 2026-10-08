@@ -651,6 +651,18 @@ failure is logged and audited (`reaction_failed`). `guardrails.react` is the
 only way a reaction is added, and it refuses any channel outside
 `SALES_CHANNEL_IDS`.
 
+**A reply to "give me a moment" never starts a new answer (8 Oct,
+REPLIES-OCT8).** "take ur time" replied to an interim line was read as a new
+question and got a second answer. Now: the acknowledgement list
+(`replies.ACK_PHRASES`) has what people say while they wait ("take your time",
+"no rush", "no worries", "no problem", "all good", "sure thing", "okie",
+"thank u", "tysm" ...), up to eight words of them; and a reply to one of the
+bot's interim lines gets **one reaction** unless it carries a real question
+(`replies.after_ack` takes the politeness off the front; "take ur time, also
+any news on ElevenLabs?" is answered as "any news on ElevenLabs?", as its own
+question). "no rush" and "no worries" contain "no" and are **not** a no: under
+an open offer they leave it open (`replies.ack_is_vote`).
+
 **Rule 13's replies.** `bot._maybe_next_step_reply` is the hook for a reply to
 the next-steps post ("done"); it is a stub that changes nothing until
 RULE13.md section 14 is built.
@@ -658,44 +670,49 @@ RULE13.md section 14 is built.
 `python verify_replies.py` runs the decision table through the real
 `on_message`, in live and test mode.
 
-### Today's objectives, on demand (NFT2-1063)
+### "What are we doing today?" (NFT2-1063, rebuilt 8 Oct: REPLIES-OCT8)
 
 "What are the sales objectives for today?", "today's plan", "what's on today",
-"what do we need to do today?", "today's priorities" route to the `today` group:
-`todays_objectives` and `show_todos`, and nothing else. The reply is the
-objectives, a blank line, then the to-do sheet.
+"what do we need to do today?", "what are we supposed to do today?", "what is
+the team working on today?" are all the same question (`toolsets.route` gives
+exactly `today`), and it is **answered by code, with no model call**
+(`bot._answer_today`): no router, no extractor, no engine.
 
-**The objectives are what today's posts contain** (`bot._todays_objectives`),
-at any time of day:
+**It is about the team's day, not the bot's posts.** Until 8 Oct the answer was
+the day's posts pasted word for word. The human: *"it shouldnt just answer from
+the scheduled messages for that day: it can go through any meeting notes for
+that day, discord chats, any important things which have to be done that day
+... and may be a very short summary of that days schedules messages (except
+the AI news and news related to the Pocs)"*. So `bot._today_brief` reads:
 
-| Post | What the answer shows |
-|---|---|
-| already gone out today | the text that was posted, word for word, from `drip_sends.body` |
-| still to come | the same plan the sender uses (`_plan_drip`), each post rendered by the composer's own template with its heading and source links |
-| the AI news | left out (`bot.OBJECTIVES_EXCLUDED_TYPES`); "any AI news?" is its own answer |
+| Group in the answer | Read from | What is shown |
+|---|---|---|
+| **From today's meetings** | sales meeting notes dated today (`notes.list_notes` / `read_note`) | each note's action items: first name, the task, the meeting in brackets |
+| **Due soon** | P1 items on the Deliverables Checklist, AI events and the day their registration closes, reminders somebody set, to-do sheet items with a due date, meetings on Outreach PoCs | everything dated from today through `TODAY_LOOKAHEAD_WORKING_DAYS` (2) working days, soonest first |
+| **In the channel today** | today's messages in the sales channels (`query.channel_recent_activity`) | the ones that carry something to do, in the person's own words, at most 5 |
+| **Also today** | what has been sent today and what the plan still holds | ONE OR TWO LINES naming what the day's posts cover, then a line for the open to-dos |
 
-It makes **no model call**, so two people asking in the same minute read the
-same words. It leaves out the tags line and every ping, a closing offer
-(`bot.OBJECTIVES_SHOW_OFFERS`: no proposal stands behind a repeated one),
-anything only a search at send time would add, a post meant for a DM, and
-groups the plan holds back or rolls to another day.
+An empty group is skipped. Nothing in any source is one line
+(`wording.NOTHING_TODAY`). The rendering is `today.py`, which is pure.
+
+**What it never says:** a time of day (clock times are taken out of quoted
+text), "scheduled", "already posted", what weekday it is, a rule's number, and
+the AI news: the news post, the news screen and any channel message about the
+news are left out. No ping and no link. A model cannot open it with "Today's a
+Wednesday, so here's what's on the schedule", because no model writes it.
 
 **It claims nothing.** No slot, no send record, nothing toward the cap, no
-proposal, no research: the scheduled post still goes once, at its own time.
-And it says nothing about when: no times, no rules, no schedule. A day with
-nothing is "Nothing's due today."
+proposal, no research: every post still goes once, at its own time. It comes
+through at any time of day and when the model is down. A source that cannot be
+read is left out and the last line says so (`wording.today_unread`), so the
+answer never looks complete when it is not.
 
-The text is put into the reply by code. The model is told only that it has
-been added and writes the to-do part; on a question that routes to `today`
-the objectives are added whether or not the model called the tool, and they
-still go out if the model call failed.
-
-**So the two match, a post's opener and close are picked from the day and the
-slot** (`drip._voice`, `_voice_seed`), by the sender and by the on-demand
-answer alike, instead of at random.
+The `todays_objectives` tool is still offered beside `show_todos` if a model
+reaches the subject another way; it puts this same code-built answer in the
+reply and hands the model only a pointer.
 
 `cadence_preview` stays for "cadence preview", "what's the queue" and "why
-isn't X due"; it is no longer offered for "what do we need to do today".
+isn't X due"; it is not offered for "what do we need to do today".
 
 ---
 
@@ -2270,8 +2287,13 @@ database must not move who the next real post names.
 
 **The post.** One message for the whole rule, headed "Next steps", addressed by
 the tags line like the other Outreach PoCs rules (no owner, no hard-coded id).
-It is fixed text from `wording.py` — an opener chosen by the day and one line a
-person: name, company, the one thing to do — and is **never composed by the
+It is fixed text from `wording.py`, **grouped by ask** since 8 Oct
+(`wording.next_step_post`): each ask is written once and the people it applies
+to are listed under it, "- Name (Company)", with anything personal (the date an
+email or DM went out, cells the row lacks) after a colon. One group per ask and
+email number; groups keep the order the rule picked people in, so call
+reminders come first; a blank line between groups. There is no opener line any
+more. It is **never composed by the
 model**, so it costs no model call and no search, and is word for word the same
 live, in test mode, on a test day and in a simulation. No rule number, no
 schedule talk.
@@ -2279,8 +2301,12 @@ schedule talk.
 ```
 **Next steps**
 @Vaishnavi
-A few next steps on people we're connected with:
-• Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+- Arjun Aryaa (Gnani.ai)
+- Oliver Shoulson (PolyAI)
+
+Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date.
+- Ariya Rastrow (Wisprflow.ai)
 ```
 
 **Timing.** Weekdays at `NEXT_STEP_TIME` (15:00 IST), a fixed-time post like
@@ -2520,8 +2546,8 @@ you: @bot cadence preview
 
 It is for the rule-by-rule queue: "cadence preview", "what's the queue", "why
 isn't X due". It is NOT the answer to "what do we need to do today?" or
-"today's objectives" any more; those get the day's posts themselves
-(`todays_objectives`, NFT2-1063), with no rules and no schedule in them.
+"today's objectives" any more; those get the day's brief, built by code
+(`bot._answer_today`), with no rules and no schedule in it.
 
 **Grouped by rule**, which is the change that matters. Each section names the
 rule and prints the reason line its evaluator wrote, so the output can be
@@ -5186,7 +5212,7 @@ clock that **stays where they put it** against the **real** database and the
 | Typed | What happens |
 |---|---|
 | `test help` | every command below, in friendly words. **Matched as plain text before any model call**, so it still answers when the API key is wrong |
-| `make it Monday` | it *is* Monday from now on, and the bot posts that day. Any day works: a weekday name, `tomorrow`, `28 Sep`, `2026-09-28` |
+| `make it Monday` | it *is* Monday **until the real day changes** (since 8 Oct a pretend day set yesterday is cleared on today's first read, and logged once: a leftover one had the bot a day behind all morning), and the bot posts that day. Any day works: a weekday name, `tomorrow`, `28 Sep`, `2026-09-28` |
 | `next day` | move on to the following day and post that |
 | `back to today` | stop pretending; the real date comes back |
 | `start over` | wipe everything recorded while testing. **Asks you to confirm first** |
@@ -5331,6 +5357,7 @@ python -m replies                         # the pure judgements: is it an ack, a
 python verify_reminders.py                # one-off reminders at an exact minute (real 60 s loop)
 python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
 python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
+python verify_replies_oct8.py             # REPLIES-OCT8: "take ur time" under an interim line (one reaction, no second answer), the 8 Oct 11:21 exchange, the "today" answer, the grouped Next steps post, the test clock; --show prints the three
 python verify_day_order.py                # NFT2-1069: every weekday's order and exact times, the 120-minute gap that never shrinks, nothing after 20:00, R7 minus rule 13's people, R11 on Wednesdays, R1's news window, the startup check; prints one planned day per weekday
 python verify_s1.py                       # cap 5 + R8/R9, the order of the day THREE WAYS (live sweep ticked every 15 min, test day, simulation), R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window

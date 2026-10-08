@@ -270,10 +270,10 @@ themselves are added in code and posted exactly as rendered)
 
 **R13 — Next steps for connected contacts**
 
-> A few next steps on people we're connected with:
-> • Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+> Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+> - Priya Rao (Acme Labs)
 >
-> (Posted as written, one line a person. You remind; you never fill those cells.)
+> (Posted as written: each ask once, names under it. You never fill those cells.)
 
 **And one that is not a nudge at all** — good news gets acknowledged and then
 left alone. This is the only exemplar carrying an emoji, and it is carrying it

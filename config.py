@@ -694,6 +694,13 @@ TODO_NOTES_DAYS = _int("TODO_NOTES_DAYS", 7)
 TODO_MAX_NEW_PER_REFRESH = _int("TODO_MAX_NEW_PER_REFRESH", 25)
 TODO_SHOW_MAX = _int("TODO_SHOW_MAX", 20)
 
+# "WHAT ARE WE DOING TODAY?" — HOW FAR AHEAD "DUE SOON" LOOKS, in WORKING days
+# after today (REPLIES-OCT8). 2 on a Thursday means today, Friday and Monday:
+# a deliverable, an event or its registration deadline, a reminder, a to-do or
+# a meeting dated inside that stretch is listed. 0 is today only. Working
+# days, so a Friday answer still sees Monday and Tuesday.
+TODAY_LOOKAHEAD_WORKING_DAYS = _int("TODAY_LOOKAHEAD_WORKING_DAYS", 2)
+
 
 def todo_refresh_weekday() -> int:
     """TODO_REFRESH_DAY as Python's weekday index (0=Monday)."""

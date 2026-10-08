@@ -1038,3 +1038,34 @@ the schedule offline; `python verify_day_order.py --days` prints one planned day
 
 **The first Monday and the first Wednesday in the live channel** are a checklist in
 `docs/test-reports/NFT2-1069.md` (what to expect at 10:00, 14:00, 15:00, 16:00, 18:00 and 20:00).
+
+## Upgrading to REPLIES-OCT8 (replies to "give me a moment", the "today" answer, grouped Next steps, the test clock)
+
+What changes for the team:
+
+- "take ur time", "no rush", "ok thanks" and the like, replied to "Give me a moment…", get a thumbs-up and nothing
+  else. A reply to that line is answered only when it carries a real question.
+- "What are we doing today?" (and "today's objectives", "what is the team working on today") now answers from
+  today's meeting notes, what is due in the next 2 working days, today's channel messages and one line on the
+  day's posts. No AI news in it, no times, no schedule talk. No model call.
+- The Next steps post writes each ask once and lists the people under it. The opener line is gone.
+- A pretend day ("make it Monday") ends when the real day changes.
+
+Plan: `docs/plans/REPLIES-OCT8.md`. Report: `docs/test-reports/REPLIES-OCT8.md`.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** One new variable; its default is what the team
+asked for, so the line is optional:
+
+```
+TODAY_LOOKAHEAD_WORKING_DAYS=2
+```
+
+Then, on the laptop, `python tools/redact_env.py`. No database migration. Nothing to clear by hand: a pretend day
+left over from an earlier day clears itself on the first read after the restart, and the log says so once
+(`[clock] the pretend day (...) has ended because the real day changed`).
+
+**The bot's role still needs Add Reactions** in the sales channels: the thumbs-up is the whole answer to "take ur
+time".
+
+`python verify_replies_oct8.py --show` checks all of it offline and prints the 11:21 exchange, a "today" answer
+and a Next steps post.

@@ -101,6 +101,7 @@ import voice
 import wording
 import toolsets
 import strategy
+import today as today_mod
 import todos
 import tracker
 from db import DB
@@ -208,13 +209,12 @@ REPLY_WALK_MAX_HOPS = 3
 # "@Saley thanks" that is NOT a reply: a reaction and no text (True), or the
 # model-written social line it used to get (False).
 ACK_NON_REPLY_GETS_REACTION = True
-# What "today's objectives" leaves out: the AI news, which has its own
-# on-demand answer ("any AI news?"). An empty set puts the news post back in.
+# What the "today" answer's one-line summary of the day's posts leaves out: the
+# AI news, which has its own on-demand answer ("any AI news?"). The news-company
+# screen is left out with it (`today.NEWS_TYPES`), since 8 Oct.
+# (OBJECTIVES_SHOW_OFFERS went on 8 Oct: the answer no longer pastes a post, so
+# there is no closing offer line to repeat or leave out.)
 OBJECTIVES_EXCLUDED_TYPES = frozenset({nextaction.R_AI_NEWS})
-# Whether the on-demand objectives repeat a post's closing offer ("Want me to
-# remind you again on Monday?"). No proposal stands behind the repeated line,
-# so a "yes" under it would be a yes to nothing: off.
-OBJECTIVES_SHOW_OFFERS = False
 
 # Every url in a piece of text — the question, an earlier answer — for the
 # "only links a tool returned" check on a profile turn (`_only_found_links`).
@@ -1398,11 +1398,27 @@ class SalesBot(discord.Client):
         Everything else returns False and is handled as before.
         """
         names = self._bot_names()
+        # A REPLY TO "GIVE ME A MOMENT" NEVER STARTS A NEW ANSWER (8 Oct). The
+        # question it belongs to is already being answered. Whatever the reply
+        # says that is not itself a question — "take ur time", "ok no rush",
+        # "yes", a remark — gets one reaction. A reply that DOES carry a
+        # question was turned into that question by `_handle_query` before it
+        # got here, and no longer counts as a reply to the interim line.
+        if self._replies_to_interim(ctx):
+            log.info("[ack] msg=%s %r — a reply to an interim line with no question "
+                     "in it: one reaction, no text, no second answer", message.id,
+                     (text or "")[:40])
+            self._mark_route(message, "ack")
+            await self._react(message, reason="acknowledged: a reply to an interim line")
+            return True
         ack = replies.is_ack(text, names)
         vote = replies.is_bare_vote(text, names)
         if not ack and not vote:
             return False
-        said_no_vote = ack and not approvals.read_vote(text)   # "thanks", "noted"
+        # "thanks", "noted", "no rush": an acknowledgement with no yes or no in
+        # it. Asked of the PHRASES (`replies.ack_is_vote`), because the vote
+        # reader finds "no" inside "no rush" and "no worries".
+        said_no_vote = ack and not replies.ack_is_vote(text, names)
         why = ""
         if not ctx["is_reply"]:
             if not ACK_NON_REPLY_GETS_REACTION:
@@ -1447,6 +1463,27 @@ class SalesBot(discord.Client):
         self._mark_route(message, "ack")
         await self._react(message, reason=f"acknowledged: {why}")
         return True
+
+    @staticmethod
+    def _replies_to_interim(ctx: dict) -> bool:
+        """Is this a direct reply to one of the bot's own "give me a moment"
+        lines? By what the bot remembers saying, and by the line's text, so it
+        still holds after a restart has emptied that memory."""
+        if not ctx.get("is_reply") or not ctx.get("direct_is_bot"):
+            return False
+        if (ctx.get("said") or {}).get("kind") == "interim":
+            return True
+        return replies.is_interim(ctx.get("parent_text") or "",
+                                  wording.INTERIM_WEB + wording.INTERIM_ENGINE)
+
+    @staticmethod
+    def _as_its_own_question(ctx: dict) -> None:
+        """Turn a reply's context into "not a reply": the message is answered
+        as a question of its own, with nothing quoted above it and no vote,
+        offer or proposal read off the line it happened to be typed under."""
+        ctx.update(is_reply=False, direct_is_bot=False, parent_id="", root_id="",
+                   parent_text="", proposals=[], closed=[], listed=[], offer=None,
+                   drip=None, chain=[], said=None, why_missing="")
 
     def _is_self_mentioned_explicitly(self, message: discord.Message) -> bool:
         """True when the bot is EXPLICITLY @-mentioned.
@@ -1532,6 +1569,18 @@ class SalesBot(discord.Client):
             # "typing…" followed by nothing would be its own small lie.
             ctx = await self._reply_context(message)
             self._reply_ctx[message.id] = ctx
+            # A QUESTION TYPED UNDER "GIVE ME A MOMENT" IS ITS OWN QUESTION.
+            # "take ur time, also any news on ElevenLabs?" is answered for the
+            # part after the politeness, with the interim line dropped from
+            # its context. With no question in it, it stays a reply to the
+            # interim line and `_maybe_acknowledge` gives it one reaction.
+            if self._replies_to_interim(ctx):
+                rest = replies.after_ack(text, self._bot_names())
+                if rest and _looks_like_question(rest):
+                    log.info("[query] msg=%s a question replied to an interim line: "
+                             "answered as its own question (%r)", message.id, rest[:80])
+                    text = rest
+                    self._as_its_own_question(ctx)
             # A REPLY TO THE NEXT-STEPS POST IS READ FIRST. "Yes" and "done"
             # there answer the post's own question, so they must reach its
             # reader before the acknowledgement path and before the vote.
@@ -1631,6 +1680,15 @@ class SalesBot(discord.Client):
             await self._reply(message, wording.time_now(clock.describe()),
                               reason="said what time the bot thinks it is")
             return True
+
+        # "WHAT ARE WE DOING TODAY?" IS ANSWERED BY CODE (8 Oct), before the
+        # extractor and the router: the question's own words say what to read,
+        # so no model chooses, writes or introduces it (`_answer_today`).
+        if toolsets.route(text) == ["today"]:
+            log.info("[query] msg=%s → the day's brief (a 'today' question, answered "
+                     "without the model)", message.id)
+            self._mark_route(message, "today")
+            return await self._answer_today(message, text)
 
         # A PLAIN "ANY AI NEWS?" IS ANSWERED BY CODE, before the extractor and
         # the router: no company, person or subject is named, so there is
@@ -3729,17 +3787,19 @@ class SalesBot(discord.Client):
                 sink.append(await self._todays_objectives())
             return {
                 "added_to_reply": True,
-                "note": ("The day's objectives are added to your reply as they are. "
-                         "Do not repeat, summarise or introduce them. Add only what "
-                         "show_todos returned."),
+                "note": ("What the team is doing today is added to your reply as it "
+                         "is. Do not repeat, summarise or introduce it, and add "
+                         "nothing about when anything is posted."),
             }
 
         return [{
             "schema": {
                 "name": "todays_objectives",
                 "description": (
-                    "WHAT THE TEAM NEEDS TO DO TODAY: the day's posts, already "
-                    "written out. Use this for 'objectives', 'today's objectives', "
+                    "WHAT THE TEAM NEEDS TO DO TODAY: today's meeting action "
+                    "items, what is due soon, what the channel said and a line on "
+                    "the day's posts, already written out. Use this for "
+                    "'objectives', 'today's objectives', "
                     "'today's plan', 'what's on today', 'what do we need to do "
                     "today', 'today's priorities'. The text is ADDED TO YOUR REPLY "
                     "FOR YOU, word for word; you are not shown it and must not "
@@ -3764,94 +3824,226 @@ class SalesBot(discord.Client):
         return _MENTION_TOKEN_RE.sub(_name, str(text or ""))
 
     async def _todays_objectives(self) -> str:
-        """Today's objectives, on demand: what today's posts contain, at any
-        time of day. READ-ONLY.
+        """What the team is doing today, on demand, at any time of day: the
+        answer `today.render` builds from what `_today_brief` read. READ-ONLY.
 
         KUSHAL, 6 OCT: "I asked for the objectives for today. It needs to come
-        through. 2:00 would be whatever it needs to post, but when we ask for
-        it, it needs to just reply through." He had been told about the
-        posting rules instead.
+        through." THE HUMAN, 8 OCT: it should not just be the day's scheduled
+        messages; it can go through that day's meeting notes, the channel, and
+        what is due around that day, with a very short summary of the day's
+        posts, the AI news and PoC news left out. (It used to paste the day's
+        posts word for word.)
 
-        THE SAME PLANNER AND THE SAME RENDERER AS THE SENDER, read at two
-        points:
+        Kept under this name because the engine's `todays_objectives` tool and
+        its fallback call it; `_answer_today` is the way a "today" question
+        normally gets here.
+        """
+        return await self._today_brief()
 
-          a post that HAS gone out today  → the text that was posted, from
-            `drip_sends.body`, word for word (no tags line was ever stored);
-          a post still to come            → `_plan_drip` with the same two
-            inputs the sender gives it, each message rendered by the
-            composer's own template (`drip.compose_fallback`), with its source
-            links and its heading, as the sender builds it.
+    async def _answer_today(self, message, text: str) -> bool:
+        """"What are we doing today?" answered by code, with no model call.
 
-        WHAT IT LEAVES OUT, each a constant at the top of this file or a line
-        here: the AI news (OBJECTIVES_EXCLUDED_TYPES — "any AI news?" is its
-        own answer); a closing offer (OBJECTIVES_SHOW_OFFERS — no proposal
-        stands behind a repeated one); the tags line and every ping; anything
-        only a search at send time would add; a post meant for a DM; groups
-        the plan holds back or rolls to another day (they are not today's).
+        A QUESTION WHOSE OWN WORDS ASK FOR TODAY (`toolsets.route` gives
+        exactly ["today"]) NEEDS NO JUDGEMENT ABOUT WHAT TO LOOK AT: it is
+        always the same four things. So no router, no engine and no model:
+        the answer cannot open with "Today's a Wednesday, so here's what's on
+        the schedule", cannot name a rule or a time, and comes through when
+        the model is down. Returns True: the question is answered either way.
+        """
+        body = await self._today_brief()
+        sent = await self._reply(message, body, reason="what the team is doing today")
+        self._remember_said(sent, kind="objectives", question=text)
+        self.memory.record(message.channel.id, text, body)
+        return True
 
-        NO MODEL CALL. A post the model would write at send time is shown from
-        its template, so two people asking in the same minute read the same
-        words (`_voice_seed`) and asking costs nothing.
+    async def _today_brief(self) -> str:
+        """Read the day and render it (`today.render`). Never raises: a source
+        that cannot be read contributes nothing and is logged, and the rest of
+        the answer still comes through.
 
-        IT CLAIMS NOTHING. No slot is recorded, no send, nothing counts
-        toward the cap, no proposal is opened, no research runs and no leave
-        check: the scheduled post still goes once, at its own time, exactly as
-        it would have.
-
-        IT SAYS NOTHING ABOUT WHEN: no times, no "posted" or "coming up", no
-        rule, no schedule. Nothing today is one line (`wording.NOTHING_TODAY`).
-        If what has gone out cannot be read it says so rather than guess.
+        IT CLAIMS NOTHING AND WRITES NOTHING. No slot is recorded, nothing
+        counts toward the cap, no proposal is opened, no research runs: every
+        post still goes once, at its own time.
         """
         today = dl.today_ist()
-        marker = dl.iso(today)
-        try:
-            already = await asyncio.to_thread(self.db.drip_sent_today, marker)
-        except Exception:
-            log.exception("[objectives] could not read today's sent posts")
-            return wording.OBJECTIVES_UNREADABLE
+        ahead = max(0, int(config.TODAY_LOOKAHEAD_WORKING_DAYS))
+        end = dl.add_working_days(today, ahead) if ahead else today
 
-        blocks: list = []
-        for row in already or []:
-            if str(row.get("action_type") or "") in OBJECTIVES_EXCLUDED_TYPES:
-                continue
-            body = str(row.get("body") or "").strip()
-            if not body:
-                continue                # sent before the text was kept, or a DM
-            if not OBJECTIVES_SHOW_OFFERS:
-                body = drip.without_offer(body)
-            blocks.append(self._without_pings(body).strip())
+        missing: list = []
 
-        planned = None
-        if drip.is_sending_day(today):
+        async def safely(what: str, coro, empty):
             try:
-                planned = await self._plan_drip(today=today, already=already)
+                return await coro
             except Exception:
-                log.exception("[objectives] today's plan could not be built")
-                return wording.OBJECTIVES_UNREADABLE
-        for planned_message in (planned or {}).get("messages") or []:
-            if planned_message.get("type") in OBJECTIVES_EXCLUDED_TYPES:
-                continue
-            if str(planned_message.get("destination") or "") in ("dm", "escalation"):
-                continue
-            if drip.nothing_to_say(planned_message):
-                continue
-            # A COPY: the wording picked here must not leak onto the message
-            # the sender will compose later.
-            copy = dict(planned_message)
-            copy["_voice"] = {}
-            copy["_voice_seed"] = self._voice_seed(marker, planned_message)
-            body = drip.compose_fallback(copy, address="",
-                                         offers=OBJECTIVES_SHOW_OFFERS)
-            body = drip.with_sources(body, copy)
-            body = drip.with_heading(body, drip.heading_for(copy, day=today))
-            body = body.replace(f" [{rules.WEB_PENDING}]", "")
-            if body.strip():
-                blocks.append(self._without_pings(body).strip())
+                log.exception("[today] %s could not be read; left out of the answer", what)
+                missing.append(what)
+                return empty
 
-        blocks = [b for b in blocks if b]
-        log.info("[objectives] %s: %d block(s) (%d already posted)", marker,
-                 len(blocks), len(already or []))
-        return "\n\n".join(blocks) if blocks else wording.NOTHING_TODAY
+        meetings = await safely("today's meeting notes", self._today_notes(today), [])
+        due = await safely("what is due soon", self._today_due(today, end), [])
+        channel = await safely("the channel", self._today_channel_messages(today), [])
+        posts = await safely("my own posts for today", self._today_posts(today), [])
+        todo = await safely("the to-do sheet", self._today_todo_line(), None)
+
+        also = today_mod.posts_summary(posts)
+        if todo:
+            also.append(todo)
+        text = today_mod.render(
+            meetings=today_mod.meeting_lines(meetings),
+            due=today_mod.due_lines(due, today=today),
+            channel=today_mod.channel_lines(channel),
+            also=also,
+        )
+        if missing:
+            # IT SAYS WHAT IS MISSING, never a guess and never a silent gap: a
+            # "today" answer that looks complete and is not is the worse lie.
+            unread = wording.today_unread(missing)
+            text = unread if text == wording.NOTHING_TODAY else f"{text}\n\n{unread}"
+        log.info("[today] %s to %s: %d meeting note(s), %d due, %d channel message(s), "
+                 "%d post(s) in the summary; %d character(s), no model call",
+                 dl.iso(today), dl.iso(end), len(meetings), len(due), len(channel),
+                 len(posts), len(text))
+        return self._without_pings(text)
+
+    async def _today_notes(self, today) -> list:
+        """Today's SALES meeting notes with their action items:
+        [{"label", "next_steps"}]. Through `notes.list_notes`, the one door the
+        notes allowlist guards."""
+        iso = dl.iso(today)
+
+        def read() -> list:
+            out, seen = [], set()
+            for meta in notes.list_notes(days=0):
+                if meta.get("date") != iso or meta.get("path") in seen:
+                    continue
+                seen.add(meta.get("path"))
+                note = notes.read_note(date=iso, label=meta.get("label"))
+                if note and note.get("path") == meta.get("path"):
+                    out.append({"label": note.get("label") or meta.get("label") or "",
+                                "next_steps": list(note.get("next_steps") or [])})
+            return out
+
+        return await asyncio.to_thread(read)
+
+    async def _today_due(self, today, end) -> list:
+        """Everything dated from `today` to `end`: [{"due": date, "what"}].
+
+        FIVE PLACES, each read the way its own rule reads it: P1 items on the
+        Deliverables Checklist that are not done; AI events and the day their
+        registration closes (when we are not registered); reminders somebody
+        set; to-do sheet items with a due date; meetings on Outreach PoCs.
+        """
+        out: list = []
+
+        def inside(day) -> bool:
+            return day is not None and today <= day <= end
+
+        for row in await self._rule_tab_rows(gtm_sheet.DELIVERABLES, "today"):
+            title = gtm_sheet.clean_cell(row.get("action_item"))
+            if not title or nextaction._matches_any(row.get("status"),
+                                                    config.DELIVERABLE_DONE_MARKERS):
+                continue
+            if not nextaction._matches_any(row.get("priority"), config.DELIVERABLE_P1_MARKERS):
+                continue
+            due = nextaction._deliverable_due(row.get("deadline"), today=today)
+            if inside(due):
+                team = gtm_sheet.clean_cell(row.get("dependency"))
+                out.append({"due": due, "what": title + (f" ({team})" if team else "")})
+
+        for row in await self._rule_tab_rows(gtm_sheet.EVENTS, "today"):
+            name = gtm_sheet.clean_cell(row.get("event"))
+            if not name:
+                continue
+            on = gtm_sheet.parse_event_date(row.get("event_date"))
+            shut = gtm_sheet.parse_event_date(row.get("registration_deadline"))
+            when = on["start"] if on["known"] else None
+            closes = shut["start"] if shut["known"] else None
+            registered = gtm_sheet.parse_flag(row.get("registered")) is True
+            if inside(closes) and not registered:
+                out.append({"due": closes, "what": f"registration for {name} closes"})
+            if inside(when):
+                out.append({"due": when, "what": name
+                            + (" (registered)" if registered else " (not registered)")})
+
+        reminders = await asyncio.to_thread(self.db.scheduled_reminders_due_by, dl.iso(end))
+        for r in reminders or []:
+            due = dl.parse_date(r.get("due_date"))
+            what = str(r.get("what") or "").strip()
+            if inside(due) and what:
+                company = str(r.get("company") or "").strip()
+                out.append({"due": due, "what": "reminder: " + what
+                            + (f" ({company})" if company and company.lower()
+                               not in what.lower() else "")})
+
+        if todos.enabled():
+            data = await asyncio.to_thread(todos.open_items, self.db)
+            for row in (data.get("rows") or []) if data.get("ok") else []:
+                due = gtm_sheet.sheet_date(row.get("due")) or dl.parse_date(row.get("due"))
+                task = str(row.get("task") or "").strip()
+                if inside(due) and task:
+                    owner = today_mod.first_name(row.get("owner"))
+                    out.append({"due": due, "what": task + (f" ({owner})" if owner else "")})
+
+        rows, _tab = await self._active_rows_of_canonical_tab("the today answer")
+        for row in rows or []:
+            met = nextaction._date(row, "meeting_date")
+            if not inside(met) or gtm_sheet.is_meeting_completed(row.get("meeting_status")):
+                continue
+            who = wording.next_step_who(gtm_sheet.clean_cell(row.get("name")),
+                                        gtm_sheet.clean_cell(row.get("company")))
+            out.append({"due": met, "what": f"meeting with {who}"})
+        return out
+
+    async def _today_channel_messages(self, today) -> list:
+        """What people wrote in the sales channels today, oldest first:
+        [{"author", "text"}]. Not the bot's messages, and not messages
+        addressed to the bot (a question to Saley is not the team's work)."""
+        got = await query.channel_recent_activity(self, days=1)
+        me = getattr(self.user, "id", None)
+        out = []
+        for m in (got or {}).get("messages") or []:
+            when = m.get("timestamp")
+            if isinstance(when, datetime):
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                if when.astimezone(dl.IST).date() != today:
+                    continue
+            text = str(m.get("text") or "")
+            if me is not None and (f"<@{me}>" in text or f"<@!{me}>" in text):
+                continue
+            out.append({"author": m.get("author") or "", "text": text, "at": when})
+        out.sort(key=lambda m: m["at"] if isinstance(m["at"], datetime)
+                 else datetime.min.replace(tzinfo=timezone.utc))
+        return out
+
+    async def _today_posts(self, today) -> list:
+        """The kinds of post the bot has sent or will send today: [{"type"}].
+        A post meant for a DM, one with nothing to say, and anything the plan
+        holds back are not today's."""
+        marker = dl.iso(today)
+        already = await asyncio.to_thread(self.db.drip_sent_today, marker)
+        posts = [{"type": str(r.get("action_type") or "")} for r in already or []
+                 if (r.get("message_id") or str(r.get("body") or "").strip())
+                 and str(r.get("action_type") or "") not in OBJECTIVES_EXCLUDED_TYPES]
+        if drip.is_sending_day(today):
+            planned = await self._plan_drip(today=today, already=already)
+            for m in (planned or {}).get("messages") or []:
+                if str(m.get("destination") or "") in ("dm", "escalation"):
+                    continue
+                if drip.nothing_to_say(m) or m.get("type") in OBJECTIVES_EXCLUDED_TYPES:
+                    continue
+                posts.append({"type": str(m.get("type") or "")})
+        return posts
+
+    async def _today_todo_line(self):
+        """"- 4 open to-dos on the to-do sheet: <link>", or None."""
+        if not todos.enabled():
+            return None
+        data = await asyncio.to_thread(todos.open_items, self.db)
+        if not data.get("ok"):
+            return None
+        link = await asyncio.to_thread(todos.link, self.db)
+        return today_mod.todo_line(int(data.get("open_total") or 0), link or "")
 
     def _todo_tools(self) -> list[dict]:
         """"@bot show the to-dos" — ALWAYS the link plus the open items.

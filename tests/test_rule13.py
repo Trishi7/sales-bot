@@ -1169,18 +1169,70 @@ class TestWords:
             assert not [p for p in llm.BANNED_PHRASES if p.lower() in low], ln
             assert "NEXT_STEP" not in ln and "next_step" not in ln, ln
 
-    def test_V1_the_three_openers(self):
+    def test_V1_there_is_no_opener_line_any_more(self):
+        """The three openers went on 8 Oct (REPLIES-OCT8): each group of the post opens on its own ask, so a line
+        saying "here are next steps" under a heading that says it was clutter."""
         import wording
-        assert len(wording.NEXT_STEP_OPENERS) == 3
-        assert wording.NEXT_STEP_OPENERS[0] == "A few next steps on people we're connected with:"
-        for o in wording.NEXT_STEP_OPENERS:
-            assert wording.register_problems(o) == [] and not RULE_NUMBER.search(o) and not SCHEDULE.search(o)
+        assert not hasattr(wording, "NEXT_STEP_OPENERS")
 
-    def test_V1_every_line_is_in_all_lines(self):
+    def test_V1_every_group_ask_is_clean_and_in_all_lines(self):
+        """One group per ask and email number: the ask is written once, names nobody, and passes the same register,
+        rule-number and schedule checks the per-person lines do."""
         import wording
         pool = " || ".join(wording.all_lines())
-        for o in wording.NEXT_STEP_OPENERS:
-            assert o in pool
+        seen = set()
+        for ask in wording.NEXT_STEP_ASKS:
+            for n in ((1, 2, 3) if ask in ("email_out", "advance", "log_date") else (0,)):
+                line = wording.next_step_group(ask, n=n)
+                assert line and line in pool, (ask, n)
+                assert line not in seen, "two asks must not share a sentence"
+                seen.add(line)
+                assert wording.register_problems(line) == [], line
+                assert not RULE_NUMBER.search(line) and not SCHEDULE.search(line), line
+                assert "Priya" not in line and ":" not in line.split(".")[0], line
+        assert wording.next_step_group("nonsense") == ""
+        assert wording.next_step_group("call", set_call=True) != wording.next_step_group("call")
+
+    def test_V1_what_is_personal_goes_after_the_colon(self):
+        import wording
+        assert wording.next_step_person("Priya Rao (Acme Labs)") == "- Priya Rao (Acme Labs)"
+        assert wording.next_step_detail("email_out") == ""
+        assert wording.next_step_detail("advance", when="5 Oct") == "sent 5 Oct"
+        assert wording.next_step_detail("call", when="28 Sep") == "DM sent 28 Sep"
+        assert wording.next_step_detail("email_out", when="5 Oct") == ""       # no date belongs to this ask
+        assert wording.next_step_detail("email_out", missing=["1st Email Sent"]) \
+            == "1st Email Sent isn't filled in either"
+        assert wording.next_step_detail("advance", when="5 Oct", missing=["1st Email Sent", "1st Email Date"]) \
+            == "sent 5 Oct; 1st Email Sent and 1st Email Date aren't filled in either"
+
+    def test_V1_the_grouped_post(self):
+        """4 people on Send email 1 and 1 on Send email 2: two groups, each ask written once, a blank line between."""
+        import wording
+        people = [{"who": f"P{i} (Co{i})", "ask": "email_out", "n": 1} for i in (1, 2)] \
+            + [{"who": "P3 (Co3)", "ask": "email_out", "n": 2}] \
+            + [{"who": f"P{i} (Co{i})", "ask": "email_out", "n": 1} for i in (4, 5)]
+        lines = wording.next_step_post(people)
+        ask1 = "Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date."
+        ask2 = "Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date."
+        assert lines == [ask1, "- P1 (Co1)", "- P2 (Co2)", "- P4 (Co4)", "- P5 (Co5)", "",
+                         ask2, "- P3 (Co3)"]
+        assert (lines.count(ask1), lines.count(ask2)) == (1, 1)
+        advance = wording.next_step_post([
+            {"who": "A (X)", "ask": "advance", "n": 1, "when": "5 Oct"},
+            {"who": "B (Y)", "ask": "advance", "n": 1, "when": "1 Oct", "missing": ["1st Email Date"]},
+            {"who": "C (Z)", "ask": "advance", "n": 2, "when": "3 Oct"}])
+        assert advance == ["Email 1 has gone out. Time to set Next Steps to Send email 2.",
+                           "- A (X): sent 5 Oct",
+                           "- B (Y): sent 1 Oct; 1st Email Date isn't filled in either", "",
+                           "Email 2 has gone out. Time to set Next Steps to Send email 3.",
+                           "- C (Z): sent 3 Oct"]
+        calls = wording.next_step_post([
+            {"who": "E (V)", "ask": "email_out", "n": 1},
+            {"who": "D (W)", "ask": "call", "when": "20 Sep", "set_call": True},
+            {"who": "F (U)", "ask": "call", "when": "21 Sep", "set_call": False}])
+        assert calls[0].startswith("Next Steps says Send email 1")        # groups open where their first person stands
+        assert sum(1 for l in calls if l.startswith("The LI DM has gone out")) == 2   # set_call differs: two asks
+        assert wording.next_step_post([]) == [] and wording.next_step_post([{"who": "X", "ask": "nope"}]) == []
 
     def test_V1_every_line_the_evaluator_makes_is_clean(self, db):
         import wording
@@ -1282,26 +1334,36 @@ class TestTheLine:
     def test_the_item_carries_what_a_reply_will_need_later(self):
         tab = fx.parse([fx.person(1, name="Priya Rao", li_date=C0, step="Research the PoC")])
         it = picked(run13(tab, date(2026, 10, 12)))[0]
-        for key in ("ask", "step", "signature", "row_key", "sheet_row", "pick_order", "opener_index", "email_n"):
+        for key in ("ask", "step", "signature", "row_key", "sheet_row", "pick_order", "email_n", "who", "when",
+                    "set_call", "missing"):
             assert key in it, key
         assert it["dayof_time"] == config.NEXT_STEP_TIME
         assert it["counts_toward_cap"] is False and it["max_items_per_post"] == 5
 
 
 class TestThePost:
-    def test_the_opener_is_a_function_of_the_day_and_cycles_over_three_days(self):
+    def test_the_post_is_grouped_by_ask_and_is_never_random(self):
+        """It used to open on one of three openers chosen by the day. Since 8 Oct there is no opener: the post is
+        the groups, each ask once, and the same queue gives the same text every time it is rendered."""
         import drip
         import wording
         rows, _ = fx.rotation_values()
-        heads = []
         for day in (date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)):
             planned = drip.plan(r13_actions(day), day=day)
             m = next(m for m in planned["messages"] if m["type"] == TRIGGER)
             body = drip.compose_fallback(m)
             assert body == drip.compose_fallback(m)                    # not random
-            heads.append(body.splitlines()[0])
-        assert heads[0] == heads[0] and set(heads[:3]) == set(wording.NEXT_STEP_OPENERS)
-        assert heads[3] == heads[0]
+            lines = body.splitlines()
+            names = [l for l in lines if l.startswith("- ")]
+            asks = [l for l in lines if l and not l.startswith("- ")]
+            assert len(names) == len(drip.shown_contacts(m)) == 5      # everybody the rule picked, once
+            assert len(asks) == len(set(asks)), "an ask is written once"
+            assert lines[0] in asks and not lines[0].endswith(":")      # it opens on an ask, not on an opener
+            for ask in asks:                                           # every ask is one of wording's
+                assert any(ask == wording.next_step_group(a, n=n, set_call=c)
+                           for a in wording.NEXT_STEP_ASKS for n in (0, 1, 2, 3) for c in (False, True)), ask
+            assert sorted(n[2:].split(":")[0] for n in names) == sorted(
+                wording.next_step_who(a["poc"], a["company"]) for a in drip.shown_contacts(m))
 
     def test_a_call_reminder_stays_first_in_the_rendered_post(self):
         """`drip.group` sorts members by due date; the post must still lead with the call (plan 5.6, 8.3)."""
@@ -1315,8 +1377,13 @@ class TestThePost:
         planned = drip.plan(picked(res), day=day)
         m = next(m for m in planned["messages"] if m["type"] == TRIGGER)
         assert drip.shown_contacts(m)[0]["poc"] == who
-        bullets = [ln for ln in drip.compose_fallback(m).splitlines() if ln.startswith("• ")]
-        assert bullets[0].startswith(f"• {who} ") and len(bullets) == 5
+        # GROUPED BY ASK since 8 Oct: the call's group is the first group, so the post opens on the call ask and
+        # the first name under it is the person to call, with the date their DM went out after the colon.
+        lines = drip.compose_fallback(m).splitlines()
+        bullets = [ln for ln in lines if ln.startswith("- ")]
+        assert lines[0].startswith("The LI DM has gone out and there's no meeting yet. Time to call them")
+        assert lines[1].startswith(f"- {who} (") and ": DM sent 7 Oct" in lines[1]
+        assert bullets[0] == lines[1] and len(bullets) == 5
 
     def test_the_post_is_verbatim_never_composed_by_the_model(self):
         import drip

@@ -1877,14 +1877,18 @@ def points_of(message: dict) -> Optional[dict]:
         people = shown_contacts(message)
         if not people:
             return None
-        # THE WHOLE POST IS FIXED TEXT FROM wording.py: an opener chosen by the
-        # day (carried on the items, never random) and one line a person. No
-        # close: every line already ends on its own ask.
-        openers = wording.NEXT_STEP_OPENERS
-        index = int(people[0].get("opener_index") or 0) % len(openers)
-        return {"header": openers[index],
-                "lines": [f"• {a.get('text', '')}" for a in people],
-                "extra": [], "close": ""}
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py, GROUPED BY ASK (8
+        # Oct): each ask written once, the people it applies to listed under
+        # it, in the order the rule picked them. No opener and no close: every
+        # group opens on its own ask.
+        lines = wording.next_step_post([
+            {"who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
+             "ask": a.get("ask"), "n": a.get("email_n"), "when": a.get("when"),
+             "missing": a.get("missing"), "set_call": a.get("set_call")}
+            for a in people])
+        if not lines:
+            return None
+        return {"header": "", "lines": lines, "extra": [], "close": ""}
     if kind == nextaction.R_CLOSURE_SUPPORT:
         if notice_of(message):
             return None                    # the notice IS the message
@@ -1911,8 +1915,10 @@ def points_of(message: dict) -> Optional[dict]:
 
 
 def points_block(points: dict) -> str:
-    """The verbatim block: header, numbered lines, any overflow line."""
-    return "\n".join([points["header"]] + points["lines"] + points.get("extra", []))
+    """The verbatim block: header (when there is one), the lines, any overflow
+    line."""
+    head = [points["header"]] if points.get("header") else []
+    return "\n".join(head + points["lines"] + points.get("extra", []))
 
 
 def fact_count(message: dict) -> int:
@@ -2678,7 +2684,7 @@ def _self_test() -> int:
                    # Due dates run AGAINST the pick order on purpose.
                    wed - timedelta(days=i), rule_id="R13")
         a.update(counts_toward_cap=False, dayof_time="15:00", pick_order=i,
-                 opener_index=1, ask="email_out",
+                 ask="email_out", email_n=1,
                  text=wording.next_step_line(
                      "email_out", who=wording.next_step_who(name, co), n=1))
         steps.append(a)
@@ -2710,15 +2716,13 @@ def _self_test() -> int:
     check("silent on a Saturday",
           plan(steps, day=date(2026, 9, 12))["messages"], [])
     check("posted as written, never composed", is_verbatim(m13[0]), True)
-    check("the post: an opener and one line a person, in pick order",
+    check("the post: the ask once, then one name a line, in pick order",
           compose_fallback(m13[0]),
-          "Next steps for some of our LinkedIn connections:\n"
-          "• Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? "
-          "If so, mark 1st Email Sent and the date.\n"
-          "• Dev Shah (Borealis): Next Steps says Send email 1. Has it gone out? "
-          "If so, mark 1st Email Sent and the date.\n"
-          "• Mei Lin (Cinder): Next Steps says Send email 1. Has it gone out? "
-          "If so, mark 1st Email Sent and the date.")
+          "Next Steps says Send email 1. Has it gone out? If so, mark 1st Email "
+          "Sent and the date.\n"
+          "- Priya Rao (Acme Labs)\n"
+          "- Dev Shah (Borealis)\n"
+          "- Mei Lin (Cinder)")
     check("the people the sender records are the people shown",
           [a["poc"] for a in shown_contacts(m13[0])],
           ["Priya Rao", "Dev Shah", "Mei Lin"])

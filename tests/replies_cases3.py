@@ -166,9 +166,12 @@ async def x6_the_objectives_answer_pings_nobody(check, test_mode):
         w.bot.db.attach_drip_message_id(on_date=day, slot=1, message_id=777,
                                         body="**AI events & summits**\n<@111> two events to look at:\n• Data Summit")
         text = await w.bot._todays_objectives()
-        check("X6: the sent post is in the answer", "Data Summit" in text, True)
-        check("X6: ...and no mention token is: the ping became the person's name", ("<@" in text, "Vaishnavi" in text),
-              (False, True))
+        import wording
+        # SINCE 8 OCT the post is summarised, not pasted: its ping cannot reach the answer because its text does not.
+        check("X6: the sent post is in the one-line summary",
+              "AI events and summits" in " ".join(rc.today_group(text, wording.TODAY_ALSO)), True)
+        check("X6: ...and no mention token is anywhere in the answer, nor the post's own sentence",
+              ("<@" in text, "two events to look at" in text), (False, False))
         return {"text": text}
 
 
@@ -184,8 +187,14 @@ async def x7_a_post_sent_before_the_text_was_kept(check, test_mode):
                                   companies="Data Summit", channel_id=w.chan.id, message_id=778,
                                   sent_at=day + "T14:00:00+05:30")             # no body: sent before this build
         text = await w.bot._todays_objectives()
-        check("X7: the row with no stored text is left out, not guessed or re-planned", "Data Summit" in text, False)
-        check("X7: the rest of the day is still there", "Person 0" in text, True)
+        import wording
+        also = " ".join(rc.today_group(text, wording.TODAY_ALSO))
+        # SINCE 8 OCT the summary says WHICH KINDS of post the day has, and a post that went out is one of them whether
+        # or not its text was kept. Nothing about its content is guessed: the summary carries no names at all.
+        check("X7: the post that went out counts as one of today's, once (it is not also re-planned)",
+              also.count("AI events and summits"), 1)
+        check("X7: nothing of its content is guessed into the summary", "Data Summit" in also, False)
+        check("X7: the rest of the day is still there", "next steps for connected contacts" in also, True)
         return {"text": text}
 
 
@@ -200,7 +209,14 @@ async def x8_the_constants_the_open_decisions_hang_on(check, test_mode):
           nextaction.R_AI_NEWS in set(botmodule.OBJECTIVES_EXCLUDED_TYPES), True)
     check("X8: the excluded set is the AI-news type by name, and nothing else",
           set(botmodule.OBJECTIVES_EXCLUDED_TYPES), {nextaction.R_AI_NEWS})
-    check("X8: Q3 (the closing offer line is left out) is one constant, off", botmodule.OBJECTIVES_SHOW_OFFERS, False)
+    # Q3 (the closing offer line) needs no constant since 8 Oct: the answer summarises the posts and pastes none, so
+    # no offer line can be in it. What is left out of the summary is the news, by type.
+    import today as today_mod
+    check("X8: the summary leaves out the AI news and the news screen, by type",
+          (set(botmodule.OBJECTIVES_EXCLUDED_TYPES) <= set(today_mod.NEWS_TYPES), sorted(today_mod.NEWS_TYPES)),
+          (True, ["ai_news", "news_company_screen"]))
+    check("X8: ...and the offer constant is gone with the pasted posts", hasattr(botmodule, "OBJECTIVES_SHOW_OFFERS"),
+          False)
     import replies
     check("X8: Q5 (the reaction) is one constant, the thumbs-up", replies.ACK_EMOJI, ack_emoji())
     return {}
@@ -326,6 +342,8 @@ async def q4_groups_the_plan_holds_back_are_not_in_the_answer(check, test_mode):
         check("Q4 setup: with a cap of 1 the AI-news post takes it and the events post is rolled or held, not scheduled",
               ("events" in scheduled, "events" in rolled + held), (False, True))
         text = await w.bot._todays_objectives()
-        check("Q4: the answer has what is scheduled today (Rule 13) and nothing of what was held back",
-              ("Person 0" in text, "Data Summit" in text), (True, False))
+        import wording
+        check("Q4: the summary has what goes today (next steps), nothing of what was held back (events), and never "
+              "the AI news", rc.today_group(text, wording.TODAY_ALSO),
+              ["- My posts today cover next steps for connected contacts."])
         return {"text": text}

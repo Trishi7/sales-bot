@@ -40,16 +40,37 @@ ACK_EMOJI = "👍"
 # thread. Deliberately no "yes" and no "no": those can be an ANSWER (to a
 # proposal, to "did you mean Acme?"), and whether they are is `is_bare_vote`'s
 # question and the caller's, not this list's.
+#
+# "TAKE YOUR TIME" AND ITS RELATIVES JOINED ON 8 OCT. "take ur time" replied to
+# "Give me a moment, I'm looking into that." was read as a new question and
+# got a second answer. They are what people say WHILE THE BOT IS WORKING, so
+# they are acknowledgements like any other: one reaction, nothing else.
 ACK_PHRASES = (
     "sure", "ok", "okay", "k", "kk", "thanks", "thank you", "thx", "ty",
     "cheers", "got it", "noted", "cool", "great", "nice", "perfect", "alright",
     "sounds good", "will do", "np",
+    # said while waiting
+    "take your time", "take ur time", "take you time", "no rush", "no hurry",
+    "no worries", "no problem", "no prob", "no probs", "all good", "its fine",
+    "thats fine", "fine", "whenever", "when you can", "carry on", "go on",
+    "waiting", "ill wait",
+    # the same thanks and yeses, spelt the way people type them
+    "sure thing", "okie", "okies", "oki", "okk", "okay cool", "thank u",
+    "thanku", "thankyou", "tysm", "tq", "thanks a lot", "thanks so much",
+    "thank you so much", "many thanks", "ty so much", "awesome", "lovely",
+    "sounds great", "good", "gotcha", "understood", "appreciated",
 )
+# Small words that may sit between acknowledgements without making the message
+# say anything: "ok and thanks", "sure, pls take ur time", "thanks so much!".
+ACK_FILLERS = ("and", "pls", "please", "then", "so", "just", "man", "yaar", "bro")
 # 👍 🙏 👌 ✅ 🙌 — sent alone, or beside the words above.
 ACK_EMOJI_SET = ("\U0001F44D", "\U0001F64F", "\U0001F44C", "✅", "\U0001F64C")
-# An acknowledgement is short. Five words of nothing but the phrases above is
-# "ok cool thanks, got it"; anything longer is somebody saying something.
-ACK_MAX_WORDS = 5
+# An acknowledgement is short. Eight words of nothing but the phrases above is
+# "ok no rush, take your time, thanks"; anything longer is somebody saying
+# something. (It was five until 8 Oct, before the three-word phrases joined.)
+ACK_MAX_WORDS = 8
+# A bare yes or no is shorter still: "yes please, thanks Saley".
+VOTE_MAX_WORDS = 5
 
 # Words that may sit beside a yes or a no without changing it.
 _VOTE_FILLERS = ("please", "thanks", "thank you", "thx", "ty")
@@ -156,10 +177,71 @@ def is_ack(text: str, names=BOT_NAMES) -> bool:
     words = _words(_EMOJI_RE.sub(" ", body))
     if len(words) > ACK_MAX_WORDS:
         return False
-    matched = _consume(words, tuple(ACK_PHRASES) + tuple(n.lower() for n in names or ()))
+    matched = _consume(words, tuple(ACK_PHRASES) + tuple(ACK_FILLERS)
+                       + tuple(n.lower() for n in names or ()))
     if matched is None:
         return False
     return emoji > 0 or any(m in ACK_PHRASES for m in matched)
+
+
+def ack_is_vote(text: str, names=BOT_NAMES) -> bool:
+    """Does this acknowledgement contain a word that is itself a yes or a no?
+
+    "sure" and "ok" do; "thanks", "noted" and "no rush" do not. THE PHRASE IS
+    ASKED, NOT THE LETTERS: `approvals.read_vote` finds a vote word anywhere,
+    so it reads "no rush" and "no worries" as a NO, and under an open proposal
+    that would have declined it. An acknowledgement that is not a vote leaves
+    whatever is open exactly as it was.
+    """
+    body = _SKIN_TONE_RE.sub("", str(text or ""))
+    words = _words(_EMOJI_RE.sub(" ", body))
+    matched = _consume(words, tuple(ACK_PHRASES) + tuple(ACK_FILLERS)
+                       + tuple(n.lower() for n in names or ())) or []
+    return any(m in _YES_WORDS or m in _NO_WORDS for m in matched)
+
+
+# Words that join a question to the acknowledgement in front of it: "take ur
+# time, ALSO any news on ElevenLabs?", "thanks, BTW who covers Acme?".
+_AFTER_ACK_JOINERS = ("also", "and", "but", "btw", "oh", "one more thing",
+                      "by the way", "meanwhile", "while youre at it")
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+def after_ack(text: str, names=BOT_NAMES) -> str:
+    """What is left of the message once the acknowledgements it OPENS with are
+    taken off, in the person's own words — "" when it was nothing else.
+
+        "take ur time"                                   -> ""
+        "sure, take ur time"                             -> ""
+        "take ur time, also any news on ElevenLabs?"     -> "any news on ElevenLabs?"
+        "what about Acme?"                               -> "what about Acme?"
+
+    A REPLY TO "GIVE ME A MOMENT" IS READ THROUGH THIS. If nothing is left the
+    person was only being polite; if a question is left, that question is
+    answered as its own question and the politeness is not handed to the model
+    as if it were part of it.
+    """
+    body = _MENTION_RE.sub(" ", str(text or ""))
+    spans = [(m.group(0).lower().replace("'", "").replace(chr(0x2019), ""), m.start())
+             for m in _WORD_RE.finditer(_EMOJI_RE.sub(" ", _SKIN_TONE_RE.sub("", body)))]
+    spans = [(w, at) for w, at in spans if w]
+    table = sorted((p.split() for p in tuple(ACK_PHRASES) + tuple(ACK_FILLERS)
+                    + tuple(_AFTER_ACK_JOINERS) + tuple(n.lower() for n in names or ())),
+                   key=len, reverse=True)
+    words = [w for w, _at in spans]
+    i = 0
+    while i < len(words):
+        for phrase in table:
+            if words[i:i + len(phrase)] == phrase:
+                i += len(phrase)
+                break
+        else:
+            break
+    if i >= len(words):
+        return ""
+    if i == 0:
+        return body.strip()
+    return body[spans[i][1]:].strip()
 
 
 def is_bare_vote(text: str, names=BOT_NAMES) -> str:
@@ -180,7 +262,7 @@ def is_bare_vote(text: str, names=BOT_NAMES) -> str:
     if "?" in body:
         return ""
     words = _words(body)
-    if not words or len(words) > ACK_MAX_WORDS:
+    if not words or len(words) > VOTE_MAX_WORDS:
         return ""
     fillers = tuple(_VOTE_FILLERS) + tuple(n.lower() for n in names or ())
     matched = _consume(words, tuple(_YES_WORDS) + tuple(_NO_WORDS) + fillers)
@@ -483,8 +565,42 @@ def _self_test() -> int:
         check(f"is_ack({text!r})", is_ack(text), True)
     for text in ("yes", "no", "ok?", "sure, but which one?", "ok and Globex",
                  "thanks, what about Acme", "", "<@123>", "Saley",
-                 "ok ok ok ok ok ok", "go ahead", "okay then send it"):
+                 "ok ok ok ok ok ok ok ok ok", "go ahead", "okay then send it"):
         check(f"is_ack({text!r})", is_ack(text), False)
+
+    print("\nsaid while the bot is working (8 Oct: 'take ur time' got a second answer)")
+    for text in ("take ur time", "take your time", "sure take ur time", "Sure, take your time!",
+                 "no rush", "ok no rush", "ok no rush thanks", "no worries", "no problem",
+                 "all good", "sure thing", "okie", "thank u", "tysm", "thanks a lot",
+                 "ok and thanks", "carry on", "np, take ur time 👍",
+                 "ok no rush, take your time, thanks"):
+        check(f"is_ack({text!r})", is_ack(text), True)
+    for text in ("take ur time, also any news on ElevenLabs?", "no rush but check Acme first",
+                 "take your time with the Acme one", "no", "no thanks, cancel it"):
+        check(f"is_ack({text!r})", is_ack(text), False)
+    check("eight words of acknowledgement at most",
+          (is_ack("ok ok ok ok ok ok ok ok"), is_ack("ok ok ok ok ok ok ok ok ok")),
+          (True, False))
+    for text, want in (("thanks", False), ("noted", False), ("no rush", False),
+                       ("no worries", False), ("no problem", False), ("take ur time", False),
+                       ("sure", True), ("ok no rush", True), ("sure take ur time", True)):
+        check(f"ack_is_vote({text!r}): 'no rush' is not a no", ack_is_vote(text), want)
+    check("a bare vote is still five words at most",
+          (is_bare_vote("yes please thanks saley"), is_bare_vote("yes yes yes yes yes yes")),
+          ("yes", ""))
+    check("'no rush' is not a bare no", is_bare_vote("no rush"), "")
+
+    print("\nwhat is left after the acknowledgement")
+    for text, want in (
+        ("take ur time", ""), ("sure, take ur time", ""), ("ok no rush thanks", ""),
+        ("👍", ""), ("thanks Saley", ""),
+        ("take ur time, also any news on ElevenLabs?", "any news on ElevenLabs?"),
+        ("sure. btw who covers Acme?", "who covers Acme?"),
+        ("ok and what about Globex", "what about Globex"),
+        ("what about Acme?", "what about Acme?"),
+        ("no rush but check Acme first", "check Acme first"),
+    ):
+        check(f"after_ack({text!r})", after_ack(text), want)
 
     print("\na bare vote")
     for text, want in [

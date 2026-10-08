@@ -786,6 +786,20 @@ async def p2_every_kind_through_the_vote_by_the_wrong_person(check, test_mode):
 # THE OBJECTIVES ANSWER (plan 8) — directly, and through on_message.
 # ==================================================================================================================
 
+def today_group(text, heading):
+    """The lines under one heading of a "today" answer (REPLIES-OCT8)."""
+    out, on = [], False
+    for line in (text or "").splitlines():
+        if line.startswith("**"):
+            on = line == f"**{heading}**"
+            continue
+        if not line.strip():
+            on = False                      # a blank line ends the group
+        elif on:
+            out.append(line)
+    return out
+
+
 def forbidden_in(text):
     return [name for name, rx in FORBIDDEN_IN_OBJECTIVES if rx.search(text or "")]
 
@@ -853,7 +867,9 @@ def _without_offer_line(post):
 
 @case
 async def o_objectives_text_is_what_the_posts_contain(check, test_mode):
-    """THE ANSWER IS THE DAY'S POSTS, word for word: the same planner, composer and formatting as the real sender."""
+    """SINCE 8 OCT (REPLIES-OCT8) THE ANSWER IS ABOUT THE TEAM'S DAY, NOT THE BOT'S POSTS. It used to be the day's
+    posts word for word; the human asked for the meetings, what is due, the channel, and "a very short summary" of
+    the posts. So the posts are now ONE LINE saying what they cover, and none of their text is pasted."""
     import wording
     w, fx = _objectives_world(test_mode)
     posts = await _real_posts(test_mode, fx)
@@ -861,18 +877,21 @@ async def o_objectives_text_is_what_the_posts_contain(check, test_mode):
         await _stock_sheet(w, fx)
         before = w.counts()
         text = await w.bot._todays_objectives()
-        check("O: the blocks are the real posts, in plan order, one blank line apart, no lead-in "
-              "(same lines; an unsent post's intro line is its own seeded draw)",
-              blocks_match(text, posts, ["events", "next_step_followups"]), True)
-        check("O: every person the real R13 post names is in the answer, with the same sentence",
-              all(l in text for l in posts["next_step_followups"].splitlines() if l.startswith("•")), True)
+        check("O: the day's posts are one line under 'Also today', naming what they cover in the order they go",
+              today_group(text, wording.TODAY_ALSO),
+              ["- My posts today cover AI events and summits and next steps for connected contacts."])
+        check("O: not one line of either real post is pasted into the answer",
+              [l for kind in ("events", "next_step_followups") for l in posts[kind].splitlines()[1:]
+               if l.strip() and l in text], [])
+        check("O: what is due soon is there instead: the registration that closes inside the look-ahead",
+              today_group(text, wording.TODAY_DUE), ["- Fri 2 Oct: registration for Data Summit closes"])
         check("O: the closing offer is not in the answer (Q3)", ("Want me to remind you" in text) == Q3_OFFER_LINES_IN_OBJECTIVES, True)
         check("O: none of the forbidden words (times, rules, rule numbers, schedule words)", forbidden_in(text), [])
         check("O: no AI-news block (Q1)", ("AI news" in text) == Q1_AI_NEWS_IN_OBJECTIVES, True)
-        check("O: no @-mention in the answer (the tags line is left out: asking pings nobody)", "<@" in text, False)
+        check("O: no @-mention in the answer (asking pings nobody)", "<@" in text, False)
         check("O: zero model calls, zero drip rows added, zero proposals",
               (w.counts()["model"] - before["model"], w.counts()["drip"], w.proposals()), (0, 0, {}))
-        print("      objectives answer as Discord would show it:")
+        print("      the answer as Discord would show it:")
         for line in text.splitlines():
             print("      | " + line)
         return {"text": text}
@@ -924,7 +943,8 @@ async def o_never_does_what_a_send_does(check, test_mode):
 
 @case
 async def o_nothing_today_is_one_line(check, test_mode):
-    """O: a day with nothing says so in one line; a Saturday; an unreadable drip_sends says 'can't read', never a guess."""
+    """O: a day with nothing says so in one line; a Saturday has no posts line; unreadable drip_sends is SAID, never
+    guessed at (since 8 Oct the rest of the answer still comes through, with a last line naming what is missing)."""
     import wording
     w, fx = _objectives_world(test_mode, rules=("R3",))
     with w:
@@ -936,7 +956,10 @@ async def o_nothing_today_is_one_line(check, test_mode):
     with w:
         await _stock_sheet(w, fx, date(2026, 10, 3))
         text = await w.bot._todays_objectives()
-        check("O5: a Saturday (not a sending day): one line, nothing planned", text, wording.NOTHING_TODAY)
+        check("O5: a Saturday (not a sending day): no posts line at all",
+              today_group(text, wording.TODAY_ALSO), [])
+        check("O5: ...and what is due in the next two WORKING days is still shown (Monday's registration)",
+              today_group(text, wording.TODAY_DUE), ["- Mon 5 Oct: registration for Data Summit closes"])
     w, fx = _objectives_world(test_mode)
     with w:
         await _stock_sheet(w, fx)
@@ -946,7 +969,11 @@ async def o_nothing_today_is_one_line(check, test_mode):
             raise sqlite3.OperationalError("unreadable")
         w.bot.db.drip_sent_today = boom
         text = await w.bot._todays_objectives()
-        check("O5: an unreadable drip_sends: the 'can't read' line, never a guess", text, wording.OBJECTIVES_UNREADABLE)
+        check("O5: an unreadable drip_sends: the answer says that part is missing, never a guess",
+              (text.splitlines()[-1], today_group(text, wording.TODAY_ALSO)),
+              (wording.today_unread(["my own posts for today"]), []))
+        check("O5: ...and what it could read still comes through",
+              today_group(text, wording.TODAY_DUE), ["- Fri 2 Oct: registration for Data Summit closes"])
         return {"text": text}
 
 
@@ -1010,34 +1037,35 @@ async def e4_two_people_asking_at_once(check, test_mode):
 
 @case
 async def o_asked_through_on_message_replies_with_the_objectives(check, test_mode):
-    """6 OCT STEP 4: 'what are the sales objectives for today?' got the posting rules. Through the real path, at 11:00."""
+    """6 OCT STEP 4: 'what are the sales objectives for today?' got the posting rules. Through the real path, at 11:00.
+
+    SINCE 8 OCT THE QUESTION IS ANSWERED BY CODE (`bot._answer_today`): no model chooses a tool or writes a word, so
+    the reply IS the day's brief and nothing else, and it comes through whether or not a model is reachable."""
     import toolsets
     w, fx = _objectives_world(test_mode)
     with w:
         await _stock_sheet(w, fx)
         text_direct = await w.bot._todays_objectives()
-        # the model picks nothing from the tools: the code guarantees the answer anyway
-        w.model.answer = "TODO-PART: send the Acme deck."
+        w.model.answer = "TODO-PART: send the Acme deck."      # a model that would add its own part is never asked
         m = Mark(w)
         await w.say("what are the sales objectives for today?", who="member", mention=True)
         reply = "\n".join(m.said)
-        check("O-route: the objectives are in the reply even when the model never calls the tool",
-              text_direct in reply, True)
-        check("O-route: the model's to-do part follows after a blank line",
-              reply.endswith("\n\nTODO-PART: send the Acme deck."), True)
+        check("O-route: the reply is the day's brief, exactly, and nothing a model wrote", reply, text_direct)
         check("O-route: nothing about rules, times or the schedule anywhere in the reply", forbidden_in(reply), [])
-        check("O-route: the tools offered are exactly show_todos and todays_objectives (cadence_preview is not)",
-              sorted(w.model.offered[0]), ["show_todos", "todays_objectives"])
-        check("O-route: two model calls at most", w.model.calls <= 2, True)
+        check("O-route: no model, router or extractor call; no tool was offered to anybody",
+              (m.d("model"), m.d("router"), m.d("extractor"), w.model.offered), (0, 0, 0, []))
+        check("O-route: routed as a 'today' question", w.routes()[-1], "today")
         check("O-route: no drip row, no proposal, no reaction", (w.drip_rows(), w.proposals(), m.reacted), ([], {}, []))
-        # the model that DOES call the tool gets only a pointer back, never the text
-        w.model.script = [("use", [("todays_objectives", {})]), ("say", "TODO-PART two.")]
-        w.model.requests.clear()
-        await w.say("objectives for today", who="member", mention=True)
-        results = [r for n, r in w.model.results if n == "todays_objectives"]
-        check("O-route: the model's tool result is only the pointer", (len(results) >= 1, results[-1].get("added_to_reply")
-                                                                      if results else None), (True, True))
-        check("O-route: ...and does not carry the text", text_direct[:40] in json_text(results), False)
+        # A MODEL THAT REACHES THE SUBJECT ANOTHER WAY and calls the tool gets only a pointer back, never the text:
+        # the code puts the brief in the reply.
+        sink: list = []
+        tool = w.bot._objectives_tools(sink=sink)[0]
+        result = await tool["handler"]({})
+        check("O-route: the tool's result is only the pointer", result.get("added_to_reply"), True)
+        check("O-route: ...and does not carry the text, which goes to the reply by code",
+              (text_direct[:40] in json_text(result), sink), (False, [text_direct]))
+        check("O-route: the 'today' tools are still exactly show_todos and todays_objectives (no cadence_preview)",
+              sorted(toolsets.GROUPS["today"]), ["show_todos", "todays_objectives"])
         return {"text": text_direct}
 
 
