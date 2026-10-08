@@ -96,12 +96,16 @@ global_rules:
     Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups,
     reminders, urgent news and answers to questions don't count.
   # Row "AI news". R1 is new content every day, so the re-ask clock does not
-  # apply to it; it is planned first so the cap cannot push it out.
+  # apply to it. Since 8 Oct it has no fixed time: it takes its place in the
+  # day's order (daily_order below).
   ai_news: >-
-    AI news posts every weekday at 2 PM: the industry, and our own PoCs —
-    the top 2 stories about people and companies on the sheet go first,
-    each marked with its sheet row. It is never held back and never rolled
-    to the next day, and it always takes one of the day's 5 posts.
+    AI news posts every weekday, in its place in the day's order: 6 PM on
+    Monday and Friday, 8 PM on Tuesday, 4 PM on Wednesday and Thursday, and
+    earlier when a rule ahead of it has nothing to post. It covers the
+    industry and our own PoCs — the top 2 stories about people and
+    companies on the sheet go first, each marked with its sheet row. It is
+    new every day, so it is never held back as "asked recently", and it
+    counts as one of the day's 5 posts.
     Every news message has the same shape: a bold heading with the day,
     then at most 5 stories, each a bold headline with a link to the outlet.
     A major story that didn't fit follows at once in "More AI News" (major
@@ -109,8 +113,21 @@ global_rules:
     the news in the channel gives the 5 best stories not sent before,
     newest first; a story is repeated only when nothing new is left.
     Urgent news is checked for every hour, weekends included, and posts
-    only when something is major; there is no 2 PM post at the weekend,
+    only when something is major; there is no AI news post at the weekend,
     and Monday's post covers it.
+  # Row "Order of the day" (new, 8 Oct). The machine copy is daily_order below.
+  day_order: >-
+    Posts are 2 hours apart, starting at 2 PM, in this order. Monday:
+    Deliverables checklist, DM sent no meeting, AI news, Closure support.
+    Tuesday: Prospects to contact, LinkedIn connected no DM, News-company
+    screen, AI news. Wednesday: New companies in the pipeline, AI news, AI
+    events and summits. Thursday: Prospects to contact, AI news, Sales
+    packages. Friday: News-company screen, LinkedIn connected no DM, AI
+    news. A rule with nothing to post takes no slot and the next one moves
+    up. Nothing in this order posts after 8 PM; what is left waits for that
+    rule's next day. Meeting prep and meeting follow-ups post at 10 AM and
+    next-step follow-ups at 3 PM, outside this order; reminders and urgent
+    news keep their own times. None of those moves a post in the order.
   # Row "Weekends". SUNDAY_RULE_IDS=R4, one post at SALES_DRIP_START.
   weekends: >-
     Saturday is silent. Sunday carries one post at most — the Deliverables
@@ -132,6 +149,26 @@ global_rules:
     per message, first names, always an easy way out; the tone settings and the
     banned phrases still apply on top.
 
+# THE ORDER OF THE DAY'S POSTS, PER WEEKDAY (NFT2-1069, the team's decision of
+# 8 Oct). The first rule listed takes SALES_DRIP_START (14:00), the next the
+# slot MESSAGE_GAP_MINUTES (120) later, and so on: 14:00, 16:00, 18:00, 20:00.
+# A rule with nothing to post takes no slot and the next one moves up. Nothing
+# in the order posts after SALES_DRIP_END (20:00).
+#
+# IT MUST AGREE WITH EACH RULE'S `weekdays`: a rule listed on a day it does not
+# run, or running on a day it is not listed, is a startup error naming both
+# (rules._parse_daily_order).
+#
+# R8, R9 AND R13 ARE IN NO LIST. They post at fixed times (MEETING_DAYOF_TIME
+# 10:00 for R8 and R9, NEXT_STEP_TIME 15:00 for R13), outside the order and the
+# gap. Sunday has no order: SUNDAY_RULE_IDS (R4), one post.
+daily_order:
+  mon: [R4, R7, R1, R10]
+  tue: [R5, R6, R2, R1]
+  wed: [R11, R1, R3]
+  thu: [R5, R1, R12]
+  fri: [R2, R6, R1]
+
 rules:
 
   # ---------------------------------------------------------------- R1
@@ -150,8 +187,9 @@ rules:
   #             checked first. Never anyone on the mapping's departures list.
   # All of it is RSS: free, and no search API.
   #
-  # ONE main post at NEWS_MAIN_TIME (14:00), NEWS_MAX_ITEMS (5) stories, covering
-  # everything SINCE THE PREVIOUS MAIN POST (Monday covers Fri 2 PM to Mon 2 PM):
+  # ONE main post a weekday, in its place in daily_order, NEWS_MAX_ITEMS (5)
+  # stories, covering everything SINCE THE PREVIOUS MAIN POST'S SLOT (Monday
+  # covers from Friday's slot, 6 PM):
   # first the top NEWS_POC_SLOTS (2) PoC stories by importance (two different
   # names; no name has more than two stories in the post), then the best of
   # everything left, PoC or industry — ties go to the PoC story, then the
@@ -175,19 +213,20 @@ rules:
   # was full is in Monday's post. The .env settings take precedence over this
   # row.
   #
-  # NEVER HELD, NEVER ROLLED. It is new content every day, so the re-ask clock
-  # does not apply (drip.NEVER_HELD), and it is planned before everything else
-  # at NEWS_MAIN_TIME, so it always holds one of the day's 5 counted posts
-  # (drip.PLANNED_FIRST). No 2 PM post on a Saturday or Sunday; the hourly
-  # checks run every day.
+  # NEVER HELD. It is new content every day, so the re-ask clock does not apply
+  # (drip.NEVER_HELD). It has NO FIXED TIME since 8 Oct: it takes its place in
+  # daily_order like any other rule and counts as one of the day's 5 posts. No
+  # AI news post on a Saturday or Sunday; the hourly checks run every day.
   - id: R1
     name: AI news
     plain: today's AI news worth reading — the industry, and our own PoCs
     # The Bot Rules tab, rule 1, column "What the Bot Shares / Checks".
     sheet_wording: >-
       Today's AI news worth reading — the industry, and our own PoCs.
-      One post every weekday at 2 PM with up to 5 stories since the last
-      post (Monday's covers the weekend). First the top 2 stories about
+      One post every weekday, in its place in the day's order (6 PM on
+      Monday and Friday, 8 PM on Tuesday, 4 PM on Wednesday and Thursday;
+      earlier when a rule ahead of it has nothing to post), with up to 5
+      stories since the last AI news post (Monday's covers the weekend). First the top 2 stories about
       people on Outreach PoCs or companies on Master Pipeline / Outreach
       PoCs, each marked with its sheet row, e.g. "(Synthflow AI — on
       Master Pipeline)"; then the best of everything else. Every news
@@ -197,10 +236,10 @@ rules:
       message (major stories only, at most 5), which doesn't count toward
       the 5 posts a day. Asked for the news in the channel, Saley gives the
       5 best stories it hasn't sent before, newest first, and repeats a
-      story only when nothing new is left. Never held back, never rolled to
-      the next day. Checked again
+      story only when nothing new is left. Never held back as "asked
+      recently". Checked again
       every hour, weekends included, and posted straight away only when
-      something is major. No 2 PM post on Saturday or Sunday. Nobody on
+      something is major. No AI news post on Saturday or Sunday. Nobody on
       the departures list is looked up.
     weekdays: [mon, tue, wed, thu, fri]
     trigger: ai_news
@@ -470,22 +509,30 @@ rules:
   # order. One line each: name — company — DM sent N days ago — last note.
   # Overflow: "+N more next Monday".
   #
-  # REPLACED BY R13 on 7 Oct 2026 (Vaishnavi: "rule 13 supercedes this"). Every
-  # row with an LI DM Date is Connected, and R13's call reminders start 7 days
-  # after the DM. The evaluator is kept; `enabled: true` brings the rule back.
+  # RULE 13 COMES FIRST (Vaishnavi, 7 Oct: "rule 13 supercedes this"). Back on
+  # Mondays since 8 Oct, but NEVER for a person Rule 13 covers: "Sid - LI
+  # Addition" Connected with an LI Connected Date (nextaction.
+  # covered_by_next_steps, Rule 13's own check). Those people get Rule 13's
+  # call reminders instead. On 7 Oct every row with an LI DM Date was
+  # Connected, so this rule lists somebody only when a DM went to a person who
+  # is not marked Connected, or whose LI Connected Date is missing.
   - id: R7
     name: DM sent, no meeting
     plain: people we DM'd who haven't booked a meeting
     # The Bot Rules tab, rule 7, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      Replaced by rule 13 from 7 Oct 2026. Rule 13's call reminders cover
-      the people we DM'd who haven't booked a meeting.
+      People we DM'd more than 7 days ago who haven't booked a meeting,
+      every Monday, second in the day's order: days since the DM and the
+      last note logged. Rule 13 comes first: anyone it covers (Sid - LI
+      Addition says Connected and the LI Connected Date is filled in) gets
+      Rule 13's reminders and is never listed here. At most 5 people a
+      post.
     weekdays: [mon]
     trigger: dm_no_meeting
     max_items_per_post: 5
     destination: channel
     counts_toward_cap: true
-    enabled: false
+    enabled: true
 
   # ---------------------------------------------------------------- R8
   # ANCHORED TO THE MEETING, NOT TO A WEEKDAY — hence the empty weekday list.
@@ -497,9 +544,18 @@ rules:
   # counts_toward_cap: false — a meeting is time-critical and must not be
   # crowded out by a Monday chase. Never held by the re-ask clock either: each
   # touch belongs to one date, and a held touch is a lost one.
+  # A FIXED TIME (8 Oct): every touch posts at MEETING_DAYOF_TIME (10:00), not
+  # only the meeting-day one. Outside daily_order and the 2-hour gap.
   - id: R8
     name: Meeting preparation
     plain: meetings coming up that need prep
+    # The Bot Rules tab, rule 8, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Meetings coming up that need prep. Three touches for each meeting on
+      Outreach PoCs: 5 days before, 3 days before and on the day. Every
+      touch posts at 10 AM, outside the day's order, and doesn't count
+      toward the 5 posts a day. Asks whether the deck, package and demo are
+      ready, with any recent news on the company.
     weekdays: []
     trigger: meeting_prep
     max_items_per_post: 3
@@ -536,7 +592,8 @@ rules:
       the meeting, then every 3 days, one step at a time: a channel post, then
       two DMs, then one escalation to Sid — and then stops. Asks for the next
       steps, the package discussed and an estimated deal size. Filling in
-      Notes/Remarks ends it. Doesn't count toward the 5 posts a day.
+      Notes/Remarks ends it. Posts at 10 AM, outside the day's order, and
+      doesn't count toward the 5 posts a day.
     weekdays: []
     trigger: meeting_followup
     max_items_per_post: 3
@@ -575,6 +632,14 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R11
+  # WEDNESDAYS ONLY since 8 Oct, first in the day's order. A company is noticed
+  # the day it appears (the snapshot is taken on every run of the queue, every
+  # sending day) and is asked about on the NEXT Wednesday that is at least
+  # NEW_COMPANY_AFTER_WORKING_DAYS (1) working day after it appeared and no
+  # more than NEW_COMPANY_WINDOW_DAYS (7) days after: exactly one Wednesday for
+  # every company. max_items_per_post is 10, not 3: with a weekly post, a
+  # company left out of this Wednesday's would be past the window by the next.
+  #
   # One WORKING day after a company first appears in the Master Pipeline.
   # THERE IS NO CREATED-DATE COLUMN on that tab, so "appears" is detected by
   # comparing today's company names against a daily snapshot in SQLite. The
@@ -588,9 +653,17 @@ rules:
   - id: R11
     name: New company in Master Pipeline
     plain: new companies in the pipeline — asks before looking up PoCs
-    weekdays: [mon, tue, wed, thu, fri]
+    # The Bot Rules tab, rule 11, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      New companies in the Master Pipeline, every Wednesday, first in the
+      day's order (2 PM): every company that appeared on the tab since last
+      Wednesday's post, whatever day it appeared. Names them and asks
+      whether to look for relevant PoCs; nothing is searched until an
+      approver says yes, and nobody is added to Outreach PoCs without a
+      separate yes. Up to 10 companies a post.
+    weekdays: [wed]
     trigger: new_pipeline_company
-    max_items_per_post: 3
+    max_items_per_post: 10
     destination: channel
     counts_toward_cap: true
     enabled: true

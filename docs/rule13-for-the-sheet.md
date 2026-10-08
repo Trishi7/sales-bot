@@ -41,8 +41,16 @@ What a post looks like:
 
 ## 2. Bot Rules tab, rule 7, "What the Bot Shares / Checks"
 
-> Replaced by rule 13 from 7 Oct 2026. Rule 13's call reminders cover the
-> people we DM'd who haven't booked a meeting.
+(Changed on 8 Oct, NFT2-1069: rule 7 is back on Mondays for the people rule 13
+does not cover. On 7 Oct this cell read "Replaced by rule 13 from 7 Oct 2026."
+The current wording, and the new Weekly Schedule, are in
+`docs/rules-for-the-sheet-oct8.md`.)
+
+> People we DM'd more than 7 days ago who haven't booked a meeting, every
+> Monday, second in the day's order: days since the DM and the last note
+> logged. Rule 13 comes first: anyone it covers (Sid - LI Addition says
+> Connected and the LI Connected Date is filled in) gets Rule 13's reminders
+> and is never listed here. At most 5 people a post.
 
 ## 3. Bot Rules tab, rule 6
 
@@ -58,12 +66,15 @@ its fallback sentences still say "no DM yet".
 
 ## 4. Bot Rules tab, rule 9, "What the Bot Shares / Checks"
 
+(Changed on 8 Oct, NFT2-1069: it now says the post goes at 10 AM.)
+
 > Meetings that happened with no next steps recorded. Checks Outreach PoCs for
 > a completed meeting whose Notes/Remarks is blank. Asks 3 days after the
-> meeting, then every 3 days, one step at a time: a channel post, then two DMs,
-> then one escalation to Sid — and then stops. Asks for the next steps, the
-> package discussed and an estimated deal size. Filling in Notes/Remarks ends
-> it. Doesn't count toward the 5 posts a day.
+> meeting, then every 3 days, one step at a time: a channel post, then two
+> DMs, then one escalation to Sid — and then stops. Asks for the next steps,
+> the package discussed and an estimated deal size. Filling in Notes/Remarks
+> ends it. Posts at 10 AM, outside the day's order, and doesn't count toward
+> the 5 posts a day.
 
 ## 5. Weekly Schedule tab, and the Global Rules "Daily cap" row
 

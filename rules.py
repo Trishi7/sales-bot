@@ -245,7 +245,19 @@ class Rule:
 
 _lock = threading.RLock()
 _cache: dict = {"loaded": False, "rules": [], "source": {}, "error": "", "remedy": "",
-                "global_rules": {}}
+                "global_rules": {}, "daily_order": {}}
+
+# THE RULES THAT POST AT A FIXED TIME and so appear in NO day's order: meeting
+# prep and meeting follow-ups (MEETING_DAYOF_TIME) and the next-step follow-ups
+# (NEXT_STEP_TIME). They sit outside the spaced posts and the gap: they move no
+# spaced post and no spaced post waits for them (drip.pinned_time). Keyed on
+# the trigger, like everything else here, because the trigger is what a rule
+# DOES; an id can be retired.
+FIXED_TIME_TRIGGERS = frozenset({"meeting_prep", "meeting_followup",
+                                 "next_step_followups"})
+# The days a day order can be written for. Saturday is silent and Sunday is the
+# one-post exception (SUNDAY_RULE_IDS), so neither has an order.
+ORDER_DAYS = (0, 1, 2, 3, 4)
 
 
 def _fail(message: str, remedy: str) -> None:
@@ -268,6 +280,77 @@ def _parse_weekdays(raw, rule_id: str) -> tuple:
         if index not in out:
             out.append(index)
     return tuple(sorted(out))
+
+
+def _parse_daily_order(raw, rules: list) -> dict:
+    """`daily_order:` as {weekday index: (rule id, ...)}, checked against the
+    rules' own weekdays. {} when the file has no such block.
+
+    THE ORDER OF THE DAY'S POSTS IS WRITTEN DOWN, PER WEEKDAY (8 Oct): the
+    first rule listed for a day takes the first slot (SALES_DRIP_START), the
+    next the slot two hours later, and so on; a rule with nothing to post takes
+    no slot and the next one moves up. It lives in the file, beside the rules,
+    so changing the order is an edit and a restart and never a code change.
+
+    TWO PLACES SAY WHICH DAYS A RULE RUNS, AND THEY MUST AGREE. A rule's
+    `weekdays` decide whether it is evaluated; the order decides where its post
+    goes. A rule listed on a day it does not run would be an empty slot nobody
+    could explain, and a rule that runs on a day it is not listed would post in
+    no particular place. Either is refused at startup, naming both lists.
+
+    A FIXED-TIME RULE IS IN NO LIST (FIXED_TIME_TRIGGERS): it has its own time.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        _fail(f"'daily_order' must be a mapping of weekday to rule ids, got "
+              f"{type(raw).__name__}",
+              "Write it as:  daily_order:\n    mon: [R4, R7, R1, R10]")
+    by_id = {r.id: r for r in rules}
+    order: dict = {}
+    for key, ids in raw.items():
+        name = str(key or "").strip().lower()[:3]
+        if name not in _WEEKDAY_INDEX or _WEEKDAY_INDEX[name] not in ORDER_DAYS:
+            _fail(f"daily_order: {key!r} is not a weekday the order covers",
+                  "Use mon, tue, wed, thu and fri. Saturday is silent and Sunday's "
+                  "one post is SUNDAY_RULE_IDS.")
+        if not isinstance(ids, (list, tuple)):
+            _fail(f"daily_order.{name} must be a list of rule ids",
+                  "Write it as a YAML list, e.g. mon: [R4, R7, R1, R10].")
+        seen: list = []
+        for item in ids:
+            rule_id = str(item or "").strip()
+            if rule_id not in by_id:
+                _fail(f"daily_order.{name} lists {rule_id!r}, which is not a rule "
+                      "in this file",
+                      "Use the ids under 'rules:' (R1, R2, ...).")
+            if by_id[rule_id].trigger in FIXED_TIME_TRIGGERS:
+                _fail(f"daily_order.{name} lists {rule_id} ({by_id[rule_id].name}), "
+                      "which posts at its own fixed time",
+                      "Take it out of daily_order. Meeting prep, meeting follow-ups "
+                      "and next-step follow-ups sit outside the order and the gap.")
+            if rule_id in seen:
+                _fail(f"daily_order.{name} lists {rule_id} twice",
+                      "A rule takes one place in a day's order.")
+            seen.append(rule_id)
+        order[_WEEKDAY_INDEX[name]] = tuple(seen)
+
+    def label(days) -> str:
+        return ", ".join(WEEKDAY_NAMES[d] for d in sorted(days)) or "no day"
+
+    for rule in rules:
+        if rule.trigger in FIXED_TIME_TRIGGERS:
+            continue
+        runs = {d for d in rule.weekdays if d in ORDER_DAYS}
+        listed = {d for d, ids in order.items() if rule.id in ids}
+        if runs != listed:
+            _fail(
+                f"{rule.id} ({rule.name}): its weekdays say [{label(runs)}] but "
+                f"daily_order lists it on [{label(listed)}]",
+                "Make the two agree: a rule's `weekdays` are the days it is "
+                "evaluated, and daily_order is where its post goes on each of "
+                "those days. Change one of them in bot_rules.yaml.")
+    return order
 
 
 def _parse_rule(raw: dict, *, order: int) -> Rule:
@@ -388,10 +471,13 @@ def load(path: Optional[str] = None, *, force: bool = False) -> list:
         for k, v in (raw_global.items() if isinstance(raw_global, dict) else ())
     }
 
+    daily_order = _parse_daily_order(data.get("daily_order"), rules)
+
     with _lock:
         _cache.update({
             "loaded": True, "rules": list(rules), "source": dict(source),
             "error": "", "remedy": "", "global_rules": global_rules,
+            "daily_order": daily_order,
         })
     return list(rules)
 
@@ -411,6 +497,7 @@ def safe_load(path: Optional[str] = None, *, force: bool = False) -> list:
             _cache.update({
                 "loaded": True, "rules": [], "source": {},
                 "error": str(e), "remedy": e.remedy, "global_rules": {},
+                "daily_order": {},
             })
         log.error(
             "[rules] NO RULES LOADED: %s. %s The bot will not say anything on "
@@ -547,6 +634,51 @@ def by_id(rule_id: str) -> Optional[Rule]:
     return None
 
 
+def is_fixed_time(rule) -> bool:
+    """Does this rule post at its own fixed time, outside the day's order?"""
+    return getattr(rule, "trigger", "") in FIXED_TIME_TRIGGERS
+
+
+def order_for(day) -> list:
+    """The rule ids whose posts are spaced through `day`, first slot first.
+
+    From `daily_order` in bot_rules.yaml. A file WITHOUT that block (a test's
+    own small rules file) falls back to the enabled, non-fixed-time rules that
+    run that day, in file order — the order the file already implies.
+    [] on a Saturday or a Sunday: neither has an order.
+    """
+    try:
+        weekday = day.weekday()
+    except AttributeError:
+        return []
+    if weekday not in ORDER_DAYS:
+        return []
+    loaded = safe_load()
+    with _lock:
+        order = dict(_cache.get("daily_order") or {})
+    if order:
+        return list(order.get(weekday, ()))
+    return [r.id for r in loaded
+            if r.enabled and not is_fixed_time(r) and weekday in r.weekdays]
+
+
+def order_index(rule_id: str, day) -> Optional[int]:
+    """Where `rule_id` stands in `day`'s order (0 = the first slot), or None
+    when it is not in it (a fixed-time rule, or a rule that does not run then)."""
+    ids = order_for(day)
+    try:
+        return ids.index(str(rule_id or "").strip())
+    except ValueError:
+        return None
+
+
+def has_daily_order() -> bool:
+    """Was a `daily_order` block read from the file? (False: the fallback.)"""
+    safe_load()
+    with _lock:
+        return bool(_cache.get("daily_order"))
+
+
 def for_day(day) -> list:
     """The enabled rules that may run on `day`, in file order.
 
@@ -624,6 +756,18 @@ def log_startup() -> None:
     for rule in rules_now:
         log.info("[rules]   %s%s", rule.describe(),
                  "   [needs web research]" if rule.needs_web else "")
+    if has_daily_order():
+        from datetime import date as _date, timedelta as _timedelta
+
+        monday = _date(2026, 1, 5)                  # any Monday: only the weekday is read
+        for offset in ORDER_DAYS:
+            ids = order_for(monday + _timedelta(days=offset))
+            log.info("[rules]   order %s: %s", WEEKDAY_NAMES[offset].capitalize(),
+                     ", ".join(ids) or "(nothing spaced)")
+    else:
+        log.warning(
+            "[rules] %s has no 'daily_order' block, so each day's posts go in the "
+            "order the rules are written in.", st["path"])
     disabled = st["count"] - st["enabled"]
     if disabled:
         log.warning(
@@ -688,12 +832,22 @@ def _self_test() -> int:
     check("R13 is outside the cap", by_id("R13").counts_toward_cap, False)
     check("R13 carries 5 per post", by_id("R13").max_items_per_post, 5)
     check("R13 needs no web", by_id("R13").needs_web, False)
-    check("R7 is switched off", by_id("R7").enabled, False)
+    # R7 CAME BACK ON MONDAYS (8 Oct). Who it lists is narrowed by Rule 13's own
+    # check, in nextaction; here it is only switched on, on its one day.
+    check("R7 is switched on", by_id("R7").enabled, True)
+    check("R7 runs Monday only",
+          [by_id("R7").runs_on(d) for d in (mon, tue, wed, thu, fri)],
+          [True, False, False, False, False])
 
     print("\ncaps and destinations")
     check("R4 carries the week's list, 20 per post", by_id("R4").max_items_per_post, 20)
     check("R5 carries 5 per post", by_id("R5").max_items_per_post, 5)
-    check("R11 carries 3 per post", by_id("R11").max_items_per_post, 3)
+    # 10, NOT 3: R11 posts once a week now, and a company left out of this
+    # Wednesday's post would be past NEW_COMPANY_WINDOW_DAYS by the next.
+    check("R11 carries 10 per post", by_id("R11").max_items_per_post, 10)
+    check("R11 runs Wednesday only",
+          [by_id("R11").runs_on(d) for d in (mon, tue, wed, thu, fri)],
+          [False, False, True, False, False])
     check("every destination is valid",
           all(r.destination in DESTINATIONS for r in rules), True)
 
@@ -704,11 +858,88 @@ def _self_test() -> int:
 
     print("\nfor_day")
     check("Monday's rules", [r.id for r in for_day(mon)],
-          ["R1", "R4", "R13", "R8", "R9", "R10", "R11"])
+          ["R1", "R4", "R13", "R7", "R8", "R9", "R10"])
+    check("Wednesday's rules", [r.id for r in for_day(wed)],
+          ["R1", "R3", "R13", "R8", "R9", "R11"])
     check("Thursday's rules", [r.id for r in for_day(thu)],
-          ["R1", "R13", "R5", "R8", "R9", "R11", "R12"])
+          ["R1", "R13", "R5", "R8", "R9", "R12"])
     check("Saturday's rules are the anchored ones only",
           [r.id for r in for_day(date(2026, 9, 26))], ["R8", "R9"])
+
+    print("\nthe order of the day's posts")
+    check("the file has a daily_order", has_daily_order(), True)
+    check("Monday's order", order_for(mon), ["R4", "R7", "R1", "R10"])
+    check("Tuesday's order", order_for(tue), ["R5", "R6", "R2", "R1"])
+    check("Wednesday's order", order_for(wed), ["R11", "R1", "R3"])
+    check("Thursday's order", order_for(thu), ["R5", "R1", "R12"])
+    check("Friday's order", order_for(fri), ["R2", "R6", "R1"])
+    check("Saturday and Sunday have no order",
+          (order_for(date(2026, 9, 26)), order_for(date(2026, 9, 27))), ([], []))
+    check("R1's place, Monday to Friday",
+          [order_index("R1", d) for d in (mon, tue, wed, thu, fri)], [2, 3, 1, 1, 2])
+    check("a fixed-time rule has no place in the order",
+          [order_index(r, mon) for r in ("R8", "R9", "R13")], [None, None, None])
+    check("R8, R9 and R13 are the fixed-time rules",
+          sorted(r.id for r in rules if is_fixed_time(r)), ["R13", "R8", "R9"])
+    check("no day has more spaced posts than the cap of 5",
+          max(len(order_for(d)) for d in (mon, tue, wed, thu, fri)) <= 5, True)
+
+    # THE STARTUP CHECK. Each case is the shipped file with ONE line changed,
+    # written to a temp file and loaded: the two lists that say which days a
+    # rule runs must agree, and the error names both.
+    print("\nthe startup check: weekdays and daily_order must agree")
+    import tempfile
+
+    with open((config.BOT_RULES_FILE or "").strip(), encoding="utf-8") as fh:
+        shipped = fh.read()
+
+    def refused(old: str, new: str) -> str:
+        """The startup error for the shipped file with `old` swapped for `new`
+        ("" when it loads)."""
+        assert shipped.count(old) == 1, (old, shipped.count(old))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bot_rules.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(shipped.replace(old, new))
+            try:
+                load(path, force=True)
+            except RulesError as e:
+                return str(e)
+            return ""
+
+    err = refused("  wed: [R11, R1, R3]", "  wed: [R1, R3]")
+    check("R11 runs Wednesday but is in no list: refused",
+          ("R11" in err, "weekdays say [wed]" in err,
+           "daily_order lists it on [no day]" in err), (True, True, True))
+    err = refused("  thu: [R5, R1, R12]", "  thu: [R5, R1, R12, R11]")
+    check("R11 listed on Thursday too: refused, naming both lists",
+          ("R11" in err, "weekdays say [wed]" in err,
+           "daily_order lists it on [wed, thu]" in err), (True, True, True))
+    err = refused("  mon: [R4, R7, R1, R10]", "  mon: [R4, R7, R1, R10, R13]")
+    check("a fixed-time rule in the order: refused",
+          "R13" in err and "fixed time" in err, True)
+    err = refused("  fri: [R2, R6, R1]", "  fri: [R2, R6, R1, R6]")
+    check("a rule listed twice in a day: refused", "R6 twice" in err, True)
+    err = refused("  fri: [R2, R6, R1]", "  fri: [R2, R6, R1, R99]")
+    check("an unknown rule id: refused", "'R99'" in err, True)
+    err = refused("  fri: [R2, R6, R1]", "  sun: [R4]\n  fri: [R2, R6, R1]")
+    check("an order for Sunday: refused", "'sun'" in err, True)
+    check("the shipped file itself loads",
+          refused("  fri: [R2, R6, R1]", "  fri:  [R2, R6, R1]"), "")
+
+    # A SMALL RULES FILE WITH NO daily_order (a test's own): the order is the
+    # one the file already implies, and nothing is refused.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bot_rules.yaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(shipped.split("\ndaily_order:")[0] + "\nrules:"
+                     + shipped.split("\nrules:", 1)[1])
+        reload(path)
+        check("no daily_order block: not an error", has_daily_order(), False)
+        check("no daily_order block: Monday goes in file order",
+              order_for(mon), ["R1", "R4", "R7", "R10"])
+    reload()
+    check("the shipped file is back", order_for(mon), ["R4", "R7", "R1", "R10"])
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

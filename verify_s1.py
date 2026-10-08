@@ -1,15 +1,21 @@
 """S1 — THE CAP, THE SCHEDULE, ONE REMINDER LANE, R9's LADDER, FREE SEARCH. Real output.
 
     python verify_s1.py            every check
-    python verify_s1.py --only i,v some of them (0 i ii iii iv v vi 6 w)
+    python verify_s1.py --only i,v some of them (0 i o ii iii iv v vi 6 w)
     python verify_s1.py --no-ddg   skip the one live call in (vi), the ddg fallback
 
   (0)   the migration: an existing database gains drip_sends.counts_toward_cap
-  (i)   a Monday with 6 countable groups + an R8 + an R9 -> 5 counted posts plus
-        the R8 and the R9; the live sweep, the test day and the simulation send
-        the same messages in the same order and make the same cap decisions
+  (i)   a Monday with 5 countable groups + an R8 + an R9 -> the four in Monday's
+        order at 14:00, 16:00, 18:00 and 20:00, the R8 and the R9 at 10:00 outside
+        the cap, and the fifth not sent (the window holds four); then the same
+        Monday under a cap of 3. The live sweep, the test day and the simulation
+        send the same messages in the same order, at the same times, and make
+        the same cap decisions
+  (o)   THE ORDER OF THE DAY (NFT2-1069): every weekday with every rule due, three
+        ways — the live sweep ticked every 15 minutes, a test day, a simulation —
+        give the same posts at the same times, and they are the times the team gave
   (ii)  R1 posts Monday, Tuesday and Wednesday (and Thursday, Friday) in a
-        simulated week
+        simulated week, each day in its place in that day's order
   (iii) a Sunday with a P1 due Monday -> one post, three ways; Saturday is
         silent; Monday's checklist still goes out
   (iv)  a reminder fires exactly once — on time, and late with "(this was due …)"
@@ -84,10 +90,12 @@ import config  # noqa: E402
 # THE SHIPPED DEFAULTS, pinned — not whatever the local .env says.
 SETTINGS = {
     "DB_PATH": os.environ["DB_PATH"], "STATE_DIR": os.environ["STATE_DIR"],
-    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "18:30",
-    "MESSAGE_GAP_MINUTES": 90, "MESSAGE_JITTER_MINUTES": 15,
-    "MESSAGE_GAP_MIN_MINUTES": 30, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
-    "SUNDAY_RULE_IDS": ["R4"], "NEWS_MAIN_TIME": "14:00", "MEETING_DAYOF_TIME": "10:00",
+    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "20:00",
+    "MESSAGE_GAP_MINUTES": 120, "MESSAGE_JITTER_MINUTES": 0,
+    "MESSAGE_GAP_MIN_MINUTES": 120, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
+    "SUNDAY_RULE_IDS": ["R4"], "MEETING_DAYOF_TIME": "10:00", "NEXT_STEP_TIME": "15:00",
+    "NEXT_STEP_CONNECTED_MARKERS": ["connected"], "NEXT_STEP_FIRST_DAYS": 2,
+    "NEW_COMPANY_AFTER_WORKING_DAYS": 1, "LI_NO_DM_DAYS": 3, "EVENTS_WINDOW_DAYS": 14,
     "TEST_MORNING_TIME": "10:00", "TEST_AFTERNOON_TIME": "14:00",
     "MEETING_FOLLOWUP_AFTER_DAYS": 3, "MEETING_FOLLOWUP_EVERY_DAYS": 3,
     "MEETING_FOLLOWUP_LADDER": ["channel", "dm", "dm", "escalation"],
@@ -120,30 +128,12 @@ import voice  # noqa: E402
 from db import DB  # noqa: E402
 
 
-def _shipped_rules_with_r7_on() -> str:
-    """A TEMP COPY of bot_rules.yaml with R7 switched on, and nothing else changed.
+# THE SHIPPED RULES FILE, AS IT IS. Until NFT2-1069 this script ran against a temp
+# copy with R7 switched on (rule 13 had replaced it, and the cap scenario needed
+# its group). R7 is back on Mondays in the shipped file, so there is nothing to
+# switch: what is proved here is proved of the file the bot loads.
+import day_order_checks as doc  # noqa: E402  the times the team gave (tests/day_order_checks.py)
 
-    WHY (RULE 13, 7 Oct 2026): rule 13 replaced rule 7 ("rule 13 supercedes this"), so the shipped file has
-    `enabled: false` on R7 and a Monday now has one counted group fewer. This script proves the CAP MECHANICS on a
-    Monday with six countable groups, a roll for the cap and an R8 and an R9 outside it. That needs six, so the
-    scenario runs against a copy of the real file with R7 on (the evaluator is kept; one word brings the rule back).
-    Check (i) also runs the same Monday against the shipped file and says what it does now: seven groups, five
-    counted, nothing rolled, no R7.
-    """
-    src = open(os.path.join(HERE, "bot_rules.yaml"), encoding="utf-8").read()
-    start = src.index("  - id: R7" + chr(10))
-    end = src.index("  - id: R8" + chr(10))
-    block = src[start:end]
-    assert "enabled: false" in block, "R7 is expected to be disabled in the shipped file"
-    path = os.path.join(TMP, "bot_rules_r7_on.yaml")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(src[:start] + block.replace("enabled: false", "enabled: true") + src[end:])
-    return path
-
-
-SHIPPED_RULES_FILE = config.BOT_RULES_FILE
-R7_ON_RULES_FILE = _shipped_rules_with_r7_on()
-config.BOT_RULES_FILE = R7_ON_RULES_FILE
 rules_mod.reload()
 
 simulation.pace_seconds = lambda **_k: 0.0
@@ -289,7 +279,8 @@ def strip(body: str) -> str:
 
 MON = date(2026, 9, 28)                 # the pretend Monday (already in the past)
 SAT, SUN = MON - timedelta(days=2), MON - timedelta(days=1)
-SHEET = {"rows": [], "deliverables": [], "pipeline": [], "funnel": {}}
+SHEET = {"rows": [], "deliverables": [], "pipeline": [], "funnel": {}, "packages": [],
+         "events": []}
 
 
 def cell(d: date) -> str:
@@ -313,9 +304,10 @@ def deliverable(n, title, pri, status, due, team=""):
 
 
 def monday_sheet(day: date) -> None:
-    """Six countable groups on a Monday — R1, R4, R7, R10, R11 and the weekly
-    line — plus one meeting today (R8) and one meeting done with no next steps
-    (R9)."""
+    """Five countable groups on a Monday — R4, R7, R1, R10 in Monday's order and
+    the weekly line after them — plus one meeting today (R8) and one meeting
+    done with no next steps (R9). (R11 was the sixth until NFT2-1069; it runs
+    on Wednesdays only now. Nova Robotics is still seeded, for the week.)"""
     SHEET["rows"] = [
         poc(2, "Echo Labs", "Eve Rao", designation="CTO",
             li_dm_date=cell(day - timedelta(days=11))),                      # R7
@@ -336,6 +328,38 @@ def monday_sheet(day: date) -> None:
     SHEET["pipeline"] = ["Old Co", "Nova Robotics"]
     SHEET["funnel"] = {"outreach_sent": 12, "replies": 4, "meetings_booked": 2,
                        "followups_done": 5, "pilots": 1}
+    SHEET["packages"], SHEET["events"] = [], []
+
+
+def week_sheet(day: date) -> None:
+    """EVERY RULE THAT RUNS ON `day` HAS SOMETHING DUE (check (o)). One contact a
+    rule, so the one-mention-a-day dedup hands nobody from one rule to another."""
+    SHEET["rows"] = [
+        poc(2, "Prospect Co", "Pia Rao", designation="Founder", first_contact="FALSE"),  # R5
+        poc(3, "Linked Co", "Lev Shah", designation="CTO",
+            li_connected_date=cell(day - timedelta(days=6))),                # R6
+        poc(4, "Echo Labs", "Eve Rao", designation="CTO",
+            li_dm_date=cell(day - timedelta(days=11))),                      # R7
+        poc(5, "Gantry Systems", "Gil Shah", designation="Head of ML",
+            meeting_date=cell(day)),                                         # R8
+        poc(6, "Harbor Robotics", "Hal Iyer", designation="CEO",
+            meeting_date=cell(day - timedelta(days=5)),
+            meeting_status="Completed"),                                     # R9
+        poc(7, "Fathom AI", "Fay Lin", designation="Founder",
+            prospect_status="Demo", closure_prob="70%"),                     # R10
+        poc(8, "Juniper Labs", "Jo Nair", designation="Founder",
+            sid_li_added="Connected", li_connected_date=cell(day - timedelta(days=10)),
+            **{role: "" for role in nextaction.NEXT_STEP_REQUIRED_ROLES}),   # R13
+    ]
+    SHEET["deliverables"] = [deliverable(2, "MSA template", "P1", "",
+                                         day + timedelta(days=2), "Legal")]   # R4
+    SHEET["packages"] = [{"_row": 2, "_extra": {}, "name": "Hinglish STT", "ready": "",
+                          "status": "In progress"}]                           # R12
+    SHEET["events"] = [{"_row": 2, "_extra": {}, "event": "Voice AI Summit",
+                        "event_date": cell(day + timedelta(days=9)),
+                        "registration_deadline": "", "registered": "Yes", "link": ""}]  # R3
+    SHEET["pipeline"] = ["Old Co", "Nova Robotics"]                           # R11 (seeded)
+    SHEET["funnel"] = {}
 
 
 def seed(path: str, day: date) -> None:
@@ -384,9 +408,15 @@ def new_bot(path: str, *, news_stubbed: bool = True):
             return list(SHEET["deliverables"])
         if kind == gtm_sheet.RESEARCHER_LINES:
             return [{"_row": i + 2, "company": c} for i, c in enumerate(SHEET["pipeline"])]
+        if kind == gtm_sheet.PACKAGES:
+            return list(SHEET["packages"])
+        if kind == gtm_sheet.EVENTS:
+            return list(SHEET["events"])
         return []
 
     async def funnel(*, today):
+        if not SHEET["funnel"]:
+            return None                  # a fixture with no weekly line
         return events_mod.funnel_action(dict(SHEET["funnel"]), today=today)
 
     real_send = bot._send_drip_message
@@ -399,6 +429,8 @@ def new_bot(path: str, *, news_stubbed: bool = True):
             "type": message.get("type"), "rule": message.get("rule_id") or "—",
             "counted": drip.counts(message), "pinned": bool(message.get("pinned")),
             "at": message.get("send_at_hhmm"), "stage": message.get("stage"),
+            # WHEN IT REALLY LEFT, by the bot's own clock: the tick it went on.
+            "clock": dl.now_ist().strftime("%H:%M"),
             "posts": list(POSTED[start:]),
         })
 
@@ -462,31 +494,38 @@ def collect(planned: dict) -> dict:
     }
 
 
-async def live_path(day: date, *, seeded: bool = True, label: str = "") -> dict:
-    """The live sweep's own method, ticked through the day. A dry run: every
-    send lands in the recording channel."""
-    begin(label or f"LIVE (dry run) — _maybe_send_drip ticked through {dl.iso(day)}")
+async def live_path(day: date, *, seeded: bool = True, label: str = "",
+                    offset: int = 0) -> dict:
+    """The live sweep's own method, ticked through the day AS THE SWEEPER TICKS
+    IT: every 15 minutes (COS_FOLLOWUP_CHECK_INTERVAL_MINUTES' default) from
+    09:00 to 21:00, `offset` minutes past each quarter. A dry run: every send
+    lands in the recording channel.
+
+    It used to be ticked only at the planned times, a gap apart. Ticking it the
+    way the real loop does is what shows a post leaves ON THE TICK AT ITS TIME
+    and that nothing leaves on any other tick.
+    """
+    begin(label or f"LIVE (dry run) — _maybe_send_drip ticked every 15 min through "
+          f"{dl.iso(day)}" + (f", {offset} min past each quarter" if offset else ""))
     path = fresh_db("live", seeded_for=day if seeded else None)
     config.SALES_TEST_MODE = False
     bot = new_bot(path)
     pretend(day, 9, 0)
     bot._live_loop_held = lambda what: False     # the live loop IS the thing under test
     planned = await bot._plan_drip(today=day, already=[])
-    times = [m["send_at"] for m in (planned or {}).get("messages") or []]
-    step = timedelta(minutes=drip.min_gap_minutes() + 1)
     ticks: list = []
-    at = None
-    for target in times + [None, None]:
-        base = target or (at + step if at else datetime.combine(day, time(22, 0), dl.IST))
-        at = base if at is None else max(base, at + step)
-        at = min(at, datetime.combine(day, time(23, 58), dl.IST))
+    at = datetime.combine(day, time(9, 0), dl.IST) + timedelta(minutes=offset)
+    end = datetime.combine(day, time(21, 0), dl.IST)
+    while at <= end:
         clock.set_time_of_day(at.timetz().replace(tzinfo=None), by="verify_s1")
         before = len(SENT)
         await bot._maybe_send_drip()
         ticks.append((at.strftime("%H:%M"), len(SENT) - before))
+        at += timedelta(minutes=15)
     clock.clear_time_override(why="verify_s1")
     got = collect(planned)
     got["ticks"] = ticks
+    got["sending_ticks"] = [(t, n) for t, n in ticks if n]
     got["rows"] = bot.db.drip_sent_today(dl.iso(day))
     return got
 
@@ -511,6 +550,12 @@ async def sim_path(day: date, *, command: str = "", seeded: bool = True,
     bot = new_bot(fresh_db("sim", seeded_for=day if seeded else None))
     await bot._handle_simulation(FakeMessage(), command)
     return collect((bot._last_test_plan or {}).get("planned"))
+
+
+def went(run: dict, *, pinned=None, clock_time: bool = False) -> list:
+    """[(rule, HH:MM)] as sent, in order: the planned time, or the tick it left on."""
+    return [(x["rule"], x["clock"] if clock_time else x["at"]) for x in run["raw"]
+            if pinned is None or x["pinned"] == pinned]
 
 
 def show_run(run: dict) -> None:
@@ -584,14 +629,16 @@ def migration() -> None:
 
 
 async def the_monday() -> None:
-    say(f"(i) A MONDAY WITH 6 COUNTABLE GROUPS + AN R8 + AN R9 — {MON:%A %d %b %Y}, "
-        f"cap {config.DAILY_MESSAGE_CAP}")
+    say(f"(i) A MONDAY WITH 5 COUNTABLE GROUPS + AN R8 + AN R9 — {MON:%A %d %b %Y}, "
+        f"cap {config.DAILY_MESSAGE_CAP}, window {config.SALES_DRIP_START}-"
+        f"{config.SALES_DRIP_END}, gap {drip.gap_minutes()} min")
     monday_sheet(MON)
 
     live = await live_path(MON)
     show_run(live)
-    print("     ticks (time -> messages sent): "
-          + ", ".join(f"{t}->{n}" for t, n in live["ticks"]))
+    print("     ticks that sent (time -> messages): "
+          + ", ".join(f"{t}->{n}" for t, n in live["sending_ticks"])
+          + f"   ({len(live['ticks'])} ticks in all)")
     test = await test_path(MON)
     show_run(test)
     sim = await sim_path(MON)
@@ -604,32 +651,38 @@ async def the_monday() -> None:
               f"{'counted' if counted else 'outside the cap'}"
               f"{', fixed time' if pinned else ''}")
     for kind, why in d["rolled"]:
-        print(f"     ROLL  {kind} ({why}) — over the cap, goes tomorrow")
+        print(f"     NOT TODAY  {kind} ({why})")
     for kind in d["held"]:
         print(f"     held  {kind}")
     print(f"     counted {d['counted']} of cap {d['cap']}")
 
     groups = len(d["go"]) + len(d["rolled"]) + len(d["held"])
-    check("8 groups were eligible: 6 that count, the R8 and the R9", groups, 8)
-    check("5 counted posts went out — the cap, exactly",
-          sum(1 for s in live["raw"] if s["counted"]), 5)
-    check("...plus the R8 and the R9, outside it",
-          sorted(s["rule"] for s in live["raw"] if not s["counted"]), ["R8", "R9"])
-    check("7 messages in all", len(live["raw"]), 7)
-    check("exactly one group rolled, and it rolled for the cap",
-          [why for _k, why in d["rolled"]], ["cap"])
+    check("7 groups were eligible: 5 that count, the R8 and the R9", groups, 7)
+    check("the four rules in Monday's order went at 14:00, 16:00, 18:00 and 20:00",
+          went(live, pinned=False),
+          [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
+    check("4 counted posts went out",
+          sum(1 for s in live["raw"] if s["counted"]), 4)
+    check("...plus the R8 and the R9, outside the cap, both at MEETING_DAYOF_TIME",
+          sorted((s["rule"], s["at"], s["pinned"]) for s in live["raw"] if not s["counted"]),
+          [("R8", "10:00", True), ("R9", "10:00", True)])
+    check("6 messages in all", len(live["raw"]), 6)
+    check("exactly one group was not sent, and for the window, not the cap: the "
+          "weekly line is fifth and the day holds four slots",
+          [why for _k, why in d["rolled"]], ["window"])
     check("nothing was held", d["held"], [])
     r1 = [s for s in live["raw"] if s["rule"] == "R1"]
-    check("R1 went, at NEWS_MAIN_TIME, as a fixed-time post that counts",
-          [(s["at"], s["pinned"], s["counted"]) for s in r1],
-          [(config.NEWS_MAIN_TIME, True, True)])
-    check("R8's day-of touch went first, at MEETING_DAYOF_TIME",
-          (live["raw"][0]["rule"], live["raw"][0]["at"]),
-          ("R8", config.MEETING_DAYOF_TIME))
-    check("...and the live sweep sent it at 10:00, before the window opened",
-          live["ticks"][0], (config.MEETING_DAYOF_TIME, 1))
-    check("the two ticks after the last post sent nothing",
-          [n for _t, n in live["ticks"][-2:]], [0, 0])
+    check("R1 went third, at 18:00, as a spaced post that counts (no fixed 14:00)",
+          [(s["at"], s["pinned"], s["counted"]) for s in r1], [("18:00", False, True)])
+    check("both meeting posts went on the 10:00 tick, before the window opened",
+          live["sending_ticks"][0], (config.MEETING_DAYOF_TIME, 2))
+    check("every post left on the tick at its own time, and no other tick sent anything",
+          live["sending_ticks"],
+          [("10:00", 2), ("14:00", 1), ("16:00", 1), ("18:00", 1), ("20:00", 1)])
+    check("...so each real send is at its planned time",
+          went(live, clock_time=True), went(live))
+    check("no tick after the last post sent anything",
+          [n for t, n in live["ticks"] if t > "20:00"], [0, 0, 0, 0])
 
     rows = live["rows"]
     print("\n   drip_sends after the live day:")
@@ -638,8 +691,29 @@ async def the_monday() -> None:
               f"counts_toward_cap={r['counts_toward_cap']} pinned={r['pinned']}")
     check("every row has counts_toward_cap filled in",
           [r["counts_toward_cap"] for r in rows if r["counts_toward_cap"] is None], [])
-    check("counted_today(rows) is 5", drip.counted_today(rows), 5)
-    check("the day is full, by the one counter", drip.cap_reached(rows, MON), True)
+    check("counted_today(rows) is 4", drip.counted_today(rows), 4)
+    check("the day is not full by the one counter: the window ended it, not the cap",
+          drip.cap_reached(rows, MON), False)
+
+    # THE SWEEPER DOES NOT TICK ON THE HOUR. Seven minutes past each quarter:
+    # every post leaves on the first tick after its time, two spaced posts are
+    # still two hours apart on the clock, and the 20:00 post still goes.
+    monday_sheet(MON)
+    off = await live_path(MON, offset=7)
+    check("ticking at :07, :22, :37, :52 — the same posts, each on the first tick "
+          "at or after its time",
+          went(off, clock_time=True),
+          [("R8", "10:07"), ("R9", "10:07"), ("R4", "14:07"), ("R7", "16:07"),
+           ("R1", "18:07"), ("R10", "20:07")] if went(off)[0][0] == "R8" else
+          [("R9", "10:07"), ("R8", "10:07"), ("R4", "14:07"), ("R7", "16:07"),
+           ("R1", "18:07"), ("R10", "20:07")])
+    check("...planned at the same slots as the on-the-hour day",
+          went(off), went(live))
+    spaced_clock = [datetime.strptime(t, "%H:%M") for _r, t in
+                    went(off, pinned=False, clock_time=True)]
+    check("...and never less than 120 minutes between two spaced posts on the clock",
+          [int((b - a).total_seconds() // 60)
+           for a, b in zip(spaced_clock, spaced_clock[1:])], [120, 120, 120])
 
     print("\n   THREE WAYS")
     check("the same messages, in the same order, with identical bodies "
@@ -648,24 +722,9 @@ async def the_monday() -> None:
     if not (live["sent"] == test["sent"] == sim["sent"]):
         for name, run in (("live", live), ("test", test), ("sim", sim)):
             print(f"     {name}: " + ", ".join(k for k, _p in run["sent"]))
-    check("the same cap decisions: who goes, who counts, who rolls, who is held",
+    check("the same decisions: who goes, AT WHAT TIME, who counts, who does not go, "
+          "who is held",
           live["decisions"] == test["decisions"] == sim["decisions"])
-
-    # THE SAME MONDAY AS SHIPPED: R7 is off (replaced by rule 13), so one counted group fewer and nothing to roll.
-    config.BOT_RULES_FILE = SHIPPED_RULES_FILE
-    rules_mod.reload()
-    monday_sheet(MON)
-    shipped = await live_path(MON)
-    sd = shipped["decisions"]
-    check("as shipped (R7 off): the same Monday has 7 groups, no R7, nothing rolled, nothing held",
-          (len(sd["go"]) + len(sd["rolled"]) + len(sd["held"]), any(g[0] == "R7" for g in sd["go"]),
-           sd["rolled"], sd["held"]), (7, False, [], []))
-    check("as shipped: 5 counted posts, plus the R8 and the R9 outside the cap",
-          (sum(1 for x in shipped["raw"] if x["counted"]),
-           sorted(x["rule"] for x in shipped["raw"] if not x["counted"])), (5, ["R8", "R9"]))
-    config.BOT_RULES_FILE = R7_ON_RULES_FILE
-    rules_mod.reload()
-    monday_sheet(MON)
     check("the live run carries no [TEST] tag; the other two tag every message",
           (any(p.startswith(config.SIMULATION_PREFIX) for s in live["raw"] for p in s["posts"]),
            all(p.startswith(config.SIMULATION_PREFIX) for s in test["raw"] for p in s["posts"]),
@@ -682,8 +741,80 @@ async def the_monday() -> None:
             for line in "\n".join(run["raw"][pick]["posts"]).splitlines():
                 print(f"     {name:<4} | {line}")
 
+    # THE CAP ITSELF, three ways. The shipped day never reaches a cap of 5 (the
+    # window holds four), so the cap is brought down to 3 to show it deciding:
+    # the first three in Monday's order count and go, the fourth and the weekly
+    # line are over the cap, and the R8 and the R9 go regardless.
+    print("\n   THE SAME MONDAY UNDER A CAP OF 3")
+    config.DAILY_MESSAGE_CAP = 3
+    try:
+        monday_sheet(MON)
+        live3 = await live_path(MON)
+        show_run(live3)
+        test3 = await test_path(MON)
+        sim3 = await sim_path(MON)
+        d3 = live3["decisions"]
+        check("3 counted posts went out — the cap, exactly — and they are the first "
+              "three of Monday's order",
+              [(s["rule"], s["at"]) for s in live3["raw"] if s["counted"]],
+              [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00")])
+        check("...plus the R8 and the R9, outside it",
+              sorted(s["rule"] for s in live3["raw"] if not s["counted"]), ["R8", "R9"])
+        check("two groups rolled, both for the cap", [why for _k, why in d3["rolled"]],
+              ["cap", "cap"])
+        check("counted_today(rows) is 3, and the day is full by the one counter",
+              (drip.counted_today(live3["rows"]), drip.cap_reached(live3["rows"], MON)),
+              (3, True))
+        check("the same messages on the live sweep, the test day and the simulation",
+              live3["sent"] == test3["sent"] == sim3["sent"])
+        check("the same cap decisions: who goes, who counts, who rolls, who is held",
+              live3["decisions"] == test3["decisions"] == sim3["decisions"])
+    finally:
+        config.DAILY_MESSAGE_CAP = 5
+
+
+# -- (o) the order of the day ----------------------------------------------------
+
+
+async def the_order() -> None:
+    say("(o) THE ORDER OF THE DAY — every weekday, every rule due, THREE WAYS")
+    days = [MON + timedelta(days=i) for i in range(5)]
+    for n, day in enumerate(days):
+        key = doc.WEEK[n]                       # the same weekday in the checks' week
+        want_spaced, want_fixed = doc.SPACED[key], sorted(doc.FIXED)
+        week_sheet(day)
+        live = await live_path(day)
+        show_run(live)
+        test = await test_path(day)
+        sim = await sim_path(day)
+        name = day.strftime("%A")
+        check(f"{name}: the spaced posts, in the team's order, two hours apart",
+              went(live, pinned=False), want_spaced)
+        check(f"{name}: meeting prep and the meeting follow-up at 10:00, next steps at 15:00",
+              sorted(went(live, pinned=True)), want_fixed)
+        check(f"{name}: the live sweep sent each one on the tick at its time",
+              went(live, clock_time=True), went(live))
+        check(f"{name}: the fixed-time posts are outside the cap, the spaced ones count",
+              sorted({(x["pinned"], x["counted"]) for x in live["raw"]}),
+              [(False, True), (True, False)])
+        check(f"{name}: nothing was left over and nothing was held",
+              (live["decisions"]["rolled"], live["decisions"]["held"]), ([], []))
+        check(f"{name}: THE TEST DAY gives the same posts at the same times",
+              (went(test), test["decisions"] == live["decisions"]), (went(live), True))
+        check(f"{name}: A SIMULATION gives the same posts at the same times",
+              (went(sim), sim["decisions"] == live["decisions"]), (went(live), True))
+        check(f"{name}: the same bodies on all three (apart from [TEST] and mentions)",
+              live["sent"] == test["sent"] == sim["sent"])
+    week_sheet(MON)
+
 
 # -- (ii) the week -------------------------------------------------------------
+
+# WHERE R1 LANDS ON EACH DAY OF THE FIXTURE'S WEEK. The fixture has something for
+# R4, R7 and R10 on the Monday and a new company for the Wednesday; nothing is
+# due for R5, R6, R3 or R12, so on those days the rules ahead of R1 that have
+# nothing to say take no slot and R1 moves up.
+R1_TIMES = {"Mon": "18:00", "Tue": "16:00", "Wed": "16:00", "Thu": "14:00", "Fri": "16:00"}
 
 
 async def the_week() -> None:
@@ -717,11 +848,24 @@ async def the_week() -> None:
     r1 = [s for s in week["raw"] if s["rule"] == "R1"]
     check("always a fresh post, never a \"re-ask\"",
           sorted({s["stage"] for s in r1}), [drip.STAGE_NUDGE])
-    check("always at NEWS_MAIN_TIME", sorted({s["at"] for s in r1}),
-          [config.NEWS_MAIN_TIME])
+    check("never a fixed-time post any more", sorted({s["pinned"] for s in r1}), [False])
+    in_order = {}
+    for day in days[:5]:
+        spaced = [s for s in by_day.get(dl.iso(day), [])
+                  if not s["pinned"] and s["rule"] in rules_mod.order_for(day)]
+        wanted = [r for r in rules_mod.order_for(day) if r in [s["rule"] for s in spaced]]
+        slots = [t.strftime("%H:%M") for t in drip.slot_times(day, count=max(1, len(spaced)))]
+        in_order[day.strftime("%a")] = (
+            [(s["rule"], s["at"]) for s in spaced] == list(zip(wanted, slots)))
+    check("every weekday's posts are in that day's order, two hours apart from 14:00",
+          in_order, {d: True for d in ("Mon", "Tue", "Wed", "Thu", "Fri")})
+    check("R1's time each day is its place among the rules that had something to say",
+          {dl.parse_date(s["day"]).strftime("%a"): s["at"] for s in r1}, R1_TIMES)
     check("no day went over the cap",
           max(sum(1 for s in v if s["counted"]) for v in by_day.values()) <= 5)
-    check("no 2 PM post at the weekend",
+    check("nothing in the week was sent after 20:00",
+          [(s["day"], s["rule"], s["at"]) for s in week["raw"] if s["at"] > "20:00"], [])
+    check("no AI news post at the weekend",
           [s for d in days[5:] for s in by_day.get(dl.iso(d), []) if s["rule"] == "R1"],
           [])
 
@@ -1141,12 +1285,15 @@ def the_wording() -> None:
 async def main() -> None:
     print(f"real date {dl.iso(dl.real_today_ist())} | pretend Monday {dl.iso(MON)} | "
           f"cap {config.DAILY_MESSAGE_CAP} | window {config.SALES_DRIP_START}-"
-          f"{config.SALES_DRIP_END} | news {config.NEWS_MAIN_TIME} | day-of "
-          f"{config.MEETING_DAYOF_TIME} | tone: {tone.describe()}")
+          f"{config.SALES_DRIP_END} | gap {drip.gap_minutes()} min | meetings "
+          f"{config.MEETING_DAYOF_TIME} | next steps {config.NEXT_STEP_TIME} | "
+          f"tone: {tone.describe()}")
     if want("0"):
         migration()
     if want("i"):
         await the_monday()
+    if want("o"):
+        await the_order()
     if want("ii"):
         await the_week()
     if want("iii"):

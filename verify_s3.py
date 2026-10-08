@@ -77,10 +77,10 @@ SETTINGS = {
     "SALES_FINAL_SAY_ID": SID,
     "ROSTER_DISPLAY_NAMES": {str(SID): "Sid", str(VAISHNAVI): "Vaishnavi",
                              str(KUSHAL): "Kushal"},
-    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "18:30",
-    "MESSAGE_GAP_MINUTES": 90, "MESSAGE_JITTER_MINUTES": 15,
-    "MESSAGE_GAP_MIN_MINUTES": 30, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
-    "SUNDAY_RULE_IDS": ["R4"], "NEWS_MAIN_TIME": "14:00", "MEETING_DAYOF_TIME": "10:00",
+    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "20:00",
+    "MESSAGE_GAP_MINUTES": 120, "MESSAGE_JITTER_MINUTES": 0,
+    "MESSAGE_GAP_MIN_MINUTES": 120, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
+    "SUNDAY_RULE_IDS": ["R4"], "MEETING_DAYOF_TIME": "10:00",
     "TEST_MORNING_TIME": "10:00", "TEST_AFTERNOON_TIME": "14:00",
     "NEXT_ACTION_ENABLED": True, "NEXT_ACTION_WEEKEND_SHIFT": True,
     "WEEKLY_FUNNEL_ENABLED": False, "SALES_DMS_ENABLED": False,
@@ -573,31 +573,12 @@ def monday_sheet() -> None:
     )
 
 
-def shipped_rules_with_r7_on() -> str:
-    """A TEMP COPY of bot_rules.yaml with R7 switched on, for check (ii) only.
-
-    WHY (RULE 13, 7 Oct 2026): Vaishnavi decided "rule 13 supercedes" rule 7, so the shipped file now has
-    `enabled: false` on R7. The evaluator, the renderer and the overflow line are KEPT (switching the rule back on is
-    one word), and this check still proves they work — against a copy of the real file with exactly that one word
-    changed. The shipped file is untouched, and the check after it proves R7 posts nothing as shipped.
-    """
-    src = open(os.path.join(HERE, "bot_rules.yaml"), encoding="utf-8").read()
-    start = src.index("  - id: R7\n")
-    end = src.index("  - id: R8\n")
-    block = src[start:end]
-    assert "enabled: false" in block, "R7 is expected to be disabled in the shipped file"
-    path = os.path.join(TMP, "bot_rules_r7_on.yaml")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(src[:start] + block.replace("enabled: false", "enabled: true") + src[end:])
-    return path
-
-
 async def the_monday() -> None:
     say(f"(i) (ii) (iii) A MONDAY — {MON:%A %d %b %Y}: R4, R7 and R10")
-    shipped_file = config.BOT_RULES_FILE
-    config.BOT_RULES_FILE = shipped_rules_with_r7_on()
+    # THE SHIPPED RULES FILE, AS IT IS. Until NFT2-1069 (8 Oct) R7 was switched off there and this check ran against
+    # a temp copy with it on; R7 is back on Mondays, so (ii) is proved of the file the bot loads.
     rules_mod.reload()
-    check("(ii) is run against a copy of the shipped rules with ONLY R7 switched on",
+    check("(ii) R7 is on in the shipped rules, and Monday is its day",
           (rules_mod.by_id("R7").enabled, "R7" in [r.id for r in rules_mod.for_day(MON)]), (True, True))
     RULES.clear()
     RULES.update({"R4", "R7", "R10"})
@@ -659,18 +640,35 @@ async def the_monday() -> None:
     check("the DM sent 3 days ago is not chased", "Hal Iyer" in body, False)
     same("R7", live, test, sim)
 
-    # BACK TO THE SHIPPED FILE. As shipped, R7 is off (replaced by rule 13 on 7 Oct 2026): the same Monday, the same
-    # seven eligible contacts, and the live sweep posts nothing for R7.
-    config.BOT_RULES_FILE = shipped_file
-    rules_mod.reload()
-    check("as shipped, R7 is off and is not one of Monday's rules",
-          (rules_mod.by_id("R7").enabled, "R7" in [r.id for r in rules_mod.for_day(MON)]), (False, False))
+    # RULE 13 COMES FIRST (NFT2-1069). The same Monday and the same seven DM'd contacts, but now Rule 13 covers some
+    # of them: "Sid - LI Addition" says Connected and LI Connected Date is filled in. R7 lists only the others, and
+    # when Rule 13 covers all seven it posts nothing at all.
+    def covered_sheet(rows_covered: set) -> None:
+        monday_sheet()
+        grid = GRIDS["Outreach PoCs"]
+        for row in grid[1:]:
+            if row[COL["Sr No"]] in rows_covered:
+                row[COL["Sid - LI Addition"]] = "Connected"
+                row[COL["LI Connected Date"]] = cell(MON - timedelta(days=40))
+
     RULES.clear()
     RULES.add("R7")
+    covered_sheet({"1", "2", "3"})
+    some = await live_path(MON)
+    listed = [l.split(" — ")[0].split(". ", 1)[1]
+              for l in "\n".join(some["posts"].get("R7") or []).splitlines() if re.match(r"^\d+\. ", l)]
+    check("with rule 13 covering three of the seven (Connected, with an LI Connected Date), R7 lists the other "
+          "four and none of those three", listed, ["Dee Evans", "Eve Rao", "Fay Lin", "Gil Shah"])
+    covered_sheet({"1", "2", "3", "4", "5", "6", "7"})
+    none = await live_path(MON)
+    check("with rule 13 covering all seven, a Monday posts no R7 at all", none["posts"].get("R7"), None)
+    covered_sheet({"1", "2", "3"})
+    for row in GRIDS["Outreach PoCs"][1:]:
+        row[COL["LI Connected Date"]] = ""          # Connected, but no date: rule 13 skips them
+    nodate = await live_path(MON)
+    check("Connected with NO LI Connected Date is not covered: all seven are R7's again (five listed, two over)",
+          ("(+2 more next Monday)" in "\n".join(nodate["posts"].get("R7") or [])), True)
     monday_sheet()
-    shipped_run = await live_path(MON)
-    check("as shipped, a Monday with seven eligible DM'd contacts posts no R7 at all",
-          shipped_run["posts"].get("R7"), None)
     RULES.clear()
     RULES.update({"R4", "R7", "R10"})
 
@@ -988,7 +986,7 @@ async def the_wednesday() -> None:
 def the_wording() -> None:
     say("(w) THE WORDING FOR THE SHEET — printed from the rules the bot loads")
     rules_mod.reload()
-    for rid in ("R3", "R4", "R5", "R7", "R10"):      # R7's is now the one-line "replaced by rule 13" sentence
+    for rid in ("R3", "R4", "R5", "R7", "R10"):      # R7's says rule 13 comes first (it is back on Mondays)
         text = rules_mod.sheet_wording_for(rid)
         print(f"\n   Bot Rules tab — rule {rid[1:]}, column \"What the Bot Shares / "
               "Checks\":")
@@ -1002,9 +1000,11 @@ def the_wording() -> None:
           [x for x in ("every Wednesday", "Team:", "no public email found",
                        "No closure support this week")
            if x not in strategy], [])
-    # RULE 7 WAS REPLACED BY RULE 13 ON 7 OCT 2026: its overflow phrase ("+N more next Monday") left the strategy with it.
-    check("...and for rule 7: replaced by rule 13, no longer describing the Monday list",
-          ("Replaced by rule 13" in strategy, "+N more next Monday" in strategy), (True, False))
+    # RULE 7 IS BACK ON MONDAYS (NFT2-1069, 8 Oct), behind rule 13: the strategy describes the Monday list again,
+    # with its overflow phrase, and says who rule 13 takes first. On 7 Oct it read "Replaced by rule 13".
+    check("...and for rule 7: the Monday list, its overflow line, and rule 13 first",
+          ("Replaced by rule 13" in strategy, "+N more next Monday" in strategy,
+           "Rule 13 comes first" in strategy), (False, True, True))
     check("...and no longer says \"every other Wednesday\"",
           "every other Wednesday" in strategy, False)
 

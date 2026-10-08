@@ -951,22 +951,49 @@ class TestShippedRules:
         assert r.plain and r.sheet_wording
 
     def test_O1_the_days(self):
-        assert ids(MONDAY) == ["R1", "R4", "R13", "R8", "R9", "R10", "R11"]
-        assert ids(THURSDAY) == ["R1", "R13", "R5", "R8", "R9", "R11", "R12"]
+        # SINCE NFT2-1069 (8 Oct): R7 is back on Mondays and R11 runs on Wednesdays only.
+        assert ids(MONDAY) == ["R1", "R4", "R13", "R7", "R8", "R9", "R10"]
+        assert ids(THURSDAY) == ["R1", "R13", "R5", "R8", "R9", "R12"]
+        assert ids(date(2026, 10, 14)) == ["R1", "R3", "R13", "R8", "R9", "R11"]
         assert ids(SATURDAY) == ["R8", "R9"]
         assert R13 not in ids(SATURDAY) and R13 not in ids(SUNDAY)
         for d in (MONDAY, TUESDAY, date(2026, 10, 14), THURSDAY, date(2026, 10, 16)):
             assert R13 in ids(d)
 
-    def test_O1_R7_is_off_as_shipped_and_produces_nothing_on_a_monday(self):
-        assert rules_mod.by_id("R7").enabled is False
-        assert "R7" not in ids(MONDAY)
+    def test_O1_R7_is_back_on_mondays_and_produces_nothing_for_a_person_rule_13_covers(self):
+        """7 Oct: "rule 13 supercedes this", and R7 was switched off. 8 Oct (NFT2-1069): R7 is back on Mondays, but
+        never for a person Rule 13 covers. The same person as before — Connected, with an LI Connected Date, DM'd
+        20 days ago, no meeting — still gets nothing from R7, and is Rule 13's."""
+        assert rules_mod.by_id("R7").enabled is True
+        assert "R7" in ids(MONDAY) and "R7" not in ids(TUESDAY)
         tab = fx.parse([fx.person(1, name="Priya Rao", li_date=date(2026, 8, 1), dm_sent="Sent",
                                   dm_date=MONDAY - D(days=20), step="Call the PoC")])
         res = nextaction.run(today=MONDAY, rows=list(tab.rows), day_rules=rules_mod.for_day(MONDAY),
                              next_step_state={})
         assert not [a for a in res["actions"] if a["rule_id"] == "R7"]
         assert not res["by_rule"].get("R7")
+        assert [a["poc"] for a in res["by_rule"].get("R13") or []] == ["Priya Rao"]
+        assert nextaction.covered_by_next_steps(tab.rows[0]) is True
+
+    def test_O1_R7_lists_a_dm_d_person_rule_13_does_not_cover(self):
+        """The other half: the same row with "Sid - LI Addition" not saying Connected is nobody's but R7's."""
+        tab = fx.parse([fx.person(1, name="Priya Rao", li_date=date(2026, 8, 1), dm_sent="Sent",
+                                  dm_date=MONDAY - D(days=20), step="Call the PoC")])
+        row = dict(tab.rows[0], sid_li_added="")
+        assert nextaction.covered_by_next_steps(row) is False
+        res = nextaction.run(today=MONDAY, rows=[row], day_rules=rules_mod.for_day(MONDAY), next_step_state={})
+        assert [a["poc"] for a in res["by_rule"].get("R7") or []] == ["Priya Rao"]
+        assert not res["by_rule"].get("R13")
+
+    def test_O1_rule_13_and_rule_7_read_one_check(self):
+        """"Reuse Rule 13's own eligibility check; don't copy it": both evaluators call the same functions."""
+        import inspect
+        r13 = inspect.getsource(nextaction._r_next_step_followups)
+        r7 = inspect.getsource(nextaction._r_dm_no_meeting)
+        assert "marked_connected(" in r13 and "has_connected_date(" in r13
+        assert "covered_by_next_steps(" in r7
+        assert "NEXT_STEP_CONNECTED_MARKERS" not in r13 and "NEXT_STEP_CONNECTED_MARKERS" not in r7
+        assert "sid_li_added" not in r7 and "li_connected_date" not in r7
 
     def test_O1_the_R7_evaluator_is_kept(self):
         assert hasattr(nextaction, "_r_dm_no_meeting") and nextaction.R_DM_NO_MEETING in nextaction.EVALUATORS
@@ -1007,9 +1034,11 @@ class TestShippedRules:
         assert "Notes/Remarks" in rules_mod.by_id("R9").sheet_wording
         assert "Notes/Remarks" in rules_mod.sheet_wording_for("R9")
 
-    def test_R7_sheet_wording_is_the_replaced_sentence(self):
-        text = rules_mod.sheet_wording_for("R7").lower()
-        assert "replaced" in text and "13" in text
+    def test_R7_sheet_wording_says_rule_13_comes_first(self):
+        """It was the one-line "Replaced by rule 13" sentence until 8 Oct, when R7 came back on Mondays."""
+        text = rules_mod.sheet_wording_for("R7")
+        assert "Rule 13 comes first" in text and "never listed here" in text
+        assert "every Monday" in text and "replaced" not in text.lower()
 
 
 # ---------------------------------------------------------------------------------------------

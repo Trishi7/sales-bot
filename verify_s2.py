@@ -72,10 +72,10 @@ LIVE_SETTINGS = {k: getattr(config, k) for k in (
 # THE SHIPPED DEFAULTS, pinned — not whatever the local .env says.
 SETTINGS = {
     "DB_PATH": os.environ["DB_PATH"], "STATE_DIR": os.environ["STATE_DIR"],
-    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "18:30",
-    "MESSAGE_GAP_MINUTES": 90, "MESSAGE_JITTER_MINUTES": 15,
-    "MESSAGE_GAP_MIN_MINUTES": 30, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
-    "SUNDAY_RULE_IDS": ["R4"], "NEWS_MAIN_TIME": "14:00", "MEETING_DAYOF_TIME": "10:00",
+    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "20:00",
+    "MESSAGE_GAP_MINUTES": 120, "MESSAGE_JITTER_MINUTES": 0,
+    "MESSAGE_GAP_MIN_MINUTES": 120, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
+    "SUNDAY_RULE_IDS": ["R4"], "MEETING_DAYOF_TIME": "10:00",
     "TEST_MORNING_TIME": "10:00", "TEST_AFTERNOON_TIME": "14:00",
     "NEXT_ACTION_ENABLED": True, "WEEKLY_FUNNEL_ENABLED": False, "EVENTS_ENABLED": False,
     "SHEET_WRITES_ENABLED": False, "DRIP_LLM_COMPOSE": True, "SALES_DMS_ENABLED": False,
@@ -827,15 +827,18 @@ async def the_weekend() -> None:
 
     since, until = bot._main_window(MON)
     print(f"\n   Monday's window: {since:%a %d %b %H:%M} -> {until:%a %d %b %H:%M} IST "
-          f"(a fixed 24 hours would have begun {ist(SUN, 14):%a %d %b %H:%M})")
-    check("the window runs from Friday's post to Monday's",
-          (since, until), (ist(FRI, 14), ist(MON, 14)))
+          f"(a fixed 24 hours would have begun {ist(SUN, 18):%a %d %b %H:%M})")
+    # AI NEWS IS THIRD IN THE ORDER ON A MONDAY AND ON A FRIDAY (NFT2-1069), so
+    # its slot is 18:00 on both; it was a fixed 14:00 until 8 Oct.
+    check("the window runs from Friday's AI news slot to Monday's (18:00 on both days)",
+          (since, until), (ist(FRI, 18), ist(MON, 18)))
     check("the story is inside it — and was outside a 24-hour one",
-          (since <= ist(SAT, 15, 30) <= until, ist(SAT, 15, 30) >= ist(SUN, 14)),
+          (since <= ist(SAT, 15, 30) <= until, ist(SAT, 15, 30) >= ist(SUN, 18)),
           (True, False))
-    tue_since, _tue_until = bot._main_window(TUE)
-    check("an ordinary day's window is still the previous post to this one",
-          tue_since, ist(MON, 14))
+    tue_since, tue_until = bot._main_window(TUE)
+    check("an ordinary day's window is still the previous post's slot to this one's: "
+          "Monday 18:00 to Tuesday 20:00 (fourth in Tuesday's order)",
+          (tue_since, tue_until), (ist(MON, 18), ist(TUE, 20)))
 
     run = await test_path(MON, [], bot=bot,
                           label=f"THE MONDAY — \"make it {dl.iso(MON)}\", same database")
@@ -875,7 +878,7 @@ def the_wording() -> None:
     strategy = persona.load_strategy()
     check("sales_strategy.md rule 1 says the same things",
           [x for x in ("our own PoCs", "(Synthflow AI — on Master Pipeline)",
-                       "More AI News", "Friday 2 PM to Monday 2 PM",
+                       "More AI News", "Monday's covers the weekend",
                        "departures list") if x not in strategy], [])
 
 

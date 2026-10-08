@@ -17,11 +17,13 @@ to claim the slot and log what the message carried. It asserts:
         logged — and neither does a restart between two slots;
   (iv)  the day's billed searches, printed with the per-rule breakdown.
 
-R1 is given the top priority band so it takes slot 1; everything else ranks
-as the engine ranks it. THE QUEUE IS SYNTHETIC: the real R1 item is pinned to
-NEWS_MAIN_TIME (14:00) by `nextaction._r_ai_news`, and that pin — with the
-hourly news checks — is exercised in verify_news_feed.py. Here R1 is left
-unpinned so slot 1 stays the research-timing case it was written for.
+THE ORDER OF THE DAY COMES FROM THE RULES FILE (NFT2-1069), so this script runs
+against a temp copy of bot_rules.yaml whose Tuesday order is R1, R2, R6, R5 —
+the shipped one is R5, R6, R2, R1. That keeps slot 1 the research-timing case
+this was written for (R1 first, then R2 reading what R1's search cached). It
+used to get R1 into slot 1 by giving it the top priority band; the band no
+longer decides the order. THE QUEUE IS SYNTHETIC: R1's own post and the hourly
+news checks are exercised in verify_news_feed.py.
 """
 import asyncio
 import logging
@@ -66,14 +68,16 @@ config.NEWS_PREFERRED_DOMAINS = []
 config.DAILY_MESSAGE_CAP = 4
 config.DAILY_MESSAGE_CAPS = {}
 config.DRIP_WEEKDAYS_ONLY = True
-# THE PRODUCTION DEFAULTS, pinned. A local .env tuned for fast testing (1-minute
-# ticks and gaps) would otherwise make this a different day entirely.
+# THE PRODUCTION TICK AND GAP, pinned. A local .env tuned for fast testing
+# (1-minute ticks and gaps) would otherwise make this a different day entirely.
+# The window is this script's own, 10:00 to 19:00, so four slots two hours
+# apart (10:00, 12:00, 14:00, 16:00) fit the 09:30-18:00 walk below.
 config.COS_FOLLOWUP_CHECK_INTERVAL_MINUTES = 15
 config.SALES_DRIP_START = "10:00"
 config.SALES_DRIP_END = "19:00"
-config.MESSAGE_GAP_MINUTES = 90
-config.MESSAGE_JITTER_MINUTES = 15
-config.MESSAGE_GAP_MIN_MINUTES = 30
+config.MESSAGE_GAP_MINUTES = 120
+config.MESSAGE_JITTER_MINUTES = 0
+config.MESSAGE_GAP_MIN_MINUTES = 120
 config.DRIP_REASK_DAYS = 2
 # R1's HOURLY NEWS CHECKS search on their own slots by design (they are
 # verified in verify_news_feed.py). This script is about the drip's research
@@ -87,6 +91,28 @@ import nextaction  # noqa: E402
 from bot import SalesBot  # noqa: E402
 
 DAY = date(2026, 9, 29)                 # a Tuesday
+
+
+def _rules_with_r1_first() -> str:
+    """A temp copy of the shipped rules with Tuesday's order starting R1, R2.
+
+    The same four rules as shipped (so `weekdays` and `daily_order` still
+    agree and the file loads), in the order this scenario needs."""
+    import rules as _rules
+
+    shipped = "  tue: [R5, R6, R2, R1]"
+    src = open(config.BOT_RULES_FILE, encoding="utf-8").read()
+    assert src.count(shipped) == 1, "Tuesday's shipped order is expected to be R5, R6, R2, R1"
+    path = os.path.join(TMP, "bot_rules_r1_first.yaml")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(src.replace(shipped, "  tue: [R1, R2, R6, R5]"))
+    config.BOT_RULES_FILE = path
+    _rules.reload()
+    assert _rules.order_for(DAY) == ["R1", "R2", "R6", "R5"], _rules.status()
+    return path
+
+
+_rules_with_r1_first()
 NOW = [datetime(DAY.year, DAY.month, DAY.day, 9, 30, tzinfo=dl.IST)]
 dl.now_ist = lambda: NOW[0]
 dl.today_ist = lambda: NOW[0].date()
@@ -141,8 +167,7 @@ def queue():
     return [
         mk(rule=rule("R1", "AI news"), trigger=nextaction.R_AI_NEWS, today=today,
            due=today, why="R1 runs every weekday", text="Today's AI news",
-           owner="Vaishnavi", web_pending=True,
-           extra={"priority": 0}),
+           owner="Vaishnavi", web_pending=True),
         mk(rule=rule("R2", "News companies to screen"),
            trigger=nextaction.R_NEWS_SCREEN, today=today, due=today,
            why="R2 runs every weekday", text="Companies in the news",

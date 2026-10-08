@@ -1034,9 +1034,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # a meeting-prep post that had gone out took a slot from a chase after all.
     # NULL on rows from before this: `drip.counts` asks the row's rule instead.
     ("drip_sends", "counts_toward_cap", "INTEGER"),
-    # WAS IT A FIXED-TIME POST (R1 at NEWS_MAIN_TIME, R8's day-of touch)? Those
-    # take no place in the spaced window, so the planner must not count them
-    # when it works out which window time the next post gets. NULL on older rows.
+    # WAS IT A FIXED-TIME POST (R8 and R9 at MEETING_DAYOF_TIME, R13 at
+    # NEXT_STEP_TIME; R1 too, until 8 Oct)? Those take no place in the spaced
+    # window, so the planner must not count them when it works out which slot
+    # the next post gets. Also set on a post that turned out to have nothing to
+    # say (R3 in an empty week): it took no slot either. NULL on older rows.
     ("drip_sends", "pinned", "INTEGER"),
     # WHAT WAS POSTED, AND EVERY MESSAGE IT BECAME (NFT2-1063). `body` is the
     # post as it went out, heading included, WITHOUT the tags line and the test

@@ -23,12 +23,12 @@ THE THIRTEEN, with the trigger name the file uses:
      R4  deliverables           Mon                 P1 only, due this week or passed
      R5  prospects              Tue, Thu            first contact FALSE or blank
      R6  li_no_dm               Tue, Fri            connected > 3d, no DM: the email check
-     R7  dm_no_meeting          Mon                 DM > 7d, no meeting (OFF since
-                                                    7 Oct 2026: R13 replaced it)
-     R8  meeting_prep           anchored            T-5, T-3, and 10:00 on the day
-     R9  meeting_followup       anchored            done + 3d, no next steps, laddered
+     R7  dm_no_meeting          Mon                 DM > 7d, no meeting, and not a
+                                                    person R13 covers
+     R8  meeting_prep           anchored, 10:00     T-5, T-3, and on the day
+     R9  meeting_followup       anchored, 10:00     done + 3d, no next steps, laddered
     R10  closure_support        Mon                 deal/demo/quote AND closure > 50
-    R11  new_pipeline_company   weekdays            1 working day after it appears
+    R11  new_pipeline_company   Wed                 appeared since last Wednesday
     R12  sales_packages         Thu                 Ready? is No or blank
     R13  next_step_followups    weekdays, 15:00     connected contacts: the next step
                                                     on the Next Steps dropdown, 5 a post
@@ -460,6 +460,43 @@ def row_gate(row: dict, *, today: date, snoozes: dict) -> tuple:
     return True, "", until
 
 
+# -- who Rule 13 covers --------------------------------------------------------
+# ONE CHECK, TWO READERS. Rule 13 names the people we are connected with, and
+# Rule 7 (DM sent, no meeting) must never list a person Rule 13 covers
+# (Vaishnavi, 7 Oct: "rule 13 supercedes this"; the team, 8 Oct: R7 comes back
+# on Mondays for everybody else). Both rules read the functions below, so the
+# two can never drift into disagreeing about who is "connected".
+
+
+def connected_markers() -> set:
+    """What "Sid - LI Addition" says when a person is connected, normalised."""
+    return {gtm_sheet.normalise_header(str(m))
+            for m in (config.NEXT_STEP_CONNECTED_MARKERS or []) if str(m).strip()}
+
+
+def marked_connected(row: dict, markers: Optional[set] = None) -> bool:
+    """Does this row's "Sid - LI Addition" say Connected?"""
+    if markers is None:
+        markers = connected_markers()
+    return _norm(row.get("sid_li_added")) in markers
+
+
+def has_connected_date(row: dict) -> bool:
+    """Does this row's LI Connected Date read as a date?"""
+    return _date(row, "li_connected_date") is not None
+
+
+def covered_by_next_steps(row: dict, markers: Optional[set] = None) -> bool:
+    """Is this person Rule 13's? Connected, WITH an LI Connected Date.
+
+    BOTH HALVES, because Rule 13 itself needs both: a row marked Connected
+    with no date is skipped by Rule 13 (and reported as a gap to fix), so it
+    is not covered, and Rule 7 may still list it. Otherwise a DM'd person with
+    a missing date would be chased by neither rule.
+    """
+    return marked_connected(row, markers) and has_connected_date(row)
+
+
 # -- the thirteen evaluators --------------------------------------------------
 # Each takes (rule, ctx) and returns a list of items. NONE of them sends, writes
 # or reads a sheet: everything they need is in `ctx`, assembled by the caller.
@@ -477,18 +514,19 @@ def _r_ai_news(rule, ctx) -> list:
     NEWS_MAX_ITEMS stories. The hourly breaking checks are not items at all —
     they post from the sweep tick, outside the drip.
 
-    ONE ITEM, not one per story, and PINNED TO NEWS_MAIN_TIME through the
-    drip's fixed-time field, rather than taking whichever slot its rank lands
-    on: the main post covers "overnight plus 11:00-14:00" and the team reads
-    it at a known time.
+    ONE ITEM, not one per story, and NO FIXED TIME (8 Oct). It used to be
+    pinned to NEWS_MAIN_TIME; the team's order of the day replaced that, so it
+    is spaced like any other rule and takes its place in `daily_order`
+    (bot_rules.yaml): third on Monday and Friday, fourth on Tuesday, second on
+    Wednesday and Thursday. What it covers is "since the previous AI news
+    post's slot", worked out by the caller (`bot._main_window`).
     """
     today = ctx["today"]
     return [_item(
         rule=rule, trigger=R_AI_NEWS, today=today, due=today,
-        why=f"R1 runs every weekday at {config.NEWS_MAIN_TIME}",
-        text="AI news: the last 24 hours on the team's topic list",
+        why="R1 runs every weekday, in its place in the day's order",
+        text="AI news: everything since the last AI news post, on the team's topic list",
         web_pending=True,
-        extra={"dayof_time": config.NEWS_MAIN_TIME},
     )]
 
 
@@ -987,8 +1025,11 @@ def _r_li_no_dm(rule, ctx) -> list:
 def _r_dm_no_meeting(rule, ctx) -> list:
     """R7 — DM sent more than DM_NO_MEETING_DAYS ago, still no meeting. Mondays.
 
-    SWITCHED OFF in bot_rules.yaml since 7 Oct 2026: R13's call reminders
-    replaced it. Kept so that `enabled: true` brings it back unchanged.
+    NEVER A PERSON RULE 13 COVERS. Rule 13's call reminders took this rule's
+    place on 7 Oct; on 8 Oct the team brought it back on Mondays for everybody
+    Rule 13 does NOT cover. `covered_by_next_steps` is Rule 13's own check
+    (Connected, with an LI Connected Date), read here rather than copied, so
+    one person is never chased by both and never falls between the two.
 
     SHOWS DAYS SINCE THE DM AND THE LAST NOTE LOGGED, because those two are what
     a person needs to decide whether to chase again or leave it. "No reply after
@@ -997,6 +1038,8 @@ def _r_dm_no_meeting(rule, ctx) -> list:
     """
     today = ctx["today"]
     days = max(0, int(config.DM_NO_MEETING_DAYS))
+    markers = connected_markers()
+    covered = 0
     out = []
     for row in ctx.get("rows") or ():
         ok, _reason, until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
@@ -1006,6 +1049,9 @@ def _r_dm_no_meeting(rule, ctx) -> list:
         if sent is None:
             continue
         if _date(row, "meeting_date") is not None:
+            continue
+        if covered_by_next_steps(row, markers):
+            covered += 1
             continue
         due = _due(sent, days)
         if due > today:
@@ -1024,11 +1070,20 @@ def _r_dm_no_meeting(rule, ctx) -> list:
             extra={"days_since_dm": elapsed, "last_note": note,
                    "role_rank": _role_rank(_text(row, "designation"))},
         ))
+    if covered:
+        log.info("[rules] %s: %d DM'd contact(s) with no meeting are Rule 13's "
+                 "(Connected, with an LI Connected Date) and are left to it; "
+                 "%d listed here", getattr(rule, "id", "") or "R7", covered, len(out))
     return out
 
 
 def _r_meeting_prep(rule, ctx) -> list:
-    """R8 — prep touches at T-5, T-3 and MEETING_DAYOF_TIME on the day.
+    """R8 — prep touches at T-5, T-3 and on the day, each at MEETING_DAYOF_TIME.
+
+    EVERY TOUCH HAS THE SAME FIXED TIME (8 Oct). Only the day-of touch used to;
+    the two earlier ones took a spaced slot and so pushed the day's other
+    posts back. A prep note is about a meeting, not about the day's order, so
+    all three go at MEETING_DAYOF_TIME, outside the order and the gap.
 
     ANCHORED TO THE MEETING, NOT TO A WEEKDAY, which is why its weekday list in
     bot_rules.yaml is empty.
@@ -1083,13 +1138,17 @@ def _r_meeting_prep(rule, ctx) -> list:
             web_pending=True,
             extra={"meeting_date": dl.iso(meeting), "touch": touch,
                    "days_out": days_out,
-                   "dayof_time": config.MEETING_DAYOF_TIME if days_out == 0 else ""},
+                   "dayof_time": config.MEETING_DAYOF_TIME},
         ))
     return out
 
 
 def _r_meeting_followup(rule, ctx) -> list:
     """R9 — meeting completed, no next steps. Then every 3 days, up a ladder.
+
+    AT MEETING_DAYOF_TIME, LIKE THE PREP (8 Oct): every rung has that fixed
+    time, outside the day's order and the gap, so a follow-up never takes one
+    of the spaced slots and never waits behind one.
 
     "NO NEXT STEPS" IS A BLANK NOTES CELL (Notes/Remarks, the `next_steps`
     role). It is never the Next Steps dropdown: a row whose dropdown says "Send
@@ -1180,7 +1239,8 @@ def _r_meeting_followup(rule, ctx) -> list:
                    "delivered_to": effective,
                    "addressed_to": addressed_to,
                    "rungs_total": len(ladder), "rungs_left": remaining,
-                   "meeting_date": dl.iso(met)},
+                   "meeting_date": dl.iso(met),
+                   "dayof_time": config.MEETING_DAYOF_TIME},
         ))
     return out
 
@@ -1279,6 +1339,17 @@ def _r_new_pipeline_company(rule, ctx) -> list:
     was down for a week) would dump every company added in that gap into one
     post.
 
+    THE RULE RUNS ON WEDNESDAYS ONLY (8 Oct), AND THE TWO NUMBERS ABOVE STILL
+    GIVE EVERY COMPANY EXACTLY ONE WEDNESDAY. The snapshot is taken on every
+    run of the queue, whatever the weekday, so a company is noticed the day it
+    appears. With a wait of 1 working day and a window of 7 days: one that
+    appears Thursday to Tuesday is 1 to 6 days old on the next Wednesday (asked
+    then, and 8 or more days old on the one after: not asked twice); one that
+    appears ON a Wednesday is not yet due that day and is exactly 7 days old on
+    the next, which the window still admits (`> window`, not `>=`). A window
+    below 7 would lose Wednesday's companies and a window of 14 or more would
+    ask twice, so 7 is the value a weekly run needs.
+
     ASKS FIRST, SEARCHES ON A YES. The item names the company and nothing
     else; the drip posts "want me to look for relevant PoCs?" and opens a
     `poc_lookup` proposal against that message. Only an approver's yes runs a
@@ -1301,8 +1372,8 @@ def _r_new_pipeline_company(rule, ctx) -> list:
             continue
         out.append(_item(
             rule=rule, trigger=R_NEW_COMPANY, today=today, due=due,
-            why=(f"R11: {name} first appeared in the Master Pipeline on "
-                 f"{dl.format_date(first_seen)}, {wait} working day(s) ago"),
+            why=(f"R11 (Wednesdays): {name} first appeared in the Master Pipeline "
+                 f"on {dl.format_date(first_seen)}, {(today - first_seen).days} day(s) ago"),
             text=(f"{name} is new in the Master Pipeline. Want me to look for "
                   "relevant PoCs for outreach?"),
             company=name, web_pending=False,
@@ -1631,8 +1702,7 @@ def _r_next_step_followups(rule, ctx) -> list:
                  "read, so nobody is named", rule_id)
         return []
 
-    markers = {gtm_sheet.normalise_header(str(m))
-               for m in (config.NEXT_STEP_CONNECTED_MARKERS or []) if str(m).strip()}
+    markers = connected_markers()
     snoozes = ctx.get("snoozes") or {}
     # Every row, not only the "active" ones, for the reason R5 gives: a row
     # marked Connected with no date may not have passed the activation gate.
@@ -1664,7 +1734,7 @@ def _r_next_step_followups(rule, ctx) -> list:
             "Sent and Date) or GTM_COLUMN_MAP.", rule_id, ", ".join(absent))
         return []
     for row in in_sheet_order:
-        if _norm(row.get("sid_li_added")) not in markers:
+        if not marked_connected(row, markers):
             continue
         report["connected"] += 1
         if "outreach_step" not in row:
@@ -1681,7 +1751,7 @@ def _r_next_step_followups(rule, ctx) -> list:
                 "found": next_step_for(row, today=today, entry=named),
             })
             continue
-        if _date(row, "li_connected_date") is None:
+        if not has_connected_date(row):
             raw = _text(row, "li_connected_date")
             report["no_date"].append(entry_of(
                 row, f"LI Connected Date reads {raw!r}" if raw
@@ -2310,14 +2380,32 @@ def _self_test() -> int:
           "no DM logged" in run(today=MON, rows=[r6],
                                 day_rules=[rules_mod.by_id("R6")])["actions"][0]["text"],
           False)
-    check("R7 is switched off in the shipped file (R13 replaced it)",
-          "R7" in [r.id for r in rules_mod.for_day(MON)], False)
-    # The evaluator is kept, so it is still exercised by naming the rule.
+    check("R7 is back on Mondays in the shipped file",
+          ("R7" in [r.id for r in rules_mod.for_day(MON)],
+           "R7" in [r.id for r in rules_mod.for_day(TUE)]), (True, False))
     r7 = row(li_dm_date="10-09-2026", next_steps="waiting on legal")
     got = run(today=MON, rows=[r7], day_rules=[rules_mod.by_id("R7")])["actions"]
     check("DM 11d ago, no meeting -> due", len(got), 1)
     check("...shows days since the DM", "11 day(s) since the DM" in got[0]["text"], True)
     check("...and the last note", "waiting on legal" in got[0]["text"], True)
+    # RULE 13 COMES FIRST: its own check decides who R7 leaves alone.
+    marker = (config.NEXT_STEP_CONNECTED_MARKERS or ["Connected"])[0]
+    r7_r13 = row(li_dm_date="10-09-2026", sid_li_added=marker,
+                 li_connected_date="01-09-2026")
+    check("a DM'd person Rule 13 covers is Rule 13's, not R7's",
+          (covered_by_next_steps(r7_r13),
+           len(run(today=MON, rows=[r7_r13],
+                   day_rules=[rules_mod.by_id("R7")])["actions"])), (True, 0))
+    r7_nodate = row(li_dm_date="10-09-2026", sid_li_added=marker)
+    check("Connected with NO date is not covered, so R7 still lists them",
+          (covered_by_next_steps(r7_nodate),
+           len(run(today=MON, rows=[r7_nodate],
+                   day_rules=[rules_mod.by_id("R7")])["actions"])), (False, 1))
+    r7_notconn = row(li_dm_date="10-09-2026", li_connected_date="01-09-2026")
+    check("a date but not marked Connected is not covered either",
+          (covered_by_next_steps(r7_notconn),
+           len(run(today=MON, rows=[r7_notconn],
+                   day_rules=[rules_mod.by_id("R7")])["actions"])), (False, 1))
 
     print("\nR8 meeting prep — touches, and the past ones skipped")
     def preps(meeting_iso, today):
@@ -2329,6 +2417,10 @@ def _self_test() -> int:
     check("day-of fires at the configured time",
           [a["dayof_time"] for a in preps("21-09-2026", date(2026, 9, 21))],
           [config.MEETING_DAYOF_TIME])
+    check("the T-5 and T-3 touches have the same fixed time",
+          ([a["dayof_time"] for a in preps("26-09-2026", date(2026, 9, 21))],
+           [a["dayof_time"] for a in preps("24-09-2026", date(2026, 9, 21))]),
+          ([config.MEETING_DAYOF_TIME], [config.MEETING_DAYOF_TIME]))
     check("a meeting booked in 3 days never gets a late T-5",
           [a["touch"] for a in preps("24-09-2026", date(2026, 9, 21))], ["T-3"])
     check("a past meeting produces nothing", preps("01-09-2026", date(2026, 9, 21)), [])

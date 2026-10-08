@@ -58,7 +58,9 @@ import config  # noqa: E402
 # THE SHIPPED DEFAULTS, pinned — not whatever the local .env says.
 SETTINGS = {
     "DB_PATH": os.environ["DB_PATH"], "STATE_DIR": os.environ["STATE_DIR"],
-    "NEWS_MAIN_TIME": "14:00", "NEWS_TOPICS": ["evals", "RLHF", "voice agent"],
+    "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "20:00", "MESSAGE_GAP_MINUTES": 120,
+    "MESSAGE_GAP_MIN_MINUTES": 120, "MESSAGE_JITTER_MINUTES": 0,
+    "NEWS_TOPICS": ["evals", "RLHF", "voice agent"],
     "NEWS_REPEAT_DAYS": 30, "NEWS_FEED_KEEP_DAYS": 14, "NEWS_SCORE_MAX_ITEMS": 40,
     "WEB_SEARCH_ENABLED": True, "SEARCH_BACKEND": "searxng",
     "WEB_QUESTION_MAX_SEARCHES": 3, "TOKEN_DAILY_BUDGET": 0,
@@ -356,8 +358,10 @@ async def main():
     while past.weekday() != 0:
         past -= timedelta(days=1)                       # a Monday
     at = lambda hh: datetime.combine(past, time(hh, 0), dl.IST)   # noqa: E731
+    # AI NEWS IS THIRD IN MONDAY'S ORDER (NFT2-1069): its slot is 18:00, where it
+    # used to be a fixed 14:00. One story before the slot, one after it.
     before = item("Monday morning story", at(13))
-    after = item("Monday afternoon story", at(15))
+    after = item("Monday evening story", at(19))
     weekend = item("Saturday story", at(13) - timedelta(days=2))
     bot = new_bot([before, after, weekend],
                   [scored(before, 4), scored(after, 5), scored(weekend, 3)])
@@ -368,9 +372,9 @@ async def main():
     finally:
         TODAY[0] = dl.real_today_ist()
     print("\n".join("   " + line for line in result["block"].splitlines()))
-    check("on a pretend past day the news it reads ends at that day's NEWS_MAIN_TIME",
-          until, at(14))
-    check("...so a story from after 14:00 that day is not there",
+    check("on a pretend past day the news it reads ends at R1's slot in that day's "
+          "order (Monday: third, 18:00)", until, at(18))
+    check("...so a story from after 18:00 that day is not there",
           titles(result), [before["title"], weekend["title"]])
     check("...the heading names the pretend day",
           result["block"].split("\n")[0], news.heading(news.MODE_ANSWER, past))

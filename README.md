@@ -2169,11 +2169,11 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
 | **R6** | LinkedIn connected, no DM (the email check) | Tue, Fri | `li_no_dm` | 5 | yes |
-| **R7** | DM sent, no meeting | **off** — replaced by R13 on 7 Oct 2026 | `dm_no_meeting` | 5 | yes |
-| **R8** | Meeting preparation | **anchored** | `meeting_prep` | 3 | **no** |
-| **R9** | Meeting done, no next steps | **anchored** | `meeting_followup` | 3 | **no** |
+| **R7** | DM sent, no meeting — never a person R13 covers | Mon | `dm_no_meeting` | 5 | yes |
+| **R8** | Meeting preparation | **anchored**, 10:00 | `meeting_prep` | 3 | **no** |
+| **R9** | Meeting done, no next steps | **anchored**, 10:00 | `meeting_followup` | 3 | **no** |
 | **R10** | Closure support | Mon | `closure_support` | 5 | yes |
-| **R11** | New company in Master Pipeline | weekdays | `new_pipeline_company` | 3 | yes |
+| **R11** | New company in Master Pipeline | Wed | `new_pipeline_company` | 10 | yes |
 | **R12** | Sales packages | Thu | `sales_packages` | 5 | yes |
 | **R13** | Next steps for connected contacts | weekdays, 15:00 | `next_step_followups` | 5 | **no** |
 
@@ -2661,7 +2661,9 @@ python rules.py          # the YAML parses and means what it says
 python nextaction.py     # the thirteen rules on fixtures: no sheet, no network, no database
 ```
 
-`rules.py` asserts that thirteen rules load (R13 listed before R5), that R7 is off, that every trigger
+`rules.py` asserts that thirteen rules load (R13 listed before R5), that R7 is on and Mondays only,
+that R11 is Wednesdays only, that each weekday's order is the one in `daily_order`, that a file whose
+`weekdays` and `daily_order` disagree is refused, that every trigger
 they name is implemented, that each runs on the right weekdays and no others,
 that the anchored rules always get to look, and that Saturday yields only those
 two.
@@ -2984,12 +2986,55 @@ it differently:
 That rule is the whole design. A message with one subject and one owner is
 answerable — *"yes, done"* means something. A document is not.
 
-### The schedule
+### The schedule: the order of the day
 
-**First post at 14:00 IST** (`SALES_DRIP_START`), then `MESSAGE_GAP_MINUTES`
-(90) ± `MESSAGE_JITTER_MINUTES` (15) apart. The jitter is **deterministic** —
-seeded on `(date, slot)` — so a restart mid-afternoon recomputes the identical
-schedule and cannot double-send.
+**The day's posts go in a written order, two hours apart, starting at 14:00 IST**
+(NFT2-1069, the team's decision of 8 Oct 2026). The order is `daily_order` in
+`bot_rules.yaml`, one list per weekday:
+
+| Day | 14:00 | 16:00 | 18:00 | 20:00 |
+|---|---|---|---|---|
+| Monday | R4 Deliverables | R7 DM sent, no meeting | R1 AI news | R10 Closure support |
+| Tuesday | R5 Prospects | R6 LinkedIn connected, no DM | R2 News screen | R1 AI news |
+| Wednesday | R11 New company PoCs | R1 AI news | R3 AI events | |
+| Thursday | R5 Prospects | R1 AI news | R12 Sales packages | |
+| Friday | R2 News screen | R6 LinkedIn connected, no DM | R1 AI news | |
+
+- **A rule with nothing to post takes no slot and the next one moves up.** A
+  Monday with no P1 deliverable due is R7 14:00, R1 16:00, R10 18:00. A slot is
+  "how many spaced posts have gone today", not a time a rule owns.
+- **Something that appears after the day was planned takes the next free
+  slot.** The plan is recomputed on every tick; what has been sent keeps its
+  slot and what is left fills the slots after it, in the day's order.
+- **The gap is `MESSAGE_GAP_MINUTES` (120) and never shrinks.**
+  `MESSAGE_JITTER_MINUTES` (0) can only *add* time to a gap; it is deterministic
+  — seeded on `(date, slot)` — so a restart recomputes the identical schedule.
+  `MESSAGE_GAP_MIN_MINUTES` (120) is a floor under the gap: the larger of the
+  two is used (`drip.gap_minutes`).
+- **Fixed-time posts are outside the order and the gap:** meeting prep (R8,
+  every touch) and meeting follow-ups (R9) at `MEETING_DAYOF_TIME` (10:00), the
+  next-step follow-ups (R13) at `NEXT_STEP_TIME` (15:00), reminders at their
+  minute, urgent news at `NEWS_CHECK_TIMES`. None moves a spaced post and no
+  spaced post waits for one. Every fixed-time post that is due goes on the same
+  tick.
+- **Sunday has no order:** `SUNDAY_RULE_IDS` (R4), one post, only when a P1 is
+  due on the Monday. Saturday is silent.
+
+**`weekdays` and `daily_order` must agree.** A rule's `weekdays` decide whether
+it is evaluated; `daily_order` decides where its post goes. A rule listed on a
+day it does not run, or running on a day it is not listed, is refused at
+startup with an error naming both — `R11 (…): its weekdays say [mon, tue, wed,
+thu, fri] but daily_order lists it on [wed]` — and, like any unreadable rules
+file, nothing proactive runs until it is fixed. R8, R9 and R13 appear in no
+list. `python -m rules` checks it.
+
+**A post goes out on the first sweep tick at or after its time**
+(`COS_FOLLOWUP_CHECK_INTERVAL_MINUTES`, 15): a 14:00 post leaves between 14:00
+and 14:15. A post that left within `drip.ON_TIME_SLACK_MINUTES` (30) of its slot
+went on time and the next slot is unchanged; later than that (an outage, the
+kill switch) and the next post is a full gap after when it really went. On the
+clock, two spaced posts are never less than the gap apart (the sender's
+catch-up guard, `drip.min_gap_minutes`).
 
 **One post per rule per day, and a rule's items go in ONE message.** They are
 never split across posts unless the rule produced more than
@@ -3005,35 +3050,31 @@ may say five has four waiting — not four dropped, and both the plan and
 
 ### The posting window
 
-**Nothing proactive lands after `SALES_DRIP_END` (18:30 IST).** Without it the
-day had no ceiling — six posts at 90-minute gaps from 14:00 ran to **21:13**.
-The cap kept the *count* down; nothing kept the last one out of somebody's
-evening.
+**Nothing in the day's order is planned after `SALES_DRIP_END` (20:00 IST).**
+Without a window the day had no ceiling — six posts at 90-minute gaps from
+14:00 ran to **21:13**. The cap kept the *count* down; nothing kept the last one
+out of somebody's evening.
 
-The fit, in order:
+The window holds **four slots**: 14:00, 16:00, 18:00, 20:00 (a slot *at* the end
+is inside it). It used to be 18:30 with the gap squeezed evenly to fit, down to
+`MESSAGE_GAP_MIN_MINUTES`; **the gap is no longer shrunk for any reason.**
 
-1. try `MESSAGE_GAP_MINUTES` (90) between every post;
-2. if that overruns the end, **shrink the gap evenly** until the day fits — every
-   post moves, none is singled out, because a schedule that depended on which
-   item happened to be third is not one anybody could predict or check;
-3. never below `MESSAGE_GAP_MIN_MINUTES` (30);
-4. whatever still does not fit **rolls to the next applicable day, where it goes
-   first** — ahead of that day's own items, because it has already waited.
+**What does not fit is not sent that day.** A fifth spaced group, or the posts
+left after a late start, would land after 20:00, so they are reported in the
+plan as not going (`rolled`, `rolled_why: window`) with the time they would have
+landed. Nothing is stored: the next day that rule runs, the queue is worked out
+afresh and the rule takes its place in that day's order. For a weekly rule that
+is next week — see "Known limits" in `docs/test-reports/NFT2-1069.md`.
 
-| Posts | Gap | All land by 18:30 |
+| Spaced groups | Sent | Not sent that day |
 |---|---|---|
-| 3 | 90 (unchanged) | ✓ 14:00 · 15:37 · 16:52 |
-| 6 | 51 | ✓ 14:00 … 17:58 |
-| 8 | 36 | ✓ 14:00 … 17:49 |
-| 12 | 30 (floor) | ✓ 9 posted, 3 roll |
+| 3 | 14:00 · 16:00 · 18:00 | — |
+| 4 | 14:00 · 16:00 · 18:00 · 20:00 | — |
+| 6 | 14:00 · 16:00 · 18:00 · 20:00 | 2 (they would land at 22:00 and 00:00) |
+| 4, the first sent at 17:20 after an outage | 17:20 · 19:20 | 2 (21:20, 23:20) |
 
-**`min_gap_minutes()` now reports the real floor.** It used to return
-`gap − jitter` (75) because nothing could compress the schedule. The window can,
-so on a busy day the honest floor is 30 — and reporting 75 would be a number the
-schedule does not honour. The sender's catch-up guard uses the same value.
-
-> **One exception, and only one.** R8's day-of touch keeps `MEETING_DAYOF_TIME`
-> (10:00), outside the window. A note about a meeting that starts at 11 is
+> **The fixed-time posts are outside the window too.** R8 and R9 keep `MEETING_DAYOF_TIME`
+> (10:00) and R13 keeps `NEXT_STEP_TIME` (15:00). A note about a meeting that starts at 11 is
 > worthless at 14:00 — that is a different problem from not interrupting
 > somebody's evening.
 
@@ -3256,16 +3297,19 @@ edit to `bot_rules.yaml` cannot rewrite what an earlier post cost the day.
 
 Nothing that is not a row in `drip_sends` can be counted, because that table is
 all the one counter reads. **So a day can carry more posts than its cap:**
-`python verify_s1.py --only i` shows a Monday with six countable groups, an R8
-and an R9 — five counted posts, the R8 and the R9, and one group rolled.
+`python verify_s1.py --only i` shows a Monday with five countable groups, an R8
+and an R9 — the four in Monday's order at 14:00, 16:00, 18:00 and 20:00, the R8
+and the R9 at 10:00, and the fifth not sent because the window holds four —
+and then the same Monday under a cap of 3, where the cap is what decides.
 
-**AI news (R1) is planned first and never held.** It is new content every day,
-so the re-ask clock does not apply to it (`drip.NEVER_HELD`) — held, it posted
-Monday, was silent Tuesday, came back Wednesday as a "re-ask" and was silent
-again on Thursday. It is decided before every other group
-(`drip.PLANNED_FIRST`), so it always holds one of the five and the cap cannot
-push it out; and it is a **fixed-time post** at `NEWS_MAIN_TIME`, outside the
-spaced window, so the window cannot roll it either. R8 and R9 are never held by
+**AI news (R1) is never held, and takes its place in the day's order.** It is
+new content every day, so the re-ask clock does not apply to it
+(`drip.NEVER_HELD`) — held, it posted Monday, was silent Tuesday, came back
+Wednesday as a "re-ask" and was silent again on Thursday. Until 8 Oct it was
+also decided before every other group and pinned to a fixed 14:00
+(`NEWS_MAIN_TIME`, now retired); it is now a spaced post like any other — third
+on Monday and Friday (18:00), fourth on Tuesday (20:00), second on Wednesday
+and Thursday (16:00), earlier when a rule ahead of it has nothing to post. R8 and R9 are never held by
 the re-ask clock for a related reason: they run on their own clocks (R8's
 touches belong to exact dates, R9 has its ladder).
 
@@ -3300,7 +3344,7 @@ nothing more (it re-plans every tick, and what has already gone counts). The
 Sunday heads-up does not hold Monday's checklist back as "asked recently".
 
 **The hourly urgent-news checks run on Saturday and Sunday too** — they have no
-weekday gate — and so do reminders somebody asked for. There is no 2 PM news
+weekday gate — and so do reminders somebody asked for. There is no AI news
 post at the weekend: R1's weekdays are Monday to Friday.
 
 **No public-holiday handling**, deliberately and stated rather than left as an
@@ -3357,7 +3401,7 @@ really about them.
 equally long ago the order is a hash of the name, so people and companies are
 mixed from the first day instead of every company from A to F.
 
-#### The 2 PM post
+#### The main post
 
 `news.choose_main`, `NEWS_MAX_ITEMS=5`:
 
@@ -3424,11 +3468,23 @@ and a simulation all do it. `NEWS_OVERFLOW_ENABLED=false` turns it off.
 
 #### The window: since the previous main post
 
-The main sweep covers **everything since the previous main post**, not a fixed
-24 hours — Monday's covers Friday 2 PM to Monday 2 PM (`_main_window`). The
-previous post is read off the schedule (the last day R1 runs, at
-`NEWS_MAIN_TIME`), so it is the same on a real day, a test day and a
-simulation. A PoC item belongs to a window by when it was **first seen**, since
+The main sweep covers **everything since the previous main post's slot**, not a
+fixed 24 hours (`_main_window`). The previous post is read off the schedule —
+the last day R1 runs, at R1's slot in that day's order (`drip.order_slot`) — so
+it is the same on a real day, a test day and a simulation: Tuesday's post
+(20:00) covers from Monday's slot (18:00), Monday's from Friday's (18:00), and
+the windows of a week join end to end. A story is never shown twice, because
+what has been posted is filtered out by link and headline, not by this window.
+
+**The slot is the one R1 holds when every rule ahead of it posts, and that has
+a cost.** On a day a rule ahead had nothing to say, the real post went earlier
+than its slot (a Monday with no deliverables: 16:00, not 18:00). Stories
+collected between the two times were too late for that post and are before the
+next window's start, so they are in neither main post. A major one still
+reaches the channel through the hourly check, and all of them are there for
+anybody who asks for the news. This is the team's choice of 8 Oct (read the
+schedule, not the record of what was sent, so a test day and the real day
+agree); it is listed as an open question in `docs/test-reports/NFT2-1069.md`. A PoC item belongs to a window by when it was **first seen**, since
 a name's query reaches back `NEWS_POC_LOOKBACK_DAYS` (7).
 
 **A story a weekend check held because the valve was full is in Monday's
@@ -4027,7 +4083,7 @@ header.
 
 | Rule | What it searches for |
 |---|---|
-| **R1** | **The AI news on the `NEWS_TOPICS` list** — one main sweep of the last 24 hours at `NEWS_MAIN_TIME`, plus hourly silent checks that post only what is major. Nobody is searched for by name — see below |
+| **R1** | **The AI news on the `NEWS_TOPICS` list** — one main sweep a weekday of everything since the previous one, in R1's place in the day's order, plus hourly silent checks that post only what is major. Nobody is searched for by name — see below |
 | **R2** | Companies in the news **not** in the Master Pipeline, judged against the use-case table in `sales_strategy.md` §2 (A–J and who buys each). **Reads the stories R1 posted today** (`news_stories`) rather than searching again |
 | **R3** | Events not already on the tab, in the current and next month — plus the **registration-deadline backfill** for rows that lack one |
 | **R6** | A published public email — **only when column F is empty** (see below) |
@@ -4105,7 +4161,7 @@ Two shapes of **one** prompt (`news.sweep_prompt`):
 
 | | When | Covers | Where it goes |
 |---|---|---|---|
-| **Main** | `NEWS_MAIN_TIME` (14:00), weekdays | the last 24 hours — overnight plus 11:00–14:00 | R1's **drip slot, pinned to that time**; counts toward the day's cap |
+| **Main** | weekdays, in R1's place in the day's order (Mon/Fri 18:00, Tue 20:00, Wed/Thu 16:00) | everything since the previous main post's slot | R1's **drip post**, spaced like any other; counts toward the day's cap |
 | **Check** | every `NEWS_CHECK_TIMES` slot (11:00–23:00 hourly, 14:00 excepted), **every day** | the hours since the previous slot or the main sweep | **silent** unless something is major; then ONE grouped message straight to the channel |
 
 **The topics are seeds, not limits**, and the prompt says so in the sheet's own
@@ -5227,7 +5283,7 @@ test state" still wipes everything. (It refuses when the pretend date is the
 *real* today on a database not named `*_test.db` — those rows are real sends.)
 
 Posts are spaced `TEST_POST_GAP_SECONDS` apart (default 20) rather than the real
-90 minutes — a test day is watched by somebody sitting there — but not zero: the
+two hours — a test day is watched by somebody sitting there — but not zero: the
 posts have to arrive one at a time, in an order a person can follow.
 
 **The footer is points, at most six lines**, each bullet at most 15 words, plain
@@ -5275,7 +5331,8 @@ python -m replies                         # the pure judgements: is it an ack, a
 python verify_reminders.py                # one-off reminders at an exact minute (real 60 s loop)
 python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
 python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
-python verify_s1.py                       # cap 5 + R8/R9, R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
+python verify_day_order.py                # NFT2-1069: every weekday's order and exact times, the 120-minute gap that never shrinks, nothing after 20:00, R7 minus rule 13's people, R11 on Wednesdays, R1's news window, the startup check; prints one planned day per weekday
+python verify_s1.py                       # cap 5 + R8/R9, the order of the day THREE WAYS (live sweep ticked every 15 min, test day, simulation), R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window
 python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5 emails + the one A:I write, R3 weekly + the reminder offer

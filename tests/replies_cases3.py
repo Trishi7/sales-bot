@@ -198,7 +198,7 @@ async def x8_the_constants_the_open_decisions_hang_on(check, test_mode):
     check("X8: Q6 (a non-reply 'thanks' reacts) is one constant, on", botmodule.ACK_NON_REPLY_GETS_REACTION, True)
     check("X8: Q1 (AI news is not in the objectives) is one constant, and it names the news post",
           nextaction.R_AI_NEWS in set(botmodule.OBJECTIVES_EXCLUDED_TYPES), True)
-    check("X8: the excluded set is the AI-news type by name, not derived from drip.PLANNED_FIRST",
+    check("X8: the excluded set is the AI-news type by name, and nothing else",
           set(botmodule.OBJECTIVES_EXCLUDED_TYPES), {nextaction.R_AI_NEWS})
     check("X8: Q3 (the closing offer line is left out) is one constant, off", botmodule.OBJECTIVES_SHOW_OFFERS, False)
     import replies
@@ -273,8 +273,11 @@ async def x10_a_reply_to_which_that_picks_none(check, test_mode):
 @case
 async def n1_news_content_comes_back_at_any_time_of_day(check, test_mode):
     """THE TICKET: 'a direct request for news returns the content, at any time of day.' The real clock is moved to
-    11:23 (before the 14:00 post) and to 18:00 (after it) on the same day; there is no time-of-day gate on the path,
-    so what comes back is simply what had been collected by then.
+    11:23 (before the day's AI news post) and to 18:00 (after it: on a Wednesday its slot is 16:00) on the same day;
+    there is no time-of-day gate on the path, so what comes back is simply what had been collected by then.
+
+    THE FIRST STORY IS FROM THE EVENING BEFORE, 21:00: after Tuesday's AI news slot (20:00 since NFT2-1069; it was
+    a fixed 14:00, and the story sat at 16:00), so it is "since the previous post" at both times of asking.
 
     SINCE 8 OCT (docs/plans/NEWS-OCT8.md) the list is chosen and written by code and a plain news question makes no
     model call, so the stories are read off the REPLY (the bold headlines), not off a tool result the model was given."""
@@ -284,7 +287,7 @@ async def n1_news_content_comes_back_at_any_time_of_day(check, test_mode):
     D = date(2026, 10, 7)
     ist = dl.IST
     t = lambda d, h, m: datetime(d.year, d.month, d.day, h, m, tzinfo=ist)   # noqa: E731
-    times = [t(date(2026, 10, 6), 16, 0), t(D, 9, 30), t(D, 10, 30), t(D, 15, 0), t(D, 17, 0)]
+    times = [t(date(2026, 10, 6), 21, 0), t(D, 9, 30), t(D, 10, 30), t(D, 15, 0), t(D, 17, 0)]
     heads = ["Frontier lab ships a new eval suite", "Voice startup closes a Series A", "Regulator publishes AI data rules",
              "Open model tops the speech benchmark", "Chip maker unveils an inference part"]
     got = {}

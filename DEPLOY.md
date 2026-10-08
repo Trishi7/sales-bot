@@ -624,8 +624,9 @@ What changes on the first day after the restart:
 
 - up to **5** counted posts a weekday; meeting prep, meeting follow-ups,
   reminders and urgent news are on top of that;
-- AI news posts **every** weekday at `NEWS_MAIN_TIME` (it used to skip
-  alternate days);
+- AI news posts **every** weekday (it used to skip alternate days). It had a
+  fixed time then, `NEWS_MAIN_TIME`; since NFT2-1069 it has a place in the
+  day's order instead — see the last section of this file;
 - a meeting's day-of prep note goes at `MEETING_DAYOF_TIME` (10:00), not when
   the window opens;
 - **Sunday can now post** — one Deliverables post at `SALES_DRIP_START`, only
@@ -977,9 +978,63 @@ NEWS_OVERFLOW_MAX_ITEMS=5
    and it gives its 5 best again.
 3. `@Saley any news on <a company on the sheet>?` → the same list shape, filtered to that company; a PoC story keeps
    its fuller line with "(Company — on Master Pipeline)".
-4. The next 2 PM post: one message, the heading, the line that tags people, a blank line, the stories; the top PoC
+4. The next AI news post: one message, the heading, the line that tags people, a blank line, the stories; the top PoC
    stories first; none of the stories an answer gave earlier that day.
 5. If a "More AI News, <day>" message follows: at most 5 stories, all major. On most days there is none.
 6. A breaking post, when one comes: `**Breaking AI News, <day>**`, the same list shape, at most 5.
 7. In the log: `[query] … → the news list (a plain news question, answered without the model)` and
    `[news] question: … giving N`.
+
+## Upgrading to NFT2-1069 (the order of the day's posts)
+
+What changes for the team: the day's posts go in a set order for each weekday, two hours apart from 2 PM (2, 4, 6,
+8 PM). AI news no longer has a fixed 2 PM slot. Rule 7 is back on Mondays (never for a person rule 13 covers). Rule 11
+is Wednesdays only. Every meeting-prep touch and every meeting follow-up posts at 10 AM. The last post of a day can be
+at 8 PM (it was 6:30 PM). Plan: `docs/plans/NFT2-1069.md`, section "8 Oct decisions". Report:
+`docs/test-reports/NFT2-1069.md`. Wording for the sheet: `docs/rules-for-the-sheet-oct8.md`.
+
+**`bot_rules.yaml` ships with the change** (the `daily_order` block, R7 `enabled: true`, R11 `weekdays: [wed]`). If the
+server's copy has local edits, a rule whose `weekdays` disagree with its days in `daily_order` stops every proactive
+post, and the first lines of the boot log say which rule: `[rules] ... could not be loaded: R11 (...): its weekdays
+say [...] but daily_order lists it on [...]`.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Three defaults changed and one name is retired. A
+`.env` that sets a line keeps its own value, so set them where they are set:
+
+```
+SALES_DRIP_END=20:00
+MESSAGE_GAP_MINUTES=120
+MESSAGE_GAP_MIN_MINUTES=120
+MESSAGE_JITTER_MINUTES=0
+DAILY_MESSAGE_CAP=5
+COS_FOLLOWUP_CHECK_INTERVAL_MINUTES=15
+```
+
+and delete the line `NEWS_MAIN_TIME=...` if it is there (retired; a value left behind does nothing).
+
+- `SALES_DRIP_END` must be `20:00`. Left at `18:30`, the fourth post of Monday and Tuesday (closure support; AI news)
+  is never sent, because it would land after the window.
+- `MESSAGE_JITTER_MINUTES` must be `0` for the times the team was given. Any other value makes every gap that much
+  longer at random, and the 8 PM post then falls after the window. The boot log warns when it is not 0.
+- `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` is how often Saley checks whether a post is due. A post goes out at the first
+  check at or after its time, so at 15 a 2 PM post leaves between 2:00 and 2:15. It should divide 120.
+- `DAILY_MESSAGE_CAP` stays 5. The longest day has 4 posts in its order.
+
+Then, on the laptop, `python tools/redact_env.py`. No database migration.
+
+**Check in the log after the restart**
+
+```
+[rules]   order Mon: R4, R7, R1, R10
+[rules]   order Tue: R5, R6, R2, R1
+[rules]   order Wed: R11, R1, R3
+[rules]   order Thu: R5, R1, R12
+[rules]   order Fri: R2, R6, R1
+Drip: up to 5 message(s) per weekday in channel ..., first at 14:00 IST, then every 120 min (plus up to 0), nothing after 20:00.
+```
+
+and no `MESSAGE_JITTER_MINUTES=...` warning. `python verify_day_order.py` and `python verify_s1.py --no-ddg` check
+the schedule offline; `python verify_day_order.py --days` prints one planned day for each weekday.
+
+**The first Monday and the first Wednesday in the live channel** are a checklist in
+`docs/test-reports/NFT2-1069.md` (what to expect at 10:00, 14:00, 15:00, 16:00, 18:00 and 20:00).

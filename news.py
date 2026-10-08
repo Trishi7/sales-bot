@@ -9,8 +9,9 @@ about, once a day, and a tap on the shoulder when something big happens.
 
 So R1 is now two shapes of ONE search:
 
-    MAIN   at NEWS_MAIN_TIME (14:00), the last 24 hours, up to NEWS_MAX_ITEMS
-           stories. It is R1's drip slot, so it counts toward the day's cap.
+    MAIN   every weekday, in R1's place in the day's order, everything since
+           the previous main post, up to NEWS_MAX_ITEMS stories. It is R1's
+           drip post, so it counts toward the day's cap.
 
     CHECK  hourly at NEWS_CHECK_TIMES, silent unless something is MAJOR
            (importance >= NEWS_BREAKING_MIN_IMPORTANCE). A check that finds
@@ -25,7 +26,7 @@ NOT LIMITS: important news off the list is welcome, tagged OTHER.
 ONE STORY IS POSTED ONCE. `news_stories` remembers every story that went out,
 main or breaking, by normalised URL AND by headline key — four outlets give one
 funding round four URLs, and the headline key is what catches the second one.
-It is also what keeps a story that broke at 16:00 out of the next day's 14:00
+It is also what keeps a story that broke at 16:00 out of the next day's main
 post: `choose` skips it and says so.
 
 THE SPREAD RULES YIELD TO IMPORTANCE. At most NEWS_PER_TOPIC_PER_DAY stories on
@@ -610,7 +611,7 @@ def _rank(stories: list) -> list:
 def choose_main(stories: list, *, today: date, db, cap: int, poc_slots: int,
                 per_topic: int, topics_per_week: int, min_importance: int,
                 offtopic_bypass: int, overflow_min: int, overflow_max: int) -> dict:
-    """THE 2 PM POST, and what did not fit it.
+    """THE MAIN POST, and what did not fit it.
 
     Returns {"keep": [...], "overflow": [...], "skipped": [...], "dropped": [...]}.
     `keep` is the main post in the order it is posted; `overflow` is "More AI
@@ -1412,17 +1413,19 @@ def latest_slot(now: datetime, times: Optional[list] = None) -> Optional[str]:
     return best
 
 
-def hours_since_previous(slot: str, *, times: Optional[list] = None,
-                         main_time: Optional[str] = None) -> int:
-    """Hours between `slot` and the slot before it — a check slot or the main
-    sweep — wrapping to yesterday for the first one. Never below 1."""
+def hours_since_previous(slot: str, *, times: Optional[list] = None) -> int:
+    """Hours between `slot` and the check slot before it, wrapping to yesterday
+    for the first one. Never below 1.
+
+    THE MAIN POST IS NOT A MARK ANY MORE. It had a fixed time (NEWS_MAIN_TIME,
+    retired 8 Oct) that stood in for the missing 14:00 check; it now moves with
+    the day's order, so a check looks back to the check before it and nothing
+    else. With the default slots the 15:00 check therefore covers from 13:00.
+    """
     at = _minutes(slot)
     if at is None:
         return 1
     marks = {_minutes(s) for s in check_slots(times)}
-    main = _minutes(main_time if main_time is not None else config.NEWS_MAIN_TIME)
-    if main is not None:
-        marks.add(main)
     marks.discard(None)
     earlier = [m for m in marks if m < at]
     if earlier:
@@ -1854,10 +1857,13 @@ def _self_test() -> int:
           latest_slot(datetime(2026, 9, 29, 15, 20), slots), "15:00")
     check("nothing before the first", latest_slot(datetime(2026, 9, 29, 9, 0), slots),
           None)
-    check("15:00 looks back to the 14:00 main sweep",
-          hours_since_previous("15:00", times=slots, main_time="14:00"), 1)
+    check("15:00 looks back to the 13:00 check (there is no 14:00 slot, and "
+          "the main post is no longer a mark)",
+          hours_since_previous("15:00", times=slots), 2)
+    check("16:00 looks back one hour",
+          hours_since_previous("16:00", times=slots), 1)
     check("11:00 looks back to last night's last slot",
-          hours_since_previous("11:00", times=slots, main_time="14:00"), 19)
+          hours_since_previous("11:00", times=slots), 19)
     check("bad entries are ignored", check_slots(["25:00", "9:05", "x"]), ["09:05"])
 
     print("\nthe strategy section")

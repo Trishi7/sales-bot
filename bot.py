@@ -8902,7 +8902,7 @@ class SalesBot(discord.Client):
             return
 
         # FROM THE EARLIEST TIME ANYTHING CAN BE DUE — the window's start, or a
-        # fixed-time post before it (R8's day-of touch at MEETING_DAYOF_TIME).
+        # fixed-time post before it (R8 and R9 at MEETING_DAYOF_TIME).
         # `drip.plan` gives every message its own time; this only stops the
         # sheet being read all night.
         hour, minute = drip.earliest_send_ist()
@@ -8941,20 +8941,23 @@ class SalesBot(discord.Client):
                     drip.counted_today(already), drip.cap_for(today),
                 )
 
-        # THE SPACING HOLDS EVEN WHEN CATCHING UP. After a quiet morning — the
-        # kill switch off until 14:00, a long outage, a clock jump — slots 1, 2
+        # THE SPACING HOLDS EVEN WHEN CATCHING UP. After a quiet afternoon — the
+        # kill switch off until 19:00, a long outage, a clock jump — slots 1, 2
         # and 3 are all past their planned times at once. Sending "everything
         # that is due" would then put three messages into one hour on three
         # consecutive sweep ticks, which is precisely what the spacing exists to
-        # prevent. So the gap is measured from the LAST ACTUAL SEND, not from
-        # the planned time, and a backlog drains at the drip's own pace.
+        # prevent. So the gap is measured from the LAST ACTUAL SPACED SEND, not
+        # from the planned time: two spaced posts are never less than the full
+        # gap apart on the clock, whatever happened to the schedule.
         #
-        # ONE EXEMPTION, AND IT IS NARROW: a post whose type is in
-        # `drip.ON_TIME_TYPES` (the next-step follow-ups) is not held by the
-        # guard, so the hold is remembered here and applied to the due list
-        # below instead of returning. Every other post is held exactly as before.
+        # FIXED-TIME POSTS ARE OUTSIDE IT, BOTH WAYS (NFT2-1069). Meeting prep
+        # and meeting follow-ups (MEETING_DAYOF_TIME) and the next-step
+        # follow-ups (NEXT_STEP_TIME) are not held by the guard, and they are
+        # not what the guard measures from: a 15:00 post neither waits for the
+        # 14:00 one nor pushes the 16:00 one back. So the hold is remembered
+        # here and applied to the spaced posts in the due list below.
         floor = drip.min_gap_minutes()
-        last_sent = self._last_drip_sent_at(already)
+        last_sent = drip.last_spaced_sent_at(already)
         gap_held = False
         if last_sent is not None:
             waited = (now - last_sent).total_seconds() / 60.0
@@ -8974,7 +8977,7 @@ class SalesBot(discord.Client):
 
         due = [m for m in planned["messages"] if m["send_at"] <= now]
         if gap_held:
-            due = [m for m in due if m.get("type") in drip.ON_TIME_TYPES]
+            due = [m for m in due if m.get("pinned")]
         if not due:
             return
 
@@ -9022,18 +9025,26 @@ class SalesBot(discord.Client):
                     "unaffected"
                 )
 
-        # ONE MESSAGE PER TICK. The next slot is not due yet by construction —
-        # the gap is at least MESSAGE_GAP_MIN_MINUTES and the sweeper ticks far
-        # more often than that — but sending one and returning makes it
-        # impossible for a backlog (a long outage, a clock jump) to arrive as a
-        # burst.
-        message = due[0]
-        # THE WEB HALF, NOW AND ONLY FOR THIS MESSAGE. Everything else in the
-        # plan stays un-researched until its own slot comes.
-        await self._research_message(message, today=today)
-        await self._send_drip_message(
-            channel, message, marker=marker, channel_id=channel_id
-        )
+        # ONE SPACED MESSAGE PER TICK. The next slot is not due yet by
+        # construction — the gap is two hours and the sweeper ticks far more
+        # often than that — but sending one and returning makes it impossible
+        # for a backlog (a long outage, a clock jump) to arrive as a burst.
+        #
+        # EVERY FIXED-TIME POST THAT IS DUE GOES ON THIS TICK, AND FIRST. They
+        # share a minute by design (two meetings' prep notes and a follow-up
+        # are all "at 10:00"), so one a tick would turn 10:00 into 10:00, 10:15
+        # and 10:30. And a spaced post does not wait for them: with a 15:00
+        # post and the 16:00 slot both overdue after an outage, both go now.
+        # There are only ever a handful: one per owner for R8 and R9, one R13.
+        fixed = [m for m in due if m.get("pinned")]
+        spaced = [m for m in due if not m.get("pinned")][:1]
+        for message in fixed + spaced:
+            # THE WEB HALF, NOW AND ONLY FOR THIS MESSAGE. Everything else in
+            # the plan stays un-researched until its own slot comes.
+            await self._research_message(message, today=today)
+            await self._send_drip_message(
+                channel, message, marker=marker, channel_id=channel_id
+            )
 
     async def _research_message(self, message: dict, *, today) -> dict:
         """Run the web research for ONE planned message's actions, just before
@@ -9072,32 +9083,16 @@ class SalesBot(discord.Client):
 
     @staticmethod
     def _last_drip_sent_at(already: list):
-        """When the most recent drip message actually went out today, or None.
+        """When the most recent SPACED drip message actually went out today, or
+        None. `drip.last_spaced_sent_at`, kept under this name for its callers.
 
         Reads the recorded `sent_at`, not the planned time: the guard above is
-        about how long ago the channel last heard from this bot, which is a fact
-        about the clock rather than about the schedule.
-
-        A post in `drip.ON_TIME_TYPES` is skipped: it goes at its own fixed
-        time whatever the spacing, so it must not push the spaced posts back
-        either.
+        about how long ago the channel last heard a spaced post, which is a
+        fact about the clock rather than about the schedule. A fixed-time post
+        is skipped: it goes at its own time whatever the spacing, so it must
+        not push the spaced posts back either.
         """
-        best = None
-        for row in already or []:
-            if (row or {}).get("action_type") in drip.ON_TIME_TYPES:
-                continue
-            raw = str((row or {}).get("sent_at") or "").strip()
-            if not raw:
-                continue
-            try:
-                when = datetime.fromisoformat(raw)
-            except ValueError:
-                continue
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=dl.IST)
-            if best is None or when > best:
-                best = when
-        return best
+        return drip.last_spaced_sent_at(already)
 
     async def _plan_drip(self, *, today, already: list, queue=None,
                          only_rule: str = ""):
@@ -9107,8 +9102,8 @@ class SalesBot(discord.Client):
         hands them to `drip.plan`, which sends nothing.
 
         THE PLAN IS UN-RESEARCHED, AND THAT IS DELIBERATE. This runs on every
-        sweep tick — every 15 minutes — and the day has a post every 90. When
-        it also ran the web research, about four complete research passes were
+        sweep tick — every 15 minutes — and the day has a post every 120. When
+        it also ran the web research, several complete research passes were
         paid for and thrown away between each pair of posts. `drip.plan` groups,
         ranks and schedules on rule, owner, priority, due date and company; the
         research changes none of those, so the web-pending placeholders plan
@@ -9247,6 +9242,11 @@ class SalesBot(discord.Client):
         # RECORDED — uncounted — so the live sweep, which re-plans every tick,
         # does not research the same empty Wednesday again fifteen minutes
         # later.
+        #
+        # RECORDED AS TAKING NO PLACE IN THE SPACED WINDOW (`pinned`): a rule
+        # with nothing to post takes no slot, so the planner must not count
+        # this row when it works out which slot the next post gets, and the
+        # catch-up guard must not measure two hours from a post nobody saw.
         if drip.nothing_to_say(message):
             await asyncio.to_thread(
                 lambda: self.db.record_drip_send(
@@ -9257,7 +9257,7 @@ class SalesBot(discord.Client):
                     stage=message["stage"], planned_at=message["send_at_hhmm"],
                     channel_id=channel_id, message_id=None,
                     sent_at=dl.now_ist().isoformat(timespec="seconds"),
-                    counts_toward_cap=False, pinned=bool(message.get("pinned")),
+                    counts_toward_cap=False, pinned=True,
                 )
             )
             log.info("[drip] slot %s for %s: %s has nothing to say today — no post, "
@@ -10650,8 +10650,8 @@ class SalesBot(discord.Client):
         that has not been posted, has MODEL_LIGHT score the ones not yet scored
         — titles and summaries only, one call — and puts the result through
         `news.choose_main` and the deterministic `news.render`. The main model
-        is not called for the news post. The item goes out in R1's drip slot,
-        pinned to NEWS_MAIN_TIME.
+        is not called for the news post. The item goes out in R1's place in
+        the day's order (`daily_order` in bot_rules.yaml).
 
         WHAT DID NOT FIT RIDES ON THE ITEM (`news_overflow`) and is posted
         right after it as "More AI News" (`_post_news_overflow`).
@@ -10759,27 +10759,43 @@ class SalesBot(discord.Client):
         """(since, until) for the MAIN sweep, as IST datetimes: everything
         since the previous main sweep.
 
-        NOT A FIXED 24 HOURS. Monday's post covers Friday 2 PM to Monday 2 PM,
-        because nothing covered the weekend in between: a story from Saturday
-        morning was outside Monday's 24 hours and was never shown to anybody.
-        It is also what brings back a story a weekend check found and the
-        breaking valve held — held stories are not recorded as posted, so they
-        are simply still there.
+        NOT A FIXED 24 HOURS. Monday's post covers from Friday's AI news slot
+        to Monday's, because nothing covered the weekend in between: a story
+        from Saturday morning was outside Monday's 24 hours and was never shown
+        to anybody. It is also what brings back a story a weekend check found
+        and the breaking valve held — held stories are not recorded as posted,
+        so they are simply still there.
 
         "THE PREVIOUS MAIN SWEEP" IS READ OFF THE SCHEDULE — the last day
-        before `today` on which R1 runs, at NEWS_MAIN_TIME — not off a record
-        of what was sent. So it is the same on a real day, a test day and a
-        simulation, and a day the bot was down does not shorten the next one's
-        window. Never longer than the feed store keeps items.
+        before `today` on which R1 runs, at R1's SLOT IN THAT DAY'S ORDER
+        (`drip.order_slot`) — not off a record of what was sent. AI news has
+        had no fixed time since 8 Oct, so "the previous post" is no longer
+        "yesterday at 2 PM": Tuesday's post (fourth, 20:00) covers from
+        Monday's slot (third, 18:00), and Monday's from Friday's (third,
+        18:00). Read off the schedule, it is the same on a real day, a test
+        day and a simulation, and a day the bot was down does not shorten the
+        next one's window. Never longer than the feed store keeps items.
 
-        The window ends now on the real day, and at the main time on a past
+        THE SLOT IS THE ONE R1 HOLDS WHEN EVERY RULE AHEAD OF IT POSTS, AND
+        THAT HAS A COST. On a day a rule ahead had nothing to say, the real
+        post went earlier than its slot (a Monday with no deliverables: 16:00,
+        not 18:00). The stories collected between the two times were too late
+        for that post and are before this window's start, so they are in
+        NEITHER main post. A major one still reaches the channel through the
+        hourly check, and all of them are there for anybody who asks for the
+        news (`_news_answer` looks back at least 24 hours). Closing the gap
+        means reading the record of what was sent instead of the schedule, and
+        then a test day and the real day stop agreeing; the team chose the
+        schedule (8 Oct). A story is never shown twice either way: what has
+        been posted is filtered out by link and headline, not by this window.
+
+        The window ends now on the real day, and at R1's slot on a past
         pretend date — a test of last Monday reads last Monday's news.
         """
-        hh, mm = digest.parse_time(config.NEWS_MAIN_TIME, default="14:00")
         if today >= dl.real_today_ist():
             until = dl.real_now_ist()
         else:
-            until = datetime(today.year, today.month, today.day, hh, mm, tzinfo=dl.IST)
+            until = drip.order_slot("R1", today)
         rule = rules.by_id("R1")
         prev = today - timedelta(days=1)
         for back in range(1, 8):
@@ -10787,7 +10803,7 @@ class SalesBot(discord.Client):
             if rule is None or rule.runs_on(day):
                 prev = day
                 break
-        since = datetime(prev.year, prev.month, prev.day, hh, mm, tzinfo=dl.IST)
+        since = drip.order_slot("R1", prev)
         floor = until - timedelta(days=max(1, int(config.NEWS_FEED_KEEP_DAYS)))
         return max(since, floor), until
 
@@ -11342,9 +11358,10 @@ class SalesBot(discord.Client):
         """R2 — which companies in today's news are not in the pipeline.
 
         READS TODAY'S ROWS FROM `news_stories` — the main post and any breaking
-        ones — rather than a search result handed across. R2 can come round
-        before the 14:00 main post has gone out; then it reads the previous
-        day's rows and says which day it read.
+        ones — rather than a search result handed across. R2 COMES BEFORE THE
+        AI NEWS POST IN THE DAY'S ORDER (third of four on a Tuesday, first on
+        a Friday); then it reads the previous day's rows and says which day it
+        read.
 
         MODEL_LIGHT, FROM THE STORED TITLES AND SUMMARIES. The stories ARE the
         snippets: no search runs to answer a question about a result set the
@@ -12496,8 +12513,8 @@ class SalesBot(discord.Client):
         it writes (`self.db` is the sandbox) and in not moving the persistent
         pretend clock; its "now" is passed down instead.
 
-        TWO STOPS, AT 10:00 AND 14:00. The real day has two: the meeting-prep
-        day-of touch is pinned to MEETING_DAYOF_TIME and everything else waits
+        TWO STOPS, AT 10:00 AND 14:00. The real day has two: the meeting posts
+        (R8 and R9) are fixed at MEETING_DAYOF_TIME and everything else waits
         for the posting window to open. Standing at one time would show a day
         that does not happen.
 

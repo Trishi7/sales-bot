@@ -228,34 +228,80 @@ class TestPostingWindow:
 
     Caught by `verify_monday.py`, which printed the 21:13 and had to flag it.
 
-    THE RULE: the gap shrinks evenly to fit SALES_DRIP_START..SALES_DRIP_END,
-    down to MESSAGE_GAP_MIN_MINUTES; the rest rolls.
+    THE FIRST RULE (S1) shrank the gap evenly to fit the window, down to
+    MESSAGE_GAP_MIN_MINUTES, and rolled the rest.
+
+    THE RULE NOW (NFT2-1069, the team's decision of 8 Oct): the gap is 120
+    minutes and NEVER SHRINKS; jitter may only add time; the slots are 14:00,
+    16:00, 18:00 and 20:00; and a post that would land after SALES_DRIP_END is
+    not sent that day. What these tests guard is unchanged — nothing lands
+    after the window and no two posts are closer than the floor — and the gap
+    is now held to something stricter than a floor: it is exact.
+
+    The schedule settings are pinned to the shipped defaults, so a laptop whose
+    .env has its own gap or window neither breaks these nor passes them for the
+    wrong reason (one of them was red here for exactly that).
     """
 
     MONDAY = date(2026, 9, 21)
+
+    @pytest.fixture(autouse=True)
+    def _shipped_schedule(self, monkeypatch):
+        import config
+        for name, value in (("SALES_DRIP_START", "14:00"), ("SALES_DRIP_END", "20:00"),
+                            ("MESSAGE_GAP_MINUTES", 120),
+                            ("MESSAGE_GAP_MIN_MINUTES", 120),
+                            ("MESSAGE_JITTER_MINUTES", 0), ("DAILY_MESSAGE_CAP", 5)):
+            monkeypatch.setattr(config, name, value)
 
     def _end_minutes(self):
         import config
         h, m = config.drip_end_ist()
         return h * 60 + m
 
-    def test_six_posts_from_1400_all_land_by_1830(self):
+    def _items(self, count, *, counts=False):
+        return [
+            {"rule": "x", "rule_id": f"X{i}", "type": "x", "rule_name": "x",
+             "label": "x", "owner": f"O{i:02d}", "priority": 2, "priority_label": "p",
+             "due_date": self.MONDAY, "due_iso": "2026-09-21", "overdue_days": 0,
+             "company": f"C{i}", "poc": "", "poc_designation": "", "sheet_row": 2,
+             "row_key": f"c{i}|", "contact_key": f"c{i}|",
+             "max_items_per_post": 5, "counts_toward_cap": counts,
+             "destination": "channel", "web_pending": False, "why": "x",
+             "text": "x", "key": f"X{i}:c{i}"}
+            for i in range(count)
+        ]
+
+    def test_the_day_holds_four_slots_two_hours_apart(self):
         import drip
-        times = drip.slot_times(self.MONDAY, count=6)
-        assert len(times) == 6
+        assert drip.slots_in_window(self.MONDAY) == 4
+        assert [t.strftime("%H:%M") for t in drip.slot_times(self.MONDAY, count=4)] \
+            == ["14:00", "16:00", "18:00", "20:00"]
+
+    def test_six_posts_from_1400_none_lands_after_the_window(self):
+        """Six posts used to be squeezed inside the window. Now four go, at
+        their slots, and two are not sent today."""
+        import drip
+        planned = drip.plan(self._items(6), day=self.MONDAY)
+        times = [m["send_at"] for m in planned["messages"]]
+        assert [t.strftime("%H:%M") for t in times] == ["14:00", "16:00", "18:00", "20:00"]
+        assert len(planned["rolled"]) == 2
         latest = max(t.hour * 60 + t.minute for t in times)
         assert latest <= self._end_minutes(), (
-            "six posts must fit the window; latest was "
+            "nothing may land after the window; latest was "
             + max(times).strftime("%H:%M")
         )
 
     @pytest.mark.parametrize("count", [1, 2, 3, 4, 5, 6, 8, 12, 25])
     def test_no_post_ever_lands_after_the_window(self, count):
         import drip
-        times = drip.slot_times(self.MONDAY, count=count)
+        planned = drip.plan(self._items(count), day=self.MONDAY)
+        assert planned["messages"], "a day with something to say says something"
         assert all(
-            (t.hour * 60 + t.minute) <= self._end_minutes() for t in times
+            m["send_at"] <= drip.window_end(self.MONDAY) for m in planned["messages"]
         ), f"{count} posts overran the window"
+        assert len(planned["messages"]) + len(planned["rolled"]) == count, (
+            "what is not sent today is reported, never silently dropped")
 
     def test_the_first_post_lands_exactly_on_the_start(self):
         import config
@@ -266,69 +312,107 @@ class TestPostingWindow:
     def test_a_light_day_keeps_the_full_gap(self):
         import config
         import drip
-        gap, _fits = drip.fitted_gap(3)
-        assert gap == config.MESSAGE_GAP_MINUTES
+        assert drip.gap_minutes() == config.MESSAGE_GAP_MINUTES == 120
+        times = drip.slot_times(self.MONDAY, count=3)
+        assert [int((b - a).total_seconds() // 60) for a, b in zip(times, times[1:])] \
+            == [120, 120]
 
-    def test_a_heavy_day_shrinks_the_gap_but_not_below_the_floor(self):
+    @pytest.mark.parametrize("count", [5, 6, 8, 10, 25])
+    def test_a_heavy_day_does_not_shrink_the_gap(self, count):
+        """It used to: `fitted_gap(10)` came back below MESSAGE_GAP_MINUTES.
+        However much the day holds, every gap is the full gap."""
         import config
         import drip
-        gap, _fits = drip.fitted_gap(10)
-        assert gap < config.MESSAGE_GAP_MINUTES
-        assert gap >= config.MESSAGE_GAP_MIN_MINUTES
+        planned = drip.plan(self._items(count), day=self.MONDAY)
+        times = [m["send_at"] for m in planned["messages"]]
+        gaps = [int((b - a).total_seconds() // 60) for a, b in zip(times, times[1:])]
+        assert gaps and all(g == config.MESSAGE_GAP_MINUTES for g in gaps), gaps
+        assert drip.min_gap_minutes() == config.MESSAGE_GAP_MINUTES
+
+    def test_the_floor_holds_under_a_gap_set_too_low(self, monkeypatch):
+        """MESSAGE_GAP_MIN_MINUTES is still a floor: the gap used is the larger
+        of the two settings."""
+        import config
+        import drip
+        monkeypatch.setattr(config, "MESSAGE_GAP_MINUTES", 30)
+        assert drip.gap_minutes() == 120
+        times = drip.slot_times(self.MONDAY, count=4)
+        assert all(int((b - a).total_seconds() // 60) >= config.MESSAGE_GAP_MIN_MINUTES
+                   for a, b in zip(times, times[1:]))
 
     def test_an_impossible_day_reports_what_fits(self):
         import drip
-        _gap, fits = drip.fitted_gap(40)
+        fits = drip.slots_in_window(self.MONDAY)
         assert 0 < fits < 40
+        planned = drip.plan(self._items(40), day=self.MONDAY)
+        assert len(planned["messages"]) == fits
+        assert len(planned["rolled"]) == 40 - fits
 
-    def test_jitter_never_pushes_a_gap_below_the_floor(self):
+    @pytest.mark.parametrize("jitter", [1, 15, 45, 120])
+    def test_jitter_never_pushes_a_gap_below_the_floor(self, monkeypatch, jitter):
         """THE BUG: the fitted gap respected MESSAGE_GAP_MIN_MINUTES but the
         per-slot jitter was then ADDED to it unclamped. On a compressed day a
         42-minute gap minus 15 minutes of jitter is 27 — below the 30 the floor
         promised. Caught by `verify_monday.py`, whose spacing check failed.
 
-        THE RULE: the STEP is clamped, not the jitter, so the schedule stays
-        deterministic and simply cannot place two posts too close together.
+        THE RULE NOW: jitter is never negative, so there is nothing to clamp.
+        It can only make a gap longer, by at most MESSAGE_JITTER_MINUTES.
         """
         import config
         import drip
-        for count in (4, 5, 6, 7, 8, 10, 12):
-            # Only the slots that FIT are spaced — `plan` caps at this count and
-            # rolls the rest, and slots past it are clamped to the window end on
-            # purpose (see `slot_times`).
-            _gap, fits = drip.fitted_gap(count)
-            times = drip.slot_times(self.MONDAY, count=count)[:fits]
+        monkeypatch.setattr(config, "MESSAGE_JITTER_MINUTES", jitter)
+        for day_offset in range(14):
+            day = date(2026, 9, 21 + day_offset) if day_offset < 10 \
+                else date(2026, 10, day_offset - 9)
+            times = drip.slot_times(day, count=8)
             gaps = [
                 int((b - a).total_seconds() // 60) for a, b in zip(times, times[1:])
             ]
-            assert all(g >= config.MESSAGE_GAP_MIN_MINUTES for g in gaps), (
-                f"{count} posts ({fits} fitting) produced gaps {gaps}, floor is "
-                f"{config.MESSAGE_GAP_MIN_MINUTES}"
+            assert all(120 <= g <= 120 + jitter for g in gaps), (
+                f"{day}: gaps {gaps} with jitter {jitter}; the gap is 120 and "
+                "jitter may only add"
             )
+            assert all(g >= config.MESSAGE_GAP_MIN_MINUTES for g in gaps)
+
+    def test_a_negative_jitter_is_read_as_none(self, monkeypatch):
+        import config
+        import drip
+        monkeypatch.setattr(config, "MESSAGE_JITTER_MINUTES", -30)
+        times = drip.slot_times(self.MONDAY, count=4)
+        assert [t.strftime("%H:%M") for t in times] == ["14:00", "16:00", "18:00", "20:00"]
 
     def test_slots_past_what_fits_are_never_assigned(self):
-        """The degenerate tail must be unreachable through `plan`."""
+        """A slot after the window exists in `slot_times` (it is how `plan`
+        knows it is too late) and must be unreachable through `plan`."""
         import drip
-        _gap, fits = drip.fitted_gap(12)
+        fits = drip.slots_in_window(self.MONDAY)
         assert fits < 12
-        items = [
-            {"rule": "x", "rule_id": f"R{i}", "type": "x", "rule_name": "x",
-             "label": "x", "owner": f"O{i}", "priority": 2, "priority_label": "p",
-             "due_date": self.MONDAY, "due_iso": "2026-09-21", "overdue_days": 0,
-             "company": f"C{i}", "poc": "", "poc_designation": "", "sheet_row": 2,
-             "row_key": f"c{i}|", "contact_key": f"c{i}|",
-             "max_items_per_post": 5, "counts_toward_cap": False,
-             "destination": "channel", "web_pending": False, "why": "x",
-             "text": "x", "key": f"R{i}:c{i}"}
-            for i in range(12)
-        ]
-        planned = drip.plan(items, day=self.MONDAY)
+        assert drip.slot_times(self.MONDAY, count=12)[fits] > drip.window_end(self.MONDAY)
+        planned = drip.plan(self._items(12), day=self.MONDAY)
         assert len(planned["messages"]) <= fits
         assert len(planned["rolled"]) >= 12 - fits
+        assert all(r["rolled_why"] == "window" for r in planned["rolled"])
 
-    def test_gaps_are_deterministic_across_calls(self):
-        """The restart guard: the same day must recompute identically."""
+    def test_a_late_post_pushes_the_next_a_full_gap_and_never_past_the_window(self):
+        """Catching up after an outage: the gap is measured from when the last
+        spaced post really went, and what that pushes past the end is not sent."""
         import drip
+        items = self._items(4)
+        first = drip.plan(items, day=self.MONDAY)["messages"][0]
+        sent = [{"slot": 1, "group_key": first["group_key"], "action_type": "x",
+                 "counts_toward_cap": 0, "pinned": 0, "planned_at": "14:00",
+                 "sent_at": "2026-09-21T17:10:00"}]
+        planned = drip.plan(items, day=self.MONDAY, already_sent=sent)
+        assert [m["send_at_hhmm"] for m in planned["messages"]] == ["19:10"]
+        assert len(planned["rolled"]) == 2
+
+    def test_gaps_are_deterministic_across_calls(self, monkeypatch):
+        """The restart guard: the same day must recompute identically."""
+        import config
+        import drip
+        assert drip.slot_times(self.MONDAY, count=6) == \
+            drip.slot_times(self.MONDAY, count=6)
+        monkeypatch.setattr(config, "MESSAGE_JITTER_MINUTES", 20)
         assert drip.slot_times(self.MONDAY, count=6) == \
             drip.slot_times(self.MONDAY, count=6)
 

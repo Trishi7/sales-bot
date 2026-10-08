@@ -26,15 +26,21 @@ THE VOLUME CONTRACT (plan section 8):
   - at most DAILY_MESSAGE_CAP (5) COUNTED posts per weekday — meeting prep,
     meeting follow-ups, reminders, urgent news and answers do not count
     (`counted_today` is the one counter);
-  - AI news (R1) is planned first, at NEWS_MAIN_TIME, never held or rolled;
-  - next-step follow-ups (R13) go at NEXT_STEP_TIME on weekdays and do not
-    count;
-  - the first at about SALES_DRIP_START (10:00 IST);
-  - then gaps of MESSAGE_GAP_MINUTES (90) plus or minus MESSAGE_JITTER_MINUTES
-    (15), so the spacing never falls below 75 minutes at the default settings;
-  - overflow ROLLS TO TOMORROW rather than being dropped — except that a group
-    which has become a positive override jumps the roll, because a reply that
-    waits a day is a reply that goes cold;
+  - THE ORDER OF THE DAY IS WRITTEN DOWN (`daily_order` in bot_rules.yaml):
+    the first rule listed for the weekday takes SALES_DRIP_START (14:00 IST),
+    the next the slot MESSAGE_GAP_MINUTES (120) later, and so on; a rule with
+    nothing to post takes no slot and the next one moves up;
+  - THE GAP NEVER SHRINKS. A busy day does not squeeze its posts closer; what
+    would land after SALES_DRIP_END (20:00) is not sent that day.
+    MESSAGE_JITTER_MINUTES (0) can only ADD time to a gap;
+  - AI news (R1) is never held, and takes its place in the order like any
+    other rule;
+  - meeting prep and meeting follow-ups (R8, R9, at MEETING_DAYOF_TIME) and the
+    next-step follow-ups (R13, at NEXT_STEP_TIME) go at FIXED TIMES, outside
+    the order and the gap: they move no spaced post, no spaced post waits for
+    them, and they do not count;
+  - what does not fit is NOT SENT LATE: it waits for the next day its rule
+    runs, when the queue is worked out afresh;
   - an empty queue means SILENCE. No "nothing to report" message, ever. A bot
     that speaks to say it has nothing to say has not understood the contract.
 
@@ -122,8 +128,8 @@ def group_key(action: dict) -> str:
     return f"{action.get('type')}|{owner_key(action)}"
 
 
-def group(actions: list) -> list:
-    """Items -> one group per (rule x owner), ranked.
+def group(actions: list, *, day: Optional[date] = None) -> list:
+    """Items -> one group per (rule x owner), in the order they post.
 
     ONE GROUP PER RULE, NOT PER ACTION TYPE, now that a rule IS the type. The
     practical difference is the cap: each group carries its rule's own
@@ -131,10 +137,17 @@ def group(actions: list) -> list:
     R11 names three companies, and the overflow of each rolls to that rule's
     next run rather than to a shared queue.
 
-    RANKING IS BY THE GROUP'S BEST ACTION, not by its size. A group holding one
-    positive override outranks a group holding nine slow-lane follow-ups,
-    because the override is the thing that decays. Within a band the oldest due
-    date leads, then the type, then the owner — so the order is stable day to
+    THE ORDER IS THE DAY'S ORDER (8 Oct), read from `daily_order` in
+    bot_rules.yaml through `rules.order_for(day)`: on a Monday the checklist,
+    then DM-sent-no-meeting, then AI news, then closure support. It used to be
+    the priority band, which put AI news last on every day and made the order
+    something nobody could read off a page. A group whose rule is not in the
+    day's order (a fixed-time rule, or a test's own rule) comes after the ones
+    that are.
+
+    WITHIN ONE PLACE IN THE ORDER, the old ranking still decides: the group's
+    best action by band, then the oldest due date, then the type, then the
+    owner — so two owners' messages for one rule keep a stable order day to
     day and a person's message does not move around for no reason.
     """
     buckets: dict = {}
@@ -165,10 +178,11 @@ def group(actions: list) -> list:
             "counts_toward_cap": bool(best.get("counts_toward_cap", True)),
             "destination": best.get("destination", "channel"),
             "web_pending": any(m.get("web_pending") for m in members),
-            # R8's DAY-OF TOUCH KEEPS ITS OWN TIME. A note about a meeting that
-            # starts at 11 is worthless at 14:00, so this one item sits OUTSIDE
-            # the posting window entirely — it is the single exception, and it
-            # is carried on the group so `plan` does not have to re-derive it.
+            # A FIXED-TIME POST KEEPS ITS OWN TIME (R8 and R9 at
+            # MEETING_DAYOF_TIME, R13 at NEXT_STEP_TIME). A note about a meeting
+            # that starts at 11 is worthless at 14:00, so these sit OUTSIDE the
+            # day's order entirely; the time is carried on the group so `plan`
+            # does not have to re-derive it.
             "dayof_time": next(
                 (m.get("dayof_time") for m in members if m.get("dayof_time")), ""
             ),
@@ -192,12 +206,10 @@ def group(actions: list) -> list:
             "count": len(members),
         })
 
-    # A GROUP THAT ROLLED OFF THE END OF THE WINDOW LEADS THE NEXT RUN. It has
-    # already waited a day for a reason that had nothing to do with its own
-    # importance — the clock ran out — and making it queue behind today's fresh
-    # items would let a busy week starve it indefinitely.
+    place = {rule_id: i for i, rule_id
+             in enumerate(rules.order_for(day or dl.today_ist()))}
     groups.sort(key=lambda g: (
-        0 if g.get("rolled_first") else 1,
+        place.get(str(g.get("rule_id") or "").strip(), len(place)),
         int(g["priority"]),
         g["due_date"] or date.max,
         str(g["type"]),
@@ -229,32 +241,45 @@ def companies_sentence(companies: list, *, cap: Optional[int] = None) -> str:
 # -- the schedule -------------------------------------------------------------
 
 
+def gap_minutes() -> int:
+    """The gap between two spaced posts, in minutes. Exactly this, never less.
+
+    THE GAP DOES NOT SHRINK (8 Oct). It used to be fitted to the day: a busy
+    day squeezed every post closer, down to MESSAGE_GAP_MIN_MINUTES, so the
+    times depended on how much there was to say and nobody could tell when a
+    post would come. Now the slots are fixed — 14:00, 16:00, 18:00, 20:00 at
+    the defaults — and a day with more to say than slots says the rest on the
+    rule's next day.
+
+    MESSAGE_GAP_MIN_MINUTES IS STILL A FLOOR: the gap used is the larger of the
+    two settings, so a .env that lowers MESSAGE_GAP_MINUTES by mistake cannot
+    take the spacing below it. Both default to 120.
+    """
+    return max(1, int(config.MESSAGE_GAP_MINUTES), int(config.MESSAGE_GAP_MIN_MINUTES))
+
+
 def min_gap_minutes() -> int:
-    """The smallest gap the schedule can ever produce, in minutes.
+    """The smallest gap the schedule can ever produce: the gap itself.
 
-    TWO FLOORS, AND THE LOWER ONE WINS. The schedule used to have exactly one —
-    gap minus jitter, 75 at the defaults — because nothing could ever compress
-    it. The posting window can: `fitted_gap` shrinks the gap evenly to land the
-    whole day before SALES_DRIP_END, down to MESSAGE_GAP_MIN_MINUTES. On a busy
-    day the real floor is therefore 30, not 75, and reporting 75 would be a
-    number the schedule does not honour.
-
-    It is used in two places that must agree: the contract report, and the
-    SENDER's catch-up guard.
+    Kept under its old name because two things that must agree both ask it:
+    the contract report, and the SENDER's catch-up guard.
 
     THE SENDER NEEDS IT because "send everything whose planned time has passed"
-    is wrong after a quiet morning. If the kill switch is off until 15:00, slots
+    is wrong after a quiet morning. If the kill switch is off until 19:00, slots
     1, 2 and 3 are all overdue at once, and without this floor they would go out
     on three consecutive sweep ticks — three messages inside an hour, which is
-    the exact thing the spacing exists to prevent. Catching up must still be
-    paced.
+    the exact thing the spacing exists to prevent. Catching up is still paced,
+    and what the pace pushes past SALES_DRIP_END is not sent (`plan`).
     """
-    nominal = int(config.MESSAGE_GAP_MINUTES) - abs(int(config.MESSAGE_JITTER_MINUTES))
-    return max(1, min(nominal, int(config.MESSAGE_GAP_MIN_MINUTES)))
+    return gap_minutes()
 
 
 def _jitter(day: date, slot: int) -> int:
-    """The deterministic offset, in minutes, for one slot on one day.
+    """The deterministic extra wait, in minutes, before one slot on one day.
+
+    IT ONLY EVER ADDS TIME (8 Oct): 0 to MESSAGE_JITTER_MINUTES, never
+    negative. It used to be plus-or-minus, and a minus is a gap shorter than
+    the one the team was told. The default is 0, which makes the slots exact.
 
     SEEDED ON (date, slot) AND NOTHING ELSE. That is what makes the schedule
     survive a restart: the sweeper recomputes the whole day on every tick, and
@@ -267,125 +292,83 @@ def _jitter(day: date, slot: int) -> int:
     if spread == 0:
         return 0
     rng = random.Random(f"{dl.iso(day)}:{int(slot)}")
-    return rng.randint(-spread, spread)
+    return rng.randint(0, spread)
 
 
 def window_minutes() -> int:
     """How many minutes the posting window holds, end minus start.
 
     Zero or negative when SALES_DRIP_END is at or before SALES_DRIP_START, which
-    is a configuration mistake — `slot_times` then falls back to the unbounded
-    schedule rather than refusing to post, because a bot that says nothing is a
-    worse failure than one that says something late.
+    is a configuration mistake — `window_end` then puts the cut-off at the end
+    of the day rather than refusing to post, because a bot that says nothing is
+    a worse failure than one that says something late.
     """
     sh, sm = config.drip_start_ist()
     eh, em = config.drip_end_ist()
     return (eh * 60 + em) - (sh * 60 + sm)
 
 
-def fitted_gap(count: int) -> tuple:
-    """(gap in minutes, how many posts fit) for `count` posts today.
+def window_end(day: date) -> datetime:
+    """The last moment of `day` a spaced post may be planned for: SALES_DRIP_END.
 
-    THE GAP SHRINKS EVENLY OR NOT AT ALL. When the day overruns the window every
-    post moves closer by the same amount — singling one out would make the
-    schedule depend on which item happened to be third, which is not something
-    anybody could predict or check.
-
-    IT NEVER SHRINKS BELOW MESSAGE_GAP_MIN_MINUTES. Below that the messages stop
-    reading as separate things and start reading as one long one delivered in
-    instalments, which is the failure the spacing exists to prevent. Whatever
-    does not fit at the floor is reported as not fitting, and `plan` rolls it.
+    A slot AT the end is inside the window (the 20:00 post is the day's fourth);
+    a slot after it is not sent that day.
     """
-    n = max(1, int(count))
-    span = window_minutes()
-    gap = max(1, int(config.MESSAGE_GAP_MINUTES))
-    floor = max(1, int(config.MESSAGE_GAP_MIN_MINUTES))
-
-    if span <= 0:
-        # Misconfigured window. Keep the old unbounded behaviour and say so.
+    if window_minutes() <= 0:
+        # Misconfigured window. Keep posting, and say so.
         log.warning(
             "[drip] SALES_DRIP_END (%s) is not after SALES_DRIP_START (%s), so there "
-            "is no posting window. Falling back to the unbounded schedule — posts may "
-            "land late in the evening.",
+            "is no posting window. Spaced posts may land late in the evening.",
             config.SALES_DRIP_END, config.SALES_DRIP_START,
         )
-        return gap, n
-
-    # One post needs no gap at all; it lands on the start time.
-    if n <= 1:
-        return gap, 1
-
-    # The gap that would exactly fill the window with n posts, allowing for the
-    # jitter which can push the last one later than the nominal spacing.
-    jitter = abs(int(config.MESSAGE_JITTER_MINUTES))
-    needed = (n - 1)
-    ideal = (span - jitter) // needed if needed else gap
-    if ideal >= gap:
-        return gap, n                      # the normal gap already fits
-    if ideal >= floor:
-        log.info(
-            "[drip] %d post(s) will not fit at %d min; shrinking the gap evenly to "
-            "%d min so the day ends by %s.",
-            n, gap, ideal, config.SALES_DRIP_END,
-        )
-        return int(ideal), n
-
-    # Even at the floor it does not fit. How many DO?
-    fits = 1 + max(0, (span - jitter) // floor)
-    log.info(
-        "[drip] %d post(s) will not fit before %s even at the %d-min floor; %d will "
-        "go today and the rest roll to the next applicable day, where they go first.",
-        n, config.SALES_DRIP_END, floor, fits,
-    )
-    return floor, max(1, int(fits))
+        return datetime(day.year, day.month, day.day, 23, 59, tzinfo=dl.IST)
+    eh, em = config.drip_end_ist()
+    return datetime(day.year, day.month, day.day, eh, em, tzinfo=dl.IST)
 
 
 def slot_times(day: date, *, count: int) -> list:
-    """The planned send times for one day, as datetimes in IST.
+    """The first `count` slots of one day, as datetimes in IST.
 
     The first slot lands on SALES_DRIP_START exactly; every later slot is the
-    previous PLANNED time plus the fitted gap plus that slot's jitter.
-    Compounding off the previous PLANNED time rather than off the actual send
-    keeps the schedule deterministic even when a send is late or a tick is
-    missed.
+    one before it plus `gap_minutes()` plus that slot's jitter (0 by default).
+    At the defaults: 14:00, 16:00, 18:00, 20:00.
 
-    NOTHING IS RETURNED AFTER SALES_DRIP_END. The gap shrinks evenly to fit the
-    day into the window (`fitted_gap`), and a time that would still fall outside
-    it is CLAMPED to the end rather than returned late — `plan` asks for only as
-    many slots as `fitted_gap` said would fit, so a clamped time means the
-    arithmetic drifted and the clamp is the backstop, not the mechanism.
-
-    THE GAP CAN NEVER GO BELOW MESSAGE_GAP_MIN_MINUTES *within the slots that
-    fit*. At the defaults that is 30 minutes, and the self-test asserts it.
-
-    SLOTS PAST `fitted_gap`'s COUNT ARE DEGENERATE, deliberately: they are all
-    clamped to the window end and sit on top of each other. `plan` never asks
-    for them — it caps at that count and rolls the rest — so they exist only so
-    that indexing by slot number cannot raise. Do not use them; ask
-    `fitted_gap` how many the day actually holds.
+    NOTHING IS SQUEEZED AND NOTHING IS CLAMPED. Ask for six slots and the fifth
+    and sixth come back at 22:00 and 00:00 — after the window, which is how
+    `plan` knows not to send them. They used to be pulled back inside it by
+    shrinking every gap, and then by stacking the leftovers on the window's
+    last minute. `slots_in_window` says how many the day really holds.
     """
     hour, minute = config.drip_start_ist()
     first = datetime(day.year, day.month, day.day, hour, minute, tzinfo=dl.IST)
-    eh, em = config.drip_end_ist()
-    last_allowed = datetime(day.year, day.month, day.day, eh, em, tzinfo=dl.IST)
-
-    n = max(1, int(count))
-    gap, _fits = fitted_gap(n)
-    floor = max(1, int(config.MESSAGE_GAP_MIN_MINUTES))
+    gap = gap_minutes()
     out = [first]
-    for slot in range(2, n + 1):
-        # THE JITTER IS CLAMPED, NOT JUST ADDED. On a compressed day the fitted
-        # gap can be close to the floor, and a negative jitter would push the
-        # real gap BELOW it — 42 minus 15 is 27, and the floor said 30. The
-        # clamp is applied to the STEP rather than to the jitter so the schedule
-        # stays deterministic: the same (date, slot) still produces the same
-        # time, it simply cannot produce one too close to its predecessor.
-        step = max(floor, gap + _jitter(day, slot))
-        nxt = out[-1] + timedelta(minutes=step)
-        if window_minutes() > 0 and nxt > last_allowed:
-            nxt = last_allowed
-        out.append(nxt)
+    for slot in range(2, max(1, int(count)) + 1):
+        out.append(out[-1] + timedelta(minutes=gap + _jitter(day, slot)))
     return out
+
+
+def order_slot(rule_id: str, day: date) -> datetime:
+    """The slot `rule_id` holds on `day` when every rule ahead of it in the
+    day's order posts: AI news on a Monday is 18:00.
+
+    READ OFF THE SCHEDULE, NOT OFF WHAT WAS SENT, so it is the same on a real
+    day, a test day and a simulation. It is what "since the previous AI news
+    post" is measured from (`bot._main_window`). A rule that is not in the
+    day's order is given the first slot.
+    """
+    place = rules.order_index(rule_id, day) or 0
+    return slot_times(day, count=place + 1)[place]
+
+
+def slots_in_window(day: date) -> int:
+    """How many spaced posts `day` can hold: the slots at or before
+    SALES_DRIP_END. Four at the defaults (14:00, 16:00, 18:00, 20:00)."""
+    end = window_end(day)
+    n = 1
+    while n < 100 and slot_times(day, count=n + 1)[-1] <= end:
+        n += 1
+    return n
 
 
 def sunday_rule_ids() -> set:
@@ -489,19 +472,13 @@ NEVER_HELD = frozenset({
     nextaction.R_NEXT_STEPS,
 })
 
-# POSTS THE CATCH-UP GUARD DOES NOT HOLD, AND THAT DO NOT HOLD OTHERS. The live
-# sender waits `min_gap_minutes()` after ANY post before sending the next, so a
-# spaced post that went at 14:31 would push a 15:00 post to the tick after
-# 15:01 — and a post that says "at 3 PM" on the Bot Rules tab would drift with
-# whatever happened to go out before it. The exemption is this one type and
-# nothing else; R1 and R8 keep exactly the behaviour they had. (NFT2-1069
-# replaces the guard with a per-message check and this constant goes.)
-ON_TIME_TYPES = frozenset({nextaction.R_NEXT_STEPS})
-
-# PLANNED BEFORE EVERYTHING ELSE, so it always holds one of the day's counted
-# posts and the cap can never push it out. Ranked by band it was last (context),
-# which made it the first thing a busy Monday rolled.
-PLANNED_FIRST = frozenset({nextaction.R_AI_NEWS})
+# A POST THAT WENT OUT THIS CLOSE TO ITS SLOT WENT "ON TIME". The live sweep
+# ticks every COS_FOLLOWUP_CHECK_INTERVAL_MINUTES (15), so a 14:00 post really
+# leaves at some minute between 14:00 and 14:15, and the 16:00 slot is still
+# the 16:00 slot. Later than this (the bot was down, the kill switch was off)
+# and the post was LATE: the next one is then measured from when it really
+# went, so the gap between two real posts is still the full gap (`_anchor`).
+ON_TIME_SLACK_MINUTES = 30
 
 
 def counts(item: dict) -> bool:
@@ -551,11 +528,13 @@ def cap_reached(already, day: date) -> bool:
 def pinned_time(group: dict, day: date) -> Optional[datetime]:
     """The fixed send time of a group that has one, else None.
 
-    Three posts have one: R8's day-of touch (MEETING_DAYOF_TIME), R1's main
-    post (NEWS_MAIN_TIME) and R13's next-step follow-ups (NEXT_STEP_TIME). Each
-    is tied to a known time — a meeting that starts, a daily read, a time the
-    team was told — so they sit OUTSIDE the spaced window: they take no window
-    slot and the window cannot roll them.
+    Three rules have one: meeting prep (R8, every touch) and the meeting
+    follow-ups (R9), both at MEETING_DAYOF_TIME, and the next-step follow-ups
+    (R13) at NEXT_STEP_TIME. Each is tied to a known time — a meeting, a time
+    the team was told — so they sit OUTSIDE the day's order: they take no
+    slot, they move no spaced post, no spaced post waits for them, and the
+    window cannot roll them. AI news (R1) had one until 8 Oct; it now takes
+    its place in the order.
     """
     raw = str(group.get("dayof_time") or "").strip()
     if not raw:
@@ -576,14 +555,13 @@ def earliest_send_ist() -> tuple:
     start of the window, or a fixed time that falls before it.
 
     THE LIVE SWEEP'S "IS IT TIME YET" GATE. It used to ask only about
-    SALES_DRIP_START, so with the window opening at 14:00 the meeting-prep
-    day-of touch — fixed at MEETING_DAYOF_TIME, 10:00 — was not even planned
-    until 14:00, while a test day posted it at 10:00. `plan` still decides what
-    is due at any given minute; this only says when to start asking.
+    SALES_DRIP_START, so with the window opening at 14:00 the meeting posts —
+    fixed at MEETING_DAYOF_TIME, 10:00 — were not even planned until 14:00,
+    while a test day posted them at 10:00. `plan` still decides what is due at
+    any given minute; this only says when to start asking.
     """
     best = tuple(config.drip_start_ist())
-    for raw in (config.MEETING_DAYOF_TIME, config.NEWS_MAIN_TIME,
-                config.NEXT_STEP_TIME):
+    for raw in (config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME):
         try:
             hh, mm = (int(x) for x in str(raw or "").strip().split(":")[:2])
         except (TypeError, ValueError):
@@ -594,12 +572,78 @@ def earliest_send_ist() -> tuple:
 
 
 def _row_pinned(row: dict) -> bool:
-    """Was this sent row a fixed-time post? Rows from before the column existed
-    carry None; R1's is the only one that can be told from its type."""
-    flag = row.get("pinned")
-    if flag is None:
-        return str(row.get("action_type") or "") in PLANNED_FIRST
-    return bool(flag)
+    """Was this sent row a fixed-time post? A row from before the column
+    existed carries None and reads as a spaced post."""
+    return bool(row.get("pinned"))
+
+
+def sent_at_of(row: dict) -> Optional[datetime]:
+    """When a sent row really went out (its `sent_at`), in IST, or None."""
+    text = str((row or {}).get("sent_at") or "").strip()
+    if not text:
+        return None
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when if when.tzinfo is not None else when.replace(tzinfo=dl.IST)
+
+
+def planned_at_of(row: dict, day: date) -> Optional[datetime]:
+    """The slot a sent row was planned for (its `planned_at`, "HH:MM"), on `day`."""
+    text = str((row or {}).get("planned_at") or "").strip()
+    try:
+        hh, mm = (int(x) for x in text.split(":")[:2])
+        return datetime(day.year, day.month, day.day, hh, mm, tzinfo=dl.IST)
+    except (TypeError, ValueError):
+        return None
+
+
+def last_spaced_sent_at(already) -> Optional[datetime]:
+    """When the most recent SPACED post really went out today, or None.
+
+    The live sender's catch-up guard measures the gap from this. A fixed-time
+    post is skipped: it goes at its own time whatever the spacing, so it must
+    not push the spaced posts back either.
+    """
+    best = None
+    for row in already or []:
+        if _row_pinned(row or {}):
+            continue
+        when = sent_at_of(row)
+        if when is not None and (best is None or when > best):
+            best = when
+    return best
+
+
+def _anchor(already, day: date) -> Optional[datetime]:
+    """The moment the NEXT spaced post is measured from, or None when no
+    spaced post has gone today.
+
+    THE SLOT, WHEN THE POST WENT ON TIME; THE CLOCK, WHEN IT WENT LATE. A post
+    that left within ON_TIME_SLACK_MINUTES of its slot counts as having gone at
+    its slot, so a sweep tick at 14:07 does not turn the day into 14:07, 16:07,
+    18:07 and push the fourth post past the window. A post that left later than
+    that (the bot was down until 17:00) is measured from when it really went,
+    so the next one is a full gap after it and never 20 minutes behind.
+
+    A row whose `sent_at` is not on `day` (a simulation records the real clock
+    against a pretend day) says nothing about lateness and is read by its slot.
+    """
+    slack = timedelta(minutes=ON_TIME_SLACK_MINUTES)
+    best = None
+    for row in already or []:
+        if _row_pinned(row or {}):
+            continue
+        planned = planned_at_of(row, day)
+        sent = sent_at_of(row)
+        at = planned
+        if sent is not None and sent.date() == day and (
+                planned is None or sent - planned > slack):
+            at = sent.replace(second=0, microsecond=0)
+        if at is not None and (best is None or at > best):
+            best = at
+    return best
 
 
 # -- the re-ask clock ---------------------------------------------------------
@@ -675,7 +719,7 @@ def plan(
         {"messages": [...],   the posts to send, in send order, each with send_at
          "sent": [...],       posts already gone out today (from SQLite)
          "held": [...],       groups suppressed today, each with a reason
-         "rolled": [...],     groups over the cap, rolling to tomorrow
+         "rolled": [...],     groups over the cap or past the window: not today
          "groups": [...],     every group, ranked, for the preview
          "counted": int,      counted posts today, sent and planned
          "cap": int,          the day's cap on counted posts
@@ -696,7 +740,7 @@ def plan(
     # THE CAP ON COUNTED POSTS. `cap` overrides it, for the dry run and the tests.
     limit = max(0, int(cap_for(day) if cap is None else cap))
 
-    groups = group(actions)
+    groups = group(actions, day=day)
     result = {
         "messages": [], "sent": already, "held": [], "rolled": [],
         "groups": groups, "day": day, "is_sending_day": is_sending_day(day),
@@ -768,16 +812,13 @@ def plan(
     # THE CAP COUNTS ONLY THE GROUPS THAT COUNT (`counts`), and it starts from
     # what today's sent rows say about themselves (`counted_today`).
     #
-    # AI NEWS IS DECIDED FIRST, so it holds one of the counted posts before any
-    # chase can take it. Everything else keeps its rank order.
+    # IN THE DAY'S ORDER, which is the order `group` returned them in. AI news
+    # used to be decided first so the cap could not push it out; the longest
+    # day's order is four posts against a cap of five, so there is nothing to
+    # protect it from, and it keeps the place the team gave it.
     counted = result["counted"]
-    order = sorted(
-        range(len(groups)),
-        key=lambda i: (0 if groups[i]["type"] in PLANNED_FIRST else 1, i),
-    )
     chosen: list = []
-    for rank in order:
-        g = groups[rank]
+    for rank, g in enumerate(groups):
         if g["group_key"] in sent_group_keys:
             continue                       # already said today; not said twice
         if g["type"] in NEVER_HELD:
@@ -811,51 +852,58 @@ def plan(
         })
 
     # ---- PASS 2: WHEN ------------------------------------------------------
-    # THE WINDOW HOLDS THE SPACED POSTS ONLY. A fixed-time post (R1 at
-    # NEWS_MAIN_TIME, R8's day-of touch at MEETING_DAYOF_TIME) takes no window
-    # slot, so it neither shifts the others nor can be rolled by the window.
+    # THE SLOTS HOLD THE SPACED POSTS ONLY. A fixed-time post (R8 and R9 at
+    # MEETING_DAYOF_TIME, R13 at NEXT_STEP_TIME) takes no slot, so it neither
+    # shifts the others nor can be rolled by the window.
     #
-    # THE WINDOW MAY ALLOW FEWER THAN THE CAP DOES. `fitted_gap` says how many
-    # posts fit between SALES_DRIP_START and SALES_DRIP_END once the gap has
-    # shrunk as far as it may; anything past that rolls, exactly as a group over
-    # the cap does — a message that would land at 21:13 is not read that night
-    # and is resented in the morning. It rolls a group OUTSIDE the cap too:
-    # "this one does not count" was never a licence to post at nine at night.
+    # A SLOT IS INDEXED BY HOW MANY SPACED POSTS HAVE GONE, not by the slot
+    # number. That is "a rule with nothing to post takes no slot and the next
+    # one moves up", and it is also why something that appears after the day
+    # was planned takes the next free slot: the plan is recomputed on every
+    # tick, what has been sent keeps its slot, and what is left fills the slots
+    # after it in the day's order.
     #
-    # A WINDOW SLOT IS INDEXED BY HOW MANY SPACED POSTS HAVE GONE, not by the
-    # slot number — so a fixed-time post going out in the middle of the day does
-    # not push every later post one gap further on.
+    # THE GAP IS NEVER SHORTENED TO FIT. Each post is at its slot, or a full
+    # gap after the post before it when that one went late (`_anchor`). What
+    # would land after SALES_DRIP_END is not sent today — a message at 21:13 is
+    # not read that night and is resented in the morning. That holds for a
+    # group OUTSIDE the cap too: "this one does not count" was never a licence
+    # to post at nine at night.
     spaced_sent = sum(1 for r in already if not _row_pinned(r))
     spaced = [c for c in chosen if c["at"] is None]
-    wanted = max(1, spaced_sent + len(spaced))
-    times = slot_times(day, count=wanted)
-    _gap, window_fits = fitted_gap(wanted)
-    room = max(0, int(window_fits) - spaced_sent)
+    times = slot_times(day, count=max(1, spaced_sent + len(spaced)))
+    step = timedelta(minutes=gap_minutes())
+    end = window_end(day)
+    previous = _anchor(already, day)
     going: list = []
     position = 0
     for c in chosen:
         if c["at"] is not None:
             going.append(c)
             continue
-        if position >= room:
-            # A ROLLED GROUP GOES FIRST NEXT TIME. `rolled_why` marks it and
-            # `rolled_first` sorts on it, because a thing that already waited a
-            # day should not queue behind a thing that has not waited at all.
+        at = times[spaced_sent + position]
+        position += 1
+        if previous is not None and at < previous + step:
+            at = previous + step
+        if at > end:
+            # NOT SENT LATE, AND NOT STORED. The next day this rule runs, the
+            # queue is worked out afresh and it takes its place in that day's
+            # order. Every post after this one is later still, so they all
+            # follow it here.
             result["rolled"].append({
                 **c["group"], "stage": c["stage"], "rolled_why": "window",
-                "rolled_first": True,
                 "why": (
-                    f"it would land after {config.SALES_DRIP_END}, so it goes first "
-                    "on the next applicable day"
+                    f"it would land at {at.strftime('%H:%M')}, after "
+                    f"{config.SALES_DRIP_END}, so it waits for the next day its "
+                    "rule runs"
                 ),
             })
             if c["against_cap"]:
                 counted -= 1
-            position += 1
             continue
-        c["at"] = times[spaced_sent + position]
+        previous = at
+        c["at"] = at
         c["spaced"] = True
-        position += 1
         going.append(c)
 
     # ---- PASS 3: THE ORDER THEY GO IN --------------------------------------
@@ -864,7 +912,7 @@ def plan(
     # message in turn") walk this list from the front, so one order here is
     # what makes the two days the same day.
     going.sort(key=lambda c: (
-        c["at"], 0 if c["group"]["type"] in PLANNED_FIRST else 1, c["rank"],
+        c["at"], 1 if c.get("spaced") else 0, c["rank"],
     ))
     for c in going:
         send_at = c["at"]
@@ -2151,8 +2199,10 @@ def preview_text(planned: dict) -> str:
         f"**Drip plan — {day.strftime('%a %d %b %Y') if day else 'today'}**",
         f"_cap {planned.get('cap', config.DAILY_MESSAGE_CAP)} counted post(s), "
         f"first at {config.SALES_DRIP_START}, "
-        f"gaps of {config.MESSAGE_GAP_MINUTES}±{config.MESSAGE_JITTER_MINUTES} min. "
-        f"Nothing has been sent._",
+        f"then every {gap_minutes()} min"
+        + (f" (plus up to {config.MESSAGE_JITTER_MINUTES})"
+           if int(config.MESSAGE_JITTER_MINUTES) > 0 else "")
+        + f", nothing after {config.SALES_DRIP_END}. Nothing has been sent._",
         "",
     ]
     if not planned.get("is_sending_day"):
@@ -2185,7 +2235,7 @@ def preview_text(planned: dict) -> str:
 
     for row in planned.get("rolled") or []:
         lines.append(
-            f"  [rolls to tomorrow] {row['type']} x {row['owner'] or '(unassigned)'} "
+            f"  [not today] {row['type']} x {row['owner'] or '(unassigned)'} "
             f"— {companies_sentence(row['companies'])} ({row['why']})"
         )
     for row in planned.get("held") or []:
@@ -2209,8 +2259,8 @@ def contract_report(planned: dict) -> dict:
     believed.
     """
     messages = planned.get("messages") or []
-    # THE SPACING IS A PROMISE ABOUT THE SPACED POSTS. A fixed-time post (R1,
-    # R8's day-of touch) lands when it lands and is not part of the gap.
+    # THE SPACING IS A PROMISE ABOUT THE SPACED POSTS. A fixed-time post (R8,
+    # R9, R13) lands when it lands and is not part of the gap.
     times = [m["send_at"] for m in messages if not m.get("pinned")]
     counted = int(planned.get("counted", len(messages)))
     cap = int(planned.get("cap", config.DAILY_MESSAGE_CAP))
@@ -2244,6 +2294,14 @@ def _self_test() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(name)s: %(message)s")
     today = date(2026, 9, 9)                       # a Wednesday
     failures = 0
+    # THE SCHEDULE IS PINNED TO THE SHIPPED DEFAULTS, not read from this
+    # machine's .env: a laptop with its own gap or cap must not turn these
+    # checks red, or green for the wrong reason.
+    config.SALES_DRIP_START, config.SALES_DRIP_END = "14:00", "20:00"
+    config.MESSAGE_GAP_MINUTES = config.MESSAGE_GAP_MIN_MINUTES = 120
+    config.MESSAGE_JITTER_MINUTES = 0
+    config.DAILY_MESSAGE_CAP = 5
+    config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME = "10:00", "15:00"
 
     def check(name, got, want):
         nonlocal failures
@@ -2267,12 +2325,15 @@ def _self_test() -> int:
             "key": f"{rule_id}:{company.lower()}",
         }
 
-    # THE SEEDED DAY FROM THE PLAN: 7 due items, 2 owners, 3 types.
+    # THE SEEDED DAY FROM THE PLAN: 7 due items, 2 owners, 3 types. The two
+    # meeting-prep items carry their fixed time, as the evaluator sets it.
     seeded = [
-        action("Acme", "Ann", nextaction.R_MEETING_PREP, "Vaishnavi",
-               nextaction.P_MEETING, date(2026, 9, 4), 5, "R8"),
-        action("Borealis", "Sam", nextaction.R_MEETING_PREP, "Vaishnavi",
-               nextaction.P_MEETING, date(2026, 9, 8), 1, "R8"),
+        dict(action("Acme", "Ann", nextaction.R_MEETING_PREP, "Vaishnavi",
+                    nextaction.P_MEETING, date(2026, 9, 4), 5, "R8"),
+             dayof_time="10:00"),
+        dict(action("Borealis", "Sam", nextaction.R_MEETING_PREP, "Vaishnavi",
+                    nextaction.P_MEETING, date(2026, 9, 8), 1, "R8"),
+             dayof_time="10:00"),
         action("Cinder", "Dev", nextaction.R_LI_NO_DM, "Vaishnavi",
                nextaction.P_REPLY, date(2026, 9, 5), 4, "R6"),
         action("Delta", "Dee", nextaction.R_LI_NO_DM, "Kushal",
@@ -2308,26 +2369,101 @@ def _self_test() -> int:
           [m["counts_toward_cap"] for m in planned["messages"]
            if m["type"] == nextaction.R_MEETING_PREP], [False])
     check("gaps at or above the floor", report["spacing_ok"], True)
-    check("the floor is MESSAGE_GAP_MIN_MINUTES on a compressed day",
-          min_gap_minutes(), config.MESSAGE_GAP_MIN_MINUTES)
+    check("the two spaced posts are exactly one gap apart",
+          report["gaps_minutes"], [120])
+    check("the meeting prep goes at its fixed time and the spaced posts at "
+          "14:00 and 16:00",
+          [(m["send_at_hhmm"], m["pinned"]) for m in planned["messages"]],
+          [("10:00", True), ("14:00", False), ("16:00", False)])
 
-    print("\nthe posting window")
-    for n, want_late in ((3, 0), (6, 0), (12, 0), (25, 0)):
-        times = slot_times(today, count=n)
-        eh, em = config.drip_end_ist()
-        late = [t for t in times if (t.hour * 60 + t.minute) > (eh * 60 + em)]
-        check(f"{n} post(s): none after {config.SALES_DRIP_END}", len(late), want_late)
+    print("\nthe slots: a gap that never shrinks, and nothing after the end")
+    check("the gap is 120 minutes", (gap_minutes(), min_gap_minutes()), (120, 120))
+    check("the day holds four slots", slots_in_window(today), 4)
+    check("...at 14:00, 16:00, 18:00 and 20:00",
+          [t.strftime("%H:%M") for t in slot_times(today, count=4)],
+          ["14:00", "16:00", "18:00", "20:00"])
     check("one post lands exactly on the start",
           slot_times(today, count=1)[0].strftime("%H:%M"), config.SALES_DRIP_START)
-    g3, _ = fitted_gap(3)
-    g8, _ = fitted_gap(8)
-    check("a light day keeps the full gap", g3, config.MESSAGE_GAP_MINUTES)
-    check("a heavy day shrinks the gap", g8 < config.MESSAGE_GAP_MINUTES, True)
-    check("...but never below the floor", g8 >= config.MESSAGE_GAP_MIN_MINUTES, True)
-    _g, fits = fitted_gap(40)
-    check("an impossible day reports what fits", fits < 40, True)
+    for n in (3, 6, 12, 25):
+        times = slot_times(today, count=n)
+        check(f"{n} slot(s): every gap is the full 120 minutes",
+              {int((b - a).total_seconds() // 60) for a, b in zip(times, times[1:])},
+              {120})
+    check("a fifth slot is after the window, not squeezed into it",
+          slot_times(today, count=5)[-1] > window_end(today), True)
+    config.MESSAGE_GAP_MINUTES = 45
+    check("MESSAGE_GAP_MIN_MINUTES is a floor under a gap set too low",
+          gap_minutes(), 120)
+    config.MESSAGE_GAP_MINUTES = 120
+    config.MESSAGE_JITTER_MINUTES = 20
+    jittered = slot_times(today, count=4)
+    steps = [int((b - a).total_seconds() // 60) for a, b in zip(jittered, jittered[1:])]
+    check("jitter only ever adds to a gap",
+          all(120 <= g <= 140 for g in steps), True)
+    check("...the same way on every run (the restart guard)",
+          slot_times(today, count=4), jittered)
+    config.MESSAGE_JITTER_MINUTES = 0
     check("no message mixes a type or an owner", report["grouping_ok"], True)
-    check("the fourth group rolls to tomorrow", report["rolled"], 1)
+    check("the fourth group is over the cap of 2", report["rolled"], 1)
+
+    print("\nthe order of the day (daily_order in bot_rules.yaml)")
+
+    def due(rule_id, type_, company="Acme"):
+        return action(company, "", type_, "", nextaction.P_CONTEXT, today, 0, rule_id)
+
+    def day_of(day, wanted):
+        items = [dict(due(r, t), due_date=day, due_iso=dl.iso(day)) for r, t in wanted]
+        return [(m["rule_id"], m["send_at_hhmm"]) for m in plan(items, day=day)["messages"]]
+
+    monday, tuesday, friday = date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 11)
+    monday_rules = [("R10", nextaction.R_CLOSURE_SUPPORT), ("R1", nextaction.R_AI_NEWS),
+                    ("R7", nextaction.R_DM_NO_MEETING), ("R4", nextaction.R_DELIVERABLES)]
+    check("Monday, every rule due: R4, R7, R1, R10 two hours apart",
+          day_of(monday, monday_rules),
+          [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
+    check("Monday with no deliverables: the others move up",
+          day_of(monday, monday_rules[:3]),
+          [("R7", "14:00"), ("R1", "16:00"), ("R10", "18:00")])
+    check("Monday with only AI news: it takes the first slot",
+          day_of(monday, monday_rules[1:2]), [("R1", "14:00")])
+    check("Wednesday: R11, R1, R3",
+          day_of(today, [("R3", nextaction.R_EVENTS), ("R1", nextaction.R_AI_NEWS),
+                         ("R11", nextaction.R_NEW_COMPANY)]),
+          [("R11", "14:00"), ("R1", "16:00"), ("R3", "18:00")])
+    check("Friday: R2, R6, R1",
+          day_of(friday, [("R1", nextaction.R_AI_NEWS), ("R6", nextaction.R_LI_NO_DM),
+                          ("R2", nextaction.R_NEWS_SCREEN)]),
+          [("R2", "14:00"), ("R6", "16:00"), ("R1", "18:00")])
+
+    print("\na post that went late, and one that appears after the day was planned")
+    mon_items = [dict(due(r, t), due_date=monday, due_iso=dl.iso(monday))
+                 for r, t in monday_rules]
+    mon_plan = plan(mon_items, day=monday)
+
+    def sent_row(message, sent_hhmm):
+        return {"slot": message["slot"], "group_key": message["group_key"],
+                "action_type": message["type"], "counts_toward_cap": 1, "pinned": 0,
+                "planned_at": message["send_at_hhmm"],
+                "sent_at": f"{dl.iso(monday)}T{sent_hhmm}:00"}
+
+    on_tick = plan(mon_items, day=monday,
+                   already_sent=[sent_row(mon_plan["messages"][0], "14:12")])
+    check("the first post left on the 14:12 tick: the rest keep their slots",
+          [(m["rule_id"], m["send_at_hhmm"]) for m in on_tick["messages"]],
+          [("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
+    late = plan(mon_items, day=monday,
+                already_sent=[sent_row(mon_plan["messages"][0], "17:05")])
+    check("the first post left at 17:05: the next is a full gap after it",
+          [(m["rule_id"], m["send_at_hhmm"]) for m in late["messages"]],
+          [("R7", "19:05")])
+    check("...and what would land after 20:00 is not sent today",
+          [(r["rule_id"], r["rolled_why"]) for r in late["rolled"]],
+          [("R1", "window"), ("R10", "window")])
+    appeared = plan(mon_items, day=monday, already_sent=[
+        sent_row(dict(mon_plan["messages"][1], send_at_hhmm="14:00", slot=1), "14:00")])
+    check("the checklist appears after R7 went at 14:00: it takes the next free slot",
+          [(m["rule_id"], m["send_at_hhmm"]) for m in appeared["messages"]],
+          [("R4", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
 
     print("\n  the day as planned:")
     for m in planned["messages"]:
@@ -2344,7 +2480,7 @@ def _self_test() -> int:
     first_sent = {"slot": 1, "group_key": planned["messages"][0]["group_key"],
                   "action_type": planned["messages"][0]["type"],
                   "owner_label": "Vaishnavi", "companies": "Acme, Borealis",
-                  "counts_toward_cap": 0, "pinned": 0,
+                  "counts_toward_cap": 0, "pinned": 1, "planned_at": "10:00",
                   "sent_at": "2026-09-09T10:00"}
     resumed = plan(seeded, day=today, cap=2, already_sent=[first_sent])
     check("a restart resumes at slot 2",
@@ -2371,11 +2507,10 @@ def _self_test() -> int:
                        * cap_for(today), today)),
           (cap_for(today) <= 4, True))
 
-    print("\nAI news is planned first, never held, never rolled")
+    print("\nAI news is never held, and takes its place in the order")
     news_item = action("", "", nextaction.R_AI_NEWS, "", nextaction.P_CONTEXT,
                        today, 0, "R1")
-    news_item["dayof_time"] = "14:00"
-    news_key = group([news_item])[0]["group_key"]
+    news_key = group([news_item], day=today)[0]["group_key"]
     with_news = plan(seeded + [news_item], day=today, cap=2,
                      history={news_key: {"last_nudge": dl.iso(today - timedelta(days=1)),
                                          "last_sent": dl.iso(today - timedelta(days=1))}})
@@ -2383,9 +2518,11 @@ def _self_test() -> int:
     check("posted yesterday, still posts today", len(got_news), 1)
     check("...as a fresh post, not a re-ask",
           [m["stage"] for m in got_news], [STAGE_NUDGE])
-    check("...at its own time, outside the spaced window",
-          [(m["send_at_hhmm"], m["pinned"]) for m in got_news], [("14:00", True)])
-    check("it holds one of the 2 counted posts; two chases roll instead of one",
+    check("...as a spaced post with no fixed time: on a Wednesday with no new "
+          "company it takes the first slot",
+          [(m["send_at_hhmm"], m["pinned"]) for m in got_news], [("14:00", False)])
+    check("it is in the day's order, so it comes before the rules that are not: "
+          "with a cap of 2, two chases wait instead of one",
           (with_news["counted"], len(with_news["rolled"])), (2, 2))
 
     print("\nempty queue means silence")
@@ -2585,8 +2722,17 @@ def _self_test() -> int:
     check("the people the sender records are the people shown",
           [a["poc"] for a in shown_contacts(m13[0])],
           ["Priya Rao", "Dev Shah", "Mei Lin"])
-    check("R13 is the only post the catch-up guard does not hold",
-          ON_TIME_TYPES, frozenset({nextaction.R_NEXT_STEPS}))
+
+    print("\nfixed-time posts and the catch-up guard")
+    check("nothing may go before the earliest fixed time",
+          earliest_send_ist(), (10, 0))
+    rows = [{"pinned": 1, "sent_at": "2026-09-09T15:01:00", "planned_at": "15:00"},
+            {"pinned": 0, "sent_at": "2026-09-09T14:03:00", "planned_at": "14:00"}]
+    check("the guard measures the gap from the last SPACED post, never from a "
+          "fixed-time one",
+          last_spaced_sent_at(rows).strftime("%H:%M"), "14:03")
+    check("no spaced post yet: nothing to measure from",
+          last_spaced_sent_at(rows[:1]), None)
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

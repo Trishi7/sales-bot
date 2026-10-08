@@ -1,7 +1,9 @@
 """A HEAVY MONDAY, end to end. `python verify_heavy_monday.py`
 
 Four rule posts + two R8 meeting-prep + one R9 follow-up + the pending-approvals
-sweep. Prints every send time and proves nothing lands after SALES_DRIP_END.
+sweep. Prints every send time and proves the four rule posts keep their two-hour
+slots (14:00, 16:00, 18:00, 20:00) however many meeting posts the day carries,
+that the gap is never shortened, and that nothing lands after SALES_DRIP_END.
 
 Nothing is sent and nothing is written: `drip.plan` computes, `approvals`
 renders, and the append is a dry run.
@@ -28,6 +30,16 @@ import deadlines as dl
 import drip
 import gtm_sheet
 import nextaction
+
+
+# THE SCHEDULE IS PINNED TO THE SHIPPED DEFAULTS (NFT2-1069), not read from
+# this machine's .env: the day these checks describe is the one the team was
+# given, and a laptop with its own gap, cap or window must not change it.
+config.SALES_DRIP_START, config.SALES_DRIP_END = "14:00", "20:00"
+config.MESSAGE_GAP_MINUTES = config.MESSAGE_GAP_MIN_MINUTES = 120
+config.MESSAGE_JITTER_MINUTES = 0
+config.DAILY_MESSAGE_CAP = 5
+config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME = "10:00", "15:00"
 
 MONDAY = date(2026, 9, 21)
 SID, VAISHNAVI, KUSHAL = 1001, 1002, 1003
@@ -82,8 +94,12 @@ def main() -> int:
         item("R10", nextaction.R_CLOSURE_SUPPORT, "Vaishnavi", "ElevenLabs"),
         item("R8", nextaction.R_MEETING_PREP, "Vaishnavi", "Wispr Flow",
              counts=False, dayof=config.MEETING_DAYOF_TIME),
-        item("R8", nextaction.R_MEETING_PREP, "Kushal", "PolyAI", counts=False),
+        # EVERY MEETING POST HAS THE FIXED TIME since 8 Oct: the earlier prep
+        # touches and the follow-ups too, not only the day-of touch.
+        item("R8", nextaction.R_MEETING_PREP, "Kushal", "PolyAI", counts=False,
+             dayof=config.MEETING_DAYOF_TIME),
         item("R9", nextaction.R_MEETING_FOLLOWUP, "Sid", "Acme", counts=False,
+             dayof=config.MEETING_DAYOF_TIME,
              extra={"rung": 3, "rung_destination": "escalation",
                     "delivered_to": "channel", "addressed_to": "Sid"}),
     ]
@@ -97,17 +113,17 @@ def main() -> int:
     print("HEAVY MONDAY — 4 rule posts + 2 R8 + 1 R9 + the approvals sweep")
     print("=" * 78)
     print(f"  window          {config.SALES_DRIP_START} - {config.SALES_DRIP_END} IST")
-    print(f"  gap             {config.MESSAGE_GAP_MINUTES} min, floor "
-          f"{config.MESSAGE_GAP_MIN_MINUTES}")
-    gap, fits = drip.fitted_gap(len(messages))
-    print(f"  fitted gap      {gap} min ({fits} post(s) fit)")
+    print(f"  gap             {drip.gap_minutes()} min, never shortened")
+    print(f"  slots           {drip.slots_in_window(MONDAY)} in the window: "
+          + ", ".join(t.strftime("%H:%M") for t in drip.slot_times(
+              MONDAY, count=drip.slots_in_window(MONDAY))))
     print(f"  cap for Monday  {cap}   ({len(counted)} counted, "
           f"{len(messages) - len(counted)} outside)")
     print()
 
     for m in sorted(messages, key=lambda x: x["send_at"]):
         flag = "" if m.get("counts_toward_cap", True) else "  [outside the cap]"
-        dayof = "  [day-of, fixed time]" if m.get("dayof_time") else ""
+        dayof = "  [fixed time]" if m.get("dayof_time") else ""
         print(f"  {m['send_at_hhmm']}  {m['rule_id']:<4} {m['rule_name']:<28} "
               f"-> {m['owner'] or '-':<10}{flag}{dayof}")
 
@@ -154,11 +170,42 @@ def main() -> int:
     check(f"nothing windowed lands after {config.SALES_DRIP_END}", len(late), 0)
     check("nothing rolled", len(planned["rolled"]), 0)
     dayof = [m for m in messages if m.get("dayof_time")]
-    check("the R8 day-of touch keeps its fixed time",
-          dayof[0]["send_at_hhmm"] if dayof else None, config.MEETING_DAYOF_TIME)
+    check("all three meeting posts (two R8, one R9) keep the fixed time",
+          sorted((m["rule_id"], m["send_at_hhmm"], m["pinned"]) for m in dayof),
+          [("R8", "10:00", True), ("R8", "10:00", True), ("R9", "10:00", True)])
     windowed = sorted(m["send_at_hhmm"] for m in messages if not m.get("dayof_time"))
     check("the first windowed post is on the start",
           windowed[0], config.SALES_DRIP_START)
+    spaced = [m for m in messages if not m["pinned"]]
+    check("the four rule posts are in Monday's order, at their two-hour slots",
+          [(m["rule_id"], m["send_at_hhmm"]) for m in spaced],
+          [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
+    check("a heavy day does NOT shrink the gap: every one is the full 120 minutes",
+          [int((b["send_at"] - a["send_at"]).total_seconds() // 60)
+           for a, b in zip(spaced, spaced[1:])], [120, 120, 120])
+    check("the meeting posts moved none of them: the same day without them",
+          [(m["rule_id"], m["send_at_hhmm"])
+           for m in drip.plan(actions[:4], day=MONDAY)["messages"]],
+          [(m["rule_id"], m["send_at_hhmm"]) for m in spaced])
+
+    # A DAY WITH MORE TO SAY THAN SLOTS. It used to squeeze every gap to fit;
+    # now the gap holds and what is past the window is not sent that day. Two
+    # more spaced rules than Monday has (these two run on other days, so they
+    # come after Monday's own in the order).
+    extra = [item("R12", nextaction.R_PACKAGES, "Vaishnavi", "Hinglish STT"),
+             item("R6", nextaction.R_LI_NO_DM, "Sid", "Wispr Flow")]
+    over = drip.plan(actions + extra, day=MONDAY)
+    over_spaced = [m for m in over["messages"] if not m["pinned"]]
+    check("six spaced groups on a four-slot day: four go, at the same times",
+          [(m["rule_id"], m["send_at_hhmm"]) for m in over_spaced],
+          [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
+    check("...the other two are not sent today, and say why: one would land "
+          "after the window, the other is the sixth against a cap of five",
+          sorted((r["rule_id"], r["rolled_why"]) for r in over["rolled"]),
+          [("R12", "cap"), ("R6", "window")])
+    check("...and nothing at all is planned after the end of the window",
+          [m["send_at_hhmm"] for m in over["messages"]
+           if m["send_at"] > drip.window_end(MONDAY)], [])
     r9 = [m for m in messages if m["rule_id"] == "R9"][0]
     check("R9's escalation posts in the channel", r9["destination"], "channel")
     check("...addressed to Sid", r9["owner"], "Sid")

@@ -79,10 +79,10 @@ SETTINGS = {
     "TEAM_ROSTER_IDS": [SID, VAISHNAVI, KUSHAL], "SALES_APPROVER_IDS": [SID, VAISHNAVI],
     "SALES_FINAL_SAY_ID": SID, "SALES_ALWAYS_TAG_IDS": [VAISHNAVI],
     "ROSTER_DISPLAY_NAMES": {str(SID): "Sid", str(VAISHNAVI): "Vaishnavi", str(KUSHAL): "Kushal"},
-    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "18:30",
-    "MESSAGE_GAP_MINUTES": 90, "MESSAGE_JITTER_MINUTES": 15,
-    "MESSAGE_GAP_MIN_MINUTES": 30, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
-    "SUNDAY_RULE_IDS": ["R4"], "NEWS_MAIN_TIME": "14:00", "MEETING_DAYOF_TIME": "10:00",
+    "DAILY_MESSAGE_CAP": 5, "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "20:00",
+    "MESSAGE_GAP_MINUTES": 120, "MESSAGE_JITTER_MINUTES": 0,
+    "MESSAGE_GAP_MIN_MINUTES": 120, "DRIP_REASK_DAYS": 2, "DRIP_WEEKDAYS_ONLY": True,
+    "SUNDAY_RULE_IDS": ["R4"], "MEETING_DAYOF_TIME": "10:00",
     "TEST_MORNING_TIME": "10:00", "TEST_AFTERNOON_TIME": "14:00",
     "NEXT_ACTION_ENABLED": True, "NEXT_ACTION_WEEKEND_SHIFT": True,
     "WEEKLY_FUNNEL_ENABLED": False, "SALES_DMS_ENABLED": False,
@@ -728,12 +728,19 @@ async def p3_gap_guard() -> None:
     await bot._maybe_send_drip()
     check("5 minutes later the Rule 13 post still goes (the gap guard does not hold it)",
           [s["rule"] for s in SENT], [spaced[0]["rule_id"], "R13"])
+    # THE ROWS THOSE TWO SENDS LEFT BEHIND say which was the fixed-time post, and the guard reads that (NFT2-1069:
+    # every fixed-time post is outside the guard, by the row's own `pinned`, where it used to be Rule 13's type).
+    real_rows = bot.db.drip_sent_today(dl.iso(THURSDAY))
+    check("the sender recorded the spaced post as spaced and the Rule 13 post as a fixed-time one",
+          [(r["action_type"] == TRIGGER, bool(r["pinned"])) for r in real_rows], [(False, False), (True, True)])
+    check("...so the guard measures from the spaced post, not from the Rule 13 post sent after it",
+          SalesBot._last_drip_sent_at(real_rows) == drip.sent_at_of(real_rows[0]), True)
     clock.clear_time_override(why="verify_rule13")
     config.NEXT_STEP_TIME = "15:00"
 
     sent_rows = [
-        {"action_type": "ai_news", "sent_at": "2026-10-15T14:10:00+05:30"},
-        {"action_type": TRIGGER, "sent_at": "2026-10-15T15:00:00+05:30"},
+        {"action_type": "ai_news", "pinned": 0, "sent_at": "2026-10-15T14:10:00+05:30"},
+        {"action_type": TRIGGER, "pinned": 1, "sent_at": "2026-10-15T15:00:00+05:30"},
     ]
     last = SalesBot._last_drip_sent_at(sent_rows)
     check("the Rule 13 row does not become the 'last post' that delays the next spaced post",

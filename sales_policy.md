@@ -236,7 +236,7 @@ themselves are added in code and posted exactly as rendered)
 > His email is on file if that's the easier way in. No rush —
 > if it's already gone, just say and I'll note it.
 
-**R7 — DM sent, no meeting** — replaced by R13 on 7 Oct 2026; not posted.
+**R7 — DM sent, no meeting** — Mondays, as a list; never anyone R13 covers.
 
 **R8 — Meeting preparation**
 

@@ -432,7 +432,7 @@ SIMULATION_PREFIX = (
 # the writes are REAL. See clock.py and simulation.parse_test_command.
 
 # The gap between two posts in a test run, in seconds. A test day is watched by
-# somebody sitting there, so the real 90-minute spacing is compressed — but not
+# somebody sitting there, so the real two-hour spacing is compressed — but not
 # to nothing: the posts have to arrive one at a time and in an order a person
 # can follow, and a burst of six is the thing this number exists to prevent.
 TEST_POST_GAP_SECONDS = _int("TEST_POST_GAP_SECONDS", 20)
@@ -444,8 +444,8 @@ TEST_CONFIRM_SECONDS = _int("TEST_CONFIRM_SECONDS", 120)
 
 # WHERE THE CLOCK STANDS FOR EACH HALF OF A TEST DAY, "HH:MM" IST.
 #
-# TWO STOPS, NOT ONE, because the real day has two. The meeting-prep day-of
-# touch is fixed at MEETING_DAYOF_TIME and lands outside the posting window;
+# TWO STOPS, NOT ONE, because the real day has two. Meeting prep and meeting
+# follow-ups are fixed at MEETING_DAYOF_TIME and land outside the posting window;
 # everything else waits for SALES_DRIP_START. Standing at one time would mean
 # either the morning items never came due or the afternoon ones all did at
 # once, and in both cases the tester would be watching a day that does not
@@ -1879,8 +1879,9 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 # Master Pipeline or the departures list. It is an AI industry feed, in two
 # shapes:
 #
-#   ONE MAIN POST at NEWS_MAIN_TIME covering the last 24 hours. It is R1's drip
-#   slot, pinned to that time, and it counts toward the day's cap like any rule.
+#   ONE MAIN POST every weekday, covering everything since the previous one. It
+#   is R1's drip post, in R1's place in the day's order (`daily_order` in
+#   bot_rules.yaml), and it counts toward the day's cap like any rule.
 #
 #   HOURLY SILENT CHECKS at NEWS_CHECK_TIMES that post ONLY when something is
 #   genuinely important (importance >= NEWS_BREAKING_MIN_IMPORTANCE). A check
@@ -1890,12 +1891,14 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 #
 # These settings take precedence over the R1 row on the Bot Rules tab.
 
-# When the main post goes out. It is R1's drip slot, pinned to this time
-# rather than to "the first slot".
-NEWS_MAIN_TIME = (os.getenv("NEWS_MAIN_TIME", "14:00") or "").strip() or "14:00"
+# NEWS_MAIN_TIME IS RETIRED (NFT2-1069, 8 Oct). It pinned the main post to
+# 14:00. The team's order of the day replaced it: AI news is third on Monday
+# and Friday (18:00), fourth on Tuesday (20:00) and second on Wednesday and
+# Thursday (16:00), and earlier when a rule ahead of it has nothing to post.
+# Nothing reads the name any more; a value left in .env is inert.
 
-# The hourly check slots, HH:MM, IST. The main time is deliberately absent: the
-# main sweep covers it.
+# The hourly check slots, HH:MM, IST. 14:00 is absent because the main post
+# used to go then; the 15:00 check looks back to 13:00, so nothing is missed.
 NEWS_CHECK_TIMES = _str_list(
     "NEWS_CHECK_TIMES",
     "11:00,12:00,13:00,15:00,16:00,17:00,18:00,19:00,20:00,21:00,22:00,23:00",
@@ -2210,9 +2213,13 @@ EMAIL_LOOKUP_MAX_PER_POST = _int("EMAIL_LOOKUP_MAX_PER_POST", 5)
 EMAIL_WRITE_ALLOWED = _bool("EMAIL_WRITE_ALLOWED", default=False)
 
 # R8 — MEETING PREP. How many days before the meeting each touch fires, and the
-# IST time the day-of touch goes at. Touches already in the past are SKIPPED, so
-# a meeting booked with three days notice gets the 3-day and day-of touches and
-# never a late 5-day one. A reschedule re-anchors every touch on the new date.
+# IST time EVERY MEETING POST goes at: all three prep touches (R8) and every
+# meeting follow-up (R9). It timed only the day-of touch until 8 Oct; the other
+# touches took a spaced slot and pushed the day's order back. One setting for
+# both rules rather than a second name, because the team gave them one time.
+# Touches already in the past are SKIPPED, so a meeting booked with three days
+# notice gets the 3-day and day-of touches and never a late 5-day one. A
+# reschedule re-anchors every touch on the new date.
 MEETING_PREP_DAYS_BEFORE: list[str] = _str_list("MEETING_PREP_DAYS_BEFORE", "5,3")
 MEETING_DAYOF_TIME = (os.getenv("MEETING_DAYOF_TIME", "10:00") or "").strip() or "10:00"
 
@@ -2250,6 +2257,11 @@ NEW_COMPANY_AFTER_WORKING_DAYS = _int("NEW_COMPANY_AFTER_WORKING_DAYS", 1)
 # R11 — how long a company stays eligible after it appears. Without a window, a
 # snapshot gap (the bot was down for a week) would dump every company added in
 # that gap into one post.
+#
+# 7 IS WHAT A WEEKLY RULE NEEDS. R11 runs on Wednesdays only since 8 Oct: with
+# 7, every company is asked about on exactly one Wednesday, whatever day it
+# appeared. Below 7 a company that appears on a Wednesday is never asked about;
+# at 14 or more every company is asked about twice.
 NEW_COMPANY_WINDOW_DAYS = _int("NEW_COMPANY_WINDOW_DAYS", 7)
 
 # RETIRED: FOLLOWUP_GRACE_DAYS — the ordinary-cadence trigger it belonged to is
@@ -2659,32 +2671,32 @@ SALES_DIGEST_TIME = SALES_DRIP_START
 # somebody's evening. A message at nine at night is not read that night and is
 # resented in the morning.
 #
-# HOW THE FIT WORKS, in order:
-#   1. try MESSAGE_GAP_MINUTES between every post;
-#   2. if that overruns SALES_DRIP_END, shrink the gap EVENLY until the day
-#      fits — every post moves, none is singled out;
-#   3. never below MESSAGE_GAP_MIN_MINUTES;
-#   4. whatever still does not fit ROLLS to the next applicable day, where it
-#      goes at the FRONT — ahead of that day's own items, because it has
-#      already waited.
+# 20:00 SINCE 8 OCT (it was 18:30): the day's order is up to four posts, two
+# hours apart from 14:00, and the fourth is at 20:00.
 #
-# THE ONE EXCEPTION IS R8's DAY-OF TOUCH. It keeps MEETING_DAYOF_TIME (10:00),
-# outside the window, because a note about a meeting that starts at 11 is
-# worthless at 14:00.
+# THE GAP IS NEVER SHRUNK TO FIT (it used to be, down to
+# MESSAGE_GAP_MIN_MINUTES). The slots are SALES_DRIP_START plus a whole number
+# of gaps, a slot AT this time is the last one, and a post that would land
+# after it is NOT SENT that day: it waits for the next day its rule runs.
+#
+# THE EXCEPTIONS ARE THE FIXED-TIME POSTS: meeting prep and meeting follow-ups
+# at MEETING_DAYOF_TIME (10:00) and the next-step follow-ups at NEXT_STEP_TIME
+# (15:00). They are outside the order, the gap and this window.
 SALES_DRIP_END = (
     os.getenv("SALES_DRIP_END", "") or ""
-).strip() or "18:30"
+).strip() or "20:00"
 
 
 def drip_end_ist() -> tuple[int, int]:
-    """SALES_DRIP_END as (hour, minute) IST. Unreadable falls back to 18:30."""
+    """SALES_DRIP_END as (hour, minute) IST. Unreadable falls back to 20:00."""
     import digest as _digest
 
-    return _digest.parse_time(SALES_DRIP_END, default="18:30")
+    return _digest.parse_time(SALES_DRIP_END, default="20:00")
 
 # HOW MANY COUNTED POSTS A WEEKDAY, EVER — FIVE, AND THE SAME FIVE EVERY WEEKDAY.
-# The volume contract, and a HARD ceiling rather than a target. Anything past it
-# ROLLS TO TOMORROW rather than being dropped.
+# The volume contract, and a HARD ceiling rather than a target. The longest day
+# in the order (`daily_order`) is four posts, so the cap is a backstop: it is
+# the posting window, four slots, that the day actually fills.
 #
 # WHAT IS NEVER COUNTED (drip.NEVER_COUNTED, and the Global Rules row
 # "daily_cap" in bot_rules.yaml): meeting prep (R8), meeting follow-ups (R9),
@@ -2697,8 +2709,8 @@ def drip_end_ist() -> tuple[int, int]:
 # about whether the day is full. Each sent row carries its own
 # `counts_toward_cap` (drip_sends), written when it is sent.
 #
-# AI NEWS (R1) IS PLANNED FIRST, at NEWS_MAIN_TIME, so it always holds one of
-# the five and the cap can never push it out.
+# AI NEWS (R1) COUNTS AS ONE OF THE FIVE and is decided in its place in the
+# day's order, like every other rule.
 DAILY_MESSAGE_CAP = _int("DAILY_MESSAGE_CAP", 5)
 
 # HOW MANY POSTS THE SUNDAY EXCEPTION MAY SEND. One, at SALES_DRIP_START, and
@@ -2730,24 +2742,24 @@ def message_cap_for(day) -> int:
         return max(0, min(int(SUNDAY_MAX_POSTS), int(DAILY_MESSAGE_CAP)))
     return max(0, int(DAILY_MESSAGE_CAP))
 
-# MINUTES BETWEEN PROACTIVE MESSAGES. Three messages in one minute is one long
-# message with extra steps; the spacing is what makes each one land as its own
-# thing and gives the person time to act on the first before the second arrives.
-MESSAGE_GAP_MINUTES = _int("MESSAGE_GAP_MINUTES", 90)
+# MINUTES BETWEEN TWO SPACED POSTS: 120, EXACTLY, AND IT NEVER SHRINKS (8 Oct;
+# it was 90 and was squeezed on a busy day). The slots are SALES_DRIP_START
+# plus a whole number of gaps: 14:00, 16:00, 18:00, 20:00.
+MESSAGE_GAP_MINUTES = _int("MESSAGE_GAP_MINUTES", 120)
 
-# ...PLUS OR MINUS THIS MANY MINUTES. A bot that posts at exactly 10:00, 11:30
-# and 13:00 every single day reads as a machine running a script, and people
-# start filing it as such. The jitter is DETERMINISTIC — seeded on the date and
-# the slot number — so a restart mid-morning recomputes the same schedule and
-# cannot double-send. Set to 0 for exact spacing.
-MESSAGE_JITTER_MINUTES = _int("MESSAGE_JITTER_MINUTES", 15)
+# ...PLUS UP TO THIS MANY MINUTES, NEVER MINUS (8 Oct; it was plus-or-minus
+# 15). 0 is exact spacing, and the default: the team was told the times. Above
+# 0 it only ever makes a gap LONGER, and it is DETERMINISTIC — seeded on the
+# date and the slot number — so a restart recomputes the same schedule and
+# cannot double-send. NOTE that any value pushes the later slots past
+# SALES_DRIP_END sooner, so the day holds fewer posts.
+MESSAGE_JITTER_MINUTES = _int("MESSAGE_JITTER_MINUTES", 0)
 
-# THE FLOOR THE GAP MAY SHRINK TO when a day will not otherwise fit inside the
-# posting window. Below this the messages stop reading as separate things and
-# start reading as one long one delivered in instalments — which is the failure
-# the spacing exists to prevent, so the day rolls its overflow instead of
-# squeezing any harder.
-MESSAGE_GAP_MIN_MINUTES = _int("MESSAGE_GAP_MIN_MINUTES", 30)
+# A FLOOR UNDER MESSAGE_GAP_MINUTES: the gap used is the LARGER of the two
+# (`drip.gap_minutes`), so a gap set too low by mistake cannot take the spacing
+# below this. It used to be how far a busy day could squeeze the gap (30);
+# nothing squeezes the gap now, and both default to 120.
+MESSAGE_GAP_MIN_MINUTES = _int("MESSAGE_GAP_MIN_MINUTES", 120)
 
 # ONE GENTLE RE-ASK, this many days after a nudge nobody actioned. Then the
 # subject goes back to the normal cadence and is never re-asked again for that
@@ -3694,11 +3706,13 @@ def validate() -> list[str]:
         else:
             log.info(
                 "Drip: up to %d message(s) per weekday in channel %s, first at %02d:%02d "
-                "IST, then gaps of %d+/-%d min. One message per (action type x owner). "
-                "Replies and ask-time deadline announcements are IMMEDIATE and are not "
-                "spaced or capped.",
+                "IST, then every %d min (plus up to %d), nothing after %s. One message "
+                "per (action type x owner), in the day's order (daily_order in the "
+                "rules file). Replies and ask-time deadline announcements are "
+                "IMMEDIATE and are not spaced or capped.",
                 DAILY_MESSAGE_CAP, channel, hour, minute,
-                MESSAGE_GAP_MINUTES, MESSAGE_JITTER_MINUTES,
+                max(MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES),
+                max(0, MESSAGE_JITTER_MINUTES), SALES_DRIP_END,
             )
         log.info(
             "[config] daily cap: %d counted post(s) on every weekday; meeting prep, "
@@ -3728,19 +3742,30 @@ def validate() -> list[str]:
                 "past more. The agreed number is 5.",
                 DAILY_MESSAGE_CAP,
             )
-        if MESSAGE_GAP_MINUTES - MESSAGE_JITTER_MINUTES < 15:
+        if max(MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES) < 15:
             log.warning(
-                "MESSAGE_GAP_MINUTES=%d minus MESSAGE_JITTER_MINUTES=%d leaves a floor of "
-                "%d minutes between messages. Below about 15 the drip stops being a drip "
-                "and becomes one long message delivered in pieces.",
-                MESSAGE_GAP_MINUTES, MESSAGE_JITTER_MINUTES,
-                MESSAGE_GAP_MINUTES - MESSAGE_JITTER_MINUTES,
+                "MESSAGE_GAP_MINUTES=%d and MESSAGE_GAP_MIN_MINUTES=%d leave %d minutes "
+                "between messages. Below about 15 the drip stops being a drip and "
+                "becomes one long message delivered in pieces. The agreed gap is 120.",
+                MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES,
+                max(MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES),
             )
         if MESSAGE_JITTER_MINUTES < 0:
             log.warning(
-                "MESSAGE_JITTER_MINUTES=%s is negative; it is used as a +/- spread, so "
-                "the sign is ignored. Set 0 for exact spacing.",
+                "MESSAGE_JITTER_MINUTES=%s is negative; jitter can only add time to a "
+                "gap, so it is read as 0.",
                 MESSAGE_JITTER_MINUTES,
+            )
+        elif MESSAGE_JITTER_MINUTES > 0:
+            log.warning(
+                "MESSAGE_JITTER_MINUTES=%d: each gap between spaced posts is %d to %d "
+                "minutes, so the posts will NOT be at 14:00, 16:00, 18:00 and 20:00, "
+                "and a later one can fall after SALES_DRIP_END (%s) and not be sent. "
+                "Set 0 for the times the team was given.",
+                MESSAGE_JITTER_MINUTES,
+                max(MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES),
+                max(MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES) + MESSAGE_JITTER_MINUTES,
+                SALES_DRIP_END,
             )
         if DRIP_REASK_DAYS < 1:
             log.warning(
