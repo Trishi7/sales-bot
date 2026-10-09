@@ -2271,6 +2271,26 @@ NEW_COMPANY_AFTER_WORKING_DAYS = _int("NEW_COMPANY_AFTER_WORKING_DAYS", 1)
 # at 14 or more every company is asked about twice.
 NEW_COMPANY_WINDOW_DAYS = _int("NEW_COMPANY_WINDOW_DAYS", 7)
 
+# R11's CROSS-CHECK AGAINST OUTREACH PoCs (9 Oct). WHICH BLANK CELLS MAKE AN
+# EXISTING ROW "INCOMPLETE". A company already on the tab is asked about again
+# only when one of its rows lacks one of these. Sheet ROLES, resolved through
+# gtm_sheet's header map, never raw header text. Email, Industry, Based and the
+# paper link are deliberately NOT here: most people on the tab legitimately
+# have no email and no paper, and counting those would put nearly every
+# company back in the Wednesday post for ever.
+POC_MANDATORY_FIELDS: list[str] = _str_list("POC_MANDATORY_FIELDS", "name,designation,li_url")
+
+# HOW MANY PEOPLE R11 SUGGESTS FOR ONE COMPANY after the first yes. Three is a
+# list somebody reads and answers; the search returns up to five and the rest
+# are the long tail. There is NO cap on companies and no overflow to another
+# week: a company held back is past its 7-day window by the next Wednesday.
+POC_SUGGEST_MAX_PER_COMPANY = _int("POC_SUGGEST_MAX_PER_COMPANY", 3)
+
+# HOW MANY EXISTING ROWS OF ONE COMPANY R11 LOOKS UP MISSING FIELDS FOR. Each
+# costs a search, and a company with twenty half-filled rows must not spend
+# the day's budget on one reply.
+POC_FILL_MAX_ROWS_PER_COMPANY = _int("POC_FILL_MAX_ROWS_PER_COMPANY", 5)
+
 # RETIRED: FOLLOWUP_GRACE_DAYS — the ordinary-cadence trigger it belonged to is
 # gone. Each of the twelve rules now carries its own interval, which is the
 # point: "how long is too long" is a different number for a connection with no

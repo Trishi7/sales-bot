@@ -86,6 +86,7 @@ import rules
 import simulation
 import notes
 import persona
+import poc_crosscheck
 import prep
 import query
 import replies
@@ -267,6 +268,13 @@ def _display(user) -> str:
         or getattr(user, "name", None)
         or str(user)
     )
+
+
+# A yes to R11's list of suggested people that is not a plain yes: it carries a
+# number, or a word that takes something back out. See `_apply_poc_row_add`.
+_QUALIFIED_YES_RE = re.compile(
+    r"\b(\d+|not|except|excluding|without|but|only|skip|leave\s+out|first|second|third)\b",
+    re.IGNORECASE)
 
 
 def _looks_like_question(text: str) -> bool:
@@ -8113,8 +8121,7 @@ class SalesBot(discord.Client):
         """
         if message.get("type") != nextaction.R_NEW_COMPANY:
             return
-        companies = [str(c).strip() for c in (message.get("companies") or [])
-                     if str(c).strip()]
+        companies = drip.new_company_names(message)     # the ones the post named, in its order
         if not companies:
             return
         key = f"poc_lookup:{marker}:{getattr(sent, 'id', 0)}"
@@ -8122,7 +8129,9 @@ class SalesBot(discord.Client):
             lambda: self.db.open_proposal(
                 proposal_key=key, kind="poc_lookup", tab=gtm_sheet.RESEARCHER_LINES,
                 sheet_row=0, row_key="", company="", poc="",
-                payload={"companies": companies}, reply_text="", trigger="R11",
+                payload={"companies": companies,
+                         "branches": drip.new_company_branches(message)},
+                reply_text="", trigger="R11",
                 proposed_text="look for PoCs at " + ", ".join(companies),
                 requested_by="R11",
                 channel_id=int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
@@ -8135,14 +8144,36 @@ class SalesBot(discord.Client):
 
     async def _apply_poc_lookup(self, message, proposal: dict, *,
                                 decided_by: str) -> None:
-        """An approver said yes to R11's question: find people, per company.
+        """An approver said yes to R11's question: look, and say what was found.
 
         "yes for Shunya" NARROWS IT to the companies the reply names; a bare
-        yes means all of them. Each company gets its own reply, in the
-        find_people format. Nothing is written anywhere — adding anyone to
-        Outreach PoCs is a separate question with its own yes.
+        yes means all of them. ONE MESSAGE comes back (`poc_crosscheck.
+        render_found`), and what it offers depends on where each company
+        stands on Outreach PoCs NOW (the tab is re-read; Wednesday's answer
+        may be days old):
+
+          no row for it     people found by the search, at most
+                            POC_SUGGEST_MAX_PER_COMPANY, and the question
+                            "Shall I go ahead?". THAT QUESTION IS A `row_add`
+                            PROPOSAL on this message (`_offer_poc_add`), so a
+                            second yes adds the rows (`_apply_poc_row_add`).
+          rows with gaps    what the search found for the BLANK cells of at
+                            most POC_FILL_MAX_ROWS_PER_COMPANY rows, and a
+                            request to paste it in. NOTHING IS OFFERED: columns
+                            A to I of an existing row are read-only to the bot.
+                            The one exception is Email: when email is all that
+                            was found and EMAIL_WRITE_ALLOWED is on, the
+                            existing `email_write` proposal is opened.
+          complete now      nothing.
+
+        THIS STEP WRITES NOTHING. Every value shown came from a search result
+        (`_find_people_data`, `_email_lookup`) or from the Master Pipeline row
+        (Industry); a field with no value is left out, never filled in.
         """
-        companies = list((proposal.get("payload") or {}).get("companies") or [])
+        import links
+
+        payload = proposal.get("payload") or {}
+        companies = list(payload.get("companies") or [])
         said = " ".join(str(getattr(message, "content", "") or "").lower().split())
         named = [c for c in companies
                  if any(len(w) >= 3 and re.search(rf"\b{re.escape(w)}\b", said)
@@ -8154,14 +8185,219 @@ class SalesBot(discord.Client):
             await self._reply(message, wording.POC_LOOKUP_EMPTY,
                               reason="poc lookup had no companies")
             return
+
+        tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POCS)
+        rows = list(getattr(tab, "rows", None) or [])
+        mandatory = poc_crosscheck.mandatory_roles()
+        index = poc_crosscheck.build_index(rows, mandatory)
+        industries = await self._pipeline_industries()
+        headers = list(getattr(tab, "headers", None) or [])
+        cols = dict(getattr(tab, "canonical_role_to_col", None) or {})
+
+        def label_of(role: str) -> str:
+            idx = cols.get(role)
+            if idx is not None and idx < len(headers) and str(headers[idx]).strip():
+                return str(headers[idx]).strip()
+            return {"industry": "Industry", "designation": "Designation", "email": "Email id",
+                    "based": "Based", "paper_links": "Research Paper Link",
+                    "li_url": "LI Url"}.get(role, role)
+
+        def same_person(a: str, b: str) -> bool:
+            ta = set(re.findall(r"[a-z0-9]+", str(a or "").lower()))
+            tb = set(re.findall(r"[a-z0-9]+", str(b or "").lower()))
+            return bool(ta) and bool(tb) and (ta <= tb or tb <= ta)
+
+        async def email_for(name: str, company: str) -> tuple:
+            """(address, source) from the existing email lookup, or ("", "")."""
+            item = {"poc": name, "company": company, "text": ""}
+            try:
+                await self._email_lookup(item, rule_id="R11")
+            except Exception:
+                log.exception("[r11] the email lookup for %s (%s) failed", name, company)
+                return "", ""
+            return (str(item.get("email_found") or "").strip(),
+                    str(item.get("email_source") or "").strip())
+
+        suggest, fill, failed, complete = [], [], [], []
+        to_add: list = []
+        emails: list = []
+        shown_roles: set = set()
         for company in chosen:
-            body = await self._find_people(company, rule="R11")
-            await self._reply(message, body, reason=f"PoC lookup for {company}")
+            key = poc_crosscheck.company_key(company)
+            branch = poc_crosscheck.classify(company, index)
+            if branch == poc_crosscheck.COMPLETE:
+                complete.append(company)
+                continue
+            data = await self._find_people_data(company, rule="R11")
+            found = list(data.get("people") or [])
+            if not data.get("ok"):
+                log.info("[r11] %s: the search could not run (%s)", company, data.get("error"))
+            industry = industries.get(key, "")
+            if branch == poc_crosscheck.BRANCH_A:
+                people = []
+                for person in found[:max(1, int(config.POC_SUGGEST_MAX_PER_COMPANY))]:
+                    profile = str(person.get("profile") or "").strip()
+                    if profile and links.profile_kind(profile) != "profile":
+                        profile = ""
+                    address, _src = await email_for(person["name"], company)
+                    people.append({
+                        "name": person["name"], "title": person.get("title") or "",
+                        "industry": industry, "email": address,
+                        "based": person.get("based") or "", "linkedin_url": profile,
+                        "paper": person.get("paper") or "", "source": person.get("source") or "",
+                    })
+                    to_add.append({
+                        "name": person["name"], "company": company, "linkedin_url": profile,
+                        "source_url": person.get("source") or "",
+                        "designation": person.get("title") or "", "industry": industry,
+                        "based": person.get("based") or "", "paper": person.get("paper") or "",
+                        "email": address,
+                    })
+                if people:
+                    suggest.append((company, people))
+                else:
+                    failed.append(company)
+                continue
+
+            # ROWS WITH GAPS: existing rows, so nothing here can be written.
+            gap_rows = [r for r in rows
+                        if poc_crosscheck.company_key(r.get("company")) == key
+                        and poc_crosscheck.row_gaps(r, mandatory)]
+            entries = []
+            for row in gap_rows[:max(1, int(config.POC_FILL_MAX_ROWS_PER_COMPANY))]:
+                name = gtm_sheet.clean_cell(row.get("name"))
+                match = next((x for x in found if same_person(x.get("name"), name)), None) \
+                    if name else None
+                values = {
+                    "industry": industry,
+                    "designation": (match or {}).get("title") or "",
+                    "based": (match or {}).get("based") or "",
+                    "paper_links": (match or {}).get("paper") or "",
+                    "li_url": "",
+                }
+                profile = str((match or {}).get("profile") or "").strip()
+                if profile and links.profile_kind(profile) == "profile":
+                    values["li_url"] = profile
+                source = str((match or {}).get("source") or "")
+                if name and not gtm_sheet.clean_cell(row.get("email")):
+                    values["email"], email_source = await email_for(name, company)
+                    source = source or email_source
+                shown, unfound = [], 0
+                for role in poc_crosscheck.FILL_ROLES:
+                    if gtm_sheet.clean_cell(row.get(role)):
+                        continue                    # the cell has a value: never printed
+                    if values.get(role):
+                        shown.append((label_of(role), values[role]))
+                        shown_roles.add(role)
+                    else:
+                        unfound += 1
+                if values.get("email") and not gtm_sheet.clean_cell(row.get("email")) \
+                        and row.get("_row"):
+                    emails.append({"sheet_row": row.get("_row"),
+                                   "row_key": activation.row_key(row),
+                                   "company": company, "poc": name,
+                                   "email": values["email"], "source": source})
+                entries.append({
+                    "name": name or f"Row {row.get('_row')} (no name on the sheet)",
+                    "title": gtm_sheet.clean_cell(row.get("designation")),
+                    "found": shown, "source": source, "unfound": unfound,
+                })
+            fill.append((company, entries))
+
+        # THE EMAIL CELL IS THE ONE THING THE BOT MAY WRITE ON AN EXISTING ROW,
+        # and it offers to only when email is ALL it found and the switch is on.
+        email_offer = bool(config.EMAIL_WRITE_ALLOWED and emails and shown_roles == {"email"})
+        out = poc_crosscheck.render_found(suggest=suggest, fill=fill, failed=failed,
+                                          email_offer=email_offer)
+        if not suggest and not fill and not failed:
+            await self._reply(
+                message,
+                poc_crosscheck._and(complete) + (" is" if len(complete) == 1 else " are")
+                + " already on Outreach PoCs with nothing missing, so there is nothing "
+                  "for me to look up.",
+                reason="poc lookup: every company is complete now")
+            return
+        state.audit("poc_lookup_answered", reason="what a search found; nothing written",
+                    suggested=[c for c, _p in suggest], fill=[c for c, _r in fill],
+                    failed=failed, complete=complete, rows_offered=out["rows"])
+
+        sent_box: list = []
+        if suggest:
+            # GATE 2. The message ends on "Shall I go ahead?", and that question
+            # is a row_add proposal on this very message.
+            posted = await self._offer_poc_add(
+                message, "", {"people": to_add, "tab": getattr(tab, "title", "") or "Outreach PoCs"},
+                body=out["text"], trigger="R11",
+                question=f"add {out['rows']} row(s) to Outreach PoCs for "
+                         + poc_crosscheck._and(out["companies"]),
+                key=f"row_add:r11:{getattr(message, 'id', 0)}", sent_box=sent_box)
+            if not posted:
+                await self._reply(message, out["text"], reason="PoC lookup (the offer "
+                                  "could not be recorded, so nothing can be added from it)")
+                return
+        else:
+            sent = await self._reply(message, out["text"], reason="PoC lookup")
+            if sent is not None:
+                sent_box.append(sent)
+
+        if email_offer and sent_box:
+            sent = sent_box[-1]
+            key = f"email_write:r11:{getattr(sent, 'id', 0)}"
+            await asyncio.to_thread(
+                lambda: self.db.open_proposal(
+                    proposal_key=key, kind="email_write", tab=gtm_sheet.POCS, sheet_row=0,
+                    row_key="", company="", poc="", payload={"emails": emails},
+                    reply_text="", trigger="R11",
+                    proposed_text="add " + ", ".join(
+                        f"{e['email']} to {e['poc']} ({e['company']})" for e in emails),
+                    requested_by="R11",
+                    channel_id=int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
+                    message_id=str(getattr(sent, "id", "") or ""),
+                    created_at=dl.now_ist().isoformat(timespec="seconds"),
+                )
+            )
+            state.audit("write_proposed",
+                        reason="permission before every write: a found email goes into "
+                               "the sheet only on a yes",
+                        proposal_key=key, kind="email_write", trigger="R11",
+                        count=len(emails))
+
+    async def _pipeline_industries(self) -> dict:
+        """{company key: Industry} from the Master Pipeline tab: the team's own
+        word for what a company does, which is what a new PoC row's Industry
+        cell gets. {} when the tab cannot be read; the field is then omitted."""
+        try:
+            rows = await self._rule_tab_rows(gtm_sheet.RESEARCHER_LINES, "R11")
+        except Exception:
+            log.exception("[r11] the Master Pipeline could not be read for Industry")
+            return {}
+        out: dict = {}
+        for row in rows or ():
+            key = poc_crosscheck.company_key(row.get("company"))
+            value = gtm_sheet.clean_cell(row.get("industry"))
+            if key and value and key not in out:
+                out[key] = value
+        return out
 
     async def _find_people(self, company: str, department: str = "", *,
                            rule: str = "find_people") -> str:
+        """The people search as the text the find_people tool posts
+        (`websearch.render_people`). R11 reads the same search as data
+        (`_find_people_data`) and renders it in its own agreed shape."""
+        import websearch
+
+        data = await self._find_people_data(company, department, rule=rule)
+        if data.get("error"):
+            return data["error"]
+        return websearch.render_people(data["company"], data["people"],
+                                       department=data["department"],
+                                       titles=data["evidence"])
+
+    async def _find_people_data(self, company: str, department: str = "", *,
+                                rule: str = "find_people") -> dict:
         """Named people at a company (and department), with the page each was
-        found on. The ONE lookup behind R11's yes and the find_people tool.
+        found on, AS DATA: {"ok", "error", "people", "evidence", ...}. The ONE
+        lookup behind R11's yes and the find_people tool.
 
         FROM SEARCH-RESULT TITLES, NOT FROM PROFILES. One search —
         `site:linkedin.com/in "<company>" <department>` — whose result titles
@@ -8182,15 +8418,20 @@ class SalesBot(discord.Client):
 
         company = " ".join(str(company or "").split())
         department = " ".join(str(department or "").split())
+
+        def cannot(why: str) -> dict:
+            return {"ok": False, "error": why, "people": [], "evidence": {},
+                    "company": company, "department": department}
+
         if not company:
-            return "Which company should I look at?"
+            return cannot("Which company should I look at?")
         if not websearch.enabled() or self.llm is None:
-            return (f"My web search is switched off, so I can't look for people at "
-                    f"{company} right now.")
+            return cannot(f"My web search is switched off, so I can't look for people at "
+                          f"{company} right now.")
         left, used, budget = await self._search_left()
         if left <= 0:
-            return (f"I can't look for people at {company} today — "
-                    f"{websearch.budget_note(used=used, budget=budget)}.")
+            return cannot(f"I can't look for people at {company} today — "
+                          f"{websearch.budget_note(used=used, budget=budget)}.")
 
         if websearch.server_side():
             result = await self.llm.web_research(
@@ -8219,8 +8460,8 @@ class SalesBot(discord.Client):
             )
         await self._bank(result, rule_id=rule)
         if not result.get("ok"):
-            return (f"I couldn't search for people at {company} just now — "
-                    f"{result.get('note') or 'the search call failed'}.")
+            return cannot(f"I couldn't search for people at {company} just now — "
+                          f"{result.get('note') or 'the search call failed'}.")
 
         evidence = websearch.evidence_urls(result)
         people, dropped = websearch.parse_people(
@@ -8237,8 +8478,8 @@ class SalesBot(discord.Client):
             company=company, department=department, rule=rule,
             kept=[p["name"] for p in people], dropped=len(dropped),
         )
-        return websearch.render_people(company, people, department=department,
-                                       titles=evidence)
+        return {"ok": True, "error": "", "people": people, "evidence": evidence,
+                "company": company, "department": department}
 
     def _people_tools(self, *, sink: Optional[list] = None) -> list[dict]:
         """find_people — "find PoCs at Shunya Labs in the research team".
@@ -8452,7 +8693,9 @@ class SalesBot(discord.Client):
             "handler": _propose,
         }]
 
-    async def _offer_poc_add(self, message, text: str, offer: dict) -> str:
+    async def _offer_poc_add(self, message, text: str, offer: dict, *,
+                             body: str = "", question: str = "", trigger: str = "question",
+                             key: str = "", sent_box: Optional[list] = None) -> str:
         """Record the row_add proposal, THEN post the question. Returns the
         offer text that was posted, "" when none was.
 
@@ -8470,6 +8713,13 @@ class SalesBot(discord.Client):
 
         Sent exactly as `_reply` sends a chunk — same kind, no test tag of its
         own — so test mode and live differ by nothing here.
+
+        R11 BRINGS ITS OWN MESSAGE (`body`, `question`, `trigger`, `key`): its
+        list of suggested people ends on "Shall I go ahead?", and that message
+        IS the offer, so the proposal is keyed to it instead of to a second
+        post. A body too long for one Discord message is split between lines
+        and the proposal is keyed to the LAST part, where the question is.
+        `sent_box` receives the message the proposal was keyed to.
         """
         people = list(offer.get("people") or [])
         if not people:
@@ -8477,9 +8727,9 @@ class SalesBot(discord.Client):
         tab_title = str(offer.get("tab") or "Outreach PoCs")
         names = [p["name"] for p in people]
         companies = {p["company"] for p in people}
-        question = approvals.row_add_question(names, tab_title)
-        body = approvals.row_add_offer(names, tab_title)
-        key = f"row_add:{message.id}"
+        question = question or approvals.row_add_question(names, tab_title)
+        body = body or approvals.row_add_offer(names, tab_title)
+        key = key or f"row_add:{message.id}"
         asker = _display(message.author)
         now = dl.now_ist().isoformat(timespec="seconds")
         opened = await asyncio.to_thread(
@@ -8487,7 +8737,7 @@ class SalesBot(discord.Client):
                 proposal_key=key, kind="row_add", tab=tab_title, sheet_row=0,
                 row_key="", company=companies.pop() if len(companies) == 1 else "",
                 poc=", ".join(names), payload={"people": people},
-                reply_text=text or "", trigger="question", proposed_text=question,
+                reply_text=text or "", trigger=trigger, proposed_text=question,
                 requested_by=asker,
                 channel_id=int(getattr(message.channel, "id", 0) or 0),
                 message_id="", created_at=now,
@@ -8497,11 +8747,18 @@ class SalesBot(discord.Client):
             log.warning("[offer] %s was not recorded (it already exists); the "
                         "offer is NOT posted", key)
             return ""
-        sent = await guardrails.send(
-            message.channel, body,
-            reason="asking before adding rows to Outreach PoCs",
-            kind="reply", reply_to=message,
-        )
+        parts = drip.split_on_lines(body) if len(body) > 1900 else [body]
+        sent = None
+        for part in parts:
+            sent = await guardrails.send(
+                message.channel, part,
+                reason="asking before adding rows to Outreach PoCs",
+                kind="reply", reply_to=message,
+            )
+            if sent is None:
+                break
+        if sent is not None and sent_box is not None:
+            sent_box.append(sent)
         if sent is None:
             await asyncio.to_thread(
                 lambda: self.db.close_proposal(
@@ -8519,7 +8776,7 @@ class SalesBot(discord.Client):
             "write_proposed",
             reason="permission before every write: no row is added until an "
                    "approver says yes",
-            proposal_key=key, kind="row_add", trigger="question", tab=tab_title,
+            proposal_key=key, kind="row_add", trigger=trigger, tab=tab_title,
             people=names, proposed=question, requested_by=asker,
         )
         log.info("[approvals] asked whether to add %s to %s (%s) — waiting for an "
@@ -8535,10 +8792,15 @@ class SalesBot(discord.Client):
         `POC_ROW_ADD_WRITE_WIRED`, and nothing else has to move. While it is
         False this returns a refusal and never touches the sheet.
 
-        When wired it is `gtm_sheet.append_row` and nothing more: Name,
-        Company and — only when a search returned a linkedin.com/in url — the
-        LinkedIn URL. No title, no email, no research link. `append_row`'s own
-        six checks (appendable tab, duplicate, band, empty row, write,
+        When wired it is `gtm_sheet.append_row` and nothing more. A NEW ROW
+        MAY CARRY (since 9 Oct) Company, Industry, Name, Designation, Based,
+        the research paper link and, only when a search returned a
+        linkedin.com/in url, the LinkedIn URL: all in columns A to I, which the
+        new-row band allows (NEW_ROW_WRITABLE_RANGES) and an existing row does
+        not. Email goes in only when EMAIL_WRITE_ALLOWED is on, the same switch
+        that guards the Email cell of an existing row. A value that is blank is
+        not sent. `append_row`'s own six checks (appendable tab, duplicate,
+        band via `config.may_write_new_row_column`, empty row, write,
         read-back) are the write gate and are not repeated or loosened here.
 
         EVERY ROW IS SIGNED, in the same request that writes it: a note on the
@@ -8563,6 +8825,14 @@ class SalesBot(discord.Client):
         values = {"company": person.get("company") or "",
                   "name": person.get("name") or "",
                   "li_url": url}
+        for role, field in (("industry", "industry"), ("designation", "designation"),
+                            ("based", "based"), ("paper_links", "paper")):
+            value = " ".join(str(person.get(field) or "").split())
+            if value:
+                values[role] = value
+        email = str(person.get("email") or "").strip()
+        if email and config.EMAIL_WRITE_ALLOWED:
+            values["email"] = email
         note = approvals.row_signature(
             approver=approver, on_date=dl.real_today_ist(),
             approval_link=approval_link, linkedin_url=url)
@@ -8628,6 +8898,37 @@ class SalesBot(discord.Client):
         # The approver's own "yes" message: what the row's note links to.
         approval_link = self._message_link(message)
         lines = []
+        # R11's OWN REPORT (M3): one block a company, and under it only what
+        # is NOT what the approver agreed to — a person skipped, a cell left out.
+        from_r11 = str(proposal.get("trigger") or "") == "R11"
+        per_company: dict = {}
+        # A QUALIFIED YES TO R11's LIST WRITES NOTHING. "yes to 1 and 2 but not
+        # 3" reads as a plain YES to the vote reader ("not" is not one of its
+        # no-words), and with nobody named it would add all of them, including
+        # the one the approver ruled out. One message is one proposal, all or
+        # nothing: so a yes that carries a number or a "not / except / only /
+        # but" and names no person is not acted on. The same question is put
+        # back on the same message, and the bot asks for a plain answer.
+        if from_r11 and not named and _QUALIFIED_YES_RE.search(said):
+            again = f"{proposal.get('proposal_key')}:again:{getattr(message, 'id', 0)}"
+            await asyncio.to_thread(
+                lambda: self.db.open_proposal(
+                    proposal_key=again, kind="row_add", tab=proposal.get("tab") or "Outreach PoCs",
+                    sheet_row=0, row_key="", company=proposal.get("company") or "",
+                    poc=proposal.get("poc") or "", payload={"people": people},
+                    reply_text="", trigger="R11",
+                    proposed_text=proposal.get("proposed_text") or "",
+                    requested_by=requested_by,
+                    channel_id=int(proposal.get("channel_id") or 0),
+                    message_id=str(proposal.get("message_id") or ""),
+                    created_at=dl.now_ist().isoformat(timespec="seconds"),
+                )
+            )
+            log.info("[approvals] %s gave a qualified yes to R11's list (%r); nothing "
+                     "written, the question is open again as %s", decided_by, said[:60], again)
+            await self._reply(message, wording.POC_ADD_ALL_OR_NONE,
+                              reason="a qualified yes to R11's list: nothing written")
+            return
         for person in chosen:
             who = f"{person.get('name')} ({person.get('company')})"
             result = await self._write_poc_row(
@@ -8636,7 +8937,23 @@ class SalesBot(discord.Client):
                        f"{requested_by}",
                 approver=decided_by, approval_link=approval_link,
             )
+            report = per_company.setdefault(
+                str(person.get("company") or ""),
+                {"company": str(person.get("company") or ""), "added": 0, "skipped": []})
             if result.get("ok"):
+                report["added"] += 1
+                if result.get("dry_run"):
+                    report["skipped"].append(
+                        f"{person.get('name')}: a dry run — SHEET_WRITES_ENABLED is off, "
+                        "nothing was really written.")
+                elif not result.get("signed"):
+                    report["skipped"].append(
+                        f"{person.get('name')}: the row is there, but I could not confirm "
+                        "my note on the Name cell — could somebody check it please?")
+                for item in result.get("refused") or []:
+                    report["skipped"].append(
+                        f"{person.get('name')}: {(item or {}).get('role')} was not written "
+                        f"({(item or {}).get('why') or 'the sheet refused it'}).")
                 where = f"Added {who} to Outreach PoCs at row {result.get('sheet_row')}"
                 if result.get("dry_run"):
                     lines.append(where + " (dry run — SHEET_WRITES_ENABLED is off, "
@@ -8694,6 +9011,15 @@ class SalesBot(discord.Client):
             else:
                 lines.append(f"Did not add {person.get('name')}: "
                              f"{result.get('error') or 'the sheet refused it'}")
+                # NO ROW NUMBERS IN R11's REPORT: a person who appeared on the tab
+                # between the search and the yes is simply "already there".
+                why = ("already on Outreach PoCs" if result.get("duplicate") else re.sub(
+                    r"\s*\(row \d+\)", "", str(result.get("error") or "the sheet refused it")))
+                report["skipped"].append(f"Skipped {person.get('name')}: {why}.".replace("..", "."))
+        if from_r11:
+            await self._reply(message, poc_crosscheck.render_written(per_company.values()),
+                              reason="poc rows added (R11)")
+            return
         if not any(line.startswith("Added ") for line in lines):
             lines.append("Nothing has changed in the sheet.")
         await self._reply(message, "\n".join(lines), reason="poc rows added")
@@ -10818,6 +11144,10 @@ class SalesBot(discord.Client):
                 prospect_rows=list(tab.rows),
                 events_unclear_seen=unclear_seen,
                 next_step_state=next_step_state,
+                # R11's CROSS-CHECK: a SUMMARY of every row on the tab (a count
+                # and the mandatory roles left blank, per company), built here
+                # so the engine is handed no row and stays pure.
+                poc_company_index=poc_crosscheck.build_index(tab.rows),
             )
         )
         result["tab"] = tab

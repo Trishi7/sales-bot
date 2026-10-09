@@ -1356,11 +1356,30 @@ def _r_new_pipeline_company(rule, ctx) -> list:
     search (bot._apply_poc_lookup). Nothing is ever added to Outreach PoCs
     without a separate yes.
     """
+    import poc_crosscheck
+
     today = ctx["today"]
     wait = max(0, int(config.NEW_COMPANY_AFTER_WORKING_DAYS))
     window = max(1, int(config.NEW_COMPANY_WINDOW_DAYS))
+    # THE OUTREACH PoCs CROSS-CHECK (9 Oct). The caller hands over a SUMMARY of
+    # that tab (`poc_crosscheck.build_index`: a row count and the mandatory
+    # roles left blank, per company) and never a row, so this stays pure. A
+    # company with no row there is Branch A; one whose rows lack a mandatory
+    # field is Branch B; one that is complete produces nothing at all. None
+    # (no summary: the tab was not read) is said in the log and treated as "no
+    # rows", because the write path re-reads the tab and refuses a duplicate.
+    index = ctx.get("poc_company_index")
+    if index is None and ctx.get("new_companies"):
+        log.info("[rules] R11: no Outreach PoCs summary was supplied; every new "
+                 "company is treated as having no contacts yet")
     out = []
-    for entry in ctx.get("new_companies") or ():
+    # THE ORDER OF THE MASTER PIPELINE TAB, so the post lists companies the way
+    # the team sees them on the sheet and not alphabetically.
+    position: dict = {}
+    for i, listed in enumerate(ctx.get("pipeline_companies") or ()):
+        position.setdefault(poc_crosscheck.company_key(listed), i)
+    # SEVERAL MASTER PIPELINE ROWS CAN NAME ONE COMPANY: each appears once.
+    for seen, entry in enumerate(poc_crosscheck.collapse(ctx.get("new_companies"))):
         name = str((entry or {}).get("company") or "").strip()
         first_seen = dl.parse_date(str((entry or {}).get("first_seen") or ""))
         if not name or first_seen is None:
@@ -1370,6 +1389,11 @@ def _r_new_pipeline_company(rule, ctx) -> list:
             continue
         if (today - first_seen).days > window:
             continue
+        branch = poc_crosscheck.classify(name, index)
+        if branch == poc_crosscheck.COMPLETE:
+            log.info("[rules] R11: %s is already on Outreach PoCs with every "
+                     "mandatory field filled; not mentioned", name)
+            continue
         out.append(_item(
             rule=rule, trigger=R_NEW_COMPANY, today=today, due=due,
             why=(f"R11 (Wednesdays): {name} first appeared in the Master Pipeline "
@@ -1377,7 +1401,11 @@ def _r_new_pipeline_company(rule, ctx) -> list:
             text=(f"{name} is new in the Master Pipeline. Want me to look for "
                   "relevant PoCs for outreach?"),
             company=name, web_pending=False,
-            extra={"first_seen": dl.iso(first_seen)},
+            extra={"first_seen": dl.iso(first_seen), "branch": branch,
+                   "sheet_order": position.get(poc_crosscheck.company_key(name),
+                                               10 ** 6 + seen),
+                   # The start of the window, for the post's "since <day>".
+                   "window_start": dl.iso(today - timedelta(days=window))},
         ))
     return out
 
@@ -1955,6 +1983,7 @@ def run(
     inactive: int = 0, day_rules: Optional[list] = None,
     prospect_rows: Optional[list] = None, events_unclear_seen=None,
     next_step_state: Optional[dict] = None,
+    poc_company_index: Optional[dict] = None,
 ) -> dict:
     """THE QUEUE. Everything the thirteen rules make due today, deduped and ranked.
 
@@ -1989,6 +2018,10 @@ def run(
         "events": list(events or []),
         "pipeline_companies": list(pipeline_companies or []),
         "new_companies": list(new_companies or []),
+        # R11's SUMMARY OF OUTREACH PoCs, built by the caller. None is kept as
+        # None: "not supplied" and "the tab is empty" are different.
+        "poc_company_index": (dict(poc_company_index)
+                              if poc_company_index is not None else None),
         "prospect_repeats": prospect_repeats or {},
         "week_companies": list(week_companies or []),
         "meeting_followups": meeting_followups or {},

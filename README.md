@@ -2483,6 +2483,61 @@ comparison is `>` and not `>=`, and the reason line on every item says so —
 nobody should have to read the source to find out where a boundary is. A
 boundary a bot decides for itself is a boundary nobody agreed to.
 
+**R11 checks Outreach PoCs before it names a company (9 Oct).** The queue
+builder hands the rule a SUMMARY of that tab, never a row
+(`poc_crosscheck.build_index`: per company, a row count and which mandatory
+fields are blank somewhere), so the engine stays pure. Several Master Pipeline
+rows naming one company collapse to one (`gtm_sheet.normalise_header(
+clean_cell(...))`, the key `pipeline_companies` already uses). Each company is
+then one of three:
+
+| Branch | On Outreach PoCs | Wednesday post (M1) | After the first yes | After the second yes |
+|---|---|---|---|---|
+| **A** | no row | listed by name | people found by the search, at most `POC_SUGGEST_MAX_PER_COMPANY` (3), ending "Shall I go ahead? This adds N rows for …" | the rows are **added** (`_write_poc_row`) and each is signed on the Name cell |
+| **B** | rows exist, one lacks a mandatory field | listed with " — already on Outreach PoCs, missing some fields" | what was found for the BLANK cells of at most `POC_FILL_MAX_ROWS_PER_COMPANY` (5) rows, and a request to paste it in | nothing: there is no second gate |
+| **complete** | rows exist, nothing mandatory blank | not mentioned | | |
+
+**Mandatory is `POC_MANDATORY_FIELDS` (name, designation, li_url).** A blank
+Email, Industry, Based or paper link is not a gap: most people on the tab
+legitimately have no email and no paper, and counting those would list nearly
+every company every week. The names are sheet roles, resolved through
+`gtm_sheet`'s header map ("Based (Sept 2026)" already resolves to `based` and
+keeps resolving when the date in the header changes).
+
+**Branch B only reminds, and this is why.** Company, Industry, Name,
+Designation, Email id, Based, Research Paper Link and LI Url are columns B to
+I, and A:I is read-only on an EXISTING row (`RESTRICTED_COLUMN_RANGES`): that
+band is the team's own record of who a person is. A NEW row may be written
+there (`NEW_ROW_WRITABLE_RANGES`), which is why Branch A can add rows and
+Branch B cannot fill cells. The one exception is the Email cell: when email is
+all the search found for a company's rows and `EMAIL_WRITE_ALLOWED` is true,
+the closing line becomes "I can fill the Email cell for you if you'd like —
+shall I?" behind the existing `email_write` proposal (blank-cell re-check
+included). With the default mandatory fields that case cannot arise, because a
+Branch B row always lacks a name, a designation or a LinkedIn URL.
+
+**Gate 2 is wired to R11.** `_apply_poc_lookup` posts ONE message
+(`poc_crosscheck.render_found`) and, when it suggests people, that message is
+the `row_add` offer (`_offer_poc_add` with R11's own text; trigger `R11`). A
+new row now carries Company, Industry (the Master Pipeline's own value for the
+company), Name, Designation, Based, the research paper link and the LinkedIn
+URL (only a `linkedin.com/in` link; anything else is blanked), plus the serial
+and the signature note. Email goes on a new row only when
+`EMAIL_WRITE_ALLOWED` is true. Based and the paper link are kept only when the
+search itself showed them (`websearch.parse_people`); a field with no value is
+left out of the message and the row, never filled in.
+
+**One message is one proposal, all or nothing.** A yes that names a person
+adds that person (the narrowing `_apply_poc_row_add` always had). A yes that
+picks by number or takes something back ("yes to 1 and 2 but not 3") writes
+NOTHING: `approvals.read_vote` reads that sentence as a yes ("not" is not one
+of its no-words), so R11's path refuses it itself, says nobody was added, and
+leaves the question open on the same message.
+
+**The post is fixed text** (R11 is in `drip.VERBATIM_TYPES`): no model call, no
+bold heading, no "Hey team". Nothing in scope posts nothing.
+`python verify_poc_crosscheck.py --show` prints all five messages.
+
 **R11 has no created-date column to work from.** The Master Pipeline tab does
 not record when a company was added, so *"appeared"* means *"in today's names
 and not in yesterday's snapshot"*. The snapshot is a SQLite table keyed on the
@@ -4609,7 +4664,7 @@ python verify_websearch.py            # live, if a real ANTHROPIC_API_KEY is pre
 python verify_websearch.py --offline  # canned response, composition path only
 ```
 
-Dry-runs **R1** and **R11** for one company and prints the composed messages with
+Dry-runs **R1** and prints the composed message (R11 left this script on 9 Oct: it stopped being a web rule when it started asking before it searches) with
 their links. It makes **real search calls** when a key is present, because a
 verification that mocks the API proves the mock works and not the tool string;
 which mode ran is printed. On the live run the model produced real funding
@@ -5358,6 +5413,7 @@ python verify_reminders.py                # one-off reminders at an exact minute
 python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
 python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
 python verify_replies_oct8.py             # REPLIES-OCT8: "take ur time" under an interim line (one reaction, no second answer), the 8 Oct 11:21 exchange, the "today" answer, the grouped Next steps post, the test clock; --show prints the three
+python verify_poc_crosscheck.py           # R11: the Outreach PoCs cross-check (three branches), the agreed messages M1-M4, no search before the first yes and no write before the second, Branch B never writes, the new row's columns; --show prints the messages
 python verify_day_order.py                # NFT2-1069: every weekday's order and exact times, the 120-minute gap that never shrinks, nothing after 20:00, R7 minus rule 13's people, R11 on Wednesdays, R1's news window, the startup check; prints one planned day per weekday
 python verify_s1.py                       # cap 5 + R8/R9, the order of the day THREE WAYS (live sweep ticked every 15 min, test day, simulation), R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window

@@ -175,9 +175,11 @@ themselves are added in code and posted exactly as rendered)
 
 **A new company** (something landed in the pipeline)
 
-> Hey team — a new company landed in the pipeline:
-> • Nova Labs
-> Shall I find the right people to contact there? Just say yes.
+> New companies in the Master Pipeline — since Wed 1 Oct
+>
+> 1. Nova Labs
+>
+> Would you like me to look these up and suggest prospective PoCs we could contact?
 
 **Closure support** (a deal that's close)
 
@@ -258,9 +260,9 @@ themselves are added in code and posted exactly as rendered)
 
 **R11 — New company in the Master Pipeline**
 
-> Hey team — a new company landed in the pipeline:
-> • Nova Labs
-> Want me to look for relevant PoCs for outreach? Say yes and I'll dig in.
+> (Posted as written, as above. A company already on Outreach PoCs with a
+> blank name, title or LinkedIn link gets " — already on Outreach PoCs,
+> missing some fields"; you show what you find and ask a person to add it.)
 
 **R12 — Sales packages**
 

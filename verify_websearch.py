@@ -152,9 +152,6 @@ async def main() -> int:
     for rule_id, trigger, text in (
         ("R1", nextaction.R_AI_NEWS,
          "AI news: the last 24 hours on the team's topic list"),
-        ("R11", nextaction.R_NEW_COMPANY,
-         f"{COMPANY} is new in the Master Pipeline. I can fill in funding, location "
-         "and industry and suggest PoCs — shall I?"),
     ):
         it = item(rule_id, trigger, COMPANY, text=text)
         res = await research(rule_id, trigger, COMPANY, live)
@@ -171,7 +168,7 @@ async def main() -> int:
         results[rule_id] = (it, res)
 
     # ---- the composed messages ------------------------------------------
-    for rule_id in ("R1", "R11"):
+    for rule_id in ("R1",):
         it, res = results[rule_id]
         planned = drip.plan([it], day=TODAY)
         msg = planned["messages"][0] if planned["messages"] else None
@@ -209,7 +206,7 @@ async def main() -> int:
           not ("allowed_domains" in websearch.tool_definition()
                and "blocked_domains" in websearch.tool_definition()), True)
 
-    for rule_id in ("R1", "R11"):
+    for rule_id in ("R1",):
         it, res = results[rule_id]
         if res.get("ok"):
             check(f"{rule_id} carries sources", len(it.get("sources") or []) > 0, True)

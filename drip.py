@@ -1207,7 +1207,9 @@ HEADINGS = {
     "R8": "Meeting prep for {company}",
     "R9": "Follow-up on the {company} meeting",
     "R10": "Closure support",
-    "R11": "New in the pipeline",
+    # R11 HAS NO HEADING: its agreed shape opens on its own plain first line
+    # ("New companies in the Master Pipeline — since Wed 1 Oct"), no bold.
+    "R11": "",
     "R12": "Sales packages",
     "R13": "Next steps",
     "reminder": "Reminder",
@@ -1270,9 +1272,14 @@ def with_heading(body: str, head: str) -> str:
 # next would send somebody to update the wrong row. It also means the post
 # costs no model call, and is word for word the same live, in test mode, on a
 # test day and in a simulation.
+#
+# R11 IS VERBATIM SINCE 9 OCT. Its shape was agreed line by line (a header with
+# the date, numbered company names, a suffix on the companies already on
+# Outreach PoCs, one question) and it ENDS ON AN OFFER a "yes" answers. A
+# composer could renumber it, drop the suffix or bring "Hey team" back.
 VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             nextaction.R_EVENTS, nextaction.R_PROSPECTS,
-                            nextaction.R_NEXT_STEPS})
+                            nextaction.R_NEXT_STEPS, nextaction.R_NEW_COMPANY})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1493,6 +1500,59 @@ def render_new_companies(companies: list, *, variant: int = 0) -> tuple:
     else:
         opener = several.format(count=_COUNT_WORDS.get(len(names), str(len(names))))
     return opener, [f"• {n}" for n in names]
+
+
+def new_company_branches(message: dict) -> dict:
+    """{company: "a" | "b"} for an R11 message, from its items: whether each
+    company has no row on Outreach PoCs yet or has rows with gaps."""
+    out: dict = {}
+    for a in message.get("actions") or ():
+        name = str(a.get("company") or "").strip()
+        if name and name not in out:
+            out[name] = str(a.get("branch") or "a")
+    return out
+
+
+def new_company_names(message: dict) -> list:
+    """R11's companies in the order of the Master Pipeline tab (`group` sorts a
+    message's companies by due date and name, which is not it), cut at the
+    rule's own limit."""
+    cap = int(message.get("max_items_per_post") or 0) or 10 ** 6
+    order: dict = {}
+    for a in message.get("actions") or ():
+        name = str(a.get("company") or "").strip()
+        if name and name not in order:
+            order[name] = int(a.get("sheet_order") if a.get("sheet_order") is not None else 10 ** 6)
+    names = [c for c in (message.get("companies") or []) if str(c).strip()]
+    was = {n: i for i, n in enumerate(names)}
+    names.sort(key=lambda n: (order.get(n, 10 ** 6), was[n]))
+    return names[:cap]
+
+
+def new_company_lines(message: dict) -> list:
+    """R11's post as lines, in the shape agreed on 8 Oct:
+
+        New companies in the Master Pipeline — since Wed 1 Oct
+
+        1. Underdog AI (Conway Research)
+        2. Limbic AI — already on Outreach PoCs, missing some fields
+
+        Would you like me to look these up and suggest prospective PoCs we could contact?
+
+    EVERY COMPANY THE RULE PRODUCED IS IN IT (up to the rule's own limit of
+    10): there is no holding back to another week, because by then the company
+    is past its window. [] when there is nobody to name.
+    """
+    import poc_crosscheck
+
+    branches = new_company_branches(message)
+    names = new_company_names(message)
+    since = None
+    for a in message.get("actions") or ():
+        since = since or dl.parse_date(a.get("window_start"))
+    if since is None:
+        since = dl.today_ist() - timedelta(days=max(1, int(config.NEW_COMPANY_WINDOW_DAYS)))
+    return poc_crosscheck.m1_lines([(n, branches.get(n, "a")) for n in names], since=since)
 
 
 def _plural(n: int, word: str) -> str:
@@ -1837,17 +1897,13 @@ def points_of(message: dict) -> Optional[dict]:
         return {"header": rendered[0], "lines": rendered[1:], "extra": [],
                 "close": _voice(message, "r4_close", DELIVERABLES_CLOSES)}
     if kind == nextaction.R_NEW_COMPANY:
-        companies = [c for c in (message.get("companies") or []) if str(c).strip()]
-        if not companies:
+        lines = new_company_lines(message)
+        if not lines:
             return None
-        opener, lines = render_new_companies(
-            companies[:cap],
-            variant=NEW_COMPANY_OPENERS.index(
-                _voice(message, "r11_opener", NEW_COMPANY_OPENERS)))
-        # THE OPENER IS PART OF THE BLOCK: the message is exactly this shape,
-        # and the composer writes nothing before it (`compose_prompt`).
-        return {"header": opener, "lines": lines, "extra": [],
-                "close": _voice(message, "r11_close", NEW_COMPANY_CLOSES),
+        # THE WHOLE POST IS THE AGREED SHAPE (`poc_crosscheck.m1_lines`), posted
+        # as written: header, numbered names, the one question. No opener
+        # variant and no separate close; the last line is the ask.
+        return {"header": lines[0], "lines": lines[1:], "extra": [], "close": "",
                 "opener_in_block": True}
     if kind == nextaction.R_DM_NO_MEETING:
         lines, extra, total = render_dm_no_meeting(actions)
@@ -2353,7 +2409,7 @@ def _self_test() -> int:
     ]
 
     print("grouping")
-    groups = group(seeded)
+    groups = group(seeded, day=today)      # the seeded Wednesday, not whatever day this runs on
     check("7 items across 2 owners x 3 types -> 4 groups", len(groups), 4)
     check("the meeting-band group leads", groups[0]["type"], nextaction.R_MEETING_PREP)
     check("no group mixes types",
@@ -2669,7 +2725,7 @@ def _self_test() -> int:
     check("AI News", heading("R1", day=date(2026, 9, 29)), "**AI News, Tue 29 Sep**")
     check("deliverables", heading("R4", day=date(2026, 9, 29)),
           "**This week's deliverables**")
-    check("new company", heading("R11"), "**New in the pipeline**")
+    check("new company: no heading, the post opens on its own first line", heading("R11"), "")
     check("reminder", heading("reminder"), "**Reminder**")
     check("no heading uses a dash as a separator",
           [k for k, v in HEADINGS.items() if "—" in v], [])

@@ -256,7 +256,9 @@ def people_prompt(company: str, department: str = "", *,
             "FORMAT, one per line and nothing else:",
             "  PERSON | <full name> | <title as the snippet states it> | "
             "<their linkedin url from the snippet, or -> | <url of the snippet or "
-            "page that names them>",
+            "page that names them> | <where they are based, exactly as a "
+            "snippet states it, or -> | <url of a research paper or their own "
+            "research page from the snippets, or ->",
             f"At most {PEOPLE_MAX} PERSON lines, founders and CXOs first.",
             f"If the snippets name nobody you would trust, reply exactly: {NOBODY_FOUND}",
         ])
@@ -353,7 +355,7 @@ def parse_people(text: str, evidence: dict, *, extra_text: str = "") -> tuple:
             continue
         name, title = parts[1], parts[2]
         profile_m = _URL_IN_RE.search(parts[3])
-        source_m = _URL_IN_RE.search(" ".join(parts[4:]))
+        source_m = _URL_IN_RE.search(parts[4])
         profile = profile_m.group(0).rstrip(".,;") if profile_m else ""
         source = source_m.group(0).rstrip(".,;") if source_m else ""
         if not name or len(name.split()) < 2:
@@ -390,8 +392,26 @@ def parse_people(text: str, evidence: dict, *, extra_text: str = "") -> tuple:
         if key in seen:
             continue
         seen.add(key)
+        # TWO OPTIONAL FIELDS, each kept only when the search itself showed it:
+        # where the person is based (every word of it must be in a snippet or
+        # title) and a paper or research page (it must be a result's own url).
+        # A value the search did not show is dropped; the person stays.
+        based = parts[5] if len(parts) > 5 else ""
+        based = "" if based in ("-", "") else " ".join(based.split())
+        if based and [t for t in re.findall(r"[a-z0-9]+", _fold(based))
+                      if not re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", haystack)]:
+            dropped.append((line.strip(), f"'{based}' is not in any snippet — kept the "
+                                          "person, dropped where they are based"))
+            based = ""
+        paper_m = _URL_IN_RE.search(parts[6]) if len(parts) > 6 else None
+        paper = paper_m.group(0).rstrip(".,;") if paper_m else ""
+        if paper and _url_norm(paper) not in evidence:
+            dropped.append((line.strip(), f"paper {paper} was not a search result — "
+                                          "kept the person, dropped the link"))
+            paper = ""
         people.append({"name": name, "title": title if title not in ("-", "") else "",
-                       "profile": profile, "source": source})
+                       "profile": profile, "source": source, "based": based,
+                       "paper": paper})
         if len(people) >= PEOPLE_MAX:
             break
     return people, dropped

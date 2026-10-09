@@ -1069,3 +1069,29 @@ time".
 
 `python verify_replies_oct8.py --show` checks all of it offline and prints the 11:21 exchange, a "today" answer
 and a Next steps post.
+
+## Upgrading to the R11 Outreach PoCs cross-check (9 Oct)
+
+What changes for the team: the Wednesday "new companies" post is compared with Outreach PoCs first. A company with
+no contacts there is listed; a yes finds up to 3 people and a second yes ADDS them as rows (Company, Industry, Name,
+Designation, Based, paper link, LinkedIn URL, signed on the Name cell). A company already on the tab with a blank
+name, title or LinkedIn link is listed as "already on Outreach PoCs, missing some fields"; a yes shows what was
+found and asks a person to paste it in, because the bot may not write columns A to I of an existing row. A company
+that is complete is not mentioned. Plan: `docs/plans/R11-POC-CROSSCHECK.md`. Report:
+`docs/test-reports/R11-POC-CROSSCHECK.md`.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Three new variables; the defaults are what was
+agreed, so the lines are optional:
+
+```
+POC_MANDATORY_FIELDS=name,designation,li_url
+POC_SUGGEST_MAX_PER_COMPANY=3
+POC_FILL_MAX_ROWS_PER_COMPANY=5
+```
+
+`EMAIL_WRITE_ALLOWED` is unchanged and stays `false` by default. With it false, a found email is shown but never
+written, on a new row or an existing one. To let the bot write found emails, set `EMAIL_WRITE_ALLOWED=true` in BOTH
+files; that is a team decision, not part of this change.
+
+Then, on the laptop, `python tools/redact_env.py`. No database migration. `python verify_poc_crosscheck.py --show`
+checks it offline and prints the messages.
