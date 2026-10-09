@@ -141,3 +141,22 @@ Happy to try again with a starting point — a careers page or the LinkedIn comp
 - **`EMAIL_WRITE_ALLOWED` is unchanged (false).** It does NOT need changing for this feature to work. It needs to be
   `true`, in both files, only if the team wants found emails WRITTEN: on a new row, or in a blank Email cell of an
   existing row.
+
+## 6. The fix pass of 9 Oct (after the live run)
+
+Eleven fixes from the live run in which Sigil Wen, already row 651, was offered as a new row. Run offline on the
+final tree:
+
+| Command | Result |
+|---|---|
+| `python verify_poc_crosscheck.py` (rewritten for the new behaviour) | ALL PASSED |
+| `python -m pytest -q tests/` | 921 passed, 25 skipped, 0 failed |
+| `python verify_websearch.py --offline` | ALL PASSED |
+| `python verify_day_order.py` | ALL PASSED |
+| `python -m poc_crosscheck`, `-m nextaction`, `-m websearch`, `-m wording`, `python drip.py` | ALL PASSED |
+| `verify_poc_lookup.py`, `verify_layouts.py`, the rest of the verify sweep | not run (the first two are live-only) |
+
+Sections 2 and 3 above describe the first build; the messages and the three-state M1 are now as
+`python verify_poc_crosscheck.py --show` prints them. The search and the email lookup are stand-ins in the check, so
+whether a real search honours the negative terms, returns a role rather than a fellowship, or finds anybody on the
+second and third query angle is untested.

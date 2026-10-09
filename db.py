@@ -492,8 +492,15 @@ CREATE TABLE IF NOT EXISTS meta (
 -- seen and leaves the rest alone, so `first_seen` is genuinely the first time
 -- and not the last time the bot looked.
 --
--- KEYED ON THE NORMALISED NAME, not the raw cell: "Acme Corp" and "acme corp"
--- are one company, and a case change in the sheet must not read as a new one.
+-- KEYED ON THE NORMALISED NAME, BECAUSE THE TAB HAS NO STABLE ID (Sr no.
+-- renumbers on every sort). That key survives a change of case or punctuation
+-- and NOTHING ELSE: on 9 Oct "Underdog AI" was edited to "Underdog AI (Conway
+-- Research)", a key the table had never seen, and the company was announced
+-- as new beside its own old name. So the name key is only half the design;
+-- the other half is `pipeline_snapshot` RECONCILING the table against the
+-- sheet on every run: a key no longer on the tab is retired (`retired_on`),
+-- and a key that vanished in the same run a related one appeared is a RENAME,
+-- which keeps its original `first_seen`.
 CREATE TABLE IF NOT EXISTS pipeline_companies (
     company_key TEXT PRIMARY KEY,
     company     TEXT NOT NULL,
@@ -1023,6 +1030,10 @@ KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls
 # alter an existing table, so an already-created sales_bot.db needs them
 # back-filled. (table, column, DDL) — each added only if missing. Idempotent.
 _MIGRATIONS: list[tuple[str, str, str]] = [
+    # R11: THE DAY A COMPANY WAS LAST SEEN TO HAVE LEFT THE MASTER PIPELINE (or
+    # been renamed away). NULL while it is on the tab. A retired row is never
+    # returned as new; it is kept so the decision is made once, not every run.
+    ("pipeline_companies", "retired_on", "TEXT"),
     # THE PENDING RECORD-OFFER. When suppress-or-convert turns a nudge into
     # "want me to mark it on the row?", the fields it offered are stored on the
     # drip row — so a reply of "yes" has something concrete to apply. Added
@@ -2363,6 +2374,13 @@ class DB:
         company first seen on Friday is due on Monday and the caller must still
         be able to see it then.
 
+        `companies` IS THE WHOLE TAB AS IT IS TODAY, and the table is
+        reconciled against it (9 Oct): a company no longer on the tab is
+        RETIRED and never returned; a company whose name changed is the same
+        row with its ORIGINAL first-seen date, not a new arrival; a rename
+        with more than one candidate is not guessed at. An empty list is an
+        unreadable tab and changes nothing.
+
         THIS IS THE WRITE THAT KEEPS THE ENGINE PURE. `nextaction` cannot take
         this snapshot itself: computing the queue would advance the state the
         queue is derived from, and every `cadence preview` would consume the
@@ -2376,26 +2394,101 @@ class DB:
         """
         import config as _config
 
-        seen_before = self._pipeline_known()
-        first_run = not seen_before
         window = max(1, int(getattr(_config, "NEW_COMPANY_WINDOW_DAYS", 7)))
+        # TODAY'S SHEET, by key. First spelling wins when two rows name one company.
+        on_sheet: dict = {}
+        for name in companies or []:
+            label = str(name or "").strip()
+            key = _norm_key(label) if label else ""
+            if key and key not in on_sheet:
+                on_sheet[key] = label
+
+        try:
+            with self.conn() as c:
+                known = {r["company_key"]: dict(r) for r in c.execute(
+                    "SELECT company_key, company, first_seen, seeded, retired_on "
+                    "FROM pipeline_companies").fetchall()}
+        except Exception:
+            log.exception("[db] the pipeline snapshot could not be read")
+            return []
+        first_run = not known
+
+        # RECONCILE THE TABLE AGAINST THE SHEET. Only when the sheet was read: an
+        # empty list is an unreadable tab, and retiring every company on a
+        # failed read would announce the whole tab again the next day.
+        vanished = [k for k, r in known.items() if not r.get("retired_on") and k not in on_sheet] \
+            if on_sheet else []
+        appeared = [k for k in on_sheet if k not in known]
+        back = [k for k in on_sheet if k in known and known[k].get("retired_on")]
+
+        def related(a: str, b: str) -> bool:
+            """One key inside the other, or every word of the shorter in the longer."""
+            if a in b or b in a:
+                return True
+            ta, tb = set(a.split()), set(b.split())
+            short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+            return bool(short) and short <= long_
+
+        renames: list = []          # (old key, new key)
+        healed: list = []           # (old key, surviving key): a rename seen a run late
+        for old in list(vanished):
+            new_keys = [k for k in appeared if related(old, k)]
+            rivals = [v for v in vanished if v != old and any(related(v, k) for k in new_keys)]
+            if len(new_keys) == 1 and not rivals:
+                renames.append((old, new_keys[0]))
+                appeared.remove(new_keys[0])
+                vanished.remove(old)
+            elif new_keys:
+                log.warning(
+                    "[db] pipeline snapshot: %r left the Master Pipeline and %s appeared. "
+                    "More than one could be its new name, so I am not guessing: %r is "
+                    "retired and the new name(s) are treated as new companies.",
+                    known[old]["company"],
+                    ", ".join(repr(on_sheet[k]) for k in new_keys), known[old]["company"])
+            else:
+                # NOTHING APPEARED TODAY, but a related company is ALREADY in the
+                # table and younger: the rename was missed on the run it happened
+                # (this is the row the 9 Oct build left behind). Give the survivor
+                # the original first-seen date.
+                kin = [k for k, r in known.items()
+                       if k != old and k in on_sheet and not r.get("retired_on")
+                       and related(old, k) and str(r["first_seen"]) > str(known[old]["first_seen"])]
+                if len(kin) == 1:
+                    healed.append((old, kin[0]))
 
         fresh: list = []
         with self.conn() as c:
-            for name in companies or []:
-                label = str(name or "").strip()
-                if not label:
-                    continue
-                key = _norm_key(label)
-                if not key or key in seen_before:
-                    continue
+            for old, new_key in renames:
+                # A RENAME IS NOT AN ARRIVAL: the same row, its new label, its
+                # ORIGINAL first_seen.
+                c.execute("UPDATE pipeline_companies SET company_key = ?, company = ? "
+                          "WHERE company_key = ?", (new_key, on_sheet[new_key], old))
+                log.info("[db] pipeline snapshot: %r was renamed to %r on the Master "
+                         "Pipeline; first seen %s is kept and it is not reported as new",
+                         known[old]["company"], on_sheet[new_key], known[old]["first_seen"])
+            for old, survivor in healed:
+                c.execute("UPDATE pipeline_companies SET first_seen = ?, seeded = ? "
+                          "WHERE company_key = ?",
+                          (known[old]["first_seen"], known[old]["seeded"], survivor))
+                log.info("[db] pipeline snapshot: %r is %r under an earlier name; its "
+                         "first-seen date is put back to %s", known[survivor]["company"],
+                         known[old]["company"], known[old]["first_seen"])
+            for old in vanished:
+                # NO LONGER ON THE TAB: never returned as new again, and decided once.
+                c.execute("UPDATE pipeline_companies SET retired_on = ? WHERE company_key = ?",
+                          (today, old))
+                log.info("[db] pipeline snapshot: %r is no longer on the Master Pipeline; "
+                         "retired", known[old]["company"])
+            for key in back:
+                c.execute("UPDATE pipeline_companies SET retired_on = NULL WHERE company_key = ?",
+                          (key,))
+            for key in appeared:
                 c.execute(
                     "INSERT OR IGNORE INTO pipeline_companies "
                     "(company_key, company, first_seen, seeded) VALUES (?, ?, ?, ?)",
-                    (key, label, today, 1 if first_run else 0),
+                    (key, on_sheet[key], today, 1 if first_run else 0),
                 )
-                seen_before.add(key)
-                fresh.append(label)
+                fresh.append(on_sheet[key])
 
         if first_run:
             log.info(
@@ -2410,13 +2503,15 @@ class DB:
             log.info("[db] pipeline snapshot: %d new company(ies): %s",
                      len(fresh), ", ".join(fresh[:8]))
 
-        # Everything recorded inside the window, so a Friday arrival is still
-        # visible on Monday when its working-day delay comes due.
+        # Everything recorded inside the window that is STILL ON THE TAB, so a
+        # Friday arrival is still visible on Monday when its working-day delay
+        # comes due.
         cutoff = _iso_days_ago(today, window)
         with self.conn() as c:
             rows = c.execute(
                 "SELECT company, first_seen FROM pipeline_companies "
-                "WHERE seeded = 0 AND first_seen >= ? ORDER BY first_seen, company",
+                "WHERE seeded = 0 AND retired_on IS NULL AND first_seen >= ? "
+                "ORDER BY first_seen, company",
                 (cutoff,),
             ).fetchall()
         return [{"company": r["company"], "first_seen": r["first_seen"]} for r in rows]

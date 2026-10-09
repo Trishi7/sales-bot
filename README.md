@@ -2567,6 +2567,27 @@ R11's path refuses it itself).
 bold heading. Nothing in scope posts nothing.
 `python verify_poc_crosscheck.py --show` prints the messages.
 
+**A renamed company is not a new company (9 Oct).** The tab has no stable id
+(Sr no. renumbers on every sort), so `pipeline_companies` is keyed on the
+normalised name. That key survives a change of case or punctuation and nothing
+else: when "Underdog AI" was edited to "Underdog AI (Conway Research)" the new
+key had never been seen, and the company was announced as new beside its own
+old name. So `db.pipeline_snapshot` now RECONCILES the table against the whole
+tab on every run:
+
+- a key no longer on the tab is **retired** (`retired_on`) and never returned
+  as new; the decision is recorded once;
+- a key that vanished in the same run a related one appeared (one name inside
+  the other, or every word of the shorter in the longer) is a **rename**: the
+  same row, its new label, its ORIGINAL `first_seen`, logged with both labels;
+- more than one candidate is **not guessed**: the old key is retired, the new
+  names are new companies, and the log says so;
+- a rename that was missed on the run it happened (the row the first build
+  left in the live database) is healed on the next run: the stale key is
+  retired and the surviving row gets its original date back;
+- a newcomer whose name merely resembles an existing one is still new, because
+  nothing left the tab; and an empty read of the tab retires nothing.
+
 **R11 has no created-date column to work from.** The Master Pipeline tab does
 not record when a company was added, so *"appeared"* means *"in today's names
 and not in yesterday's snapshot"*. The snapshot is a SQLite table keyed on the

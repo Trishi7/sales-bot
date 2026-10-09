@@ -526,7 +526,106 @@ async def the_write():
               "One other I found:" in text and dead_links(text) == [], True)
 
 
+async def rename_and_ghost():
+    say("BUG 0 — A RENAMED COMPANY IS NOT A NEW COMPANY")
+    import tempfile
+    from db import DB
+
+    def fresh():
+        return DB(os.path.join(tempfile.mkdtemp(prefix="saley-r11-db-"), "snap_test.db"))
+
+    def table(d):
+        with d.conn() as c:
+            return {r[0]: (r[1], r[2], r[3]) for r in c.execute(
+                "SELECT company_key, company, first_seen, retired_on FROM pipeline_companies")}
+
+    class Tap(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.INFO)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+    tap = Tap()
+    logging.getLogger("db").addHandler(tap)
+    was = logging.getLogger("db").level
+    logging.getLogger("db").setLevel(logging.INFO)
+    try:
+        d = fresh()
+        d.pipeline_snapshot(["Old Co"], today="2026-09-20")                       # the first run seeds
+        d.pipeline_snapshot(["Old Co", "Underdog AI"], today="2026-10-02")
+        got = d.pipeline_snapshot(["Old Co", "Underdog AI (Conway Research)"], today="2026-10-06")
+        check("the cell changes from 'Underdog AI' to 'Underdog AI (Conway Research)': ONE company comes back, "
+              "under its new name, with its ORIGINAL first-seen date",
+              got, [{"company": "Underdog AI (Conway Research)", "first_seen": "2026-10-02"}])
+        check("...the table holds one row for it, not two", sorted(k for k in table(d) if "underdog" in k),
+              ["underdog ai conway research"])
+        check("...and the rename is logged with both labels",
+              any("'Underdog AI' was renamed to 'Underdog AI (Conway Research)'" in l for l in tap.lines), True)
+
+        got = d.pipeline_snapshot(["Old Co", "Underdog AI (Conway Research)", "Underdog Robotics"],
+                                  today="2026-10-07")
+        check("a genuinely new company whose name resembles an existing one is still reported as new, not "
+              "swallowed as a rename (nothing left the tab)",
+              ([g["company"] for g in got], table(d)["underdog robotics"][1]),
+              (["Underdog AI (Conway Research)", "Underdog Robotics"], "2026-10-07"))
+
+        got = d.pipeline_snapshot(["Old Co", "Underdog Robotics"], today="2026-10-08")
+        check("a key absent from today's sheet is never returned as new", [g["company"] for g in got],
+              ["Underdog Robotics"])
+        check("...and is marked retired, so it is decided once", table(d)["underdog ai conway research"][2],
+              "2026-10-08")
+        got = d.pipeline_snapshot(["Old Co", "Underdog Robotics"], today="2026-10-09")
+        check("...the next run does not reconsider it", (
+            [g["company"] for g in got], table(d)["underdog ai conway research"][2]),
+            (["Underdog Robotics"], "2026-10-08"))
+        before = table(d)
+        check("an EMPTY read of the tab (it could not be read) retires nothing",
+              (d.pipeline_snapshot([], today="2026-10-10") is not None, table(d)), (True, before))
+
+        d = fresh()
+        d.pipeline_snapshot(["Old Co"], today="2026-09-20")
+        d.pipeline_snapshot(["Old Co", "Acme"], today="2026-10-02")
+        tap.lines.clear()
+        got = d.pipeline_snapshot(["Old Co", "Acme Labs", "Acme Robotics"], today="2026-10-06")
+        check("two plausible new names for one that left: not guessed. The old one is retired and both new "
+              "names are new companies",
+              (table(d)["acme"][2], sorted(g["company"] for g in got),
+               sorted(g["first_seen"] for g in got)),
+              ("2026-10-06", ["Acme Labs", "Acme Robotics"], ["2026-10-06", "2026-10-06"]))
+        check("...and the log says it did not guess", any("I am not guessing" in l for l in tap.lines), True)
+
+        # THE LIVE DATABASE AS THE 9 OCT BUILD LEFT IT: both keys present, the new one with a fresh date.
+        d = fresh()
+        d.pipeline_snapshot(["Old Co"], today="2026-09-20")
+        d.pipeline_snapshot(["Old Co", "Underdog AI"], today="2026-09-25")
+        with d.conn() as c:
+            c.execute("INSERT INTO pipeline_companies (company_key, company, first_seen, seeded) VALUES "
+                      "('underdog ai conway research', 'Underdog AI (Conway Research)', '2026-10-08', 0)")
+        got = d.pipeline_snapshot(["Old Co", "Underdog AI (Conway Research)"], today="2026-10-14")
+        check("the ghost the live database already has: the next run retires the stale 'underdog ai' row with no "
+              "manual step, and the surviving row gets its original first-seen date back",
+              (table(d)["underdog ai"][2], table(d)["underdog ai conway research"][1]),
+              ("2026-10-14", "2026-09-25"))
+        check("...so neither is announced as new (first seen 25 Sep is outside the window)", got, [])
+    finally:
+        logging.getLogger("db").removeHandler(tap)
+        logging.getLogger("db").setLevel(was)
+
+    # Through the bot: one M1 line, with the right suffix, after a rename between two Wednesdays.
+    with Stage(["Underdog AI"], SHEET) as s:
+        await s.w.bot._plan_drip(today=WED, already=[])                      # a run sees the old name
+        s.w.sheet.grids["Master Pipeline"][-1][1] = "Underdog AI (Conway Research)"      # the cell is edited
+        text = await s.wednesday()
+        check("through the bot: after the rename M1 has ONE Underdog line, with the right suffix",
+              [l for l in text.splitlines() if "Underdog" in l],
+              ["1. Underdog AI (Conway Research) — already on Outreach PoCs"])
+        check("the header's date is the start of the 7-day window counted from the day the bot is on",
+              text.splitlines()[0], "New companies in the Master Pipeline — since Wed 7 Oct")
+
+
 async def main():
+    await rename_and_ghost()
     await m1()
     await the_reply()
     await the_write()
