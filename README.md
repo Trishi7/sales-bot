@@ -2485,58 +2485,87 @@ boundary a bot decides for itself is a boundary nobody agreed to.
 
 **R11 checks Outreach PoCs before it names a company (9 Oct).** The queue
 builder hands the rule a SUMMARY of that tab, never a row
-(`poc_crosscheck.build_index`: per company, a row count and which mandatory
-fields are blank somewhere), so the engine stays pure. Several Master Pipeline
-rows naming one company collapse to one (`gtm_sheet.normalise_header(
-clean_cell(...))`, the key `pipeline_companies` already uses). Each company is
-then one of three:
+(`poc_crosscheck.build_index`: per Master Pipeline company, a row count and
+which mandatory fields are blank somewhere), so the engine stays pure.
+Duplicate Master Pipeline rows collapse to one company.
 
-| Branch | On Outreach PoCs | Wednesday post (M1) | After the first yes | After the second yes |
-|---|---|---|---|---|
-| **A** | no row | listed by name | people found by the search, at most `POC_SUGGEST_MAX_PER_COMPANY` (3), ending "Shall I go ahead? This adds N rows for …" | the rows are **added** (`_write_poc_row`) and each is signed on the Name cell |
-| **B** | rows exist, one lacks a mandatory field | listed with " — already on Outreach PoCs, missing some fields" | what was found for the BLANK cells of at most `POC_FILL_MAX_ROWS_PER_COMPANY` (5) rows, and a request to paste it in | nothing: there is no second gate |
-| **complete** | rows exist, nothing mandatory blank | not mentioned | | |
+**Companies are matched with the tab's own matcher, `tab.find_company`**
+(exact, then substring), and people by `activation.row_key` (company | name).
+On 9 Oct the Master Pipeline said "Underdog AI" and Outreach PoCs said
+"Underdog AI (Conway Research)"; compared by equal keys they were two
+companies, and Sigil Wen, already row 651, was offered as a new row. The
+Master Pipeline's spelling is carried unchanged through every heading, every
+search and every row written.
 
-**Mandatory is `POC_MANDATORY_FIELDS` (name, designation, li_url).** A blank
-Email, Industry, Based or paper link is not a gap: most people on the tab
-legitimately have no email and no paper, and counting those would list nearly
-every company every week. The names are sheet roles, resolved through
-`gtm_sheet`'s header map ("Based (Sept 2026)" already resolves to `based` and
-keeps resolving when the date in the header changes).
+**Three states, all listed in the Wednesday post (M1), under one question:**
 
-**Branch B only reminds, and this is why.** Company, Industry, Name,
-Designation, Email id, Based, Research Paper Link and LI Url are columns B to
-I, and A:I is read-only on an EXISTING row (`RESTRICTED_COLUMN_RANGES`): that
-band is the team's own record of who a person is. A NEW row may be written
-there (`NEW_ROW_WRITABLE_RANGES`), which is why Branch A can add rows and
-Branch B cannot fill cells. The one exception is the Email cell: when email is
-all the search found for a company's rows and `EMAIL_WRITE_ALLOWED` is true,
-the closing line becomes "I can fill the Email cell for you if you'd like —
-shall I?" behind the existing `email_write` proposal (blank-cell re-check
-included). With the default mandatory fields that case cannot arise, because a
-Branch B row always lacks a name, a designation or a LinkedIn URL.
+| On Outreach PoCs | M1 line | After the first yes |
+|---|---|---|
+| no row | `1. Oogam AI` | people from scratch, at most `POC_SUGGEST_MAX_PER_COMPANY` (3); a second yes ADDS them |
+| rows, one lacks a mandatory field | `… — already on Outreach PoCs, missing some fields` | **Missing fields**: what was found for the blank cells of at most `POC_FILL_MAX_ROWS_PER_COMPANY` (5) rows. GAPS ONLY, no new people. A person pastes them in |
+| rows, nothing mandatory blank | `… — already on Outreach PoCs` | MORE people, at most 3, leaving out everybody already there; a second yes adds them |
 
-**Gate 2 is wired to R11.** `_apply_poc_lookup` posts ONE message
-(`poc_crosscheck.render_found`) and, when it suggests people, that message is
-the `row_add` offer (`_offer_poc_add` with R11's own text; trigger `R11`). A
-new row now carries Company, Industry (the Master Pipeline's own value for the
-company), Name, Designation, Based, the research paper link and the LinkedIn
-URL (only a `linkedin.com/in` link; anything else is blanked), plus the serial
-and the signature note. Email goes on a new row only when
-`EMAIL_WRITE_ALLOWED` is true. Based and the paper link are kept only when the
-search itself showed them (`websearch.parse_people`); a field with no value is
-left out of the message and the row, never filled in.
+Mandatory is `POC_MANDATORY_FIELDS` (name, designation, li_url). A blank Email,
+Industry, Based or paper link is not a gap.
 
-**One message is one proposal, all or nothing.** A yes that names a person
-adds that person (the narrowing `_apply_poc_row_add` always had). A yes that
-picks by number or takes something back ("yes to 1 and 2 but not 3") writes
-NOTHING: `approvals.read_vote` reads that sentence as a yes ("not" is not one
-of its no-words), so R11's path refuses it itself, says nobody was added, and
-leaves the question open on the same message.
+**Missing fields is remind-only because A:I is read-only.** Company, Industry,
+Name, Designation, Email id, Based, Research Paper Link and LI Url are columns
+B to I, and A:I may not be written on an EXISTING row
+(`RESTRICTED_COLUMN_RANGES`): that band is the team's own record of who a
+person is. A NEW row may be written there (`NEW_ROW_WRITABLE_RANGES`). The one
+exception is the Email cell, behind the existing `email_write` proposal, when
+email is all that was found and `EMAIL_WRITE_ALLOWED` is true.
+
+**Who is left out is decided BEFORE the search and checked AFTER it.** Before:
+everybody on the sheet for the company, plus everybody suggested earlier in
+the same thread, go into the query as negative terms (`-"Sigil Wen"`) and into
+the extraction prompt by name, so a search is not spent on them. After: every
+person that comes back is checked against the same list
+(`poc_crosscheck.is_excluded`), because a search engine treats a negative term
+as a hint and a model sometimes returns an excluded person under another
+spelling. The pre-filter saves the search; the post-filter is what makes a
+duplicate impossible. The list is never cut short. The second yes re-reads the
+tab once more and skips anybody who is on it by then.
+
+**"Find a different person"** replied to the list is the same lookup and the
+same renderer (`bot._maybe_more_pocs`), headed "More PoCs": it leaves out who
+was shown before (the thread's state rides on the list's own `row_add`
+proposal) and takes the NEXT search angle (`websearch.PEOPLE_ANGLES`: profile
+titles, then the team page, then role keywords, then careers), because the
+same query returns the same people. The earlier list's offer is closed and the
+new message carries its own.
+
+**What a message never carries** (`poc_crosscheck.render_found`):
+
+- a field with no value. "->", "-", "—", "n/a", "unknown", "not found", "tbd"
+  and the like are no value (`is_blank`, on `gtm_sheet._UNKNOWN_WORDS`); the
+  line is left out, and one trailing note covers every omission;
+- a link that is not masked. Every url is kept absolute and rendered through
+  `links.link` as `[linkedin.com/in/x](<https://…>)`; a host with no scheme is
+  never emitted;
+- a Source that repeats the LinkedIn or the paper link;
+- a "designation" that is a fellowship, an award, alumni status or a seat at
+  another organisation (`role_at_company`): the title is omitted;
+- Industry on a person: it is the Master Pipeline's own cell, shown once on the
+  company subheading ("Underdog AI (Conway Research) — AI Labs") and never
+  searched for;
+- a row count or a company name in the add question, which is always "Shall I
+  go ahead and add these new people to the Outreach PoCs sheet?".
+
+Every failure ends on the same two lines (`poc_crosscheck.TRY_AGAIN`).
+
+**Gate 2.** The list is itself the `row_add` offer (`_offer_poc_add`, trigger
+`R11`). A new row carries Company, Industry, Name, Designation, Based, the
+paper link and the LinkedIn URL (only a `linkedin.com/in` link), the serial
+and the signature note; Email only when `EMAIL_WRITE_ALLOWED` is true. One
+message is one proposal: a yes that names a person adds that person; a yes
+that picks by number ("yes to 1 and 2 but not 3") writes nothing and the
+question stays open (`approvals.read_vote` reads that sentence as a yes, so
+R11's path refuses it itself).
 
 **The post is fixed text** (R11 is in `drip.VERBATIM_TYPES`): no model call, no
-bold heading, no "Hey team". Nothing in scope posts nothing.
-`python verify_poc_crosscheck.py --show` prints all five messages.
+bold heading. Nothing in scope posts nothing.
+`python verify_poc_crosscheck.py --show` prints the messages.
 
 **R11 has no created-date column to work from.** The Master Pipeline tab does
 not record when a company was added, so *"appeared"* means *"in today's names

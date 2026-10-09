@@ -277,6 +277,15 @@ _QUALIFIED_YES_RE = re.compile(
     re.IGNORECASE)
 
 
+# "Find a different person", "anyone else?", "more people" — said under R11's
+# list of suggested PoCs. See `_maybe_more_pocs`.
+_MORE_POCS_RE = re.compile(
+    r"\b(different|another|others?|more|additional|else)\b[^.?!\n]{0,40}\b(person|people|pocs?|"
+    r"contacts?|names?|ones?|options?|candidates?)\b|\b(some|any)(one|body)\s+else\b|"
+    r"\bfind\s+(more|others|another)\b|\b(any|some)\s+others?\b|\btry\s+again\b",
+    re.IGNORECASE)
+
+
 def _looks_like_question(text: str) -> bool:
     """Heuristic: does this read like a question worth handing to the engine?
     Deliberately liberal — the engine answers honestly ("I couldn't find…") when
@@ -1594,6 +1603,10 @@ class SalesBot(discord.Client):
             # reader before the acknowledgement path and before the vote.
             if self._is_next_step_reply(ctx) \
                     and await self._maybe_next_step_reply(message, text, ctx):
+                return True
+            # "FIND A DIFFERENT PERSON" UNDER R11's LIST is that list again with
+            # other people, never the general people-search answer.
+            if await self._maybe_more_pocs(message, text, ctx):
                 return True
             if await self._maybe_acknowledge(message, text, ctx):
                 return True
@@ -8147,31 +8160,9 @@ class SalesBot(discord.Client):
         """An approver said yes to R11's question: look, and say what was found.
 
         "yes for Shunya" NARROWS IT to the companies the reply names; a bare
-        yes means all of them. ONE MESSAGE comes back (`poc_crosscheck.
-        render_found`), and what it offers depends on where each company
-        stands on Outreach PoCs NOW (the tab is re-read; Wednesday's answer
-        may be days old):
-
-          no row for it     people found by the search, at most
-                            POC_SUGGEST_MAX_PER_COMPANY, and the question
-                            "Shall I go ahead?". THAT QUESTION IS A `row_add`
-                            PROPOSAL on this message (`_offer_poc_add`), so a
-                            second yes adds the rows (`_apply_poc_row_add`).
-          rows with gaps    what the search found for the BLANK cells of at
-                            most POC_FILL_MAX_ROWS_PER_COMPANY rows, and a
-                            request to paste it in. NOTHING IS OFFERED: columns
-                            A to I of an existing row are read-only to the bot.
-                            The one exception is Email: when email is all that
-                            was found and EMAIL_WRITE_ALLOWED is on, the
-                            existing `email_write` proposal is opened.
-          complete now      nothing.
-
-        THIS STEP WRITES NOTHING. Every value shown came from a search result
-        (`_find_people_data`, `_email_lookup`) or from the Master Pipeline row
-        (Industry); a field with no value is left out, never filled in.
+        yes means all of them. ONE MESSAGE comes back (`_r11_answer`).
+        THIS STEP WRITES NOTHING: adding anybody is the second yes.
         """
-        import links
-
         payload = proposal.get("payload") or {}
         companies = list(payload.get("companies") or [])
         said = " ".join(str(getattr(message, "content", "") or "").lower().split())
@@ -8185,11 +8176,90 @@ class SalesBot(discord.Client):
             await self._reply(message, wording.POC_LOOKUP_EMPTY,
                               reason="poc lookup had no companies")
             return
+        await self._r11_answer(message, chosen, suggested={}, attempt=0)
+
+    async def _maybe_more_pocs(self, message, text: str, ctx: dict) -> bool:
+        """"Find a different person" replied to R11's list of suggested PoCs.
+
+        ON 9 OCT THIS FELL THROUGH TO THE GENERAL find_people ANSWER: the old
+        "people worth a look" shape, and the very person already on the sheet
+        again. It is now the same lookup and the same renderer as the first
+        reply, with two differences: everybody suggested earlier in this
+        thread is left out as well as everybody on the sheet (the list rides
+        on the proposal the earlier message carries), and the search takes its
+        NEXT angle (`websearch.PEOPLE_ANGLES`), because the same query returns
+        the same people and, with those filtered out, nothing.
+
+        The earlier list's offer is closed (it is replaced, not answered) and
+        the new message carries its own. Returns False for anything that is
+        not such a request under such a message.
+        """
+        if not ctx.get("direct_is_bot") or not _MORE_POCS_RE.search(text or ""):
+            return False
+        if replies.is_bare_vote(text, self._bot_names()):
+            return False
+        state_, old = None, None
+        for q in list(ctx.get("proposals") or []) + list(ctx.get("closed") or []):
+            r11 = (q.get("payload") or {}).get("r11") if isinstance(q.get("payload"), dict) else None
+            if q.get("kind") == "row_add" and r11:
+                state_ = r11
+                if q.get("status") == "open":
+                    old = q
+        if state_ is None:
+            state_ = (ctx.get("said") or {}).get("r11")
+        if not state_ or not state_.get("companies"):
+            return False
+        companies = list(state_.get("companies") or [])
+        said = " ".join(str(text or "").lower().split())
+        named = [c for c in companies
+                 if any(len(w) >= 4 and re.search(rf"\b{re.escape(w)}\b", said)
+                        for w in re.findall(r"[a-z0-9]+", c.lower()))]
+        self._mark_route(message, "r11_more")
+        if old is not None:
+            await asyncio.to_thread(
+                lambda: self.db.close_proposal(
+                    proposal_key=old.get("proposal_key"), status="expired",
+                    decision="replaced by a new list of suggested PoCs",
+                    decided_by="", decided_at=dl.now_ist().isoformat(timespec="seconds")))
+        log.info("[r11] msg=%s asked for different PoCs for %s (attempt %d)", message.id,
+                 ", ".join(named or companies), int(state_.get("attempt") or 0) + 1)
+        await self._r11_answer(message, named or companies,
+                               suggested=dict(state_.get("suggested") or {}),
+                               attempt=int(state_.get("attempt") or 0) + 1, more=True)
+        return True
+
+    async def _r11_answer(self, message, companies: list, *, suggested: dict,
+                          attempt: int, more: bool = False) -> None:
+        """Look the companies up and post the ONE message about them
+        (`poc_crosscheck.render_found`). Where each company stands is read off
+        Outreach PoCs NOW, with the tab's own matcher (`tab.find_company`:
+        exact, then substring), so "Underdog AI" finds the rows filed under
+        "Underdog AI (Conway Research)":
+
+          no row            people from scratch, at most POC_SUGGEST_MAX_PER_COMPANY
+          rows with a gap   the blank cells of at most POC_FILL_MAX_ROWS_PER_COMPANY
+                            rows, shown for a person to paste in. GAPS ONLY: no new
+                            people are suggested for such a company. Columns A to I
+                            of an existing row are read-only to the bot
+          rows, complete    MORE people, leaving out everybody already there
+
+        WHO IS LEFT OUT IS DECIDED BEFORE THE SEARCH AND CHECKED AFTER IT.
+        Before: everybody on the sheet for the company plus everybody suggested
+        earlier in this thread go into the query as negative terms and into
+        the prompt by name, so the search is not spent on them. After: every
+        person that comes back is checked against the same list
+        (`poc_crosscheck.is_excluded`), because a search engine treats a
+        negative term as a hint and a model sometimes returns an excluded
+        person spelt differently. THE LIST IS NEVER CUT SHORT.
+
+        THE MASTER PIPELINE'S SPELLING OF THE COMPANY is what every heading,
+        every search and every new row carries. Industry is that tab's own
+        cell and is never searched for. Nothing is written here.
+        """
+        import links
 
         tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.POCS)
-        rows = list(getattr(tab, "rows", None) or [])
         mandatory = poc_crosscheck.mandatory_roles()
-        index = poc_crosscheck.build_index(rows, mandatory)
         industries = await self._pipeline_industries()
         headers = list(getattr(tab, "headers", None) or [])
         cols = dict(getattr(tab, "canonical_role_to_col", None) or {})
@@ -8198,139 +8268,133 @@ class SalesBot(discord.Client):
             idx = cols.get(role)
             if idx is not None and idx < len(headers) and str(headers[idx]).strip():
                 return str(headers[idx]).strip()
-            return {"industry": "Industry", "designation": "Designation", "email": "Email id",
-                    "based": "Based", "paper_links": "Research Paper Link",
-                    "li_url": "LI Url"}.get(role, role)
-
-        def same_person(a: str, b: str) -> bool:
-            ta = set(re.findall(r"[a-z0-9]+", str(a or "").lower()))
-            tb = set(re.findall(r"[a-z0-9]+", str(b or "").lower()))
-            return bool(ta) and bool(tb) and (ta <= tb or tb <= ta)
+            return {"designation": "Designation", "email": "Email id", "based": "Based",
+                    "paper_links": "Research Paper Link", "li_url": "LI Url"}.get(role, role)
 
         async def email_for(name: str, company: str) -> tuple:
-            """(address, source) from the existing email lookup, or ("", "")."""
             item = {"poc": name, "company": company, "text": ""}
             try:
                 await self._email_lookup(item, rule_id="R11")
             except Exception:
                 log.exception("[r11] the email lookup for %s (%s) failed", name, company)
                 return "", ""
-            return (str(item.get("email_found") or "").strip(),
-                    str(item.get("email_source") or "").strip())
+            return (poc_crosscheck.clean(item.get("email_found")),
+                    poc_crosscheck.clean(item.get("email_source")))
 
-        suggest, fill, failed, complete = [], [], [], []
-        to_add: list = []
-        emails: list = []
+        def profile_of(person: dict) -> str:
+            url = poc_crosscheck.clean((person or {}).get("profile"))
+            return url if url and links.profile_kind(url) == "profile" else ""
+
+        add, fill, to_add, emails = [], [], [], []
         shown_roles: set = set()
-        for company in chosen:
-            key = poc_crosscheck.company_key(company)
-            branch = poc_crosscheck.classify(company, index)
-            if branch == poc_crosscheck.COMPLETE:
-                complete.append(company)
+        suggested = {k: list(v) for k, v in (suggested or {}).items()}
+        for company in companies:
+            rows = list(tab.find_company(gtm_sheet.clean_cell(company)) or []) if tab else []
+            gap_rows = [r for r in rows if poc_crosscheck.row_gaps(r, mandatory)]
+            industry = industries.get(poc_crosscheck.company_key(company), "")
+
+            if gap_rows and not more:
+                # GAPS ONLY: the people are known; what is looked up is their cells.
+                data = await self._find_people_data(company, rule="R11")
+                found = list(data.get("people") or [])
+                entries = []
+                for row in gap_rows[:max(1, int(config.POC_FILL_MAX_ROWS_PER_COMPANY))]:
+                    name = gtm_sheet.clean_cell(row.get("name"))
+                    match = next((x for x in found
+                                  if poc_crosscheck.is_excluded(x.get("name"), [name])), None) \
+                        if name else None
+                    values = {
+                        "designation": poc_crosscheck.role_at_company((match or {}).get("title"),
+                                                                      company),
+                        "based": poc_crosscheck.clean((match or {}).get("based")),
+                        "paper_links": poc_crosscheck.clean((match or {}).get("paper")),
+                        "li_url": profile_of(match),
+                    }
+                    source = poc_crosscheck.clean((match or {}).get("source"))
+                    if name and poc_crosscheck.is_blank(row.get("email")):
+                        values["email"], email_source = await email_for(name, company)
+                        source = source or email_source
+                    shown, unfound = [], 0
+                    for role in poc_crosscheck.FILL_ROLES:
+                        if not poc_crosscheck.is_blank(row.get(role)):
+                            continue                # the cell has a value: never printed
+                        if values.get(role):
+                            shown.append((label_of(role), values[role]))
+                            shown_roles.add(role)
+                        else:
+                            unfound += 1
+                    if values.get("email") and row.get("_row"):
+                        emails.append({"sheet_row": row.get("_row"),
+                                       "row_key": activation.row_key(row),
+                                       "company": company, "poc": name,
+                                       "email": values["email"], "source": source})
+                    entries.append({
+                        "name": name or f"Row {row.get('_row')} (no name on the sheet)",
+                        "title": gtm_sheet.clean_cell(row.get("designation")),
+                        "found": shown, "source": source, "unfound": unfound,
+                    })
+                fill.append({"company": company, "industry": industry, "rows": entries})
                 continue
-            data = await self._find_people_data(company, rule="R11")
-            found = list(data.get("people") or [])
+            if gap_rows:
+                continue                            # "someone else" never applies to a gaps company
+
+            # PEOPLE TO ADD. The exclusion list first, whole, then the search.
+            on_sheet = poc_crosscheck.names_on_sheet(rows)
+            earlier = list(suggested.get(company) or [])
+            exclude = on_sheet + [n for n in earlier if n not in on_sheet]
+            data = await self._find_people_data(company, rule="R11", exclude=exclude,
+                                                angle=attempt)
             if not data.get("ok"):
                 log.info("[r11] %s: the search could not run (%s)", company, data.get("error"))
-            industry = industries.get(key, "")
-            if branch == poc_crosscheck.BRANCH_A:
-                people = []
-                for person in found[:max(1, int(config.POC_SUGGEST_MAX_PER_COMPANY))]:
-                    profile = str(person.get("profile") or "").strip()
-                    if profile and links.profile_kind(profile) != "profile":
-                        profile = ""
-                    address, _src = await email_for(person["name"], company)
-                    people.append({
-                        "name": person["name"], "title": person.get("title") or "",
-                        "industry": industry, "email": address,
-                        "based": person.get("based") or "", "linkedin_url": profile,
-                        "paper": person.get("paper") or "", "source": person.get("source") or "",
-                    })
-                    to_add.append({
-                        "name": person["name"], "company": company, "linkedin_url": profile,
-                        "source_url": person.get("source") or "",
-                        "designation": person.get("title") or "", "industry": industry,
-                        "based": person.get("based") or "", "paper": person.get("paper") or "",
-                        "email": address,
-                    })
-                if people:
-                    suggest.append((company, people))
-                else:
-                    failed.append(company)
-                continue
-
-            # ROWS WITH GAPS: existing rows, so nothing here can be written.
-            gap_rows = [r for r in rows
-                        if poc_crosscheck.company_key(r.get("company")) == key
-                        and poc_crosscheck.row_gaps(r, mandatory)]
-            entries = []
-            for row in gap_rows[:max(1, int(config.POC_FILL_MAX_ROWS_PER_COMPANY))]:
-                name = gtm_sheet.clean_cell(row.get("name"))
-                match = next((x for x in found if same_person(x.get("name"), name)), None) \
-                    if name else None
-                values = {
-                    "industry": industry,
-                    "designation": (match or {}).get("title") or "",
-                    "based": (match or {}).get("based") or "",
-                    "paper_links": (match or {}).get("paper") or "",
-                    "li_url": "",
-                }
-                profile = str((match or {}).get("profile") or "").strip()
-                if profile and links.profile_kind(profile) == "profile":
-                    values["li_url"] = profile
-                source = str((match or {}).get("source") or "")
-                if name and not gtm_sheet.clean_cell(row.get("email")):
-                    values["email"], email_source = await email_for(name, company)
-                    source = source or email_source
-                shown, unfound = [], 0
-                for role in poc_crosscheck.FILL_ROLES:
-                    if gtm_sheet.clean_cell(row.get(role)):
-                        continue                    # the cell has a value: never printed
-                    if values.get(role):
-                        shown.append((label_of(role), values[role]))
-                        shown_roles.add(role)
-                    else:
-                        unfound += 1
-                if values.get("email") and not gtm_sheet.clean_cell(row.get("email")) \
-                        and row.get("_row"):
-                    emails.append({"sheet_row": row.get("_row"),
-                                   "row_key": activation.row_key(row),
-                                   "company": company, "poc": name,
-                                   "email": values["email"], "source": source})
-                entries.append({
-                    "name": name or f"Row {row.get('_row')} (no name on the sheet)",
-                    "title": gtm_sheet.clean_cell(row.get("designation")),
-                    "found": shown, "source": source, "unfound": unfound,
+            people = []
+            for person in data.get("people") or []:
+                name = poc_crosscheck.clean(person.get("name"))
+                if not name or poc_crosscheck.is_excluded(name, exclude + [x["name"] for x in people]):
+                    if name:
+                        log.info("[r11] %s: %s came back although excluded; dropped", company, name)
+                    continue
+                if len(people) >= max(1, int(config.POC_SUGGEST_MAX_PER_COMPANY)):
+                    break
+                profile = profile_of(person)
+                address, _src = await email_for(name, company)
+                title = poc_crosscheck.role_at_company(person.get("title"), company)
+                people.append({
+                    "name": name, "title": title, "email": address,
+                    "based": poc_crosscheck.clean(person.get("based")), "linkedin_url": profile,
+                    "paper": poc_crosscheck.clean(person.get("paper")),
+                    "source": poc_crosscheck.clean(person.get("source")),
                 })
-            fill.append((company, entries))
+                to_add.append({
+                    "name": name, "company": company, "linkedin_url": profile,
+                    "source_url": poc_crosscheck.clean(person.get("source")),
+                    "designation": title, "industry": industry,
+                    "based": poc_crosscheck.clean(person.get("based")),
+                    "paper": poc_crosscheck.clean(person.get("paper")), "email": address,
+                })
+            suggested[company] = earlier + [x["name"] for x in people]
+            add.append({"company": company, "industry": industry, "people": people,
+                        "already": on_sheet})
 
-        # THE EMAIL CELL IS THE ONE THING THE BOT MAY WRITE ON AN EXISTING ROW,
-        # and it offers to only when email is ALL it found and the switch is on.
         email_offer = bool(config.EMAIL_WRITE_ALLOWED and emails and shown_roles == {"email"})
-        out = poc_crosscheck.render_found(suggest=suggest, fill=fill, failed=failed,
-                                          email_offer=email_offer)
-        if not suggest and not fill and not failed:
-            await self._reply(
-                message,
-                poc_crosscheck._and(complete) + (" is" if len(complete) == 1 else " are")
-                + " already on Outreach PoCs with nothing missing, so there is nothing "
-                  "for me to look up.",
-                reason="poc lookup: every company is complete now")
-            return
+        out = poc_crosscheck.render_found(
+            add=add, fill=fill, email_offer=email_offer, left_out=more,
+            title=poc_crosscheck.MORE_HEADER if more else poc_crosscheck.ADD_HEADER)
+        thread = {"companies": list(companies), "suggested": suggested, "attempt": int(attempt)}
         state.audit("poc_lookup_answered", reason="what a search found; nothing written",
-                    suggested=[c for c, _p in suggest], fill=[c for c, _r in fill],
-                    failed=failed, complete=complete, rows_offered=out["rows"])
+                    add=[a["company"] for a in add], fill=[f["company"] for f in fill],
+                    people=[x["name"] for x in to_add], attempt=int(attempt))
 
         sent_box: list = []
-        if suggest:
-            # GATE 2. The message ends on "Shall I go ahead?", and that question
-            # is a row_add proposal on this very message.
+        if to_add:
+            # GATE 2. The message ends on "Shall I go ahead …?", and that question
+            # is a row_add proposal on this very message. It also carries the
+            # thread's state, so "find a different person" knows who was shown.
             posted = await self._offer_poc_add(
                 message, "", {"people": to_add, "tab": getattr(tab, "title", "") or "Outreach PoCs"},
                 body=out["text"], trigger="R11",
-                question=f"add {out['rows']} row(s) to Outreach PoCs for "
-                         + poc_crosscheck._and(out["companies"]),
-                key=f"row_add:r11:{getattr(message, 'id', 0)}", sent_box=sent_box)
+                question="add the suggested people to Outreach PoCs",
+                key=f"row_add:r11:{getattr(message, 'id', 0)}", sent_box=sent_box,
+                extra_payload={"r11": thread})
             if not posted:
                 await self._reply(message, out["text"], reason="PoC lookup (the offer "
                                   "could not be recorded, so nothing can be added from it)")
@@ -8339,6 +8403,7 @@ class SalesBot(discord.Client):
             sent = await self._reply(message, out["text"], reason="PoC lookup")
             if sent is not None:
                 sent_box.append(sent)
+                self._remember_said(sent, kind="r11_found", r11=thread)
 
         if email_offer and sent_box:
             sent = sent_box[-1]
@@ -8394,7 +8459,8 @@ class SalesBot(discord.Client):
                                        titles=data["evidence"])
 
     async def _find_people_data(self, company: str, department: str = "", *,
-                                rule: str = "find_people") -> dict:
+                                rule: str = "find_people", exclude=(),
+                                angle: int = 0) -> dict:
         """Named people at a company (and department), with the page each was
         found on, AS DATA: {"ok", "error", "people", "evidence", ...}. The ONE
         lookup behind R11's yes and the find_people tool.
@@ -8435,14 +8501,16 @@ class SalesBot(discord.Client):
 
         if websearch.server_side():
             result = await self.llm.web_research(
-                rule=rule, prompt=websearch.people_prompt(company, department),
+                rule=rule, prompt=websearch.people_prompt(company, department,
+                                                          exclude=exclude),
                 max_uses=min(2, left), lean=True,
             )
         else:
             # THE COMPANY'S OWN PAGE, WHEN A SEARCH FINDS ONE. The second query
             # runs here rather than inside `web_research` because its result
             # decides which page (if any) is worth fetching.
-            queries = websearch.people_queries(company, department)
+            queries = websearch.people_queries(company, department,
+                                               exclude=exclude, angle=angle)
             pages: list = []
             if left >= 2:
                 own = await asyncio.to_thread(
@@ -8454,7 +8522,7 @@ class SalesBot(discord.Client):
             result = await self.llm.web_research(
                 rule=rule,
                 prompt=websearch.people_prompt(company, department,
-                                               from_snippets=True),
+                                               from_snippets=True, exclude=exclude),
                 max_uses=1, lean=True, queries=queries[:1], pages=pages,
                 focus=("founder", "chief", "head of", "director", "lead"),
             )
@@ -8695,7 +8763,8 @@ class SalesBot(discord.Client):
 
     async def _offer_poc_add(self, message, text: str, offer: dict, *,
                              body: str = "", question: str = "", trigger: str = "question",
-                             key: str = "", sent_box: Optional[list] = None) -> str:
+                             key: str = "", sent_box: Optional[list] = None,
+                             extra_payload: Optional[dict] = None) -> str:
         """Record the row_add proposal, THEN post the question. Returns the
         offer text that was posted, "" when none was.
 
@@ -8736,7 +8805,8 @@ class SalesBot(discord.Client):
             lambda: self.db.open_proposal(
                 proposal_key=key, kind="row_add", tab=tab_title, sheet_row=0,
                 row_key="", company=companies.pop() if len(companies) == 1 else "",
-                poc=", ".join(names), payload={"people": people},
+                poc=", ".join(names),
+                payload={"people": people, **(extra_payload or {})},
                 reply_text=text or "", trigger=trigger, proposed_text=question,
                 requested_by=asker,
                 channel_id=int(getattr(message.channel, "id", 0) or 0),
@@ -8902,6 +8972,25 @@ class SalesBot(discord.Client):
         # is NOT what the approver agreed to — a person skipped, a cell left out.
         from_r11 = str(proposal.get("trigger") or "") == "R11"
         per_company: dict = {}
+        if from_r11:
+            # RE-READ BEFORE WRITING. The sheet may have changed since the search,
+            # and the tab may file the company under a longer name than the
+            # Master Pipeline's ("Underdog AI (Conway Research)"), which the
+            # append's own same-company check would not see. Anybody now on the
+            # tab for that company is skipped and said.
+            kept = []
+            for person in chosen:
+                rows_now = tab.find_company(gtm_sheet.clean_cell(person.get("company")))
+                if poc_crosscheck.is_excluded(person.get("name"),
+                                              poc_crosscheck.names_on_sheet(rows_now)):
+                    per_company.setdefault(
+                        str(person.get("company") or ""),
+                        {"company": str(person.get("company") or ""), "added": 0,
+                         "skipped": []})["skipped"].append(
+                        f"Skipped {person.get('name')}: already on Outreach PoCs.")
+                else:
+                    kept.append(person)
+            chosen = kept
         # A QUALIFIED YES TO R11's LIST WRITES NOTHING. "yes to 1 and 2 but not
         # 3" reads as a plain YES to the vote reader ("not" is not one of its
         # no-words), and with nobody named it would add all of them, including
@@ -9017,8 +9106,13 @@ class SalesBot(discord.Client):
                     r"\s*\(row \d+\)", "", str(result.get("error") or "the sheet refused it")))
                 report["skipped"].append(f"Skipped {person.get('name')}: {why}.".replace("..", "."))
         if from_r11:
-            await self._reply(message, poc_crosscheck.render_written(per_company.values()),
-                              reason="poc rows added (R11)")
+            # In the order the list named the companies, not the order they were dealt with.
+            order = list(dict.fromkeys(str(p.get("company") or "") for p in people))
+            await self._reply(
+                message,
+                poc_crosscheck.render_written(
+                    [per_company[c] for c in order if c in per_company]),
+                reason="poc rows added (R11)")
             return
         if not any(line.startswith("Added ") for line in lines):
             lines.append("Nothing has changed in the sheet.")
@@ -11147,7 +11241,8 @@ class SalesBot(discord.Client):
                 # R11's CROSS-CHECK: a SUMMARY of every row on the tab (a count
                 # and the mandatory roles left blank, per company), built here
                 # so the engine is handed no row and stays pure.
-                poc_company_index=poc_crosscheck.build_index(tab.rows),
+                poc_company_index=poc_crosscheck.build_index(
+                    tab.find_company, pipeline_companies),
             )
         )
         result["tab"] = tab

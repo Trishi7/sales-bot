@@ -245,7 +245,7 @@ TODAY_ALSO = "Also today"
 TODAY_POSTS_LEAD = "My posts today cover"
 # A yes to R11's list that picks and chooses by number ("yes to 1 and 2 but not
 # 3"). The list is one question, all or none; people can be picked by name.
-POC_ADD_ALL_OR_NONE = ("I have not added anyone yet. I can add all of them or none, or just "
+POC_ADD_ALL_OR_NONE = ("I haven't added anyone yet. I can add all of them or none, or just "
                        "the people you name — could you reply to the list again with a plain "
                        "yes, a no, or the names please?")
 NOTHING_TODAY = ("Nothing on for today that I can see: no meeting notes, nothing due "

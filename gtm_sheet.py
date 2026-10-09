@@ -999,6 +999,9 @@ _UNKNOWN_WORDS = {
     "not available", "na", "n a", "tbd", "tba", "unknown", "?",
     "to be confirmed", "to be announced", "not announced", "not yet announced",
     "not confirmed",
+    # What a sheet cell or a model writes for "nothing" (R11, 9 Oct: "Based  ->"
+    # was posted). Dashes and arrows normalise to "" and need no entry.
+    "none", "null", "nil", "n a", "not found", "no value", "nothing",
 }
 
 

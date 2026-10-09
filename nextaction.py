@@ -1389,11 +1389,10 @@ def _r_new_pipeline_company(rule, ctx) -> list:
             continue
         if (today - first_seen).days > window:
             continue
+        # THREE STATES, ALL LISTED (9 Oct): no row yet, rows with a mandatory
+        # gap, and rows with nothing missing. The last used to be left out; the
+        # team wants it named too, because a yes then looks for MORE people.
         branch = poc_crosscheck.classify(name, index)
-        if branch == poc_crosscheck.COMPLETE:
-            log.info("[rules] R11: %s is already on Outreach PoCs with every "
-                     "mandatory field filled; not mentioned", name)
-            continue
         out.append(_item(
             rule=rule, trigger=R_NEW_COMPANY, today=today, due=due,
             why=(f"R11 (Wednesdays): {name} first appeared in the Master Pipeline "

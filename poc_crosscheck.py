@@ -1,56 +1,50 @@
 """R11's OUTREACH PoCs CROSS-CHECK — who is already on the tab, and what the bot says about it.
 
-WHAT WAS MISSING (9 Oct 2026). R11 named every company new to the Master
-Pipeline and offered to look for people, without ever looking at Outreach PoCs:
-a company with five contacts already on the tab was treated exactly like one
-with none. And when an approver said yes, the people it found were only shown;
-nothing could add them.
+THREE STATES for a company new to the Master Pipeline, decided from a small
+summary of the PoCs tab (`build_index`):
 
-THREE BRANCHES, decided from a small summary of the PoCs tab (`build_index`):
+    NEW       no row for it          look for people from scratch and offer to ADD ROWS
+    GAPS      rows, and one lacks a  look up the blank cells of those rows and ASK A
+              MANDATORY field        PERSON TO PASTE THEM IN. Gaps only: no new people
+    MORE      rows, nothing          look for MORE people, leaving out everybody already
+              mandatory blank        on the sheet, and offer to add them
 
-    A         no row for the company. Find people and offer to ADD ROWS.
-    B         rows exist and at least one lacks a MANDATORY field
-              (POC_MANDATORY_FIELDS: name, designation, li_url). Show what a
-              search finds for the blank cells and ASK A PERSON TO PASTE IT IN.
-    complete  rows exist and none lacks a mandatory field. Named in no message.
+WHY "GAPS" ONLY REMINDS. Company, Industry, Name, Designation, Email id, Based,
+Research Paper Link and LI Url are columns B to I, and A:I is READ-ONLY on an
+existing row (RESTRICTED_COLUMN_RANGES): the team's own record of who a person
+is. A NEW row may be written there, an existing one may not.
 
-WHY BRANCH B ONLY REMINDS. Company, Industry, Name, Designation, Email id,
-Based, Research Paper Link and LI Url are columns B to I, and A:I is READ-ONLY
-on an existing row (RESTRICTED_COLUMN_RANGES): that band is the team's own
-record of who a person is. A new row may be written there
-(NEW_ROW_WRITABLE_RANGES), an existing one may not. The one exception is the
-Email cell, through an `email_write` proposal, only while it is still blank and
-only when EMAIL_WRITE_ALLOWED is true. So Branch B shows, and a person writes.
+THE SHEET CELL IS THE IDENTITY (9 Oct, the live run). The Master Pipeline said
+"Underdog AI" and Outreach PoCs said "Underdog AI (Conway Research)"; compared
+by equal keys they were two companies, so Sigil Wen, row 651, was offered as a
+new row. Companies are now matched with `gtm_sheet`'s own `find_company`
+(exact, then substring), people by `activation.row_key`, and the Master
+Pipeline's spelling is carried unchanged through every message and every row.
 
-A BLANK OPTIONAL FIELD IS NOT A GAP. Most people on the tab legitimately have
-no email and no paper; counting those would put nearly every company in Branch
-B for ever.
+WHAT A MESSAGE NEVER CARRIES: a field with no value ("->", "-", "n/a",
+"unknown" are no value: `is_blank`), a link that is not masked, a Source that
+repeats the LinkedIn link, a "designation" that is a fellowship or a seat
+somewhere else, a row count.
 
-THIS MODULE IS PURE. It is handed rows and found values and returns a summary
-or text. It reads no sheet, runs no search and writes nothing; `bot.py` does
-those, behind the two approvals. The message shapes were agreed with Vaishnavi
-and Kushal on 8 Oct: plain text, no bold, no emoji, a blank line between
-blocks, asking and never instructing.
+THIS MODULE IS PURE: rows and found values in, a summary or text out.
 """
 import logging
 import re
 from datetime import date
-from typing import Optional
 
+import activation
 import config
 import gtm_sheet
+import links
 
 log = logging.getLogger(__name__)
 
-BRANCH_A = "a"
-BRANCH_B = "b"
-COMPLETE = "complete"
+NEW = "a"            # no row on Outreach PoCs
+GAPS = "b"           # rows with a blank mandatory field
+MORE = "c"           # rows, nothing mandatory blank
+BRANCH_A, BRANCH_B, COMPLETE = NEW, GAPS, MORE          # the names the first build used
 
-# The seven fields this feature is about, by the sheet's role names, in the
-# order the tab holds them (columns C to I, with Name at D).
 FIELD_ROLES = ("industry", "name", "designation", "email", "based", "paper_links", "li_url")
-# Other ways to say a role in POC_MANDATORY_FIELDS. The role map itself lives in
-# gtm_sheet; these are only spellings a person might type in .env.
 _ROLE_ALIASES = {
     "research_paper_link": "paper_links", "research_paper": "paper_links",
     "paper": "paper_links", "paper_link": "paper_links",
@@ -61,40 +55,63 @@ DEFAULT_MANDATORY = ("name", "designation", "li_url")
 
 # -- the words ----------------------------------------------------------------
 M1_HEADER = "New companies in the Master Pipeline — since {since}"
-M1_SUFFIX_B = " — already on Outreach PoCs, missing some fields"
+M1_SUFFIX = {NEW: "", GAPS: " — already on Outreach PoCs, missing some fields",
+             MORE: " — already on Outreach PoCs"}
 M1_ASK = "Would you like me to look these up and suggest prospective PoCs we could contact?"
 
-M2_HEADER = "Suggested PoCs"
-M2B_HEADER = "Missing fields"
+ADD_HEADER = "Suggested PoCs"
+MORE_HEADER = "More PoCs"
+FILL_HEADER = "Missing fields"
 NOTE_OMITTED = "Some fields are missing because I could not find them on the web."
-M2B_REQUEST = "Those columns are ones I'm not able to write to, so could you add them please?"
-M2B_EMAIL_OFFER = "I can fill the Email cell for you if you'd like — shall I?"
-M4_BODY = ("I'm sorry, I searched and could not find named people I would be confident "
-           "suggesting.\nHappy to try again with a starting point — a careers page or the "
-           "LinkedIn company URL would be enough.")
+ADD_CLOSE = "Shall I go ahead and add these new people to the Outreach PoCs sheet?"
+FILL_CLOSE = "Those {companies} columns are ones I'm not able to write to, so could you add them please?"
+FILL_EMAIL_OFFER = "I can fill the Email cell for you if you'd like — shall I?"
+# ONE "try again" phrasing, in every failure case.
+TRY_AGAIN = ("I can try again if you'd like — it would help if you could give me a starting point,\n"
+             "a team page or their LinkedIn.")
+NOBODY = "I'm sorry, I searched and could not find named people I would be confident suggesting."
 M3_ADDED = "added to Outreach PoCs"
 
-# M2's labels, in order. The value column starts 12 characters after the indent.
-SUGGEST_FIELDS = (("industry", "Industry"), ("email", "Email"), ("based", "Based"),
-                  ("linkedin_url", "LinkedIn"), ("paper", "Paper"), ("source", "Source"))
-# M2b's order: the sheet's own column order, then where it was found.
-FILL_ROLES = ("industry", "designation", "email", "based", "paper_links", "li_url")
+# Suggested PoCs: labels in order. Missing fields uses the sheet's own headers.
+ADD_FIELDS = (("email", "Email"), ("based", "Based"), ("linkedin_url", "LinkedIn"),
+              ("paper", "Paper"), ("source", "Source"))
+FILL_ROLES = ("designation", "email", "based", "paper_links", "li_url")
+_URL_FIELDS = ("linkedin_url", "paper", "source")
 _INDENT = "   "
 _LABEL_WIDTH = 12
 
+# What is not a role AT THE COMPANY: a fellowship, an award, alumni status, a
+# board or advisory seat. "Thiel Fellow" is where somebody has been, not what
+# they do at Underdog AI. Omitting a title is always safe.
+_NOT_A_ROLE_RE = re.compile(
+    r"\b(fellow|fellowship|alumn\w*|award\w*|winner|laureate|scholar(ship)?|"
+    r"board\s+(member|director|observer|advis\w+)|advis[oe]r\w*|advisory|investor|"
+    r"angel|mentor|volunteer|student|graduate|ex|former(ly)?|previously)\b", re.IGNORECASE)
+_ELSEWHERE_RE = re.compile(r"\s(?:at|@)\s+(.+)$", re.IGNORECASE)
+
 
 def company_key(name) -> str:
-    """One company, one key: the same normalisation `db._norm_key` uses for
-    `pipeline_companies.company_key`, so the Master Pipeline's three spellings
-    of one company and the PoCs tab's fourth all meet here."""
+    """The normalisation `db._norm_key` uses for `pipeline_companies.company_key`."""
     return gtm_sheet.normalise_header(gtm_sheet.clean_cell(name))
 
 
+def is_blank(value) -> bool:
+    """Is this "no value"? Empty, whitespace, None, a dash or an arrow ("-",
+    "--", "->", "—"), or one of the words a sheet or a model writes for
+    "nothing" (`gtm_sheet._UNKNOWN_WORDS`: n/a, unknown, not found, tbd …).
+    ON 9 OCT "Based  ->" WAS POSTED: the value was the literal arrow from the
+    prompt's own "or ->", and the omit rule only tested for empty."""
+    norm = gtm_sheet.normalise_header(str(value if value is not None else ""))
+    return not norm or norm in gtm_sheet._UNKNOWN_WORDS
+
+
+def clean(value) -> str:
+    """The value, or "" when it is no value."""
+    return "" if is_blank(value) else " ".join(str(value).split())
+
+
 def mandatory_roles() -> tuple:
-    """POC_MANDATORY_FIELDS as sheet roles. An entry that is not one of the
-    seven fields is dropped and logged; an empty or unusable setting falls
-    back to the default rather than making nothing mandatory (which would
-    call every company complete)."""
+    """POC_MANDATORY_FIELDS as sheet roles; the default when it is unusable."""
     out = []
     for raw in (getattr(config, "POC_MANDATORY_FIELDS", None) or ()):
         role = gtm_sheet.normalise_header(str(raw)).replace(" ", "_")
@@ -108,57 +125,50 @@ def mandatory_roles() -> tuple:
     return tuple(out) or DEFAULT_MANDATORY
 
 
-def _blank(row: dict, role: str) -> bool:
-    return not gtm_sheet.clean_cell((row or {}).get(role))
-
-
 def row_gaps(row: dict, mandatory=None) -> list:
     """The mandatory roles this row leaves blank."""
-    return [r for r in (mandatory or mandatory_roles()) if _blank(row, r)]
+    return [r for r in (mandatory or mandatory_roles()) if is_blank((row or {}).get(r))]
 
 
-def build_index(rows, mandatory=None) -> dict:
-    """{company_key: {"rows": n, "gaps": [role, ...], "gap_rows": k}} for the
-    whole Outreach PoCs tab. THE ONLY THING R11 IS GIVEN ABOUT THAT TAB: a
-    count and which mandatory fields are blank somewhere, never a row, a name
-    or a cell. Built by the caller, so the engine stays pure and a preview of
-    the queue reads nothing it was not handed."""
+def finder_for(rows):
+    """`tab.find_company` for a plain list of rows: the same matcher (exact
+    normalised first, then substring), for callers and tests holding no Tab."""
+    return gtm_sheet.Tab.find_company.__get__(type("_Rows", (), {"rows": list(rows or [])})())
+
+
+def build_index(find_company, companies, mandatory=None) -> dict:
+    """{company_key: {"rows", "gaps", "gap_rows"}} for the given Master
+    Pipeline companies. `find_company` is the Outreach PoCs tab's own matcher
+    (`tab.find_company`), so "Underdog AI" finds the rows filed under
+    "Underdog AI (Conway Research)". THE ONLY THING R11 IS GIVEN ABOUT THAT
+    TAB: counts and roles, never a row, a name or a cell."""
     mandatory = tuple(mandatory or mandatory_roles())
     index: dict = {}
-    for row in rows or ():
-        key = company_key((row or {}).get("company"))
-        if not key:
+    for company in companies or ():
+        key = company_key(company)
+        if not key or key in index:
             continue
-        entry = index.setdefault(key, {"rows": 0, "gaps": [], "gap_rows": 0})
-        entry["rows"] += 1
-        gaps = row_gaps(row, mandatory)
-        if gaps:
-            entry["gap_rows"] += 1
-            for role in gaps:
-                if role not in entry["gaps"]:
-                    entry["gaps"].append(role)
+        rows = list(find_company(gtm_sheet.clean_cell(company)) or [])
+        gaps, gap_rows = [], 0
+        for row in rows:
+            missing = row_gaps(row, mandatory)
+            gap_rows += 1 if missing else 0
+            gaps += [r for r in missing if r not in gaps]
+        index[key] = {"rows": len(rows), "gaps": gaps, "gap_rows": gap_rows}
     return index
 
 
 def classify(company, index) -> str:
-    """BRANCH_A, BRANCH_B or COMPLETE for one company against the index.
-
-    NO INDEX AT ALL (None: the tab could not be summarised) IS BRANCH A, said
-    in the log by the caller. The write path re-reads the tab and refuses a
-    duplicate, so the worst case is an offer the sheet then declines; calling
-    everything complete would silently drop the week's companies instead.
-    """
+    """NEW, GAPS or MORE. No index, or no entry, is NEW: the write path
+    re-reads the tab and drops anybody already on it."""
     entry = (index or {}).get(company_key(company))
     if not entry or not int(entry.get("rows") or 0):
-        return BRANCH_A
-    return BRANCH_B if entry.get("gaps") else COMPLETE
+        return NEW
+    return GAPS if entry.get("gaps") else MORE
 
 
 def collapse(entries) -> list:
-    """The new-company entries with duplicates folded: several Master Pipeline
-    rows naming one company become one, keeping the first spelling and the
-    EARLIEST first-seen date (so a re-typed duplicate cannot restart a
-    company's week)."""
+    """New-company entries with duplicates folded, earliest first-seen kept."""
     order, seen = [], {}
     for entry in entries or ():
         name = gtm_sheet.clean_cell((entry or {}).get("company"))
@@ -174,15 +184,82 @@ def collapse(entries) -> list:
     return [seen[k] for k in order]
 
 
-# -- showing a link the way the messages do -----------------------------------
+# -- people -------------------------------------------------------------------
+
+def person_key(company, name) -> str:
+    """`activation.row_key` for a person: normalised company | name. The
+    company alone is never the identity (row_key's own docstring records the
+    two contacts that mistake dropped)."""
+    return activation.row_key({"company": company, "name": name})
+
+
+def _name_key(name) -> str:
+    return gtm_sheet.normalise_header(gtm_sheet.clean_cell(name))
+
+
+def names_on_sheet(rows) -> list:
+    """The people already on Outreach PoCs for one company, as the sheet
+    spells them. NEVER CAPPED: it is a handful of names, and a slice here is
+    how a known person would be offered again."""
+    out = []
+    for row in rows or ():
+        name = gtm_sheet.clean_cell((row or {}).get("name"))
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def is_excluded(name, excluded) -> bool:
+    """Is this found person one of `excluded` (on the sheet, or suggested
+    earlier)? By normalised name, and by one name's words all being in the
+    other's, so "Sigil Wen" excludes "Sigil S. Wen". THE POST-FILTER: a search
+    treats a negative term as a hint and a model sometimes returns an excluded
+    person spelt differently, so this is what makes a duplicate impossible."""
+    want = set(_name_key(name).split())
+    if not want:
+        return True
+    for other in excluded or ():
+        have = set(_name_key(other).split())
+        if have and (want <= have or have <= want):
+            return True
+    return False
+
+
+def role_at_company(title, company="") -> str:
+    """The title, when it is a role at this company; "" otherwise."""
+    title = clean(title)
+    if not title or _NOT_A_ROLE_RE.search(title):
+        return ""
+    elsewhere = _ELSEWHERE_RE.search(title)
+    if elsewhere:
+        org, ours = company_key(elsewhere.group(1)), company_key(company)
+        if org and ours and org not in ours and ours not in org \
+                and not (set(org.split()) & (set(ours.split()) - {"ai", "labs", "inc", "the"})):
+            return ""
+        title = title[:elsewhere.start()].strip(" ,-—")
+    return title
+
+
+def url_key(url) -> str:
+    """A url for comparing: no scheme, no www., no trailing slash, lowercase."""
+    text = re.sub(r"^[a-z]+://", "", str(url or "").strip(), flags=re.IGNORECASE)
+    return re.sub(r"^www\.", "", text, flags=re.IGNORECASE).rstrip("/").lower()
+
 
 def bare(url) -> str:
-    """"linkedin.com/in/sigil" from "https://www.linkedin.com/in/sigil/": the
-    address as a person would read it out. Nothing is added or completed."""
-    text = str(url or "").strip()
-    text = re.sub(r"^[a-z]+://", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^www\.", "", text, flags=re.IGNORECASE)
-    return text.rstrip("/")
+    """"linkedin.com/in/sigil": the LABEL of a link, never the link itself."""
+    text = re.sub(r"^[a-z]+://", "", str(url or "").strip(), flags=re.IGNORECASE)
+    return re.sub(r"^www\.", "", text, flags=re.IGNORECASE).rstrip("/")
+
+
+def masked(url) -> str:
+    """`[linkedin.com/in/sigil](<https://www.linkedin.com/in/sigil>)`, through
+    `links.link`: clickable, no embed. "" for anything that is not an absolute
+    http(s) url — a host with no scheme is dead text and is never emitted."""
+    url = str(url or "").strip()
+    if not re.match(r"^https?://\S+$", url, re.IGNORECASE):
+        return ""
+    return links.link(bare(url), url)
 
 
 def _day(d: date) -> str:
@@ -190,174 +267,192 @@ def _day(d: date) -> str:
 
 
 def _field(label: str, value: str) -> str:
-    return f"{_INDENT}{label:<{_LABEL_WIDTH}}{value}"
+    """One aligned line. A label as long as the column ("Research Paper Link",
+    "Based (Sept 2026)") still gets two spaces before its value."""
+    pad = label.ljust(_LABEL_WIDTH) if len(label) < _LABEL_WIDTH - 1 else label + "  "
+    return f"{_INDENT}{pad}{value}"
 
 
-def _and(names: list) -> str:
+def _and(names) -> str:
     names = [n for n in names if n]
     if len(names) <= 1:
         return "".join(names)
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
-# -- M1 -------------------------------------------------------------------------
+def _subheading(company: str, industry: str = "") -> str:
+    """"Underdog AI (Conway Research) — AI Labs". Industry is the Master
+    Pipeline's own cell and is the same for everybody at the company, so it
+    sits here and not on each person; a blank cell drops it."""
+    industry = clean(industry)
+    return company + (f" — {industry}" if industry else "")
+
+
+# -- M1 -----------------------------------------------------------------------
 
 def m1_lines(companies, *, since: date) -> list:
-    """M1 as lines. `companies` is [(name, branch)] in the order they go.
-
-        New companies in the Master Pipeline — since Wed 1 Oct
-
-        1. Underdog AI (Conway Research)
-        2. Limbic AI — already on Outreach PoCs, missing some fields
-
-        Would you like me to look these up and suggest prospective PoCs we could contact?
-
-    Company names only, numbered. Branch B says THAT fields are missing, never
-    which. [] when there is nobody to name: nothing in scope posts nothing.
-    """
-    named = [(str(n).strip(), b) for n, b in (companies or ()) if str(n).strip()
-             and b in (BRANCH_A, BRANCH_B)]
+    """M1 as lines, `companies` being [(name, state)]. All three states are
+    listed and the one question covers them. [] when there is nobody to name."""
+    named = [(str(n).strip(), s) for n, s in (companies or ()) if str(n).strip() and s in M1_SUFFIX]
     if not named:
         return []
     lines = [M1_HEADER.format(since=_day(since)), ""]
-    for i, (name, branch) in enumerate(named, 1):
-        lines.append(f"{i}. {name}" + (M1_SUFFIX_B if branch == BRANCH_B else ""))
+    for i, (name, state) in enumerate(named, 1):
+        lines.append(f"{i}. {name}{M1_SUFFIX[state]}")
     return lines + ["", M1_ASK]
 
 
-# -- M2 / M2b / M4, one message -------------------------------------------------
+# -- the reply to a yes ---------------------------------------------------------
 
-def _person_head(person: dict) -> str:
-    name = str(person.get("name") or "").strip()
-    title = str(person.get("title") or person.get("designation") or "").strip()
-    return name + (f" — {title}" if title else "")
-
-
-def suggestion_block(people) -> tuple:
-    """(lines, omitted) for one company's suggested people, numbered. A field
-    with no value prints NOTHING; `omitted` says whether any was left out."""
-    lines, omitted = [], False
-    for i, person in enumerate(people or (), 1):
-        if lines:
-            lines.append("")
-        lines.append(f"{i}. {_person_head(person)}")
-        for key, label in SUGGEST_FIELDS:
-            value = str(person.get(key) or "").strip()
-            if key in ("linkedin_url", "paper", "source"):
-                value = bare(value)
+def person_lines(person: dict, number: int = 0) -> tuple:
+    """(lines, omitted) for one suggested person."""
+    title = clean(person.get("title"))
+    head = clean(person.get("name")) + (f" — {title}" if title else "")
+    lines = [f"{number}. {head}" if number else head]
+    omitted = not title
+    shown: set = set()
+    for key, label in ADD_FIELDS:
+        raw = clean(person.get(key))
+        if key in _URL_FIELDS:
+            value = masked(raw)
+            if key == "source" and url_key(raw) in shown:
+                continue                # a source that repeats a field says nothing
             if value:
-                lines.append(_field(label, value))
-            elif key != "source":
-                omitted = True
-    return lines, omitted
-
-
-def fill_block(rows) -> tuple:
-    """(lines, omitted) for one Branch B company. `rows` is
-    [{"name", "title", "found": [(label, value)], "source", "unfound": n}]:
-    existing rows, so NOT numbered, each showing only cells that are blank on
-    the sheet and for which something was found, under the sheet's own column
-    names."""
-    lines, omitted = [], False
-    for row in rows or ():
-        found = [(str(l), str(v).strip()) for l, v in (row.get("found") or ()) if str(v).strip()]
-        if int(row.get("unfound") or 0):
-            omitted = True
-        if not found:
-            continue
-        if lines:
-            lines.append("")
-        lines.append(_person_head(row))
-        for label, value in found:
-            lines.append(_field(label, bare(value) if "://" in value else value))
-        source = bare(row.get("source"))
-        if source:
-            lines.append(_field("Source", source))
-    return lines, omitted
-
-
-def render_found(*, suggest=(), fill=(), failed=(), email_offer: bool = False) -> dict:
-    """The one message after the first yes.
-
-    `suggest` is [(company, [person, ...])] (Branch A, people found),
-    `fill` is [(company, [row, ...])] (Branch B), `failed` the companies the
-    search found nobody for. Returns {"text", "rows", "companies", "kind"}:
-    `rows` is how many rows a yes would add, `kind` is "none" when nothing at
-    all was found (M4), else "found".
-
-    ORDER: M2's sections, then M2b's, then the ONE note covering every
-    omission, then a line for each company the search failed on, then the
-    closing lines. One message, never two.
-    """
-    suggest = [(c, list(p)) for c, p in (suggest or ()) if p]
-    fill_blocks = []
-    omitted = False
-    for company, rows in (fill or ()):
-        lines, miss = fill_block(rows)
-        omitted = omitted or miss
-        if lines:
-            fill_blocks.append((company, lines))
-    failed = [str(c).strip() for c in (failed or ()) if str(c).strip()]
-
-    if not suggest and not fill_blocks:
-        names = failed or [c for c, _r in (fill or ())]
-        return {"kind": "none", "rows": 0, "companies": [],
-                "text": f"No PoCs found — {_and(names)}\n\n{M4_BODY}"}
-
-    parts: list = []
-    if suggest:
-        if len(suggest) == 1:
-            company, people = suggest[0]
-            block, miss = suggestion_block(people)
-            omitted = omitted or miss
-            parts.append("\n".join([f"{M2_HEADER} — {company}", ""] + block))
+                shown.add(url_key(raw))
         else:
-            parts.append(M2_HEADER)
-            for company, people in suggest:
-                block, miss = suggestion_block(people)
+            value = raw
+        if value:
+            lines.append(_field(label, value))
+        elif key != "source":
+            omitted = True
+    return lines, omitted
+
+
+def _already(names, found: int, *, left_out: bool = False) -> str:
+    names = [n for n in names if n]
+    if not names:
+        return ""
+    are = "is" if len(names) == 1 else "are"
+    if not found:
+        return f"{_and(names)} {are} already on the sheet, and I could not find anyone else."
+    if left_out:
+        return f"Already on the sheet, so I left them out: {', '.join(names)}."
+    count = {1: "One other", 2: "Two others", 3: "Three others"}.get(found, f"{found} others")
+    return f"{_and(names)} {are} already on the sheet. {count} I found:"
+
+
+def render_found(*, add=(), fill=(), title: str = ADD_HEADER, email_offer: bool = False,
+                 left_out: bool = False) -> dict:
+    """The ONE message after a yes (or after "find someone else").
+
+    `add`  [{"company", "industry", "people": [...], "already": [names]}] —
+           companies to find people for: with no row yet, or complete and
+           wanting more. `already` are the people left out as known.
+    `fill` [{"company", "industry", "rows": [{"name", "title", "found":
+           [(label, value)], "source", "unfound": n}]}] — existing rows.
+
+    Two sections, each headed only when it has something in it; one note for
+    every omitted field; then the closing lines. THE ADD LINE NEVER COUNTS ROWS
+    OR NAMES A COMPANY. Returns {"text", "people": n, "kind"}; kind is "none"
+    when nothing at all was found.
+    """
+    add = [dict(a) for a in (add or ())]
+    fill = [dict(f) for f in (fill or ())]
+    people_total = sum(len(a.get("people") or ()) for a in add)
+    fill_found = any(r.get("found") for f in fill for r in (f.get("rows") or ()))
+
+    # NOTHING FOUND FOR ANYBODY, and nothing else to say: the short form.
+    if not people_total and not fill_found and not any(a.get("already") for a in add) and not fill:
+        names = [a["company"] for a in add]
+        return {"kind": "none", "people": 0,
+                "text": f"No PoCs found — {_and(names)}\n\n{NOBODY}\n{TRY_AGAIN}"}
+
+    omitted = False
+    single = (len(add) + len(fill)) == 1
+    parts: list = []
+    if add:
+        if single:
+            parts.append(f"{title} — {add[0]['company']}")
+        else:
+            parts.append(title)
+        for a in add:
+            block: list = []
+            if not single:
+                block += [_subheading(a["company"], a.get("industry")), ""]
+            people = list(a.get("people") or ())
+            intro = _already(a.get("already") or (), len(people), left_out=left_out)
+            if intro:
+                block += [intro, ""] if people else [intro, TRY_AGAIN]
+            elif not people:
+                block += [NOBODY, TRY_AGAIN]
+            for i, person in enumerate(people, 1):
+                lines, miss = person_lines(person, i)
                 omitted = omitted or miss
-                parts.append("\n".join([company, ""] + block))
-    if fill_blocks:
-        parts.append(M2B_HEADER)
-        for company, lines in fill_blocks:
-            parts.append("\n".join([company, ""] + lines))
+                block += lines + [""]
+            parts.append("\n".join(block).strip("\n"))
+    fill_companies = []
+    if fill:
+        if single:
+            parts.append(f"{FILL_HEADER} — {fill[0]['company']}")
+        else:
+            parts.append(FILL_HEADER)
+        for f in fill:
+            block = [] if single else [_subheading(f["company"], f.get("industry")), ""]
+            unfound_names = []
+            for row in f.get("rows") or ():
+                found = [(str(l), clean(v)) for l, v in (row.get("found") or ()) if clean(v)]
+                if int(row.get("unfound") or 0):
+                    omitted = omitted or bool(found)
+                if not found:
+                    unfound_names.append(clean(row.get("name")))
+                    continue
+                title_ = clean(row.get("title"))
+                block.append(clean(row.get("name")) + (f" — {title_}" if title_ else ""))
+                shown = set()
+                for label, value in found:
+                    is_url = bool(re.match(r"^https?://", value, re.IGNORECASE))
+                    block.append(_field(label, masked(value) if is_url else value))
+                    if is_url:
+                        shown.add(url_key(value))
+                source = clean(row.get("source"))
+                if masked(source) and url_key(source) not in shown:
+                    block.append(_field("Source", masked(source)))
+                block.append("")
+                if f["company"] not in fill_companies:
+                    fill_companies.append(f["company"])
+            if unfound_names:
+                block += [f"I could not find the missing details for {_and(unfound_names)} on the web.",
+                          TRY_AGAIN]
+            parts.append("\n".join(block).strip("\n"))
     if omitted:
         parts.append(NOTE_OMITTED)
-    for company in failed:
-        parts.append(f"I could not find PoCs for {company}. Happy to try again with a "
-                     "careers page\nor the LinkedIn company URL.")
-    rows = sum(len(p) for _c, p in suggest)
-    if suggest:
-        parts.append(f"Shall I go ahead? This adds {rows} row{'s' if rows != 1 else ''} "
-                     f"for {_and([c for c, _p in suggest])}.")
-    if fill_blocks:
-        parts.append(M2B_EMAIL_OFFER if email_offer else M2B_REQUEST)
-    return {"kind": "found", "rows": rows, "companies": [c for c, _p in suggest],
-            "text": "\n\n".join(parts)}
+    closes = []
+    if people_total:
+        closes.append(ADD_CLOSE)
+    if fill_companies:
+        closes.append(FILL_EMAIL_OFFER if email_offer
+                      else FILL_CLOSE.format(companies=_and(fill_companies)))
+    if closes:
+        parts.append("\n".join(closes))
+    return {"kind": "found", "people": people_total, "text": "\n\n".join(p for p in parts if p)}
 
 
-# -- M3 -------------------------------------------------------------------------
+# -- M3 -----------------------------------------------------------------------
 
 def render_written(results) -> str:
-    """M3. `results` is [{"company", "added": n, "skipped": [text, ...]}], one
-    per company, in one message. No row numbers, no links, no recap of fields:
-    only what a person needs to know that is NOT what they approved."""
+    """M3: one block a company; under it only what is NOT what was approved."""
     parts = []
     for res in results or ():
         company = str(res.get("company") or "").strip()
-        added = int(res.get("added") or 0)
         skipped = [str(s).strip() for s in (res.get("skipped") or ()) if str(s).strip()]
-        if added:
-            block = [f"Done — {company}", M3_ADDED]
-        else:
-            block = [f"Not added — {company}"]
-        block += skipped
-        parts.append("\n".join(block))
+        block = [f"Done — {company}", M3_ADDED] if int(res.get("added") or 0) \
+            else [f"Not added — {company}"]
+        parts.append("\n".join(block + skipped))
     return "\n\n".join(parts)
 
 
 def _self_test() -> int:
-    """`python -m poc_crosscheck` — the index, the branches and the shapes."""
+    """`python -m poc_crosscheck` — the matcher, the states and the shapes."""
     failures = 0
 
     def check(name, got, want=True):
@@ -367,88 +462,99 @@ def _self_test() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f": got {got!r}, want {want!r}"))
 
     config.POC_MANDATORY_FIELDS = ["name", "designation", "li_url"]
-    full = {"company": "Acme AI", "name": "Ann Lee", "designation": "CTO",
-            "li_url": "https://www.linkedin.com/in/ann"}
-    rows = [full, dict(full, name="Bo Chen", li_url=""), {"company": " acme  ai ", "name": "Cy", "designation": "x",
-                                                         "li_url": "y"},
-            {"company": "Borealis", "name": "Dee", "designation": "CEO", "li_url": "z", "email": "", "paper_links": ""}]
-    index = build_index(rows)
-    print("the index and the branches")
-    check("one key a company, whatever the spelling", sorted(index), ["acme ai", "borealis"])
-    check("it carries counts and roles, never a row", index["acme ai"], {"rows": 3, "gaps": ["li_url"], "gap_rows": 1})
-    check("no row at all: Branch A", classify("Cinder Labs", index), BRANCH_A)
-    check("a mandatory field blank on one row: Branch B", classify("ACME AI", index), BRANCH_B)
-    check("only optional fields blank: complete", classify("Borealis", index), COMPLETE)
-    check("no index at all: Branch A", classify("Acme AI", None), BRANCH_A)
-    config.POC_MANDATORY_FIELDS = ["name", "research_paper_link", "nonsense"]
-    check("the setting takes aliases and drops what is not a field", mandatory_roles(), ("name", "paper_links"))
-    config.POC_MANDATORY_FIELDS = []
-    check("an empty setting falls back to the default", mandatory_roles(), DEFAULT_MANDATORY)
-    check("duplicates collapse, earliest date kept",
-          collapse([{"company": "Acme AI", "first_seen": "2026-10-06"}, {"company": "acme ai ", "first_seen": "2026-10-02"},
-                    {"company": "Borealis", "first_seen": "2026-10-05"}]),
-          [{"company": "Acme AI", "first_seen": "2026-10-02"}, {"company": "Borealis", "first_seen": "2026-10-05"}])
+    rows = [{"company": "Underdog AI (Conway Research)", "name": "Sigil Wen", "designation": "CEO", "li_url": "x"},
+            {"company": "Underdog AI (Conway Research)", "name": "Daniel Hong", "designation": "MTS", "li_url": "y"},
+            {"company": "Limbic AI", "name": "Ross Harper", "designation": "CEO", "li_url": ""}]
+    index = build_index(finder_for(rows), ["Underdog AI", "Limbic AI", "Oogam AI", "underdog ai "])
+    print("matching and the three states")
+    check("'Underdog AI' finds the rows filed under 'Underdog AI (Conway Research)'",
+          index["underdog ai"], {"rows": 2, "gaps": [], "gap_rows": 0})
+    check("no row: NEW; a mandatory blank: GAPS; complete: MORE",
+          [classify(c, index) for c in ("Oogam AI", "Limbic AI", "Underdog AI")], [NEW, GAPS, MORE])
+    check("the people on the sheet, never capped", names_on_sheet(rows[:2]), ["Sigil Wen", "Daniel Hong"])
+    check("a known person is excluded, whatever the spelling",
+          [is_excluded(n, ["Sigil Wen", "Daniel Hong"]) for n in ("sigil wen", "Sigil S. Wen", "Ana Pereira")],
+          [True, True, False])
+    check("a person is company|name, never the company alone",
+          person_key("Underdog AI", "Sigil Wen") != person_key("Underdog AI", "Daniel Hong"), True)
+
+    print("\nno value")
+    for v in ("", "  ", None, "none", "NULL", "-", "--", "->", "—", "n/a", "N/A", "na", "nil", "unknown",
+              "Not Found", "not available", "tbd", "TBA"):
+        check(f"is_blank({v!r})", is_blank(v), True)
+    check("a real value is not blank", [is_blank(v) for v in ("Pune", "AI Labs", "0")], [False] * 3)
+    check("a fellowship, an award or a seat elsewhere is not a role here",
+          [role_at_company(t, "Underdog AI") for t in ("Thiel Fellow", "Forbes 30 Under 30 winner", "Advisor",
+                                                       "Board Member at OtherCo", "CTO at Globex", "->")], [""] * 6)
+    check("a role here is kept",
+          [role_at_company(t, "Underdog AI") for t in ("Founder & CEO", "Research Engineer at Underdog AI")],
+          ["Founder & CEO", "Research Engineer"])
 
     print("\nM1")
-    check("the agreed shape", "\n".join(m1_lines(
-        [("Underdog AI (Conway Research)", BRANCH_A), ("Limbic AI", BRANCH_B)], since=date(2026, 10, 1))),
-        "New companies in the Master Pipeline — since Thu 1 Oct\n\n"
-        "1. Underdog AI (Conway Research)\n"
-        "2. Limbic AI — already on Outreach PoCs, missing some fields\n\n"
-        "Would you like me to look these up and suggest prospective PoCs we could contact?")
-    check("nothing in scope: no lines at all", m1_lines([("X", COMPLETE)], since=date(2026, 10, 1)), [])
+    check("three states, one question", "\n".join(m1_lines(
+        [("Oogam AI", NEW), ("Limbic AI", GAPS), ("Underdog AI (Conway Research)", MORE)], since=date(2026, 10, 7))),
+        "New companies in the Master Pipeline — since Wed 7 Oct\n\n1. Oogam AI\n"
+        "2. Limbic AI — already on Outreach PoCs, missing some fields\n"
+        "3. Underdog AI (Conway Research) — already on Outreach PoCs\n\n" + M1_ASK)
 
-    print("\nM2, M2b, M4")
-    sigil = {"name": "Sigil Wen", "title": "Founder & CEO", "industry": "AI Labs", "email": "sigil@underdog.ai",
-             "based": "San Francisco, USA", "linkedin_url": "https://www.linkedin.com/in/sigil/",
-             "source": "https://underdog.ai/team"}
-    daniel = {"name": "Daniel Hong", "title": "Founding Team", "industry": "AI Labs", "based": "Seoul, South Korea",
-              "linkedin_url": "https://linkedin.com/in/unifiedh", "paper": "https://unifiedh.com",
-              "source": "https://linkedin.com/company/underdog-ai/people"}
-    one = render_found(suggest=[("Underdog AI", [dict(sigil, paper="https://x.example/p")])])
-    check("one company, everything found: one-line header, no note",
-          (one["text"].splitlines()[0], NOTE_OMITTED in one["text"], one["rows"]),
-          ("Suggested PoCs — Underdog AI", False, 1))
-    two = render_found(suggest=[("Underdog AI (Conway Research)", [sigil, daniel]),
-                                ("Limbic AI", [{"name": "Ross Harper", "title": "Co-founder & CEO",
-                                                "source": "https://limbic.ai/team"}])])
-    text = two["text"]
-    check("two companies: stacked, the note once, the count in the closing line",
-          (text.splitlines()[0], text.count(NOTE_OMITTED),
-           text.endswith("Shall I go ahead? This adds 3 rows for Underdog AI (Conway Research) and Limbic AI.")),
-          ("Suggested PoCs", 1, True))
-    check("an omitted field prints nothing", [l for l in text.splitlines() if re.search(r"not found|n/a|\s{2}$", l)], [])
-    check("labels in order, values aligned, links bare",
-          text.split("\n\n")[2].splitlines(),
-          ["1. Sigil Wen — Founder & CEO", "   Industry    AI Labs", "   Email       sigil@underdog.ai",
-           "   Based       San Francisco, USA", "   LinkedIn    linkedin.com/in/sigil", "   Source      underdog.ai/team"])
-    fill = [("VoiceCare AI", [{"name": "Anil Keshav", "title": "Head of Clinical AI",
-                               "found": [("Email id", "anil@voicecare.ai"), ("LI Url", "https://linkedin.com/in/anilkeshav")],
-                               "source": "https://voicecare.ai/about", "unfound": 0},
-                              {"name": "Mara Ellis", "title": "Research Lead", "found": [], "unfound": 1}])]
-    b = render_found(fill=fill)["text"]
-    check("Branch B: not numbered, the sheet's own labels, a request and no offer",
-          b, "Missing fields\n\nVoiceCare AI\n\nAnil Keshav — Head of Clinical AI\n   Email id    anil@voicecare.ai\n"
-             "   LI Url      linkedin.com/in/anilkeshav\n   Source      voicecare.ai/about\n\n"
-             + NOTE_OMITTED + "\n\n" + M2B_REQUEST)
-    both = render_found(suggest=[("Underdog AI", [sigil])], fill=fill, failed=["Limbic AI"])["text"]
-    order = [both.index(x) for x in ("Suggested PoCs — Underdog AI", "Missing fields", NOTE_OMITTED,
-                                    "I could not find PoCs for Limbic AI", "Shall I go ahead?", M2B_REQUEST)]
-    check("both in one message, in the agreed order", order, sorted(order))
-    check("the email offer replaces the request only when asked for",
-          render_found(fill=fill, email_offer=True)["text"].endswith(M2B_EMAIL_OFFER), True)
-    none = render_found(failed=["Limbic AI"])
-    check("nothing found for anybody: M4", (none["kind"], none["text"]),
-          ("none", "No PoCs found — Limbic AI\n\n" + M4_BODY))
-    check("no bold, no emoji, no 'Hey team'",
-          [x for x in ("**", "Hey team", "•") if x in text + b + both + none["text"]], [])
+    print("\nthe reply")
+    priya = {"name": "Priya Raghavan", "title": "VP Research", "email": "priya@oogam.ai", "based": "Bengaluru, India",
+             "linkedin_url": "https://www.linkedin.com/in/priyaraghavan", "source": "https://oogam.ai/team"}
+    ana = {"name": "Ana Pereira", "title": "Research Engineer", "based": "->",
+           "linkedin_url": "https://www.linkedin.com/in/anapereira", "source": "https://www.linkedin.com/in/anapereira/"}
+    out = render_found(
+        add=[{"company": "Oogam AI", "industry": "Voice AI", "people": [priya]},
+             {"company": "Underdog AI (Conway Research)", "industry": "AI Labs", "people": [ana],
+              "already": ["Sigil Wen", "Daniel Hong"]}],
+        fill=[{"company": "Limbic AI", "industry": "Mental Health AI", "rows": [
+            {"name": "Ross Harper", "title": "Co-founder & CEO", "unfound": 0, "source": "https://limbic.ai/team",
+             "found": [("LI Url", "https://www.linkedin.com/in/rossgharper")]}]}])
+    text = out["text"]
+    check("two sections, industry on the subheadings, the two closing lines last", (
+        [l for l in text.splitlines() if l in ("Suggested PoCs", "Missing fields", "Oogam AI — Voice AI",
+                                                "Underdog AI (Conway Research) — AI Labs",
+                                                "Limbic AI — Mental Health AI")],
+        text.splitlines()[-2:]),
+        (["Suggested PoCs", "Oogam AI — Voice AI", "Underdog AI (Conway Research) — AI Labs", "Missing fields",
+          "Limbic AI — Mental Health AI"],
+         [ADD_CLOSE, "Those Limbic AI columns are ones I'm not able to write to, so could you add them please?"]))
+    check("the known people are named, then the new one",
+          "Sigil Wen and Daniel Hong are already on the sheet. One other I found:" in text, True)
+    check("'->' prints nothing; a Source equal to the LinkedIn link is dropped; links are masked",
+          text.split("1. Ana Pereira — Research Engineer\n")[1].split("\n\n")[0],
+          "   LinkedIn    [linkedin.com/in/anapereira](<https://www.linkedin.com/in/anapereira>)")
+    check("no Industry line on a person, no row count, no dead link",
+          [x for x in ("   Industry", "This adds", "rows for") if x in text]
+          + re.findall(r"(?<![\[(<./\w])(?:linkedin\.com|oogam\.ai)/\S+", text), [])
+    check("the note appears exactly once", text.count(NOTE_OMITTED), 1)
+    full = dict(priya, paper="https://oogam.ai/paper")
+    one = render_found(add=[{"company": "Oogam AI", "industry": "Voice AI", "people": [full]}])["text"]
+    check("one company, one section: the one-line header, no subheading, no note when all was found",
+          (one.splitlines()[0], "Oogam AI — Voice AI" in one, NOTE_OMITTED in one, one.splitlines()[-1]),
+          ("Suggested PoCs — Oogam AI", False, False, ADD_CLOSE))
+    nobody = render_found(add=[{"company": "Limbic AI", "people": []}])
+    check("nothing found: the short form with the one try-again close",
+          (nobody["kind"], nobody["text"]), ("none", f"No PoCs found — Limbic AI\n\n{NOBODY}\n{TRY_AGAIN}"))
+    known = render_found(add=[{"company": "Underdog AI (Conway Research)", "industry": "AI Labs", "people": [],
+                               "already": ["Sigil Wen", "Daniel Hong"]},
+                              {"company": "Oogam AI", "people": [priya]}])["text"]
+    check("everybody found is already known: said, with the same close",
+          "Sigil Wen and Daniel Hong are already on the sheet, and I could not find anyone else.\n" + TRY_AGAIN
+          in known, True)
+    gaps = render_found(fill=[{"company": "Limbic AI", "industry": "Mental Health AI",
+                               "rows": [{"name": "Ross Harper", "found": [], "unfound": 2}]}])["text"]
+    check("no details found for an existing row: said, with the same close, and no closing request",
+          gaps, "Missing fields — Limbic AI\n\nI could not find the missing details for Ross Harper on the web.\n"
+                + TRY_AGAIN)
+    more = render_found(add=[{"company": "Underdog AI (Conway Research)", "industry": "AI Labs", "people": [ana],
+                              "already": ["Sigil Wen", "Daniel Hong"]}], title=MORE_HEADER, left_out=True)["text"]
+    check("the follow-up shape", more.splitlines()[:3],
+          ["More PoCs — Underdog AI (Conway Research)", "",
+           "Already on the sheet, so I left them out: Sigil Wen, Daniel Hong."])
 
     print("\nM3")
-    check("one per company, nothing else",
-          render_written([{"company": "Underdog AI (Conway Research)", "added": 2},
-                          {"company": "Limbic AI", "added": 1, "skipped": ["Skipped Ross Harper: already on the tab."]}]),
-          "Done — Underdog AI (Conway Research)\nadded to Outreach PoCs\n\n"
-          "Done — Limbic AI\nadded to Outreach PoCs\nSkipped Ross Harper: already on the tab.")
+    check("one block a company", render_written([{"company": "Oogam AI", "added": 2}]),
+          "Done — Oogam AI\nadded to Outreach PoCs")
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

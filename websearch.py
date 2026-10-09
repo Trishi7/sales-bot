@@ -202,7 +202,19 @@ PEOPLE_MAX = 5
 NOBODY_FOUND = "NOBODY FOUND"
 
 
-def people_queries(company: str, department: str = "") -> list:
+# THE ANGLES A PEOPLE SEARCH CAN TAKE, in the order they are tried. The first
+# is the one every first search uses. "Find a different person" moves to the
+# next: re-running the same query returns the same top results, and with the
+# people already known filtered out that is an empty answer every time.
+PEOPLE_ANGLES = (
+    'site:linkedin.com/in "{company}"',
+    '"{company}" team OR about OR leadership OR founders',
+    '"{company}" (CTO OR "head of" OR "research lead" OR "chief scientist" OR "VP") linkedin',
+    '"{company}" careers OR hiring OR "join us" engineer OR researcher',
+)
+
+
+def people_queries(company: str, department: str = "", *, exclude=(), angle: int = 0) -> list:
     """The two searches behind find_people, as `search_backend.search` kwargs.
 
     LINKEDIN'S RESULT TITLES ARE THE ANSWER: a profile's title on a results
@@ -213,7 +225,15 @@ def people_queries(company: str, department: str = "") -> list:
     """
     company = " ".join(str(company or "").split())
     dept = " ".join(str(department or "").split())
-    first = f'site:linkedin.com/in "{company}"' + (f" {dept}" if dept else "")
+    first = PEOPLE_ANGLES[int(angle) % len(PEOPLE_ANGLES)].format(company=company) \
+        + (f" {dept}" if dept else "")
+    # PEOPLE WE ALREADY HAVE, AS NEGATIVE TERMS (SearXNG and DuckDuckGo both take
+    # -"Name"). Every name, never a slice: it is a handful per company. A search
+    # engine treats these as a hint, which is why the caller filters again.
+    for name in exclude or ():
+        name = " ".join(str(name or "").split())
+        if name:
+            first += f' -"{name}"'
     return [
         {"q": first, "n": 10},
         {"q": f'"{company}" team OR about OR leadership', "n": 5},
@@ -229,8 +249,29 @@ def own_site_page(company: str, results: list) -> str:
     return ""
 
 
+def _people_rules(company: str, exclude=()) -> list:
+    """The two rules added on 9 Oct, for both shapes of the prompt: whose title
+    counts, and who must not come back."""
+    lines = [
+        "",
+        f"THE TITLE IS THEIR ROLE AT {company.upper()} AND NOTHING ELSE. A fellowship, "
+        "an award, alumni status, a board seat or an advisory role, or a job at "
+        "another organisation, is not their title here: write NONE for the title "
+        "rather than any of those.",
+    ]
+    names = [" ".join(str(n or "").split()) for n in (exclude or ())]
+    names = [n for n in names if n]
+    if names:
+        lines += [
+            "",
+            "THESE PEOPLE ARE ALREADY ON OUR SHEET. DO NOT RETURN THEM, under any "
+            "spelling: " + "; ".join(names) + ".",
+        ]
+    return lines
+
+
 def people_prompt(company: str, department: str = "", *,
-                  from_snippets: bool = False) -> str:
+                  from_snippets: bool = False, exclude=()) -> str:
     """The one question behind R11's yes and the find_people tool."""
     company = " ".join(str(company or "").split())
     dept = " ".join(str(department or "").split())
@@ -255,13 +296,13 @@ def people_prompt(company: str, department: str = "", *,
             "",
             "FORMAT, one per line and nothing else:",
             "  PERSON | <full name> | <title as the snippet states it> | "
-            "<their linkedin url from the snippet, or -> | <url of the snippet or "
+            "<their linkedin url from the snippet, or NONE | <url of the snippet or "
             "page that names them> | <where they are based, exactly as a "
-            "snippet states it, or -> | <url of a research paper or their own "
-            "research page from the snippets, or ->",
+            "snippet states it, or NONE | <url of a research paper or their own "
+            "research page from the snippets, or NONE",
             f"At most {PEOPLE_MAX} PERSON lines, founders and CXOs first.",
             f"If the snippets name nobody you would trust, reply exactly: {NOBODY_FOUND}",
-        ])
+        ] + _people_rules(company, exclude))
     return "\n".join([
         f"Find named people who work at {company}{where} and would be worth "
         "contacting for membrane's outreach: founders and co-founders first, then "
@@ -279,10 +320,10 @@ def people_prompt(company: str, department: str = "", *,
         "",
         "FORMAT, one per line and nothing else:",
         "  PERSON | <full name> | <title as the page states it> | "
-        "<profile url, or -> | <url of the page that names them>",
+        "<profile url, or NONE | <url of the page that names them>",
         f"At most {PEOPLE_MAX} PERSON lines, founders and CXOs first.",
         f"If you found nobody you would trust, reply exactly: {NOBODY_FOUND}",
-    ])
+    ] + _people_rules(company, exclude))
 
 
 _PERSON_RE = re.compile(r"^\s*[-*•]?\s*PERSON\s*\|", re.IGNORECASE)
@@ -397,7 +438,9 @@ def parse_people(text: str, evidence: dict, *, extra_text: str = "") -> tuple:
         # title) and a paper or research page (it must be a result's own url).
         # A value the search did not show is dropped; the person stays.
         based = parts[5] if len(parts) > 5 else ""
-        based = "" if based in ("-", "") else " ".join(based.split())
+        based = "" if _no_value(based) else " ".join(based.split())
+        if _no_value(title):
+            title = ""
         if based and [t for t in re.findall(r"[a-z0-9]+", _fold(based))
                       if not re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", haystack)]:
             dropped.append((line.strip(), f"'{based}' is not in any snippet — kept the "
@@ -415,6 +458,13 @@ def parse_people(text: str, evidence: dict, *, extra_text: str = "") -> tuple:
         if len(people) >= PEOPLE_MAX:
             break
     return people, dropped
+
+
+def _no_value(text) -> bool:
+    """"NONE", "-", "->", "n/a", "unknown": the ways a model says it has nothing."""
+    import gtm_sheet
+    norm = gtm_sheet.normalise_header(str(text or ""))
+    return not norm or norm in gtm_sheet._UNKNOWN_WORDS
 
 
 def _is_own_site(url: str, company: str) -> bool:
