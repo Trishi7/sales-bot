@@ -249,12 +249,41 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R2
-  # For companies in the news that are NOT in the Master Pipeline, say why each
-  # is or isn't relevant to membrane. Permission is asked before anything is
-  # added to the sheet — the bot never adds a row on its own.
+  # Companies in the news that are on NEITHER sheet, each with a verdict.
+  # REBUILT 12 OCT 2026, after the 11 Oct post named two tracked companies:
+  #
+  #   - EVERY company on the Master Pipeline and on Outreach PoCs is known, read
+  #     fresh just before the message is built. No cap on the list, ever.
+  #   - THE SCREEN IS IN CODE. The model names the companies the stories are
+  #     about; each name is matched against both sheets on its FULL name; only
+  #     what survives is sent back for a verdict (Good fit / Weak fit).
+  #   - THE NEWS is the feed since R2 last posted, by when each story was first
+  #     seen, never further back than the previous scheduled day.
+  #   - On Outreach PoCs but not the Master Pipeline: its own line, asking for a
+  #     pipeline row. On the Master Pipeline: dropped, never mentioned.
+  #   - Asked and not answered: it comes back, for two weeks.
+  #   - NOTHING NEW, NOTHING POSTED. If the sheets cannot be read the message is
+  #     cancelled (logged at ERROR).
+  #
+  # Permission is asked before anything is added to the sheet, twice: the reply
+  # names the company, the bot says back what it understood, and an approver
+  # answers that. The bot never adds a row on its own.
   - id: R2
     name: News-company screen
     plain: companies in the news that aren't in the pipeline yet
+    # The Bot Rules tab, rule 2, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      New companies in the news. Tuesday and Friday: companies in the AI
+      news since the last time we posted that are on neither the Master
+      Pipeline nor Outreach PoCs, up to 5, each with a link to the story,
+      what happened, and Good fit or Weak fit with one reason. A company
+      on Outreach PoCs but not on the Master Pipeline is listed
+      separately, asking whether to add a pipeline row. Companies already
+      on the Master Pipeline are never listed. Reply with the company's
+      name to add it ("add Mirage Labs"); Saley says back what it
+      understood and asks once more before adding a row with the company
+      name only. A company nobody answered about comes back in the next
+      message, for two weeks. Nothing is posted when nothing is new.
     weekdays: [tue, fri]
     trigger: news_company_screen
     max_items_per_post: 5

@@ -531,11 +531,19 @@ def _r_ai_news(rule, ctx) -> list:
 
 
 def _r_news_company_screen(rule, ctx) -> list:
-    """R2 — companies in the news that are NOT in the Master Pipeline. WEB-DEPENDENT.
+    """R2 — companies in the news that are on NEITHER sheet. WEB-DEPENDENT.
 
-    The screen says why each is or is not relevant to membrane. PERMISSION IS
-    ASKED before anything is added to the sheet — this rule proposes, it never
-    writes, and neither does anything downstream of it.
+    ONE CARRIER ITEM, every Tuesday and Friday. The screen itself happens at
+    research time (`bot._screen_companies`): it needs a fresh read of both
+    sheets, the feed store and two model calls, and this engine reads no sheet
+    and keeps no state. When nothing survives the screen the carrier has no
+    research and nothing is posted (`drip.nothing_to_say`).
+
+    THE CARRIER HAS NO CONTACT, so the one-mention-a-day dedup never sees it:
+    R2 cannot win or lose a contact against another rule.
+
+    PERMISSION IS ASKED before anything is added to the sheet — this rule
+    proposes, it never writes.
     """
     today = ctx["today"]
     known = len(ctx.get("pipeline_companies") or ())

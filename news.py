@@ -217,7 +217,12 @@ SCREEN_OFFERINGS = (
 
 def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "",
                   allow_lookup: bool = False) -> str:
-    """R2 — which of today's news companies are NOT in the pipeline.
+    """R2's ONE-CALL PROMPT, as it was until 12 Oct 2026. NO LONGER USED BY R2.
+
+    R2 now asks for company names only, filters them against both sheets in
+    code and asks for a verdict on the survivors (`news_screen.py`). This is
+    kept for the on-demand "screen these stories" path and the checks that
+    read it; it lists every tracked company, with no cap.
 
     READS THE STORIES R1 ALREADY POSTED. The question is about a result set we
     are holding, and searching again to answer it would spend the budget twice.
@@ -272,7 +277,9 @@ def screen_prompt(stories: list, known_companies: list, *, use_cases: str = "",
         head = s.get("headline") or s.get("title") or s.get("about") or "?"
         what = s.get("what") or ""
         lines.append(f"  - {head}: {what} <{s.get('url', '')}>")
-    lines += ["", "ALREADY TRACKED:", "  " + ", ".join(known_companies[:200])]
+    # EVERY NAME. This was cut at 200 until 12 Oct 2026, and Yellow.ai, number
+    # 368 of 382, was proposed as a new company because the model never saw it.
+    lines += ["", "ALREADY TRACKED:", "  " + ", ".join(known_companies)]
     return "\n".join(lines)
 
 

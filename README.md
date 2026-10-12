@@ -4209,7 +4209,7 @@ nothing at all there is no model call: the result is `NOTHING FOUND`.
 |---|---|
 | **R1 main (14:00)** | **No search at all.** `news_feed_items` from the last 24 h not yet posted; MODEL_LIGHT scores importance 1-5 and assigns a topic in one call (titles + summaries only, ~3k tokens); `news.choose` applies the caps; `news.render` stays deterministic. Sonnet is not called for the news post |
 | **R1 hourly checks** | `feeds.poll()`, then MODEL_LIGHT scores **only** items published since the last check that nobody has scored. Nothing new → **no model call at all**. The grouped breaking message posts at ≥ `NEWS_BREAKING_MIN_IMPORTANCE` exactly as before |
-| **R2** | MODEL_LIGHT, from the stored titles and summaries of today's posted stories. A search (`n=5`) only for a company the stories name but do not describe — the model writes `LOOKUP \| <company>` instead of guessing |
+| **R2** | **No search.** Two MODEL_LIGHT calls over the feed's titles and summaries: the company names, then (after the code-side filter) a verdict for the survivors. A search (`n=5`) only for a company whose story does not say what it does — the model writes `LOOKUP \| <company>` instead of guessing |
 | **R3 discovery** | `fetch_page` on each url in `EVENTS_CALENDAR_URLS` (default empty) plus `search("AI conference <month> <year> India OR global", n=10)` for this month and next; MODEL_LIGHT returns EVENT lines |
 | **R3 deadlines** | `fetch_page(row link)` first, read around the registration words; `search('"<event>" registration deadline', n=5)` second, only for what the page did not answer |
 | **R6 email** | `search('"<name>" "<company>" email contact', n=8)` → MODEL_LIGHT extracts an address **with its url**, else "no public email found". **Never guessed, and checked:** an address that is not in a snippet character for character is dropped (`websearch.verified_emails`) |
@@ -4335,7 +4335,7 @@ header.
 | Rule | What it searches for |
 |---|---|
 | **R1** | **The AI news on the `NEWS_TOPICS` list** — one main sweep a weekday of everything since the previous one, in R1's place in the day's order, plus hourly silent checks that post only what is major. Nobody is searched for by name — see below |
-| **R2** | Companies in the news **not** in the Master Pipeline, judged against the use-case table in `sales_strategy.md` §2 (A–J and who buys each). **Reads the stories R1 posted today** (`news_stories`) rather than searching again |
+| **R2** | Companies in the news that are on **neither** sheet, each with one of two verdicts judged against "What we sell" in `sales_strategy.md`. **Reads the feed store since its own last post** and matches names against both sheets in code — see "R2 screens the feed, in code" |
 | **R3** | Events not already on the tab, in the current and next month — plus the **registration-deadline backfill** for rows that lack one |
 | **R6** | A published public email — **only when column F is empty** (see below) |
 | **R8** | Recent news about the person and company, for meeting prep |
@@ -4518,31 +4518,143 @@ lean system prompt is 1,884, and every call logs its size:
 
 R1 (main and check), R2, R3's discovery and deadline backfill, and the per-row
 research loop (R6, R8, R10, R11) all run lean; the per-row loop keeps
-`_research_context` as the sheet context in the user prompt. R2 needs the
-use-case table, so the **"What we sell"** section of `sales_strategy.md` is cut
-out (4,000 characters at most) and put in R2's *user* prompt. `lean=False`
+`_research_context` as the sheet context in the user prompt. R2's verdict call
+needs the use-case table, so the **"What we sell"** section of
+`sales_strategy.md` is cut out (4,000 characters at most) and put in that
+call's *user* prompt (R2's names call carries neither). `lean=False`
 keeps the old behaviour for any caller not named here.
 
-### R2 reads what R1 posted
+### R2 screens the feed, in code (rebuilt 12 Oct 2026)
 
-The news-company screen wants companies in today's news that are **not** in
-the Master Pipeline. It reads **today's rows from `news_stories`** — the main
-post and any breaking ones, i.e. what the team was actually shown — and makes
-one cheap call to judge them. R2 can come round before the 14:00 main post; it
-then reads the previous day's rows and logs which day it read. Each company gets
-a line on whether it fits membrane and **why**, judged against the use-case
-table (A–J), with its link:
+**The bug.** On 11 October the post named three companies as "not in the
+pipeline". Two were tracked. ElevenLabs was number 1 of the 382 on the list:
+the model saw it, wrote "already tracked, so probably skip", and it still went
+out, because nothing in code checked the answer. Yellow.ai was number 368: the
+list handed to the model was cut at 200 names (and at 120 in a second place),
+so it was never seen. Two faults, two fixes: **the list is never cut**, and
+**the screen happens in code** (`news_screen.py`, pure).
+
+**The flow** (`bot._screen_companies`), Tuesdays and Fridays:
+
+1. **Both sheets, read fresh, no cap.** A company is known if it is on the
+   Master Pipeline **or** on Outreach PoCs: 382 today (281 + 212, 111 on
+   both). The read is **forced**, past the 60-second sheet cache, immediately
+   before the message is built, so a company added seconds earlier is in the
+   list. (The sweep reads both tabs every tick, which keeps the cache warm; the
+   forced read is what removes the race.) The count is logged. **If the read
+   fails, comes back stale, or either tab comes back empty, the message is
+   cancelled** and the reason is logged at ERROR (`[news] R2 CANCELLED`): a
+   screen run against an empty list would propose every tracked company.
+2. **The news since the last post, from the feed store.** See the window below.
+   Nothing is fetched for this message.
+3. **One light call for the company NAMES.** No verdict, no reason, no list of
+   tracked companies, no strategy text.
+4. **Each name is matched against both sheets in code** (`news_screen.classify`).
+5. **One light call for a verdict and a reason**, for the survivors that will
+   be shown, five at most.
+6. **One search** for a company whose story did not say what it does, and only
+   then (two such companies at most).
+7. **Nothing survived, nothing posted.** No "nothing new today".
+
+This is cheaper than before: the old single call wrote a relevance paragraph
+for every company it named, including the ones it should have dropped, and
+went through the search path. Now names in, tracked ones dropped, and only the
+survivors are explained.
+
+**The window** (`news_screen.window`, `bot._screen_window`):
+
+- It **starts at the moment R2 last posted** and **ends now**. Both ends are
+  included: a story timed exactly at the marker is in.
+- A story counts by **when it was first seen** (`news_feed_items.seen_at`), not
+  when it was published. Feeds are polled every 15 minutes, so a story
+  published before the marker and picked up after it would otherwise never be
+  looked at.
+- **The floor: never earlier than the previous scheduled R2 slot.** Friday
+  looks back to Tuesday even if Tuesday posted nothing, so a run of quiet
+  weeks, or a fortnight's outage, cannot become a fortnight-wide sweep.
+- **The first run ever**, with no marker: `NEWS_SCREEN_FIRST_RUN_DAYS` (7).
+- Only **scored** items are read, most important first, at most
+  `NEWS_SCORE_MAX_ITEMS` (40), the same cap the scorer uses. Stories found by
+  searching for one of our own companies (`kind = poc`) are left out: they are
+  about a tracked company by construction.
+
+**The marker and test days.** "Last time we posted" is one row in
+`rule_last_posted` (rule id `R2`). **A test day ("make it Friday"), a
+simulation and a pretend clock never move it**, and never touch the ledger
+below: `_after_send` writes both only when `_is_live_send` is true (no test run
+in progress, no simulation, no pretend clock, and the post is dated the real
+today). The screen itself only reads. A tester checking the message cannot
+consume the live window.
+
+**Name matching: the full name decides.** `news_screen.name_key` lower-cases,
+drops punctuation and spaces and a trailing legal suffix (Inc, Ltd, LLC, Corp,
+Co, PLC, GmbH, and ".ai"), so "Eleven Labs", "ElevenLabs Inc." and
+"ElevenLabs" are one company. Nothing else is dropped. "Nudge Security" and
+"Nudge - AI Commerce Discovery" are two companies and stay two; a story about
+Google is not a story about Google DeepMind. `gtm_sheet.find_company` falls
+back to a substring match, which is exactly what would merge the two Nudges,
+so it is **not** used here. **A partial match is a question, never an
+assumption:** when a name contains a tracked name as whole words, or the other
+way round, the company is still treated as not tracked and its line asks
+"Google may be the same company as Google DeepMind, which we already track.
+Could you confirm before I add it?".
+
+**Three outcomes:**
+
+| The company is | What happens |
+|---|---|
+| on the Master Pipeline | dropped, never mentioned |
+| on Outreach PoCs, not on the Master Pipeline (101 today) | its own line: "Vapi.ai isn't on the Master Pipeline, but it is on Outreach PoCs. Shall I add a pipeline row?" |
+| on neither | proposed, with a verdict |
+
+**The message** is fixed text (`news_screen.render`; R2 is in
+`drip.VERBATIM_TYPES`, so no model composes it):
 
 ```
-In the news today and not in the Master Pipeline:
-• Nebius — fits use case C, inference infrastructure, buys eval data <https://nebius.com/news>
-Say the word and I'll add any of these — I won't add anything without a yes.
+**New companies in the news**
+@Vaishnavi
+
+Two companies in today's news aren't on the Master Pipeline yet:
+
+- **[Nudge Security](<url>)** — raised $25M. **Weak fit:** sells to enterprise security teams, not AI teams.
+
+- **[Mirage Labs](<url>)** — launched an Indic speech model. **Good fit:** Phase 1 voice focus, and evals are close to Pulse.
+
+Would you like me to add either of them to the Master Pipeline?
 ```
 
-**It asks. It never writes.** Adding a row is `approvals` plus
-`gtm_sheet.append_row`, and neither is reachable from here. R2 is the one news
-path that reads the sheet — `_known_companies`, the tracked list it screens
-against — because "not in the pipeline" is its whole question.
+The company's name is the link, masked, pointing at the article; a url with no
+scheme is never made into a link. When a company is in several stories the
+link goes to the most important one, and on a tie the newest. There are
+**exactly two verdicts**, Good fit and Weak fit: anything else the model writes
+is a weak fit. At most five companies; the rest are counted in one line
+("Two more companies are waiting — I'll bring them next time.") and come back
+next time.
+
+**Repeats** (`news_screen_ledger`, keyed on the normalised name). A company
+asked about and not answered **comes back in the next message**, with the
+verdict it already had (it is not paid for again). It is dropped only when
+somebody replies to the message without choosing it, or when
+`NEWS_SCREEN_STALE_DAYS` (14) pass. A dropped company is not proposed again
+inside those 14 days even if it is in the news again; after that it may be.
+
+**The reply** (`bot._maybe_screen_reply`, `news_screen.read_reply`). Reply
+with the company's name: "add Mirage Labs". The name is read out of the reply,
+never a bare yes or no (`approvals.read_vote` is not used: it would read "yes
+to Mirage but not Nudge" as a no). A name that was not in the message is said
+and nothing is done. A name that fits two companies ("add Nudge" with two
+Nudges) gets "which one?" and **nothing is ever written on it**. What was
+understood is said back, and then **one more question is asked before anything
+is written**: a `pipeline_add` proposal that an approver answers. On a yes the
+bot appends ONE row to the Master Pipeline carrying **the company name only**
+(industry, geography and funding are the team's to fill in), signed with a
+note on the Company cell. A question about a company is not an answer.
+
+**Known limitation: products.** A story that names a product, not the company,
+is not matched: "ElevenReader" does not resolve to ElevenLabs. Not handled in
+this release.
+
+`python verify_news_screen.py --show` checks all of it offline.
 
 ### Test mode
 
@@ -5595,6 +5707,7 @@ python verify_voice_profile.py            # LIVE: builds the voice profile (1 li
 python verify_voice_profile.py --offline  # the parts that need neither Discord nor the model
 python verify_llm_audit.py                # every API call site, measured (system size, caching, tools)
 python verify_tokens.py --live            # prompt caching, trimming, the prefilter, a check's tokens
+python verify_news_screen.py              # R2: all 382 companies known, the code-side filter, the window and its marker, the three outcomes, repeats, the reply (--show prints the messages)
 python verify_news_events.py              # R1/R2/R3's web half, stubbed search
 python verify_news_events.py --live       # ...against the real API, spends budget
 python verify_research_timing.py          # research at send time + the day cache
@@ -6059,6 +6172,7 @@ guardrails forbid.
 | `mapping_sheet.py` | the researcher/buyer mapping — **read-only**: no write method, read-only scope, and the legend loaded as enforced rules |
 | `tracker.py` | the canonical tab read as a pipeline: last touch, open/engaged, the twice-weekly reminder, the playbook's six-stage funnel definition, and the week's leading/lagging metrics. **The three flags are removed** — see `nextaction.py` |
 | `clock.py` | **what time the bot thinks it is**, and the only place that decides. Real IST, or the persistent pretend clock a tester set with "make it Monday" (stored in SQLite, so it survives a restart). No dependencies but `config` |
+| `news_screen.py` | **R2, new companies in the news**: the full-name matcher against both sheets (known / PoCs only / new, and the partial-match question), the news window, the names and verdict prompts and their parsers, the repeat-and-drop merge, the fixed message, and the reply reader. Pure |
 | `news.py` | **R1 and R2**: the one sweep prompt (main and check), STORY parsing, the url and headline keys, `choose` (no-repeats, per-topic, per-week, cap, breaking bar), rendering, the check-slot clock, and R2's screen prompt. No I/O — the search is `llm.web_research(lean=True)`, made by bot.py |
 | `events_discovery.py` | **R3's web half**: event discovery in the current and next month, tolerant matching against what the tab already has, the per-run and per-month limits, and the registration-deadline backfill. Proposes; never writes. No I/O |
 | `gtm_sheet.write_cells_on` | a **tab-aware** single-cell write for the Events tab: allow-listed tabs, mapped columns, one cell at a time, and it **never overwrites a non-empty cell** |

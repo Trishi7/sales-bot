@@ -201,6 +201,17 @@ class StubLLM:
         return {"ok": True, "text": text, "sources": [], "searches": 1,
                 "errors": [], "note": ""}
 
+    # R2 (12 Oct 2026): two LIGHT calls and no search. Each logs a line the
+    # checks below count.
+    async def screen_names(self, *, stories):
+        self.wlog.info("[screen] R2: names call (stub), %d story/stories", len(stories))
+        return "\n".join(f"NAMES | {i} | Nebius" for i, _s in enumerate(stories, 1))
+
+    async def screen_verdicts(self, *, candidates, use_cases="", allow_lookup=False):
+        self.wlog.info("[screen] R2: verdict call (stub), %d company/companies", len(candidates))
+        return "\n".join(f"VERDICT | {c['company']} | raised a round | GOOD | buys eval data"
+                         for c in candidates)
+
 
 class FakeChannel:
     id = 4242
@@ -262,8 +273,13 @@ def make_bot():
             sum(len(a.get("sources") or []) for a in acts))
 
     bot._run_next_actions = run_next_actions
+    async def known_index(*, force=False):
+        import news_screen
+        return news_screen.build_index(["Acme AI"], ["Globex", "Initech"])
+
     bot._active_rows_of_canonical_tab = rows
     bot._known_companies = known
+    bot._known_company_index = known_index
     bot._event_actions = nothing
     bot._funnel_action = no_funnel
     bot._sweep_proposals = no_sweep
@@ -371,12 +387,17 @@ async def main():
     for m in [m for (t, _n, m) in LINES if t == t2 and (
             "[research-cache]" in m or "[websearch]" in m or "SENT" in m)]:
         print("      " + m)
-    # R2 READS TODAY'S POSTED STORIES from news_stories and makes its one
-    # screen call; what it must not do is run R1's news search again.
+    # R2 READS THE FEED STORE; what it must not do is run R1's news search
+    # again. CHANGED 12 Oct 2026: it used to make one `[websearch] R2` call (a
+    # billed search path). It now makes NO search at all: the feed store here
+    # holds no scored story, so it makes no model call either and has nothing
+    # to post.
     check("R2's slot did not re-run the news search",
           lines_of(t2, "[websearch] R1:"), [])
-    check("...and made exactly its one screen call",
-          len(lines_of(t2, "[websearch] R2:")), 1)
+    check("...and made no search of its own",
+          lines_of(t2, "[websearch] R2:"), [])
+    check("...nor is it served from the day's research cache (it must read the sheets fresh)",
+          [m for m in lines_of(t2, "[research-cache]") if "R2" in m], [])
 
     print("\n(iv) the day's budget")
     used = bot.db.web_searches_today(marker)

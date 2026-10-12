@@ -1940,10 +1940,22 @@ NEWS_MAX_ITEMS = _int("NEWS_MAX_ITEMS", 5)
 # HOW MANY PoC NAMES ARE LOOKED UP A DAY. One Google News RSS query per name
 # ("<company>", or "<person>" "<company>"), polled with the other feeds: plain
 # HTTP, free, no search API. The names take turns, least recently checked
-# first (the `news_targets` table), so 300 names at 15 a day come round every
-# 20 days. Nobody on the mapping's departures list is ever looked up. 0 turns
+# first (the `news_targets` table), so 382 names at 40 a day come round every
+# 10 days (it was 15 a day until 12 Oct 2026: a 25-day cycle against a 7-day
+# lookback, an 18-day blind spot for each company). Nobody on the mapping's departures list is ever looked up. 0 turns
 # PoC news off.
-NEWS_POC_TARGETS_PER_DAY = _int("NEWS_POC_TARGETS_PER_DAY", 15)
+NEWS_POC_TARGETS_PER_DAY = _int("NEWS_POC_TARGETS_PER_DAY", 40)
+
+# R2 (the news-company screen): a company proposed and not answered comes back
+# in the next message until it is this many days old; then it is dropped. A
+# company dropped that way may be proposed again after the same number of days
+# if it is in the news again.
+NEWS_SCREEN_STALE_DAYS = _int("NEWS_SCREEN_STALE_DAYS", 14)
+
+# R2: how far back the very first run looks, when it has never posted and so
+# has no "last time we posted" to start from. Every later run starts at the
+# last post and never reaches back past the previous scheduled R2 day.
+NEWS_SCREEN_FIRST_RUN_DAYS = _int("NEWS_SCREEN_FIRST_RUN_DAYS", 7)
 
 # How far back a PoC query looks, in days. Wider than the topic queries' two
 # days because a name is only looked up every few weeks: a round announced on

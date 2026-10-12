@@ -333,6 +333,8 @@ def proposal_label(kind: str, *, company: str = "", poc: str = "", names=(),
         return "adding the email I found to the sheet"
     if kind == "row_add":
         return f"adding {listed or 'them'} to {str(tab or '').strip() or 'Outreach PoCs'}"
+    if kind == "pipeline_add":
+        return f"adding {listed or 'them'} to the Master Pipeline"
     if kind == "event_append":
         if count > 1:
             return f"adding {count} events to the events tab"

@@ -11,8 +11,9 @@ covers what the feature is supposed to guarantee:
   1. R1's MAIN SWEEP: one lean search on the topic list, every story tagged and
      linked, and NOT ONE read of the PoCs, the mapping, the pipeline or the
      departures list (those readers are booby-trapped here);
-  3. R2: a company in today's posted news that is not in the Master Pipeline,
-     screened against the use-case table, asking before it adds anything;
+  3. R2: a company in the feed's news that is on neither sheet (12 Oct 2026:
+     names from one call, the sheets checked IN CODE, a verdict from a second
+     call for what survives), asking before it adds anything;
   4. R3: a discovery proposal and a registration-deadline backfill proposal,
      both proposing rather than writing, both on the lean prompt;
   5. the budget counter moving.
@@ -126,8 +127,14 @@ def install_fakes(bot, *, reply_for):
     async def tab_rows(kind, _for):
         return EVENT_ROWS if kind == gtm_sheet.EVENTS else []
 
+    async def known_index(*, force=False):
+        # R2's OWN READ OF BOTH SHEETS (12 Oct). A stand-in, like the rest.
+        import news_screen
+        return news_screen.build_index(["Acme AI"], ["Globex", "Initech"])
+
     bot._active_rows_of_canonical_tab = rows
     bot._known_companies = known
+    bot._known_company_index = known_index
     bot._rule_tab_rows = tab_rows
 
     import mapping_sheet
@@ -161,6 +168,25 @@ def install_fakes(bot, *, reply_for):
                 "searches": 1, "errors": [], "note": "" if text else "nothing came back",
             }
 
+        # R2's TWO LIGHT CALLS (12 Oct): the names, then the verdict.
+        async def screen_names(self, *, stories):
+            import news_screen
+            prompt = news_screen.names_prompt(stories)
+            CALLS.append({"rule": "R2-names", "prompt": prompt, "lean": True})
+            if LIVE:
+                return await real.screen_names(stories=stories)
+            return reply_for("R2-names", prompt)
+
+        async def screen_verdicts(self, *, candidates, use_cases="", allow_lookup=False):
+            import news_screen
+            prompt = news_screen.verdict_prompt(candidates, use_cases=use_cases,
+                                                allow_lookup=allow_lookup)
+            CALLS.append({"rule": "R2-verdicts", "prompt": prompt, "lean": True})
+            if LIVE:
+                return await real.screen_verdicts(candidates=candidates, use_cases=use_cases,
+                                                  allow_lookup=allow_lookup)
+            return reply_for("R2-verdicts", prompt)
+
     bot.llm = RecordingLLM()
 
 
@@ -177,15 +203,33 @@ async def scenario_main(bot, today):
                 "STORY | OTHER | Chipmaker posts record quarter | AI demand "
                 "| https://reuters.com/chips | 3\n"
             )
-        if rule == "R2":
-            return ("SCREEN | Nebius | builds inference infrastructure | fits evals: "
-                    "buys eval data for its hosted models | https://reuters.com/nebius\n"
-                    "SKIP | EU AI Act phase two | regulation, not a specific company\n")
+        if rule == "R2-names":
+            # GLOBEX IS ON THE MASTER PIPELINE and the model names it anyway:
+            # the code-side filter must drop it.
+            return "NAMES | 1 | Nebius\nNAMES | 2 | NONE\nNAMES | 3 | Globex\n"
+        if rule == "R2-verdicts":
+            return ("VERDICT | Nebius | raised $700m for inference capacity | GOOD | "
+                    "buys eval data for its hosted models\n")
         return ""
 
     install_fakes(bot, reply_for=reply)
     CALLS.clear()
     FORBIDDEN_READS.clear()
+    # R2 READS THE FEED STORE (12 Oct), by when each story was first seen: three
+    # scored stories seen the day before, inside its first-run window.
+    import feeds
+    seen = feeds.utc_iso(datetime.combine(today - timedelta(days=1), datetime.min.time())
+                         .replace(hour=6, tzinfo=dl.IST))
+    feed = [("Nebius raises $700m", "https://reuters.com/nebius", 5),
+            ("EU AI Act phase two", "https://reuters.com/eu-ai-act", 4),
+            ("Globex ships an agent", "https://reuters.com/globex", 3)]
+    bot.db.news_feed_add([
+        {"url": u, "url_key": news.url_key(u), "headline_key": news.headline_key(t), "title": t,
+         "summary": "", "source": "Reuters", "published_at": seen, "topic_hint": "",
+         "seen_at": seen, "kind": feeds.KIND_INDUSTRY, "sheet_ref": ""} for t, u, _i in feed])
+    bot.db.news_feed_set_scores(
+        [{"url_key": news.url_key(u), "importance": i, "topic": "funding", "what": ""}
+         for _t, u, i in feed], scored_at=seen)
     items = [item(nextaction.R_AI_NEWS, "R1"), item(nextaction.R_NEWS_SCREEN, "R2")]
     await bot._news_run(items, today=today)
 
@@ -212,25 +256,39 @@ async def scenario_main(bot, today):
           len(r1["sources"]), len(bullets), live_optional=True)
     print("   " + "\n   ".join(r1["text"].splitlines()))
 
-    print("\n3. R2 — a company in today's posted news that we do not track")
+    print("\n3. R2 — a company in the news that is on neither sheet")
     r2 = items[1]
     check("the screen ran", r2["web_pending"], False)
     check("it names the company", "Nebius" in r2["text"], live_optional=True)
-    check("with what they do and why, in words",
-          "fits evals" in r2["text"] and "builds inference" in r2["text"],
-          live_optional=True)
+    # CHANGED 12 Oct: one line a company, "what happened. **Verdict:** reason",
+    # where it was "what they do" and "why it fits" on two lines.
+    check("with what happened, the verdict in bold and one clause of reason",
+          "raised $700m for inference capacity. **Good fit:** buys eval data for its "
+          "hosted models." in r2["text"], live_optional=True)
     check("the regulation story is not screened", "EU AI Act" in r2["text"], False)
-    check("and its link", "<https://reuters.com/nebius>" in r2["text"],
+    check("a company on the Master Pipeline that the model named anyway is dropped in code",
+          "Globex" in r2["text"], False, live_optional=True)
+    check("the company's name is the link, masked",
+          "**[Nebius](<https://reuters.com/nebius>)**" in r2["text"], live_optional=True)
+    check("it asks before adding anything",
+          "Would you like me to add it to the Master Pipeline?" in r2["text"],
           live_optional=True)
-    check("it asks before adding anything", "without a yes" in r2["text"])
-    r2_calls = [c for c in CALLS if c["rule"] == "R2"]
-    check("R2 read today's posted stories", bool(r2_calls) and
-          "Nebius raises $700m" in r2_calls[0]["prompt"], live_optional=True)
-    check("...on the lean prompt, with what we sell in the question",
-          bool(r2_calls) and r2_calls[0]["lean"]
-          and "WHAT MEMBRANE SELLS" in r2_calls[0]["prompt"])
+    names_calls = [c for c in CALLS if c["rule"] == "R2-names"]
+    verdict_calls = [c for c in CALLS if c["rule"] == "R2-verdicts"]
+    check("R2 read the feed's stories, and asked for names only: ONE call, no strategy "
+          "text and no list of tracked companies in it",
+          (len(names_calls), bool(names_calls) and "Nebius raises $700m" in names_calls[0]["prompt"],
+           bool(names_calls) and "WHAT MEMBRANE SELLS" in names_calls[0]["prompt"],
+           bool(names_calls) and "Initech" in names_calls[0]["prompt"]),
+          (1, True, False, False))
+    check("...then ONE verdict call, for the survivor only, with what we sell in the question",
+          (len(verdict_calls), bool(verdict_calls) and "WHAT MEMBRANE SELLS" in verdict_calls[0]["prompt"],
+           bool(verdict_calls) and "Globex" in verdict_calls[0]["prompt"]),
+          (1, True, False), live_optional=True)
+    check("R2 no longer goes through the search path at all",
+          [c for c in CALLS if c["rule"] == "R2"], [])
     if LIVE and r2.get("text"):
-        bullets = [l for l in r2["text"].splitlines() if l.strip().startswith("•")]
+        bullets = [l for l in r2["text"].splitlines() if l.strip().startswith("- ")]
         check("live: every screened company carries a link",
               all("<http" in b for b in bullets))
     print("   " + "\n   ".join(r2["text"].splitlines()))
@@ -240,7 +298,10 @@ async def scenario_main(bot, today):
     # pretending: a search is real money on the day it is made.
     marker = dl.iso(dl.real_today_ist())
     spent = bot.db.web_searches_today(marker)
-    check("the budget counter moved", spent >= 2)
+    # CHANGED 12 Oct: this was `>= 2`. R2 banked a search request for a question
+    # about stories the bot already held; it now makes two light model calls and
+    # no search (one only when a story does not say what a company does).
+    check("the budget counter moved (R1's one search; R2 spends none)", spent, 1)
     print(f"   {spent} search(es) banked; "
           f"{bot.db.web_search_budget_left(marker)} left of "
           f"{config.WEB_SEARCH_DAILY_BUDGET}")

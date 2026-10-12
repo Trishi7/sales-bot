@@ -1198,7 +1198,7 @@ HEADINGS = {
     # daily post, the follow-up, a breaking post and an answer in the channel.
     "R1": "AI News, {day}",
     "R1_breaking": "Breaking AI News, {day}",
-    "R2": "Companies in the news",
+    "R2": "New companies in the news",
     "R3": "AI events & summits",
     "R4": "This week's deliverables",
     # R5 HAS NO HEADING HERE: its bold first line carries the company
@@ -1282,7 +1282,11 @@ def with_heading(body: str, head: str) -> str:
 # composer could renumber it, drop the suffix or bring "Hey team" back.
 VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             nextaction.R_EVENTS, nextaction.R_PROSPECTS,
-                            nextaction.R_NEXT_STEPS, nextaction.R_NEW_COMPANY})
+                            nextaction.R_NEXT_STEPS, nextaction.R_NEW_COMPANY,
+                            # R2 (12 Oct): its list is built and checked in code
+                            # (`news_screen.render`). On 11 Oct a composed post put
+                            # a tracked company under "not in the pipeline".
+                            nextaction.R_NEWS_SCREEN})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1342,7 +1346,7 @@ def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> s
 
 
 def with_tags(text: str, *, owner_id=None, owner_name: str = "",
-              is_dm: bool = False) -> str:
+              is_dm: bool = False, gap: bool = False) -> str:
     """`text` with the tag line in front of it. The one place tags are attached.
 
     Separate from `compose_fallback` and `compose_prompt` on purpose: the model
@@ -1356,7 +1360,8 @@ def with_tags(text: str, *, owner_id=None, owner_name: str = "",
         return body
     if not body:
         return prefix
-    return f"{prefix}\n{body}"
+    # `gap` puts a blank line under the tags (R2's agreed shape).
+    return f"{prefix}\n\n{body}" if gap else f"{prefix}\n{body}"
 
 
 def research_of(message: dict) -> str:
@@ -1835,6 +1840,12 @@ def nothing_to_say(message: dict) -> bool:
         # Cannot happen (nobody due means no item, so no group); if it ever
         # did, an opener with nobody under it must not be posted.
         return not shown_contacts(message)
+    if message.get("type") == nextaction.R_NEWS_SCREEN:
+        # R2: NOTHING SURVIVED THE SCREEN, OR THE SCREEN WAS CANCELLED (the
+        # sheets could not be read). Every company in the news already being
+        # tracked is a good outcome, not news, so nothing is posted: no "nothing
+        # new today", no placeholder.
+        return not research_of(message)
     if message.get("type") != nextaction.R_EVENTS:
         return False
     return not event_lines(message) and not research_of(message)

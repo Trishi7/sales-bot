@@ -81,6 +81,7 @@ import mapping_sheet
 import meetings
 import leave
 import news
+import news_screen
 import nextaction
 import rules
 import simulation
@@ -325,6 +326,17 @@ _PROSPECT_IN_RE = re.compile(
     r"\b(?:find|get|give|show|list)\s+(?:me\s+|us\s+)?(?:some\s+|the\s+)?"
     r"(?:pocs?|prospects?)\s+(?:to (?:contact|reach)\s+)?in\s+(?P<ind>[^?.\n]+)",
     re.IGNORECASE)
+
+
+# R2's REPLY: does this message ask for something to be added (or all of them)?
+_SCREEN_ADD_RE = re.compile(
+    r"\b(add|adding|yes|yeah|yep|go ahead|both|all|either|please do|put|include)\b",
+    re.IGNORECASE)
+
+
+class ScreenCancelled(Exception):
+    """R2's company list could not be read, or came back empty. The message is
+    cancelled: see `SalesBot._known_company_index`."""
 
 
 def _looks_like_question(text: str) -> bool:
@@ -1651,6 +1663,10 @@ class SalesBot(discord.Client):
             # "FIND A DIFFERENT PERSON" UNDER R11's LIST is that list again with
             # other people, never the general people-search answer.
             if await self._maybe_more_pocs(message, text, ctx):
+                return True
+            # "ADD MIRAGE LABS" UNDER THE NEW-COMPANIES POST names a company; it
+            # is read by name, never as a bare yes or no.
+            if await self._maybe_screen_reply(message, text, ctx):
                 return True
             # A YES OR "MOVE ON" UNDER THE PoCs-TO-CONTACT POST answers that
             # post: the rest of the list, or the next company. Before the
@@ -7481,6 +7497,9 @@ class SalesBot(discord.Client):
                 kind, when=f"{on:%a} {on.day} {on:%b}" if on else "")
         if kind == "poc_lookup":
             return wording.proposal_label(kind, names=payload.get("companies") or [])
+        if kind == "pipeline_add":
+            return wording.proposal_label(
+                kind, names=[c.get("company") for c in (payload.get("companies") or [])])
         return wording.proposal_label(
             kind, company=str(proposal.get("company") or ""),
             poc=str(proposal.get("poc") or ""))
@@ -7581,6 +7600,15 @@ class SalesBot(discord.Client):
             )
         )
 
+        if decision == approvals.DECLINE and proposal.get("kind") == "pipeline_add":
+            # R2: "no" to "Shall I go ahead?". The companies are answered, so
+            # they are not asked about again (the ledger's 'dropped').
+            payload = proposal.get("payload") or {}
+            if payload.get("live"):
+                await asyncio.to_thread(
+                    lambda: self._ledger().screen_ledger_close(
+                        [c.get("company_key") for c in (payload.get("companies") or [])],
+                        status="dropped", at=feeds.utc_iso(dl.real_now_ist())))
         if decision == approvals.DECLINE and proposal.get("kind") in (
                 "poc_lookup", "events_remind"):
             # A QUESTION DECLINED (R11's lookup, R3's reminder): nothing
@@ -9509,6 +9537,11 @@ class SalesBot(discord.Client):
         if kind == "poc_lookup":
             await self._apply_poc_lookup(message, proposal, decided_by=decided_by)
             return
+        if kind == "pipeline_add":
+            # R2: a Master Pipeline row for a company in the news, after the
+            # second question was answered by an approver.
+            await self._apply_pipeline_add(message, proposal, decided_by=decided_by)
+            return
         if kind == "row_add":
             await self._apply_poc_row_add(message, proposal, decided_by=decided_by)
             return
@@ -10357,6 +10390,8 @@ class SalesBot(discord.Client):
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
+            # R2's agreed shape has a blank line between the tags and the list.
+            gap=message.get("type") == nextaction.R_NEWS_SCREEN,
         )
         opener_text = body
         # THE HEADING GOES ON LAST, ABOVE THE TAGS LINE: one bold line per
@@ -11030,6 +11065,35 @@ class SalesBot(discord.Client):
                 log.info("[rules] R3: %r listed once as \"date unclear\"; it is not "
                          "listed again until the sheet's date can be read",
                          action.get("company"))
+        elif kind == nextaction.R_NEWS_SCREEN:
+            # R2: THE MARKER AND THE LEDGER, FOR A LIVE POST ONLY. A test day or
+            # a simulation gets the same message and leaves both untouched, so
+            # checking the message never consumes the real news window.
+            info = next((a.get("screen") for a in (message.get("actions") or [])
+                         if a.get("screen")), None) or {}
+            shown = list(info.get("shown") or [])
+            self._remember_said(sent, kind="news_screen", rows=shown)
+            if not self._is_live_send(marker):
+                log.info("[news] R2: %s is a test day, a simulation or a pretend date — "
+                         "the last-posted marker and the ledger of proposed companies are "
+                         "NOT touched", marker)
+            elif shown:
+                at = feeds.utc_iso(dl.real_now_ist())
+                mid = str(getattr(sent, "id", "") or "")
+                ledger = self._ledger()
+                await asyncio.to_thread(
+                    lambda: ledger.screen_ledger_record(
+                        shown=shown, held=list(info.get("held") or []),
+                        stale=list(info.get("stale") or []), at=at, message_id=mid))
+                if info.get("now_known"):
+                    await asyncio.to_thread(
+                        lambda: ledger.screen_ledger_close(
+                            list(info["now_known"]), status="added", at=at))
+                await asyncio.to_thread(
+                    lambda: ledger.set_rule_last_posted("R2", posted_at=at, message_id=mid))
+                log.info("[news] R2: posted about %d company/companies (%d held back); the "
+                         "last-posted marker is now %s", len(shown),
+                         len(info.get("held") or []), at)
         elif kind == nextaction.R_NEXT_STEPS:
             await self._record_next_steps(message, sent=sent, marker=marker)
 
@@ -12266,128 +12330,457 @@ class SalesBot(discord.Client):
     # (in words) and the Phase 1 focus. R2 judges fit against it.
     STRATEGY_USE_CASE_HEADING = "What we sell"
 
+    def _is_live_send(self, marker: str) -> bool:
+        """Is this a REAL post on the REAL day? False for a test day ("make it
+        Friday"), a simulation, a pretend clock and any day that is not today.
+
+        THIS IS THE GATE ON R2's STATE. The "last time we posted" marker and
+        the ledger of proposed companies are written only when it is True, so a
+        tester checking the message cannot consume the live news window.
+        """
+        import simulation
+        if self._test_run_active() or simulation.in_simulation() or clock.pretending():
+            return False
+        return str(marker or "") == dl.iso(dl.real_today_ist())
+
+    async def _known_company_index(self, *, force: bool = False) -> dict:
+        """Every company on the Master Pipeline and on Outreach PoCs, as
+        `news_screen.build_index` gives it. NO CAP, at any size.
+
+        `force=True` BYPASSES THE 60-SECOND SHEET CACHE. R2 calls it that way
+        immediately before the message is built: a company added to the sheet
+        seconds earlier is then in the list, whatever else read the sheet in
+        the last minute. (The sweep reads both tabs every tick, which keeps the
+        cache warm; only this forced read removes the race.)
+
+        RAISES `ScreenCancelled` when either tab cannot be read or comes back
+        with no company on it. `gtm_sheet.read` hands back its last good copy
+        when a read fails, so a forced read that returns an OLD copy is a
+        failed read, and is treated as one. A screen run against an empty list
+        would propose every tracked company at once.
+        """
+        try:
+            tabs = await asyncio.to_thread(lambda: gtm_sheet.SHEETS.read(force=force))
+        except Exception as e:
+            raise ScreenCancelled(f"the sheet could not be read ({type(e).__name__}: {e})")
+        names: dict = {}
+        for kind, label in ((gtm_sheet.POCS, "Outreach PoCs"),
+                            (gtm_sheet.RESEARCHER_LINES, "Master Pipeline")):
+            tab = (tabs or {}).get(kind)
+            if tab is None:
+                raise ScreenCancelled(f"the {label} tab did not come back from the sheet")
+            if force and float(getattr(tab, "age_seconds", 0.0) or 0.0) > 30:
+                raise ScreenCancelled(
+                    f"the fresh read of {label} failed; the copy on hand is "
+                    f"{int(tab.age_seconds)}s old")
+            found = [gtm_sheet.clean_cell(r.get("company")) for r in (tab.rows or [])]
+            names[kind] = [n for n in found if n]
+            if not names[kind]:
+                raise ScreenCancelled(f"the {label} tab came back with no companies on it")
+        index = news_screen.build_index(names[gtm_sheet.POCS], names[gtm_sheet.RESEARCHER_LINES])
+        log.info("[news] R2: %d known companies (%d on the Master Pipeline, %d on Outreach "
+                 "PoCs, %d on Outreach PoCs only)%s", index["count"], len(index["pipeline"]),
+                 len(index["pocs"]),
+                 len([k for k in index["pocs"] if k not in index["pipeline"]]),
+                 ", read fresh" if force else "")
+        return index
+
+    def _screen_window(self, today) -> tuple:
+        """(since, until, why) for R2's news window (`news_screen.window`).
+
+        FROM THE LAST POST TO NOW, never earlier than the previous scheduled R2
+        slot; seven days on the first run ever. On a past pretend date the
+        window ends at that day's own R2 slot, and a marker later than that is
+        ignored, so a test of last Tuesday reads last Tuesday's news.
+        """
+        rule = rules.by_id("R2")
+        until = dl.real_now_ist() if today >= dl.real_today_ist() else drip.order_slot("R2", today)
+        prev = news_screen.previous_run_day(today, getattr(rule, "weekdays", ()) or ())
+        floor = drip.order_slot("R2", prev)
+        marker = None
+        raw_marker = self._ledger().rule_last_posted("R2")
+        if raw_marker:
+            try:
+                marker = datetime.fromisoformat(raw_marker).astimezone(dl.IST)
+            except ValueError:
+                log.warning("[news] R2: the last-posted marker %r is not a date; ignored",
+                            raw_marker)
+        if marker is not None and marker > until:
+            marker = floor
+        since, until = news_screen.window(
+            now=until, marker=marker, floor=floor,
+            first_days=int(config.NEWS_SCREEN_FIRST_RUN_DAYS))
+        why = ("no marker yet: the first run looks back %d days"
+               % int(config.NEWS_SCREEN_FIRST_RUN_DAYS) if marker is None
+               else "from the last post" if since == marker
+               else "from the previous scheduled day (%s)" % dl.iso(prev))
+        return since, until, why
+
     async def _screen_companies(self, items: list, *, today, marker: str) -> None:
-        """R2 — which companies in today's news are not in the pipeline.
+        """R2 — which companies in the news are on neither sheet.
 
-        READS TODAY'S ROWS FROM `news_stories` — the main post and any breaking
-        ones — rather than a search result handed across. R2 COMES BEFORE THE
-        AI NEWS POST IN THE DAY'S ORDER (third of four on a Tuesday, first on
-        a Friday); then it reads the previous day's rows and says which day it
-        read.
+        SEVEN STEPS, AND THE FOURTH IS THE FIX (12 Oct 2026):
 
-        MODEL_LIGHT, FROM THE STORED TITLES AND SUMMARIES. The stories ARE the
-        snippets: no search runs to answer a question about a result set the
-        bot is already holding. A SEARCH HAPPENS ONLY FOR A COMPANY THE STORIES
-        DO NOT DESCRIBE — the model writes a LOOKUP line instead of guessing
-        what it does, and that one company gets a five-result lookup and a
-        second pass. At most two such lookups.
+          1. BOTH SHEETS, READ FRESH, NO CAP (`_known_company_index`). If that
+             fails or comes back empty THE MESSAGE IS CANCELLED and the reason
+             is logged at ERROR.
+          2. THE FEED SINCE THE LAST POST (`_screen_window`), by when each
+             story was first SEEN, the most important NEWS_SCORE_MAX_ITEMS of
+             what the scorer has scored. Nothing is fetched for this.
+          3. ONE LIGHT CALL: which companies are the stories about. Names only.
+          4. EACH NAME IS CHECKED AGAINST BOTH SHEETS IN CODE
+             (`news_screen.classify`). On the Master Pipeline: dropped, and
+             never mentioned. On Outreach PoCs only: its own line. On neither:
+             a candidate. Nothing the model says can put a tracked company in
+             the post, which is what happened to ElevenLabs on 11 Oct.
+          5. ONE LIGHT CALL for a verdict and a reason, for the survivors
+             shown, five at most. A company carried over from an earlier
+             message keeps the verdict it had and is not paid for again.
+          6. ONE SEARCH for a company whose story did not say what it does,
+             and only then (two such companies at most).
+          7. NOTHING SURVIVED, NOTHING POSTED (`drip.nothing_to_say`).
 
-        LEAN, WITH "WHAT WE SELL" IN THE USER PROMPT. The lean system prompt
-        does not carry the strategy doc, so the one section R2 judges fit
-        against (offerings, use cases, Phase 1 focus) is cut out of
-        sales_strategy.md and put in the question. It judges in words.
+        WHAT WAS ASKED AND NOT ANSWERED COMES BACK (`news_screen.merge`), until
+        somebody answers or NEWS_SCREEN_STALE_DAYS pass.
+
+        THIS READS STATE AND WRITES NONE. The marker and the ledger are written
+        by `_after_send`, and only for a live post.
         """
         import websearch
 
-        stories = await asyncio.to_thread(self.db.news_stories_on, marker)
-        read_day = marker
-        if not stories:
-            read_day = dl.iso(today - timedelta(days=1))
-            stories = await asyncio.to_thread(self.db.news_stories_on, read_day)
-            if stories:
-                log.info("[news] R2: nothing posted yet today; screening %s's %d "
-                         "story/stories", read_day, len(stories))
-        if not stories:
+        def cancel(why: str, *, pending: bool = False) -> None:
             for item in items:
-                self._mark_unresearched(
-                    item, "no news has been posted today or yesterday, so there is "
-                          "nothing to screen",
-                    still_pending=False,
-                )
+                item["research"] = ""
+                item["sources"] = []
+                item.pop("screen", None)
+                self._mark_unresearched(item, why, still_pending=pending)
+
+        try:
+            index = await self._known_company_index(force=True)
+        except ScreenCancelled as e:
+            log.error("[news] R2 CANCELLED for %s: %s. NOTHING IS POSTED. A screen run "
+                      "against a missing or empty company list would propose companies "
+                      "we already track.", marker, e)
+            state.audit("news_screen_cancelled", reason=str(e), day=marker)
+            cancel(f"the company sheets could not be read ({e})")
             return
 
-        known: list = []
-        try:
-            known = await self._known_companies()
-        except Exception:
-            log.exception("[news] could not read the tracked companies for the screen")
+        since, until, why = self._screen_window(today)
+        cap = max(1, int(config.NEWS_SCORE_MAX_ITEMS))
+        rows = await asyncio.to_thread(
+            lambda: self._ledger().news_feed_seen_between(
+                feeds.utc_iso(since), feeds.utc_iso(until), limit=cap))
+        log.info("[news] R2 window %s to %s (%s): %d scored story/stories first seen in "
+                 "it (at most %d are read)", since.isoformat(timespec="minutes"),
+                 until.isoformat(timespec="minutes"), why, len(rows), cap)
 
-        use_cases = ""
-        try:
-            use_cases = news.extract_section(
-                persona.load_strategy(), self.STRATEGY_USE_CASE_HEADING, cap=4000)
-        except Exception:
-            log.exception("[news] could not read the use-case table for the screen")
-        if not use_cases:
-            log.warning("[news] R2: no %r section found in the strategy doc; the "
-                        "screen runs without the use-case table",
-                        self.STRATEGY_USE_CASE_HEADING)
+        fresh: list = []
+        if rows:
+            text = await self.llm.screen_names(stories=rows)
+            if text is None:
+                cancel("the screen could not be run", pending=True)
+                return
+            dropped: list = []
+            for named in news_screen.parse_names(text, rows):
+                where = news_screen.classify(named["company"], index)
+                if where["outcome"] == news_screen.KNOWN:
+                    dropped.append(f"{named['company']} (= {where['sheet_name']})")
+                    continue
+                story = news_screen.best_story(named["stories"])
+                fresh.append({
+                    "company_key": news_screen.name_key(named["company"]),
+                    "company": named["company"], "outcome": where["outcome"],
+                    "sheet_name": where["sheet_name"], "similar": where["similar"],
+                    "url": str(story.get("url") or ""), "title": str(story.get("title") or ""),
+                    "summary": str(story.get("what") or story.get("summary") or ""),
+                    "importance": int(story.get("importance") or 0),
+                })
+            log.info("[news] R2: the stories name %d company/companies; %d already on the "
+                     "Master Pipeline and dropped in code%s; %d left", len(dropped) + len(fresh),
+                     len(dropped), (": " + ", ".join(dropped[:12])) if dropped else "", len(fresh))
 
-        server = websearch.server_side()
-        shown = [{"title": s.get("headline") or "", "url": s.get("url") or "",
-                  "snippet": s.get("what") or "", "source": "", "date": ""}
-                 for s in stories if s.get("url")]
-        try:
-            result = await self.llm.web_research(
-                rule="R2",
-                prompt=news.screen_prompt(stories, known, use_cases=use_cases,
-                                          allow_lookup=not server),
-                max_uses=1, lean=True, snippets=shown,
-            )
-            await self._bank(result, rule_id="R2")
-            # THE ONE CASE R2 SEARCHES: a company the stories name but do not
-            # describe. Five results each, two companies at most, one more pass.
-            lookups = [] if server else news.parse_screen_lookups(
-                result.get("text") or "")[:2]
-            if result.get("ok") and lookups:
-                extra: list = []
-                for company in lookups:
-                    extra += await asyncio.to_thread(
-                        lambda c=company: search_backend.search(
-                            f'"{c}" company', n=5, rule="R2"))
-                log.info("[news] R2: looked up %s — %d snippet(s)",
-                         ", ".join(lookups), len(extra))
-                if extra:
-                    result = await self.llm.web_research(
-                        rule="R2",
-                        prompt=news.screen_prompt(stories, known, use_cases=use_cases),
-                        max_uses=1, lean=True, snippets=extra,
-                    )
-                    await self._bank(result, rule_id="R2")
-        except Exception:
-            log.exception("[news] the screen call raised")
-            result = {"ok": False, "note": "the screen call failed"}
+        # WHAT WAS ASKED BEFORE AND NOT ANSWERED. Each is checked against the
+        # sheets again: a company somebody has since added is simply finished.
+        ledger = await asyncio.to_thread(self._ledger().screen_ledger)
+        carried, now_known = [], []
+        for row in ledger:
+            flat = {**(row.get("payload") or {}), **{k: v for k, v in row.items() if k != "payload"}}
+            if row.get("status") in ("open", "waiting"):
+                where = news_screen.classify(row.get("company") or "", index)
+                if where["outcome"] == news_screen.KNOWN:
+                    now_known.append(row["company_key"])
+                    continue
+                flat.update(outcome=where["outcome"], sheet_name=where["sheet_name"],
+                            similar=where["similar"])
+            carried.append(flat)
+        merged = news_screen.merge(fresh, carried, now=dl.real_now_ist().astimezone(timezone.utc),
+                                   stale_days=int(config.NEWS_SCREEN_STALE_DAYS))
+        candidates = merged["candidates"]
+        if merged["suppressed"] or merged["stale"]:
+            log.info("[news] R2: %d answered in the last %d days and not proposed again (%s); "
+                     "%d unanswered for %d days and dropped (%s)", len(merged["suppressed"]),
+                     int(config.NEWS_SCREEN_STALE_DAYS),
+                     ", ".join(c["company"] for c in merged["suppressed"][:8]) or "none",
+                     len(merged["stale"]), int(config.NEWS_SCREEN_STALE_DAYS),
+                     ", ".join(str(c.get("company")) for c in merged["stale"][:8]) or "none")
+        shown, held = candidates[:news_screen.MAX_SHOWN], candidates[news_screen.MAX_SHOWN:]
 
-        if not result.get("ok"):
-            for item in items:
-                self._mark_unresearched(item, result.get("note")
-                                        or "the screen could not be run")
+        # THE VERDICT, ONLY FOR NEW COMPANIES THAT WILL BE SHOWN AND HAVE NONE.
+        need = [c for c in shown if c.get("outcome") != news_screen.POCS_ONLY
+                and not c.get("verdict")]
+        if need:
+            use_cases = ""
+            try:
+                use_cases = news.extract_section(
+                    persona.load_strategy(), self.STRATEGY_USE_CASE_HEADING, cap=4000)
+            except Exception:
+                log.exception("[news] could not read the use-case table for the screen")
+            if not use_cases:
+                log.warning("[news] R2: no %r section found in the strategy doc; the "
+                            "verdicts are given without it", self.STRATEGY_USE_CASE_HEADING)
+            may_search = websearch.enabled() and not websearch.server_side()
+            text = await self.llm.screen_verdicts(candidates=need, use_cases=use_cases,
+                                                  allow_lookup=may_search)
+            if text is None:
+                cancel("the screen could not be run", pending=True)
+                return
+            verdicts = news_screen.parse_verdicts(text)
+            wanted = {news_screen.name_key(n) for n in news_screen.parse_lookups(text)}
+            lookups = [c for c in need if c["company_key"] in wanted
+                       and c["company_key"] not in verdicts][:2] if may_search else []
+            for c in lookups:
+                # ONE SEARCH, ONLY FOR A COMPANY THE STORY DID NOT DESCRIBE.
+                try:
+                    found = await asyncio.to_thread(
+                        lambda q=c["company"]: search_backend.search(
+                            f'"{q}" company', n=5, rule="R2"))
+                except Exception:
+                    log.exception("[news] R2: the lookup for %s failed", c["company"])
+                    found = []
+                c["lookup"] = " / ".join(
+                    " ".join(str(r.get("snippet") or r.get("title") or "").split())[:200]
+                    for r in (found or [])[:3])
+                log.info("[news] R2: looked up %s (its story did not say what it does) — "
+                         "%d result(s)", c["company"], len(found or []))
+            if lookups:
+                again = await self.llm.screen_verdicts(
+                    candidates=lookups, use_cases=use_cases, allow_lookup=False)
+                verdicts.update(news_screen.parse_verdicts(again or ""))
+            for c in need:
+                c.update(verdicts.get(c["company_key"]) or {})
+            # NO VERDICT CAME BACK FOR IT: it waits for next time rather than
+            # going out with a judgement nobody made.
+            unjudged = [c for c in need if not c.get("verdict")]
+            if unjudged:
+                log.warning("[news] R2: no verdict came back for %s; held for next time",
+                            ", ".join(c["company"] for c in unjudged))
+                shown = [c for c in shown if c not in unjudged]
+                held = unjudged + held
+
+        body = news_screen.render(shown, held=len(held))
+        log.info("[news] R2: %d to show (%d new, %d on Outreach PoCs only), %d held back, "
+                 "%d carried over from an earlier message", len(shown),
+                 len([c for c in shown if c.get("outcome") != news_screen.POCS_ONLY]),
+                 len([c for c in shown if c.get("outcome") == news_screen.POCS_ONLY]),
+                 len(held), len([c for c in shown if c.get("carried")]))
+        if not body:
+            cancel("every company in the news is already on the Master Pipeline")
             return
 
-        text = result.get("text") or ""
-        # ONLY STORIES ABOUT A SPECIFIC COMPANY are screened. The rest come back
-        # as SKIP lines, and each is logged with its reason.
-        for skip in news.parse_screen_skips(text):
-            log.info("[news] R2 skipped %r — %s", skip["story"][:120],
-                     skip["why"] or "not about a specific company")
-        rows = news.parse_screen(text)
-        log.info("[news] the screen named %d company/companies not in the pipeline "
-                 "(from %s's stories)", len(rows), read_day)
+        def row_of(c: dict) -> dict:
+            return {"company_key": c["company_key"], "company": c.get("company") or "",
+                    "outcome": c.get("outcome") or news_screen.NEW,
+                    "sheet_name": c.get("sheet_name") or "",
+                    "payload": {k: c.get(k) for k in ("url", "title", "summary", "importance",
+                                                      "what", "verdict", "reason", "similar")
+                                if c.get(k)}}
+
         for item in items:
-            if rows:
-                body = news.render_screen(rows)
-                item["text"] = body
-                item["research"] = body
-                item["sources"] = [{"url": r["url"], "title": r["company"]}
-                                   for r in rows if r.get("url")]
-                item["research_note"] = ""
-                item["web_pending"] = False
+            item["text"] = body
+            item["research"] = body
+            item["sources"] = [{"url": c["url"], "title": c["company"]} for c in shown
+                               if c.get("outcome") != news_screen.POCS_ONLY
+                               and str(c.get("url") or "").startswith("http")]
+            item["research_note"] = ""
+            item["web_pending"] = False
+            # WHAT `_after_send` WRITES DOWN, if and only if this is a live post.
+            item["screen"] = {"shown": [row_of(c) for c in shown],
+                              "held": [row_of(c) for c in held],
+                              "stale": [{"company_key": c.get("company_key")}
+                                        for c in merged["stale"]],
+                              "now_known": now_known}
+
+    async def _maybe_screen_reply(self, message, text: str, ctx: dict) -> bool:
+        """A reply to R2's message: "add Mirage Labs".
+
+        THE COMPANY NAME IS READ OUT OF THE REPLY (`news_screen.read_reply`),
+        never a bare yes or no out of a sentence: with two companies in one
+        message "yes" does not say which, and `approvals.read_vote` would read
+        "yes to Mirage but not Nudge" as a no.
+
+          - a name that was not in the message: said, and nothing is done;
+          - a name that fits two companies ("add Nudge"): the bot asks which.
+            NOTHING IS EVER WRITTEN ON AN AMBIGUOUS NAME;
+          - what was understood is said back, and then ONE MORE QUESTION is
+            asked before anything is written: a `pipeline_add` proposal on that
+            question, which an approver answers like any other proposal.
+
+        A reply that answers the message without choosing a company drops that
+        company from the next message (the ledger's 'dropped'). A question
+        about a company is not an answer and is handed on.
+        """
+        if not ctx.get("direct_is_bot"):
+            return False
+        said = ctx.get("said") or {}
+        if (ctx.get("drip") or {}).get("action_type") != nextaction.R_NEWS_SCREEN \
+                and said.get("kind") != "news_screen":
+            return False
+        rows = await asyncio.to_thread(
+            self._ledger().screen_ledger_for_message, str(ctx.get("root_id") or ""))
+        live = bool(rows)
+        rows = rows or list(said.get("rows") or [])
+        if not rows:
+            return False
+        label = lambda r: str(r.get("sheet_name") or r.get("company") or "")  # noqa: E731
+        names = [label(r) for r in rows if label(r)]
+        got = news_screen.read_reply(text, names)
+        wants = bool(_SCREEN_ADD_RE.search(text or "")) or got["none"] or got["bare_yes"]
+        if not wants or ("?" in (text or "") and not got["chosen"]):
+            return False
+        self._mark_route(message, "news_screen")
+        now = feeds.utc_iso(dl.real_now_ist())
+
+        async def drop(keep: list) -> None:
+            gone = [r["company_key"] for r in rows if label(r) not in keep]
+            if live and gone:
+                n = await asyncio.to_thread(
+                    lambda: self._ledger().screen_ledger_close(gone, status="dropped", at=now))
+                log.info("[news] R2: msg=%s answered the message without choosing %d "
+                         "company/companies; dropped, not asked about again for %d days",
+                         getattr(message, "id", "?"), n, int(config.NEWS_SCREEN_STALE_DAYS))
+
+        if got["none"]:
+            await drop([])
+            await self._react(message, reason="R2: none of the companies is wanted")
+            return True
+        if got["bare_yes"]:
+            if len(names) != 1:
+                await self._reply(message, news_screen.WHICH_ONE.format(
+                                      names=news_screen._and(names)),
+                                  reason="R2: a yes that does not say which company")
+                return True
+            got["chosen"] = list(names)
+        chosen = [n for n in got["chosen"] if n in names]
+        if not chosen and not got["ambiguous"] and not got["unknown"]:
+            await self._reply(message, news_screen.NOTHING_UNDERSTOOD.format(
+                                  names=news_screen._and(names)),
+                              reason="R2: could not tell which company was meant")
+            return True
+        body = news_screen.confirm_text(chosen, ambiguous=got["ambiguous"],
+                                        unknown=got["unknown"])
+        sent = await self._reply(message, self._without_pings(body),
+                                 reason="R2: what was understood, and the question before a write")
+        if not chosen:
+            log.info("[news] R2: msg=%s named nothing I could act on (ambiguous: %s; not in "
+                     "the message: %s); nothing is written", getattr(message, "id", "?"),
+                     [a for a, _f in got["ambiguous"]], got["unknown"])
+            return True
+        unsure = [n for _said, fits in got["ambiguous"] for n in fits]
+        await drop(chosen + unsure)
+        picked = [r for r in rows if label(r) in chosen]
+        key = f"pipeline_add:{dl.iso(dl.real_today_ist())}:{getattr(sent, 'id', 0)}"
+        await asyncio.to_thread(
+            lambda: self.db.open_proposal(
+                proposal_key=key, kind="pipeline_add", tab=gtm_sheet.RESEARCHER_LINES,
+                sheet_row=0, row_key="", company=", ".join(chosen), poc="",
+                payload={"companies": [
+                    {"company": label(r), "company_key": r["company_key"],
+                     "outcome": r.get("outcome") or news_screen.NEW,
+                     "url": str((r.get("payload") or {}).get("url") or r.get("url") or "")}
+                    for r in picked], "live": live},
+                reply_text=str(text or ""), trigger="R2",
+                proposed_text="add " + news_screen._and(chosen) + " to the Master Pipeline",
+                requested_by=_display(message.author),
+                channel_id=int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
+                message_id=str(getattr(sent, "id", "") or ""),
+                created_at=dl.now_ist().isoformat(timespec="seconds"),
+            )
+        )
+        self._remember_said(sent, kind="news_screen_confirm", companies=chosen)
+        log.info("[approvals] R2: %s asked to add %s to the Master Pipeline (%s) — asked "
+                 "once more; nothing is written until an approver says yes",
+                 _display(message.author), ", ".join(chosen), key)
+        return True
+
+    async def _apply_pipeline_add(self, message, proposal: dict, *, decided_by: str) -> None:
+        """An approver said yes to "Shall I go ahead?": ONE ROW A COMPANY on
+        the Master Pipeline, carrying the COMPANY NAME and nothing else.
+
+        NOTHING IS INVENTED. Industry, geography and funding are the team's to
+        fill in; the bot knows a headline, not a company profile. The sheets
+        are read fresh first, and a company that is on the Master Pipeline by
+        now is said, not added twice. Each row is signed with a note on its
+        Company cell (who approved, when, the approval and the story).
+        """
+        companies = list((proposal.get("payload") or {}).get("companies") or [])
+        if not companies:
+            await self._reply(message, wording.nothing_left(self._proposal_label(proposal)),
+                              reason="approved pipeline add had no companies")
+            return
+        try:
+            index = await self._known_company_index(force=True)
+            tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.RESEARCHER_LINES)
+        except ScreenCancelled as e:
+            log.error("[news] R2: the Master Pipeline could not be read to add a row: %s", e)
+            tab = None
+        if tab is None:
+            await self._reply(message, "I couldn't read the Master Pipeline just now, so I "
+                                       "haven't added anything. Nothing has changed.",
+                              reason="pipeline add: no tab")
+            return
+        link = self._message_link(message)
+        lines, added_keys = [], []
+        for c in companies:
+            name = " ".join(str(c.get("company") or "").split())
+            where = news_screen.classify(name, index)
+            if where["outcome"] == news_screen.KNOWN:
+                lines.append(f"{name} is already on the Master Pipeline "
+                             f"(as {where['sheet_name']}), so I haven't added it again.")
+                added_keys.append(c.get("company_key"))
+                continue
+            if not link:
+                lines.append(f"I couldn't link this approval, so I haven't added {name}.")
+                continue
+            note = approvals.row_signature(approver=decided_by, on_date=dl.real_today_ist(),
+                                           approval_link=link)
+            url = str(c.get("url") or "")
+            if url.startswith("http"):
+                note += f"\nIn the news: {url}"
+            result = await asyncio.to_thread(
+                lambda n=name, t=note: gtm_sheet.SHEETS.append_row(
+                    tab, {"company": n},
+                    reason=f"approved by {decided_by}: R2 found this company in the news",
+                    expect_company=n, note_role="company", note_text=t))
+            if result.get("ok"):
+                added_keys.append(c.get("company_key"))
+                lines.append(f"Added {name} to the Master Pipeline at row "
+                             f"{result.get('sheet_row')}"
+                             + (" (dry run: SHEET_WRITES_ENABLED is off, nothing was really "
+                                "written)." if result.get("dry_run") else
+                                ". Only the company name is filled in; the rest of the row "
+                                "is yours."))
+                state.audit("pipeline_row_added", reason=f"approved by {decided_by}",
+                            company=name, sheet_row=result.get("sheet_row"),
+                            dry_run=bool(result.get("dry_run")))
             else:
-                self._mark_unresearched(
-                    item,
-                    "every company in today's news is already in the Master Pipeline",
-                    still_pending=False,
-                )
+                lines.append(f"I couldn't add {name}: "
+                             + str(result.get("error") or "the sheet refused it") + ".")
+        if (proposal.get("payload") or {}).get("live") and added_keys:
+            await asyncio.to_thread(
+                lambda: self._ledger().screen_ledger_close(
+                    [k for k in added_keys if k], status="added",
+                    at=feeds.utc_iso(dl.real_now_ist())))
+        await self._reply(message, "\n".join(lines), reason="R2: the approved pipeline rows")
 
     # -- R3: discovery and the deadline backfill ---------------------------
 
@@ -12755,6 +13148,14 @@ class SalesBot(discord.Client):
         days = max(1, int(config.RESEARCH_CACHE_DAYS))
         misses: list = []
         for item in pending:
+            if item.get("rule") == nextaction.R_NEWS_SCREEN:
+                # R2 IS NEVER SERVED FROM THE DAY'S CACHE. Its whole point is a
+                # FRESH read of both sheets immediately before the message is
+                # built; a cached screen from a send that failed ten minutes
+                # ago would bring back the 60-second race as a ten-minute one,
+                # and would lose what `_after_send` has to write down.
+                misses.append(item)
+                continue
             key = self._research_key(item)
             store, per_row = self._research_store(item)
             hit = await asyncio.to_thread(
@@ -12785,6 +13186,8 @@ class SalesBot(discord.Client):
         for item in misses:
             if item.get("web_pending"):
                 continue                   # no answer yet; leave it uncached
+            if item.get("rule") == nextaction.R_NEWS_SCREEN:
+                continue                   # never cached: see above
             key = self._research_key(item)
             # AN EMAIL LOOKUP THAT RAN IS AN ANSWER EITHER WAY: "no public
             # email found" is kept too, or the same contact would be searched
@@ -12979,7 +13382,7 @@ class SalesBot(discord.Client):
             if known:
                 bits.append(
                     "Companies and people already on our sheet:\n"
-                    + ", ".join(known[:120])
+                    + ", ".join(known)        # every name: no cap (12 Oct 2026)
                 )
         return "\n".join(bits) or "(no further context)"
 
@@ -12991,7 +13394,12 @@ class SalesBot(discord.Client):
             try:
                 tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, kind)
             except Exception:
+                # NOT SILENT: a list missing one whole sheet looks complete.
+                log.warning("[gtm] the %s tab could not be read for the known-company "
+                            "list; the list is missing it", kind, exc_info=True)
                 continue
+            if tab is None:
+                log.warning("[gtm] no %s tab came back for the known-company list", kind)
             for row in (tab.rows if tab else []):
                 name = gtm_sheet.clean_cell(row.get("company"))
                 key = gtm_sheet.normalise_header(name)

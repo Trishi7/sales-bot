@@ -83,7 +83,10 @@ FREQ = {
     "engine:final": "per question that hits the iteration cap",
     "web_research:R1": "per weekday (main post, 14:00)",
     "web_research:R1-check": "per hourly check (up to 12/day, every day)",
-    "web_research:R2": "per R2 slot (Tue, Fri)",
+    # R2 SINCE 12 OCT 2026: two light calls and no search path. The verdict
+    # call is made only when a company survives the code-side filter.
+    "screen_names": "per R2 slot (Tue, Fri) with news in its window",
+    "screen_verdicts": "per R2 slot with a company on neither sheet",
     "web_research:R3": "per R3 slot (every other Wed)",
     "web_research:R3-deadlines": "per R3 slot with a missing deadline",
     "web_research:R6": "per R6 item at its slot",
@@ -254,6 +257,19 @@ async def main(out_json):
 
     L.web_research = tagged
 
+    # R2's two light calls, each under its own site.
+    real_names, real_verdicts = L.screen_names, L.screen_verdicts
+
+    async def names(**kw):
+        SITE[0] = "screen_names"
+        return await real_names(**kw)
+
+    async def verdicts(**kw):
+        SITE[0] = "screen_verdicts"
+        return await real_verdicts(**kw)
+
+    L.screen_names, L.screen_verdicts = names, verdicts
+
     async def known():
         return ["Acme AI", "Globex"]
 
@@ -261,7 +277,12 @@ async def main(out_json):
         return [{"event": "NeurIPS 2026", "event_date": "2026-12-01",
                  "registration_deadline": "", "_row": 2, "link": "https://neurips.cc"}]
 
+    async def known_index(*, force=False):
+        import news_screen
+        return news_screen.build_index(["Acme AI"], ["Globex"])
+
     bot._known_companies = known
+    bot._known_company_index = known_index
     bot._rule_tab_rows = ev_rows
     await bot._news_run([item(nextaction.R_AI_NEWS, "R1")], today=today)
     await bot._maybe_breaking_news(force=True, channel=FakeChannel())
@@ -269,6 +290,22 @@ async def main(out_json):
                                  "headline": "Nebius raises", "what": "a round",
                                  "topic": "OTHER", "headline_key": "nebius raises"}],
                                on_date="2026-10-05", rule_id="R1", kind="main")
+    # R2 READS THE FEED STORE: one scored story, first seen inside its window.
+    import feeds
+    import news as _news
+    import deadlines as _dl
+    from datetime import timedelta as _td
+    from datetime import datetime as _dt
+    _seen = feeds.utc_iso(_dt.combine(today - _td(days=1), _dt.min.time()).replace(hour=6, tzinfo=_dl.IST))
+    bot.db.news_feed_add([{
+        "url": "https://x.com/nebius", "url_key": _news.url_key("https://x.com/nebius"),
+        "headline_key": _news.headline_key("Nebius raises a round"),
+        "title": "Nebius raises a round", "summary": "for inference capacity", "source": "X",
+        "published_at": _seen, "topic_hint": "", "seen_at": _seen,
+        "kind": feeds.KIND_INDUSTRY, "sheet_ref": ""}])
+    bot.db.news_feed_set_scores([{"url_key": _news.url_key("https://x.com/nebius"),
+                                  "importance": 4, "topic": "funding", "what": ""}],
+                                scored_at=_seen)
     await bot._news_run([item(nextaction.R_NEWS_SCREEN, "R2")], today=today)
     await bot._events_run([item(nextaction.R_EVENTS, "R3")], today=today)
     await bot._research_uncached([

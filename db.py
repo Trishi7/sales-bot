@@ -1017,6 +1017,53 @@ CREATE TABLE IF NOT EXISTS news_feed_items (
 );
 CREATE INDEX IF NOT EXISTS ix_news_feed_published ON news_feed_items(published_at);
 CREATE INDEX IF NOT EXISTS ix_news_feed_headline ON news_feed_items(headline_key);
+CREATE INDEX IF NOT EXISTS ix_news_feed_seen ON news_feed_items(seen_at);
+
+-- WHEN A RULE LAST POSTED, ONE ROW A RULE. Today only R2 (the news-company
+-- screen) keeps one: its news window starts at "last time we posted".
+--
+-- WRITTEN ONLY AFTER A LIVE POST HAS LANDED. A test day ("make it Friday") and
+-- a simulation must never move it: a tester checking the message would
+-- otherwise consume the real window, and the next live post would skip those
+-- stories. `posted_at` is an ISO datetime in UTC.
+CREATE TABLE IF NOT EXISTS rule_last_posted (
+    rule_id     TEXT PRIMARY KEY,
+    posted_at   TEXT NOT NULL,
+    message_id  TEXT NOT NULL DEFAULT '',
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- R2: WHAT HAS BEEN PROPOSED, AND WHAT BECAME OF IT. Keyed on the normalised
+-- company name (`news_screen.name_key`).
+--
+-- A company proposed and not answered COMES BACK in the next message. It
+-- leaves only when somebody replies to the message without choosing it
+-- ('dropped'), when two weeks pass ('stale'), or when it is added ('added').
+--
+--   status 'open'     asked about, no answer yet. `message_id` is the post.
+--   status 'waiting'  survived the screen but did not fit in the five; it is
+--                     shown next time. Never asked about yet.
+--   status 'dropped'  somebody answered the message and did not choose it.
+--   status 'stale'    NEWS_SCREEN_STALE_DAYS passed with no answer.
+--   status 'added'    an approver said yes and the pipeline row was written.
+--
+-- `first_at` is when it first went into the ledger, and is what the two weeks
+-- are counted from. A dropped or stale company may be proposed again once
+-- that is more than two weeks ago and it is in the news again.
+CREATE TABLE IF NOT EXISTS news_screen_ledger (
+    company_key  TEXT PRIMARY KEY,
+    company      TEXT NOT NULL DEFAULT '',
+    outcome      TEXT NOT NULL DEFAULT 'new',   -- new | pocs_only
+    sheet_name   TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'open',
+    first_at     TEXT NOT NULL DEFAULT '',
+    last_at      TEXT NOT NULL DEFAULT '',
+    times        INTEGER NOT NULL DEFAULT 0,
+    message_id   TEXT NOT NULL DEFAULT '',
+    payload      TEXT NOT NULL DEFAULT '{}',    -- the story, the verdict, the reason
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_news_screen_message ON news_screen_ledger(message_id);
 
 -- THE VOICE PROFILE: how the team writes, learned from its own messages in the
 -- real sales channels (voice.py). ONE ROW, id 1, replaced on every rebuild.
@@ -3503,6 +3550,139 @@ class DB:
                 (str(since_utc), str(until_utc), str(since_utc), str(until_utc)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def news_feed_seen_between(self, since_utc: str, until_utc: str, *,
+                               limit: int = 40) -> list[dict]:
+        """R2's stories: SCORED industry items FIRST SEEN in [since, until],
+        both ends included, most important first and then newest; at most
+        `limit`.
+
+        BY `seen_at`, NOT `published_at`. The feeds are polled every 15
+        minutes, so a story published just before the last post and picked up
+        just after it would belong, by its publication time, to a window that
+        has already closed, and nobody would ever look at it.
+
+        PoC items are left out: each was found by searching for a company that
+        is on our sheets, so it is about a tracked company by construction.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_feed_items WHERE seen_at >= ? AND seen_at <= ? "
+                "AND importance > 0 AND COALESCE(kind, '') != 'poc' "
+                "ORDER BY importance DESC, published_at DESC LIMIT ?",
+                (str(since_utc), str(until_utc), max(1, int(limit))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- per-rule "last posted" markers ---------------------------------------
+
+    def rule_last_posted(self, rule_id: str) -> str:
+        """When this rule last posted, as stored (ISO, UTC), or "" when it
+        never has. Raises nothing: an unreadable table reads as "never"."""
+        try:
+            with self.conn() as c:
+                row = c.execute("SELECT posted_at FROM rule_last_posted WHERE rule_id = ?",
+                                (str(rule_id),)).fetchone()
+            return str(row["posted_at"]) if row else ""
+        except Exception:
+            log.exception("[db] the last-posted marker for %s could not be read", rule_id)
+            return ""
+
+    def set_rule_last_posted(self, rule_id: str, *, posted_at: str, message_id: str = "") -> None:
+        """Record that a rule posted. THE CALLER GUARANTEES IT WAS A LIVE POST
+        (`bot._is_live_send`); this function is not reachable from a test day
+        or a simulation."""
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO rule_last_posted (rule_id, posted_at, message_id) VALUES (?, ?, ?) "
+                "ON CONFLICT(rule_id) DO UPDATE SET posted_at = excluded.posted_at, "
+                "message_id = excluded.message_id, updated_at = CURRENT_TIMESTAMP",
+                (str(rule_id), str(posted_at), str(message_id or "")))
+
+    # -- R2: the ledger of proposed companies -----------------------------------
+
+    @staticmethod
+    def _screen_row(r) -> dict:
+        row = dict(r)
+        try:
+            row["payload"] = json.loads(row.get("payload") or "{}")
+        except ValueError:
+            row["payload"] = {}
+        return row
+
+    def screen_ledger(self) -> list:
+        """Every row of R2's ledger, oldest first. [] when it cannot be read."""
+        try:
+            with self.conn() as c:
+                rows = c.execute("SELECT * FROM news_screen_ledger "
+                                 "ORDER BY first_at, company_key").fetchall()
+            return [self._screen_row(r) for r in rows]
+        except Exception:
+            log.exception("[db] R2's ledger could not be read")
+            return []
+
+    def screen_ledger_for_message(self, message_id: str) -> list:
+        """The companies one R2 post asked about, in the order it listed them."""
+        with self.conn() as c:
+            rows = c.execute("SELECT * FROM news_screen_ledger WHERE message_id = ? "
+                             "ORDER BY rowid", (str(message_id),)).fetchall()
+        out = [self._screen_row(r) for r in rows]
+        return sorted(out, key=lambda r: int((r["payload"] or {}).get("position") or 0))
+
+    def screen_ledger_record(self, *, shown: list, held: list, stale: list, at: str,
+                             message_id: str) -> None:
+        """One live R2 post, written down in one transaction: the companies it
+        asked about ('open'), the ones held back ('waiting'), and the ones
+        that had gone two weeks without an answer ('stale').
+
+        A company that comes back keeps its `first_at`: that is what the two
+        weeks are counted from. One that was dropped or stale long enough ago
+        to be proposed again starts a fresh clock.
+        """
+        with self.conn() as c:
+            for row in stale or []:
+                c.execute("UPDATE news_screen_ledger SET status = 'stale', last_at = ?, "
+                          "updated_at = CURRENT_TIMESTAMP WHERE company_key = ?",
+                          (str(at), str(row.get("company_key") or "")))
+            for status, rows in (("open", shown or []), ("waiting", held or [])):
+                for i, row in enumerate(rows):
+                    key = str(row.get("company_key") or "")
+                    if not key:
+                        continue
+                    old = c.execute("SELECT status, first_at, times FROM news_screen_ledger "
+                                    "WHERE company_key = ?", (key,)).fetchone()
+                    keep = bool(old) and old["status"] in ("open", "waiting")
+                    first = old["first_at"] if keep else str(at)
+                    times = (int(old["times"] or 0) if keep else 0) + (1 if status == "open" else 0)
+                    payload = dict(row.get("payload") or {}, position=i)
+                    c.execute(
+                        "INSERT INTO news_screen_ledger (company_key, company, outcome, "
+                        "sheet_name, status, first_at, last_at, times, message_id, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(company_key) DO UPDATE "
+                        "SET company = excluded.company, outcome = excluded.outcome, "
+                        "sheet_name = excluded.sheet_name, status = excluded.status, "
+                        "first_at = excluded.first_at, last_at = excluded.last_at, "
+                        "times = excluded.times, message_id = excluded.message_id, "
+                        "payload = excluded.payload, updated_at = CURRENT_TIMESTAMP",
+                        (key, str(row.get("company") or ""), str(row.get("outcome") or "new"),
+                         str(row.get("sheet_name") or ""), status, first, str(at), times,
+                         str(message_id) if status == "open" else "",
+                         json.dumps(payload, ensure_ascii=False)))
+
+    def screen_ledger_close(self, keys: list, *, status: str, at: str) -> int:
+        """Close ledger rows: 'dropped' (answered, not chosen) or 'added'."""
+        keys = [str(k) for k in (keys or []) if str(k)]
+        if not keys:
+            return 0
+        with self.conn() as c:
+            n = 0
+            for key in keys:
+                n += int(c.execute(
+                    "UPDATE news_screen_ledger SET status = ?, last_at = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE company_key = ? "
+                    "AND status IN ('open', 'waiting')",
+                    (str(status), str(at), key)).rowcount or 0)
+        return n
 
     def news_feed_set_scores(self, scored: list, *, scored_at: str) -> int:
         """Write the light model's verdicts back: [{url_key, importance, topic,

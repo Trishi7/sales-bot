@@ -1004,6 +1004,55 @@ class LLM:
             return None
         return (_text_of(resp) or "").strip()
 
+    async def screen_names(self, *, stories: list) -> Optional[str]:
+        """R2, step one: WHICH COMPANIES ARE THESE STORIES ABOUT. Names only.
+
+        ONE MODEL_LIGHT call over titles and summaries; no search, no strategy
+        text, no list of tracked companies. The model is NOT asked what is new:
+        that is decided in code afterwards (`news_screen.classify`), which is
+        the whole point of the 11 Oct fix. Returns the raw NAMES lines, or
+        None when the call failed.
+        """
+        import news_screen
+        import websearch
+
+        if not stories:
+            return ""
+        try:
+            resp = await self._create(
+                system=websearch.SAFETY_PREAMBLE + "\n\n" + websearch.LEAN_LINE,
+                prompt=news_screen.names_prompt(stories), max_tokens=900,
+                site="screen_names", include_strategy=False, light=True)
+        except Exception:
+            log.exception("[news] R2: the company-names call raised")
+            return None
+        return (_text_of(resp) or "").strip()
+
+    async def screen_verdicts(self, *, candidates: list, use_cases: str = "",
+                              allow_lookup: bool = False) -> Optional[str]:
+        """R2, step three: ONE VERDICT AND ONE REASON for each company that
+        survived the code-side filter, five at most.
+
+        ONE MODEL_LIGHT call. It is shown only the survivors, so nothing is
+        paid for explaining a company that was going to be dropped. Returns
+        the raw VERDICT / LOOKUP lines, or None when the call failed.
+        """
+        import news_screen
+        import websearch
+
+        if not candidates:
+            return ""
+        try:
+            resp = await self._create(
+                system=websearch.SAFETY_PREAMBLE + "\n\n" + websearch.LEAN_LINE,
+                prompt=news_screen.verdict_prompt(candidates, use_cases=use_cases,
+                                                  allow_lookup=allow_lookup),
+                max_tokens=700, site="screen_verdicts", include_strategy=False, light=True)
+        except Exception:
+            log.exception("[news] R2: the verdict call raised")
+            return None
+        return (_text_of(resp) or "").strip()
+
     async def extract_email(self, *, person: str, company: str,
                             results: list) -> str:
         """R5 / R6: pick ONE person's published email out of search results.

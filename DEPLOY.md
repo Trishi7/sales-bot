@@ -1149,3 +1149,52 @@ line is still in `.env`.
 `bot_rules.yaml`); paste it into the sheet by hand.
 
 `python verify_prospects_priority.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R2 rebuild (12 Oct): new companies in the news
+
+What changes for the team: the Tuesday and Friday "companies in the news" post no longer names companies we
+already track. Every company on the Master Pipeline and on Outreach PoCs is checked, in code, however many there
+are. Each new company is one line: its name linking to the article, what happened, **Good fit** or **Weak fit**, and
+one reason. A company that is on Outreach PoCs but not on the Master Pipeline gets its own line asking for a
+pipeline row. Reply with the company's name ("add Mirage Labs"); the bot says back what it understood and asks once
+more before an approver's yes adds a row carrying the company name only. A company nobody answered about comes back
+next time, for two weeks. When nothing is new, nothing is posted.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** One default changed. The laptop's `.env` sets
+the old value, and a value in `.env` beats the new default, so change the line (or delete it) in BOTH files:
+
+```
+NEWS_POC_TARGETS_PER_DAY=40
+```
+
+Two new variables; the defaults are what was specified, so the lines are optional:
+
+```
+NEWS_SCREEN_STALE_DAYS=14
+NEWS_SCREEN_FIRST_RUN_DAYS=7
+```
+
+Then, on the laptop, `python tools/redact_env.py`. Nothing is retired.
+
+**Database.** Two new tables, `rule_last_posted` and `news_screen_ledger`, and one index, created on start.
+Nothing to run by hand. The first live R2 post has no marker and looks back seven days.
+
+**The Master Pipeline must be appendable** for the add to work: `SHEET_APPENDABLE_TABS` has to include
+`researcher_lines` (it does by default and on the laptop).
+
+**What to look for in the log** on a Tuesday or Friday:
+
+```
+[news] R2: 382 known companies (281 on the Master Pipeline, 212 on Outreach PoCs, 101 on Outreach PoCs only), read fresh
+[news] R2 window 2026-10-13T18:02 to 2026-10-16T14:00 (from the last post): 23 scored story/stories first seen in it (at most 40 are read)
+[news] R2: the stories name 9 company/companies; 6 already on the Master Pipeline and dropped in code: ...; 3 left
+[news] R2: posted about 3 company/companies (0 held back); the last-posted marker is now ...
+```
+
+(the numbers are illustrative). `[news] R2 CANCELLED ...` at ERROR means the sheets could not be read and nothing
+was posted. On a test day the log says the marker and the ledger were NOT touched.
+
+**The Bot Rules tab.** Rule 2's "What the Bot Shares / Checks" wording is new (`sheet_wording` in
+`bot_rules.yaml`); paste it into the sheet by hand.
+
+`python verify_news_screen.py --show` checks all of it offline and prints the messages.
