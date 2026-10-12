@@ -1561,7 +1561,7 @@ def _r_sales_packages(rule, ctx) -> list:
 
 # -- R13: next steps for connected contacts -----------------------------------
 
-# What the Next Steps dropdown (Q) says, as a code. `dm` and `call` are two
+# What the Next Steps dropdown says, as a code. `dm` and `call` are two
 # options on the dropdown and ONE stage of the rule: see `step_signature`.
 STEP_BLANK = "blank"
 STEP_RESEARCH = "research"
@@ -1577,8 +1577,7 @@ NEXT_STEP_REQUIRED_ROLES = (
     "email_2_date", "email_3_sent", "email_3_date",
 )
 
-# WHAT A PERSON IS REMINDED ABOUT, as a code. `ASK_DROPPED` is not an ask at
-# all: it is the one line that says the bot is going to stop reminding.
+# WHAT A PERSON IS REMINDED ABOUT, as a code.
 ASK_REPLIED = "replied"            # they answered the DM: set up a meeting
 ASK_CALL = "call"                  # the DM went out: call them
 ASK_ADVANCE = "advance"            # email N went out a week ago: send N + 1
@@ -1586,27 +1585,27 @@ ASK_EMAIL_OUT = "email_out"        # email N has not gone out: send it
 ASK_RESEARCH = "research"          # Next Steps says Research the PoC
 ASK_BLANK = "blank"                # Next Steps is blank: research them
 ASK_UNRESPONSIVE = "unresponsive"  # the calls ran out
-ASK_DROPPED = "dropped"            # three weeks, nothing moved
 
 # THE ORDER PEOPLE ARE PICKED IN, hottest first. The number is the tier.
 #   1  replied to the DM            a real person is waiting on us
 #   2  call due                     that clock has already run out
-#   3  the last 3 days before the drop   a final chance before they come off
-#   4  the next email is due        (the "advance" asks)
-#   5  an email that has not gone out
-#   6  research, and a blank Next Steps
-#   7  unresponsive
-TIER_REPLIED, TIER_CALL, TIER_LAST_CHANCE, TIER_ADVANCE, TIER_EMAIL, TIER_RESEARCH, \
-    TIER_UNRESPONSIVE = 1, 2, 3, 4, 5, 6, 7
+#   3  the next email is due        (the "advance" asks)
+#   4  an email that has not gone out
+#   5  research, and a blank Next Steps
+#   6  unresponsive
+#
+# NOBODY IS EVER DROPPED (12 Oct 2026). A three-week drop, with a "last chance"
+# tier in front of it, was built and reversed the same day: there is no point
+# dropping somebody while their row still says work is due. The rule keeps
+# reminding, ROTATES inside each tier (`_next_step_order`), and moves when the
+# sheet moves.
+TIER_REPLIED, TIER_CALL, TIER_ADVANCE, TIER_EMAIL, TIER_RESEARCH, TIER_UNRESPONSIVE = \
+    1, 2, 3, 4, 5, 6
 _TIER_OF_ASK = {
     ASK_REPLIED: TIER_REPLIED, ASK_CALL: TIER_CALL, ASK_ADVANCE: TIER_ADVANCE,
     ASK_EMAIL_OUT: TIER_EMAIL, ASK_RESEARCH: TIER_RESEARCH, ASK_BLANK: TIER_RESEARCH,
     ASK_UNRESPONSIVE: TIER_UNRESPONSIVE,
 }
-LAST_CHANCE_DAYS = 3
-# How many people the drop line names in one post. They do not use up the
-# post's five places.
-DROP_LINE_MAX = 5
 
 _EMAIL_STEP_RE = re.compile(r"send e ?mail ([123])")
 
@@ -1678,7 +1677,14 @@ def step_signature(row: dict, code: Optional[str] = None) -> str:
 
 def dm_replied(row: dict) -> bool:
     """Does LI DM Sent say they REPLIED? Checked before `dm_sent`, always: a
-    reply must never be read as a plain "sent"."""
+    reply must never be read as a plain "sent".
+
+    "RECEIVED" IS IN BOTH MARKER LISTS, ON PURPOSE. The dropdown holds blank,
+    Sent and Received, and Received means they answered. Because this check
+    runs FIRST, a Received DM takes the meeting branch and never the call
+    ladder; because it is also a "sent" marker, anything that only asks
+    "has the DM gone out?" still gets a yes, so nobody stalls at the DM step.
+    DO NOT REORDER THE TWO CHECKS."""
     return bool(config.NEXT_STEP_DM_REPLIED_MARKERS and _matches_any(
         row.get("li_dm_sent"), config.NEXT_STEP_DM_REPLIED_MARKERS))
 
@@ -1716,8 +1722,7 @@ def next_step_for(row: dict, *, today: date, entry: Optional[dict] = None) -> di
       date nobody logged would hide the person for good. So a connected row
       with no LI Connected Date, an email marked sent with no date, and a DM
       marked sent with no date are all due straight away. None of them needs a
-      date in the sheet, because the three-week drop is counted from the day
-      the bot first named the person, not from any sheet date.
+      date in the sheet.
 
     TWO KNOWN GAPS, WHERE NOTHING IS SAID (`silent`), on purpose:
       - Next Steps says "Reach by LI DM" and LI DM Sent is blank. Nothing
@@ -1799,7 +1804,7 @@ def next_step_for(row: dict, *, today: date, entry: Optional[dict] = None) -> di
     if dm is None:
         # NO DATE TO COUNT FROM: the first call is due straight away, and the
         # calls repeat from the last one. The ladder's end cannot be counted
-        # either, so the three-week drop is what ends this one.
+        # either, so this reminder keeps coming until the row moves.
         due = (last_call + timedelta(days=call_every)) if (calls and last_call) else today
         return done(ASK_CALL, due,
                     f"the DM is marked sent with no date; call reminder {calls + 1}",
@@ -1870,21 +1875,29 @@ def company_scores(rows) -> dict:
 def _next_step_order(person: dict) -> tuple:
     """THE ORDER PEOPLE ARE PICKED IN, in one place.
 
-    The tier first (see TIER_*). Inside a tier the OLDEST LI Connected Date
-    first: somebody connected on 3 September and still waiting comes before
-    somebody connected yesterday. A tie goes to the better R5 company score
-    (`company_scores`), then to sheet order. A row with NO LI Connected Date
-    goes last in its tier, in sheet order, because there is no date to sort
-    it by.
+    The tier first (see TIER_*). INSIDE A TIER, A ROTATION: least recently
+    named first. A person never named for their current step sorts ahead of
+    anybody who has been, because "" comes before every ISO date. Without it
+    the same five would be named every weekday for ever and the rest of the
+    tier would never be reached, now that nothing drops anybody.
 
-    Priority (AF) is read and shown in the preview and is deliberately not
+    Then the OLDEST LI Connected Date, then the better R5 company score
+    (`company_scores`), then sheet order. A row with NO LI Connected Date goes
+    last among people named equally recently, in sheet order, because there is
+    no date to sort it by.
+
+    Priority is read and shown in the preview and is deliberately not
     used here: the tiers are the priority.
+
+    R6 HAS NO ROTATION, BY DESIGN, AND THIS RULE DOES. They are not to be made
+    alike.
     """
     connected = person.get("connected")
     row_no = person["row"].get("_row") or 0
+    last = str(person.get("last_date") or "")
     if connected is None:
-        return (person["tier"], 1, "", 0, row_no)
-    return (person["tier"], 0, dl.iso(connected), -int(person.get("score") or 0), row_no)
+        return (person["tier"], last, 1, "", 0, row_no)
+    return (person["tier"], last, 0, dl.iso(connected), -int(person.get("score") or 0), row_no)
 
 
 def _r_next_step_followups(rule, ctx) -> list:
@@ -1897,21 +1910,21 @@ def _r_next_step_followups(rule, ctx) -> list:
     A Completed meeting leaves for good (R9 takes over); a meeting booked for
     today or later pauses the person.
 
-    WHO IS PICKED: at most `max_items_per_post`, in `_next_step_order`.
+    WHO IS PICKED: at most `max_items_per_post`, in `_next_step_order`: the
+    tier, then whoever was named least recently.
 
-    THE THREE-WEEK DROP IS THE ONLY ENDING. The clock starts the day the bot
-    FIRST NAMES a person for a step (`first_named` in the state), not at any
-    sheet date. After NEXT_STEP_DROP_AFTER_DAYS of being named with the step
-    unchanged, the person is named ONCE under the drop line and then not
-    again. The clock restarts when the step's signature changes, and a dropped
-    person comes back under the new step: dropping ends an ask, not a person.
-    The reminder to mark somebody unresponsive is itself a drop, the same way.
-    For a call counted from an LI DM Date the call ladder's own end wins and
-    gives the unresponsive line; with no date to count the ladder from, the
-    three-week drop is the backstop.
+    NOBODY IS DROPPED AND NOTHING CLOSES A PERSON. A reminder keeps coming
+    round, in its turn, until the sheet moves: the step changes, a meeting is
+    booked or completed, or a stop marker takes the row out. (A three-week drop
+    was built on 12 Oct 2026 and removed the same day. The `closed`,
+    `closed_date` and `first_named` columns it used are left in the table,
+    unread.)
 
-    THE DROP LINE DOES NOT USE UP THE FIVE PLACES: five are picked for the
-    reminders, then up to DROP_LINE_MAX people being dropped today are added.
+    THE UNRESPONSIVE LINE REPEATS, AND THAT IS INTENDED. Once the call ladder
+    has run out the person is in the last tier and comes round with the
+    rotation like anybody else. The reminder names the action that ends it:
+    setting Prospect Status to Unresponsive takes the row out through the
+    ordinary stop markers. It is not a one-off, so do not make it one.
 
     THE EVALUATOR PICKS, NOT THE DRIP. Every other rule hands over everything
     that qualified and lets the post take what fits. Here the five ARE the
@@ -1919,13 +1932,14 @@ def _r_next_step_followups(rule, ctx) -> list:
     own ordering choose a different five from the ones this order meant.
 
     `ctx["next_step_state"]` is {row_key: {...}} from the caller. NONE MEANS
-    UNREADABLE, AND THEN NOTHING IS PRODUCED: with no state every drop clock
-    would restart and people already dropped would be reminded about again.
+    UNREADABLE, AND THEN NOTHING IS PRODUCED: with no state the rotation would
+    restart from the top and the people named yesterday would be named again.
     Nothing is written here; the sender records a mention after a real send.
 
-    A STORED ENTRY WHOSE SIGNATURE DIFFERS FROM THE ROW'S IS IGNORED, `closed`
-    included. That is all "the state for the old step clears" needs, and it
-    means a preview never has to write.
+    A STORED ENTRY WHOSE SIGNATURE DIFFERS FROM THE ROW'S IS IGNORED. That is
+    all "the state for the old step clears" needs (the person is new again and
+    goes to the front of their tier), and it means a preview never has to
+    write.
 
     ONCE TODAY'S POST HAS GONE, TODAY'S PEOPLE STAY TODAY'S PEOPLE. The queue
     is recomputed on every sweep tick. Without this, the tick after the post
@@ -1939,8 +1953,8 @@ def _r_next_step_followups(rule, ctx) -> list:
     state = ctx.get("next_step_state")
     rule_id = getattr(rule, "id", "") or "R13"
     report = {"state": "ok", "connected": 0, "due": 0, "waiting": 0, "completed": 0,
-              "no_date": [], "unknown_step": [], "paused": [], "closed": [],
-              "silent": [], "dropping": [], "picked": [], "queued": []}
+              "no_date": [], "unknown_step": [], "paused": [],
+              "silent": [], "picked": [], "queued": []}
     ctx.setdefault("reports", {})[rule_id] = report
     if state is None:
         report["state"] = "unreadable"
@@ -1954,10 +1968,8 @@ def _r_next_step_followups(rule, ctx) -> list:
     # marked Connected may not have passed the activation gate.
     source = ctx.get("prospect_rows")
     due_people: list = []
-    dropping: list = []
     named_today: list = []
     today_iso = dl.iso(today)
-    drop_after = max(1, int(config.NEXT_STEP_DROP_AFTER_DAYS))
 
     def entry_of(row, detail=""):
         return {"sheet_row": row.get("_row"), "poc": _text(row, "name"),
@@ -1983,14 +1995,11 @@ def _r_next_step_followups(rule, ctx) -> list:
         return []
     scores = company_scores(in_sheet_order)
 
-    def person_of(row, key, found, *, first_named=None):
+    def person_of(row, key, found, *, last_date=""):
         import prospects
-        days = (today - first_named).days if first_named is not None else None
-        tier = _TIER_OF_ASK.get(found["ask"], TIER_RESEARCH)
-        if days is not None and drop_after - LAST_CHANCE_DAYS <= days < drop_after:
-            tier = min(tier, TIER_LAST_CHANCE)
-        return {"row": row, "key": key, "found": found, "ask": found["ask"], "tier": tier,
-                "connected": _date(row, "li_connected_date"), "days_named": days,
+        return {"row": row, "key": key, "found": found, "ask": found["ask"],
+                "tier": _TIER_OF_ASK.get(found["ask"], TIER_RESEARCH),
+                "connected": _date(row, "li_connected_date"), "last_date": last_date,
                 "score": scores.get(prospects.company_key(_text(row, "company")), 0)}
 
     for row in in_sheet_order:
@@ -2037,44 +2046,28 @@ def _r_next_step_followups(rule, ctx) -> list:
             log.info("[rules] %s: row %s (%s) has a Next Steps value I don't know "
                      "(%r) — skipped", rule_id, row.get("_row"), _describe(row), raw)
             continue
-        same = bool(stored) and str(stored.get("signature") or "") == found["signature"]
-        if same and stored.get("closed"):
-            # DROPPED, AND NOTHING HAS MOVED SINCE. A changed signature is a new
-            # step and brings the person back; this is the same one.
-            report["closed"].append(entry_of(
-                row, f"dropped on {stored.get('closed_date') or 'an earlier day'}"))
-            continue
         if found["status"] == "silent":
             report["silent"].append(entry_of(row, found["why"]))
-            continue
-        first_named = dl.parse_date(stored.get("first_named")) if same else None
-        person = person_of(row, key, found, first_named=first_named)
-        # THE THREE-WEEK DROP. Not for a call counted from an LI DM Date, nor
-        # for the unresponsive reminder: the call ladder's own end ends those.
-        ladder = found["ask"] == ASK_UNRESPONSIVE or (
-            found["ask"] == ASK_CALL and found.get("has_dm_date"))
-        if not ladder and person["days_named"] is not None \
-                and person["days_named"] >= drop_after:
-            dropping.append(person)
             continue
         if found["status"] == "waiting":
             report["waiting"] += 1
             continue
-        due_people.append(person)
+        # THE ROTATION'S CLOCK BELONGS TO THE STEP: a person whose step changed
+        # since they were last named is new again.
+        same = bool(stored) and str(stored.get("signature") or "") == found["signature"]
+        due_people.append(person_of(
+            row, key, found, last_date=str(stored.get("last_date") or "") if same else ""))
 
     report["due"] = len(due_people)
     limit = max(1, int(getattr(rule, "max_items_per_post", 5) or 5))
     ranked = sorted(due_people, key=_next_step_order)
     picked, queued = ranked[:limit], ranked[limit:]
-    drops = sorted(dropping, key=_next_step_order)[:DROP_LINE_MAX]
-    for person in drops:
-        person["ask"] = ASK_DROPPED
     if named_today:
-        picked, queued, drops = named_today, ranked, []
+        picked, queued = named_today, ranked
         report["posted_today"] = True
 
     out = []
-    for position, person in enumerate(list(picked) + list(drops)):
+    for position, person in enumerate(picked):
         row, found, ask = person["row"], person["found"], person["ask"]
         n = found["n"]
         label = {
@@ -2083,13 +2076,10 @@ def _r_next_step_followups(rule, ctx) -> list:
         }.get(found["code"], wording.STEP_EMAILS[n - 1] if n else "")
         who = wording.next_step_who(_text(row, "name"), _text(row, "company"))
         line = wording.next_step_line(ask, who=who, n=n) or f"{who}: named in today's post"
-        entry = {**entry_of(row, ask), "line": line}
-        (report["dropping"] if ask == ASK_DROPPED else report["picked"]).append(entry)
+        report["picked"].append({**entry_of(row, ask), "line": line})
         out.append(_item(
             rule=rule, trigger=R_NEXT_STEPS, today=today, due=found["due"] or today,
             why=("R13: already named in today's post" if named_today else
-                 f"R13: three weeks named with nothing moved; dropped today"
-                 if ask == ASK_DROPPED else
                  f"R13: {found['why']}; {position + 1} of {len(picked)} in today's "
                  f"post, {len(queued)} more due and waiting their turn"),
             text=line, company=_text(row, "company"), poc=_text(row, "name"),
@@ -2101,7 +2091,6 @@ def _r_next_step_followups(rule, ctx) -> list:
                 "step": found["code"], "step_label": label, "ask": ask,
                 "signature": found["signature"],
                 "pick_order": position, "tier": person["tier"],
-                "days_named": person["days_named"],
                 # WHAT THE GROUPED POST NEEDS: who they are and which group.
                 "who": who, "poc_priority": _text(row, "poc_priority"),
                 "email_n": n,
@@ -2111,13 +2100,12 @@ def _r_next_step_followups(rule, ctx) -> list:
         report["queued"].append(entry_of(person["row"], person["ask"]))
 
     log.info(
-        "[rules] %s: %d connected, %d due -> %d picked, %d queued; %d dropped today "
-        "(of %d at three weeks); %d waiting, %d with no LI Connected Date (included), "
-        "%d unknown step, %d with nothing to say, %d paused for a meeting, %d "
-        "completed, %d already dropped", rule_id, report["connected"], report["due"],
-        len(picked), len(queued), len(drops), len(dropping), report["waiting"],
-        len(report["no_date"]), len(report["unknown_step"]), len(report["silent"]),
-        len(report["paused"]), report["completed"], len(report["closed"]),
+        "[rules] %s: %d connected, %d due -> %d picked, %d queued (they come round in "
+        "turn; nobody is dropped); %d waiting, %d with no LI Connected Date (included), "
+        "%d unknown step, %d with nothing to say, %d paused for a meeting, %d completed",
+        rule_id, report["connected"], report["due"], len(picked), len(queued),
+        report["waiting"], len(report["no_date"]), len(report["unknown_step"]),
+        len(report["silent"]), len(report["paused"]), report["completed"],
     )
     return out
 
@@ -2162,8 +2150,6 @@ def next_step_report_lines(report: Optional[dict], rule_id: str = "R13") -> list
     ]
     for key, label in (
         ("queued", "Due, waiting their turn"),
-        ("dropping", "Dropped today (three weeks, nothing moved)"),
-        ("closed", "Already dropped; they return when the sheet moves"),
         ("silent", "Nothing to remind about (known gaps)"),
         ("no_date", "Connected with no LI Connected Date (included, sorted last)"),
         ("unknown_step", "Next Steps value I don't recognise (skipped)"),
@@ -2784,14 +2770,13 @@ def _self_test() -> int:
         "NEXT_STEP_AFTER_EMAIL_DAYS", "NEXT_STEP_CALL_AFTER_DM_DAYS",
         "NEXT_STEP_CALL_EVERY_DAYS", "NEXT_STEP_CALL_UNTIL_DAYS",
         "NEXT_STEP_DM_REPLIED_MARKERS", "NEXT_STEP_DM_SENT_MARKERS",
-        "NEXT_STEP_DROP_AFTER_DAYS", "NEXT_STEP_PAUSE_FOR_BOOKED_MEETING",
+        "NEXT_STEP_PAUSE_FOR_BOOKED_MEETING",
         "NEXT_STEP_CONNECTED_MARKERS", "NEXT_STEP_TIME")}
     config.NEXT_STEP_FIRST_DAYS = config.NEXT_STEP_AFTER_PREVIOUS_DAYS = 2
     config.NEXT_STEP_AFTER_EMAIL_DAYS = config.NEXT_STEP_CALL_AFTER_DM_DAYS = 7
     config.NEXT_STEP_CALL_EVERY_DAYS, config.NEXT_STEP_CALL_UNTIL_DAYS = 3, 21
-    config.NEXT_STEP_DM_REPLIED_MARKERS = ["replied", "responded"]
-    config.NEXT_STEP_DM_SENT_MARKERS = ["sent", "yes", "done"]
-    config.NEXT_STEP_DROP_AFTER_DAYS = 21
+    config.NEXT_STEP_DM_REPLIED_MARKERS = ["replied", "responded", "received"]
+    config.NEXT_STEP_DM_SENT_MARKERS = ["sent", "received"]
     config.NEXT_STEP_PAUSE_FOR_BOOKED_MEETING = True
     config.NEXT_STEP_CONNECTED_MARKERS = ["connected"]
     config.NEXT_STEP_TIME = "15:00"
@@ -2849,6 +2834,12 @@ def _self_test() -> int:
     check("a replied DM is the replied ask, never a call",
           step(conn(outreach_step="Reach by LI DM", li_dm_sent="Replied",
                     li_dm_date="01-09-2026"))[:2], ("due", ASK_REPLIED))
+    check("'Received' means they answered: the meeting ask, not a call and not 'DM not sent'",
+          step(conn(outreach_step="Reach by LI DM", li_dm_sent="Received"))[:2],
+          ("due", ASK_REPLIED))
+    check("...and it still counts as the DM having gone out",
+          (dm_replied(conn(li_dm_sent="Received")), dm_sent(conn(li_dm_sent="Received"))),
+          (True, True))
     dm_row = conn(outreach_step="Reach by LI DM", li_dm_sent="Sent",
                   li_dm_date="14-09-2026")                 # a Monday
     check("DM 6 days ago: waiting",
@@ -2873,7 +2864,7 @@ def _self_test() -> int:
     check("an unknown Next Steps value is not guessed at",
           step(conn(outreach_step="ping them"))[0], "unknown_step")
 
-    print("\nR13 next steps — who is in, the order and the three-week drop")
+    print("\nR13 next steps — who is in, the six tiers and the rotation")
 
     def r13_run(rows_, today=MON, state=None, **kw):
         return run(today=today, rows=rows_, day_rules=[r13],
@@ -2895,12 +2886,18 @@ def _self_test() -> int:
     check("...and is outside the cap", {a["counts_toward_cap"] for a in picked}, {False})
     check("the preview line says what to do and names no cell",
           picked[0]["text"], "P7 (Co7): send the first email")
-    state13 = {a["contact_key"]: {"signature": a["signature"], "last_date": "2026-09-21",
-                                  "first_named": "2026-09-21"} for a in picked}
+    state13 = {a["contact_key"]: {"signature": a["signature"], "last_date": "2026-09-21"}
+               for a in picked}
     day2 = sorted(r13_run(people, today=TUE, state=state13)["actions"],
                   key=lambda a: a["pick_order"])
-    check("the next day: the SAME five (no rotation; they leave by acting or by the drop)",
-          [a["poc"] for a in day2], ["P7", "P6", "P5", "P4", "P3"])
+    check("the next day THE TIER ROTATES: the three never named, then the oldest of yesterday's",
+          [a["poc"] for a in day2], ["P2", "P1", "P0", "P7", "P6"])
+    people[6]["outreach_step"] = "Send email 2"
+    check("a changed step makes the person new again: with the never-named, oldest first",
+          [a["poc"] for a in sorted(r13_run(people, today=TUE, state=state13)["actions"],
+                                    key=lambda a: a["pick_order"])],
+          ["P6", "P2", "P1", "P0", "P7"])
+    people[6]["outreach_step"] = "Send email 1"
     caller = conn(_row=40, company="Zeta", name="Zed", outreach_step="Call the PoC",
                   li_dm_date="14-09-2026")
     replier = conn(_row=41, company="Yota", name="Yan", outreach_step="Reach by LI DM",
@@ -2929,38 +2926,25 @@ def _self_test() -> int:
 
     one = conn(_row=60, company="Solo", name="Sol", outreach_step="Send email 1")
     key1, sig1 = activation.row_key(one), step_signature(one)
-
-    def named(first, **more):
-        return {key1: dict({"signature": sig1, "first_named": first,
-                            "last_date": first}, **more)}
-
     day = date(2026, 10, 12)
-    for days, want in ((20, ["email_out"]), (21, ["dropped"])):
-        got = r13_run([one], today=day, state=named(dl.iso(day - timedelta(days=days))))
-        check(f"day {days} of being named: {want[0]}",
-              [a["ask"] for a in got["actions"]], want)
-    check("day 20 is in the last-chance tier",
-          r13_run([one], today=day, state=named(dl.iso(day - timedelta(days=20)))
-                  )["actions"][0]["tier"], TIER_LAST_CHANCE)
-    check("day 22, already dropped: absent",
-          r13_run([one], today=day, state=named(
-              dl.iso(day - timedelta(days=22)), closed=True,
-              closed_date=dl.iso(day - timedelta(days=1))))["actions"], [])
-    moved = dict(one, outreach_step="Send email 2")
-    check("...and back when the sheet moves, with no clock running",
-          [(a["ask"], a["days_named"]) for a in r13_run([moved], today=day, state=named(
-              dl.iso(day - timedelta(days=22)), closed=True,
-              closed_date=dl.iso(day - timedelta(days=1))))["actions"]],
-          [("email_out", None)])
-    check("the drop line does not use up the five places",
-          len(r13_run(people + [one], today=day, state=named(
-              dl.iso(day - timedelta(days=30))))["actions"]), 6)
-    check("a call counted from an LI DM Date is ended by its ladder, not by the drop",
-          [a["ask"] for a in r13_run([dm_row], today=date(2026, 10, 6), state={
-              activation.row_key(dm_row): {"signature": sig13, "first_named": "2026-09-01",
-                                           "last_date": "2026-10-01", "calls": 4,
-                                           "last_call_date": "2026-10-01"}})["actions"]],
-          ["unresponsive"])
+    check("named 25 days ago with nothing moved: still named, normally. Nobody is dropped",
+          [a["ask"] for a in r13_run([one], today=day, state={key1: {
+              "signature": sig1, "last_date": dl.iso(day - timedelta(days=25))}})["actions"]],
+          ["email_out"])
+    check("a row the old drop had closed is named again: nothing closes a person",
+          [a["ask"] for a in r13_run([one], today=day, state={key1: {
+              "signature": sig1, "last_date": dl.iso(day - timedelta(days=30)), "closed": True,
+              "closed_date": "2026-09-20"}})["actions"]], ["email_out"])
+    gone = r13_run([dm_row], today=date(2026, 10, 6))["actions"]
+    again = r13_run([dm_row], today=date(2026, 10, 9), state={
+        activation.row_key(dm_row): {"signature": sig13, "last_date": "2026-10-06",
+                                     "last_ask": "unresponsive"}})["actions"]
+    check("the unresponsive reminder comes round again until the row is marked",
+          ([a["ask"] for a in gone], [a["ask"] for a in again]),
+          (["unresponsive"], ["unresponsive"]))
+    check("the tiers are six, in this order",
+          (TIER_REPLIED, TIER_CALL, TIER_ADVANCE, TIER_EMAIL, TIER_RESEARCH, TIER_UNRESPONSIVE),
+          (1, 2, 3, 4, 5, 6))
     check("Prospect Status Unresponsive stops it",
           r13_run([conn(prospect_status="Unresponsive")])["actions"], [])
     check("a meeting booked ahead pauses it",

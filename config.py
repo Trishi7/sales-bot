@@ -880,9 +880,9 @@ GTM_SHEET_ORIGINAL_ID = (
 #
 # WHAT REPLACES IT, per Vaishnavi's walkthrough: the bot writes into the REAL
 # "Outreach PoCs" tab, into the columns the team actually keeps, and ONLY inside
-# the WRITABLE WINDOW between the restricted bands (RESTRICTED_COLUMN_RANGES,
-# default A:I, Q:W and Z:AE — the identity block, the outreach-step block and
-# the commercial block are untouchable, enforced in code since V1). There is no copy and no "which sheet"
+# the WRITABLE WINDOW the restricted roles leave (RESTRICTED_COLUMN_ROLES —
+# the identity block, the outreach-step block and the commercial block are
+# untouchable, enforced in code since V1, and by ROLE since 12 Oct 2026). There is no copy and no "which sheet"
 # question left to get wrong.
 #
 # WHAT DID NOT CHANGE: SQLite is still the brain. Deadlines, snoozes, scheduled
@@ -978,14 +978,15 @@ PROPOSAL_BARE_YES_MINUTES = _int("PROPOSAL_BARE_YES_MINUTES", 30)
 # propose one, and an approver's yes appends it.
 #
 # THE IDENTITY COLUMNS OF A *NEW* OUTREACH PoCs ROW ARE WRITABLE, and only
-# there. A:I on an EXISTING row stays as locked as it has always been: those
+# there. The identity block on an EXISTING row stays as locked as it has always been: those
 # cells hold work somebody did, and the bands exist to protect exactly that. A
 # row the bot is creating has no such work in it — every cell is blank because
-# the row did not exist a second ago — so filling A-I of a brand-new row
+# the row did not exist a second ago — so filling the identity cells of a brand-new row
 # destroys nothing and is the only way an appended row is any use at all.
 #
-# Q-W AND Z-AE OF A NEW ROW ARE STILL REFUSED. Q-W is the outreach sequence the
-# team keeps by hand (the Next Steps dropdown and the three emails); Z-AE is
+# THE STEP BLOCK AND THE COMMERCIAL BLOCK OF A NEW ROW ARE STILL REFUSED. The
+# step block is the outreach sequence the team keeps by hand (the Next Steps
+# dropdown, the three emails, the LinkedIn DM cells); the commercial block is
 # commercial judgement and a formula block. A bot that has just discovered a
 # company has no business stating its closure probability or which email went
 # out.
@@ -998,69 +999,9 @@ SHEET_APPENDABLE_TABS: list[str] = _str_list(
     "SHEET_APPENDABLE_TABS", "outreach_pocs,researcher_lines,events_summits",
 )
 
-# The columns the bot may fill on a NEW Outreach PoCs row. A:I is the identity
-# block; J:P and X:Y are the writable windows, which it could write anyway.
-# Q:W and Z:AE are absent on purpose — see above. (Until the 7 Oct 2026 layout
-# this was A:R; on today's sheet that would reach the Next Steps dropdown and
-# 1st Email Sent, and startup warns if it still does.)
-NEW_ROW_WRITABLE_RANGES = (
-    os.getenv("NEW_ROW_WRITABLE_RANGES", "") or ""
-).strip() or "A:P,X:Y"
-
-# PARSED ON FIRST USE, not at import: `parse_column_ranges` is defined further
-# down this file with the other band helpers, and moving either one to sit
-# beside the other would separate a setting from the paragraph that explains it.
-_NEW_ROW_INDEXES: Optional[frozenset] = None
-
-
-def new_row_writable_indexes() -> frozenset:
-    """The column indexes the bot may fill on a row it is CREATING."""
-    global _NEW_ROW_INDEXES
-    if _NEW_ROW_INDEXES is None:
-        _NEW_ROW_INDEXES = frozenset(
-            i for lo, hi in parse_column_ranges(NEW_ROW_WRITABLE_RANGES)
-            for i in range(lo, hi + 1)
-        )
-    return _NEW_ROW_INDEXES
-
-
-def new_row_locked_overlap() -> str:
-    """The columns NEW_ROW_WRITABLE_RANGES opens that a restricted band locks, as
-    "Q:R". "" when there are none.
-
-    Checked against the CONFIGURED bands, not a literal: the sheet's layout
-    moved on 7 Oct 2026 and a warning that still tested "S:X" stayed silent
-    while a new row was allowed to fill the Next Steps dropdown. The FIRST band
-    is left out — it is the identity block, the one a new row exists to fill.
-    """
-    locked = frozenset(
-        i for lo, hi in RESTRICTED_COLUMN_BANDS[1:] for i in range(lo, hi + 1)
-    )
-    cols = sorted(new_row_writable_indexes() & locked)
-    runs: list = []
-    for i in cols:
-        if runs and i == runs[-1][1] + 1:
-            runs[-1][1] = i
-        else:
-            runs.append([i, i])
-    return ", ".join(
-        f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
-        for lo, hi in runs
-    )
-
-
-def may_write_new_row_column(index0) -> bool:
-    """May the bot fill this column on a row it is CREATING?
-
-    FAILS CLOSED, like `is_restricted_column`: an index that cannot be read as a
-    number is refused. This is a widening of the write surface and the one place
-    A:I is reachable at all, so it gets the same paranoia as the lock it relaxes.
-    """
-    try:
-        idx = int(index0)
-    except (TypeError, ValueError):
-        return False
-    return idx in new_row_writable_indexes()
+# WHAT A NEW Outreach PoCs ROW MAY FILL is NEW_ROW_WRITABLE_ROLES, defined with
+# the write lock further down ("THE WRITE LOCK, BY ROLE"): the two lists are one
+# design and are resolved together.
 
 
 # -- FOCUS COMMANDS -----------------------------------------------------------
@@ -1623,30 +1564,71 @@ GTM_READ_HIDDEN_TABS = _bool("GTM_READ_HIDDEN_TABS", default=True)
 # log read instead of a debugging session, so it defaults ON.
 GTM_LOG_FULL_SCHEMA = _bool("GTM_LOG_FULL_SCHEMA", default=True)
 
-# -- RESTRICTED COLUMN BANDS: WHERE THE BOT MAY NEVER WRITE -------------------
-# Comma-separated A1 column ranges ("A:I,Q:W,Z:AE") or bare single columns
-# ("A,C").
-# Every column inside a band is DENIED to every write path in code, resolved to
-# column INDEXES once at import so a band cannot mean one thing in one code path
-# and something else in another.
+# -- THE WRITE LOCK, BY ROLE: WHERE THE BOT MAY NEVER WRITE -------------------
 #
-# THIS IS A WRITE LOCK, NOT A READ LOCK. Reading stays completely unrestricted —
-# the bot still parses, quotes and answers questions about every column in the
-# tab. The bands exist because the sheet's left-hand identity block and its
-# right-hand formula block are maintained by people and by formulas, and a bot
-# writing into either would destroy work it cannot see.
+# THE LOCK IS STATED BY ROLE, NOT BY COLUMN LETTER (12 Oct 2026). Until then it
+# was letters ("A:I,Q:W,Z:AE"). On 12 Oct the Next Steps column and the two LI
+# DM columns were moved on the sheet, and the letters went on locking the SAME
+# LETTERS: the Next Steps dropdown and the first email's cells were now inside
+# the window the bot was allowed to write in. A letter band silently unlocks
+# whatever moves into it. A role moves with its header.
 #
-# THE 7 OCT 2026 LAYOUT HAS THREE BANDS. A:I is the identity block, Q:W the
-# outreach steps (the Next Steps dropdown and the three emails' sent/date
-# cells, which R13 reminds about and never fills) and Z:AE the commercial
-# block. Before that date it was two, A:I and S:X.
+# gtm_sheet maps every column by its HEADER TEXT to a role. The lock names
+# roles, and is resolved to column indexes from the headers ACTUALLY FOUND on
+# the tab, every time the tab is read (`resolve_column_lock`).
 #
-# The columns BETWEEN the bands are the WRITABLE WINDOW, and the NAMED columns
-# inside it are logged at startup — so a shifted column is visible before any
-# write, rather than after one has landed in the wrong place.
-RESTRICTED_COLUMN_RANGES = (
-    os.getenv("RESTRICTED_COLUMN_RANGES", "") or ""
-).strip() or "A:I,Q:W,Z:AE"
+# THIS IS A WRITE LOCK, NOT A READ LOCK. Reading stays completely unrestricted.
+#
+# THREE BLOCKS, named by what they are. Today's letters are printed in the
+# startup log ([gtm.lock]); they are not written here, because they move.
+#
+#   THE IDENTITY BLOCK    who a person is: the serial number through the
+#                         LinkedIn URL, the Email cell included. Maintained by
+#                         people; a NEW row may fill it (see below).
+#   THE STEP BLOCK        the outreach sequence the team keeps by hand and R13
+#                         only reminds about: Next Steps, the three emails'
+#                         Sent and Date cells, LI DM Sent, LI DM Date.
+#   THE COMMERCIAL BLOCK  Notes/Remarks through Deal Status, AND PRIORITY.
+#                         (Priority sat in no letter band at all before this,
+#                         so nothing locked it. It is locked now.)
+IDENTITY_ROLES = ("sr_no", "company", "industry", "name", "designation", "email",
+                  "based", "paper_links", "li_url")
+STEP_ROLES = ("outreach_step", "email_1_sent", "email_1_date", "email_2_sent",
+              "email_2_date", "email_3_sent", "email_3_date", "li_dm_sent", "li_dm_date")
+COMMERCIAL_ROLES = ("next_steps", "package", "prospect_status", "closure_prob",
+                    "deal_size", "deal_status", "poc_priority")
+
+# The roles no write path may ever touch on an EXISTING row. Role names are
+# gtm_sheet's own (its ALIASES map); the three blocks above are the default.
+#
+# FAILS CLOSED ON A ROLE IT CANNOT FIND. If a role here maps to no column on
+# the tab (a renamed header, a deleted column) EVERY write to the tab is
+# refused while that is so, and it is logged at ERROR naming the roles. A
+# write lock that quietly carries on with a role unlocked is worse than none:
+# nobody finds out until a cell has been overwritten.
+RESTRICTED_COLUMN_ROLES: list[str] = [r.strip().lower() for r in _str_list(
+    "RESTRICTED_COLUMN_ROLES", ",".join(IDENTITY_ROLES + STEP_ROLES + COMMERCIAL_ROLES),
+) if r.strip()]
+
+# LETTER RANGES, AS AN EXTRA. Empty by default. Anything given here is ADDED to
+# what the roles lock (the effective lock is the UNION), so a letter range can
+# only ever lock MORE. It can never unlock a role.
+RESTRICTED_COLUMN_RANGES = (os.getenv("RESTRICTED_COLUMN_RANGES", "") or "").strip()
+
+# WHAT A NEW ROW MAY FILL, by role: the identity block, plus who made the first
+# contact and the LinkedIn connection cells. Nothing from the step block or the
+# commercial block: a bot that has just discovered a company has no business
+# stating which email went out or its closure probability. A role named here
+# that IS in one of those two blocks is ignored, and startup warns.
+NEW_ROW_WRITABLE_ROLES: list[str] = [r.strip().lower() for r in _str_list(
+    "NEW_ROW_WRITABLE_ROLES",
+    ",".join(IDENTITY_ROLES + ("first_contact", "first_contact_type",
+                               "first_contact_date", "sid_li_added", "li_connected_date")),
+) if r.strip()]
+
+# Letter ranges a new row may ALSO fill. Empty by default. A column the step or
+# commercial block locks stays locked whatever is written here.
+NEW_ROW_WRITABLE_RANGES = (os.getenv("NEW_ROW_WRITABLE_RANGES", "") or "").strip()
 
 
 def _column_index(label: str):
@@ -1674,9 +1656,8 @@ def parse_column_ranges(spec: str) -> list:
     """"A:I,Q:W" -> [(0, 8), (16, 22)] — inclusive, 0-based pairs.
 
     An unparseable fragment is dropped WITH A WARNING NAMING IT rather than
-    raising: a typo here must not take the bot down. It must not silently WIDEN
-    what may be written either, which is why the fragment is named — the bands
-    that did parse still lock exactly what they lock.
+    raising: a typo here must not take the bot down. It cannot WIDEN what may
+    be written either: a range only ever adds to the lock.
     """
     out: list = []
     for part in str(spec or "").split(","):
@@ -1688,74 +1669,237 @@ def parse_column_ranges(spec: str) -> list:
         hi = _column_index(hi_label) if hi_label.strip() else lo
         if lo is None or hi is None:
             log.warning(
-                "RESTRICTED_COLUMN_RANGES: %r is not a column range like 'A:I' or 'S'; "
-                "that fragment is ignored. The other bands still apply.", frag,
+                "%r is not a column range like 'A:I' or 'S'; that fragment is ignored. "
+                "The role lock and the other ranges still apply.", frag,
             )
             continue
         out.append((min(lo, hi), max(lo, hi)))
     return sorted(out)
 
 
-RESTRICTED_COLUMN_BANDS: list = parse_column_ranges(RESTRICTED_COLUMN_RANGES)
-RESTRICTED_COLUMN_INDEXES: frozenset = frozenset(
-    i for lo, hi in RESTRICTED_COLUMN_BANDS for i in range(lo, hi + 1)
-)
+def _runs(indexes) -> list:
+    """Sorted indexes as inclusive (lo, hi) runs: {0,1,2,5} -> [(0, 2), (5, 5)]."""
+    out: list = []
+    for i in sorted(set(indexes)):
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return [(lo, hi) for lo, hi in out]
+
+
+def _runs_label(indexes) -> str:
+    return ", ".join(f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
+                     for lo, hi in _runs(indexes))
+
+
+class ColumnLock:
+    """The write lock, resolved against ONE read of the Outreach PoCs tab.
+
+        restricted   the column indexes no write path may touch on an existing
+                     row: every restricted role's column, plus any letter range
+        by_role      {restricted role: index} for the roles that mapped
+        unmapped     the restricted roles that mapped to NO column. Non-empty
+                     means the lock FAILED CLOSED: every write is refused
+        new_row      the indexes a row the bot is CREATING may fill
+        ignored_new  roles in NEW_ROW_WRITABLE_ROLES that the step or
+                     commercial block locks, and that were therefore not opened
+        role_of      {index: role} for every mapped column (canonical roles)
+    """
+
+    def __init__(self, *, restricted, by_role, unmapped, new_row, ignored_new, role_of,
+                 headers):
+        self.restricted = frozenset(restricted)
+        self.by_role = dict(by_role)
+        self.unmapped = tuple(unmapped)
+        self.new_row = frozenset(new_row)
+        self.ignored_new = tuple(ignored_new)
+        self.role_of = dict(role_of)
+        self.headers = list(headers or [])
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.unmapped)
+
+    def writable(self) -> list:
+        """The mapped columns an existing row may be written in, as indexes."""
+        return sorted(i for i in self.role_of if i not in self.restricted)
+
+
+def resolve_column_lock(role_to_col: dict, headers=(), *,
+                        canonical: Optional[dict] = None) -> ColumnLock:
+    """Turn the role lists into column indexes for the headers actually found.
+
+    `role_to_col` is the tab's {role: index} (compatibility names included, so
+    a role can be named either way); `canonical` the same map without those
+    names, used to say which role each column is.
+
+    THE UNION. The restricted set is every restricted role's column PLUS every
+    column in RESTRICTED_COLUMN_RANGES. A range adds; nothing subtracts.
+
+    THE NEW-ROW SET is the columns of NEW_ROW_WRITABLE_ROLES plus
+    NEW_ROW_WRITABLE_RANGES, MINUS every column the step or commercial block
+    locks. Only the identity block is ever re-opened for a new row.
+    """
+    role_to_col = dict(role_to_col or {})
+    canonical = dict(canonical or role_to_col)
+    restricted_roles = list(dict.fromkeys(RESTRICTED_COLUMN_ROLES))
+    by_role = {r: int(role_to_col[r]) for r in restricted_roles if r in role_to_col}
+    unmapped = [r for r in restricted_roles if r not in role_to_col]
+    ranged = {i for lo, hi in parse_column_ranges(RESTRICTED_COLUMN_RANGES)
+              for i in range(lo, hi + 1)}
+    restricted = set(by_role.values()) | ranged
+    identity = {by_role[r] for r in by_role if r in IDENTITY_ROLES}
+    locked_for_good = restricted - identity
+    ignored_new = [r for r in NEW_ROW_WRITABLE_ROLES
+                   if r in restricted_roles and r not in IDENTITY_ROLES]
+    opened = {int(role_to_col[r]) for r in NEW_ROW_WRITABLE_ROLES if r in role_to_col}
+    opened |= {i for lo, hi in parse_column_ranges(NEW_ROW_WRITABLE_RANGES)
+               for i in range(lo, hi + 1)}
+    return ColumnLock(
+        restricted=restricted, by_role=by_role, unmapped=unmapped,
+        new_row=opened - locked_for_good, ignored_new=ignored_new,
+        role_of={int(i): r for r, i in canonical.items()}, headers=headers)
+
+
+# THE LOCK IN FORCE: the one resolved from the most recent read of the Outreach
+# PoCs tab. Every write path re-reads the tab fresh before it writes, so this
+# is never older than the write it guards. None until a tab has been read, and
+# then NOTHING may be written: "I have not looked at the sheet yet" is not a
+# reason to write to it.
+_ACTIVE_LOCK: Optional[ColumnLock] = None
+
+
+def set_active_lock(lock: Optional[ColumnLock]) -> None:
+    global _ACTIVE_LOCK
+    _ACTIVE_LOCK = lock
+
+
+def active_lock() -> Optional[ColumnLock]:
+    return _ACTIVE_LOCK
+
+
+def lock_failure() -> str:
+    """Why NO write may happen at all right now, or "" when the lock is sound."""
+    lock = _ACTIVE_LOCK
+    if lock is None:
+        return ("the write lock has not been resolved yet: the Outreach PoCs tab has "
+                "not been read")
+    if lock.unmapped:
+        return ("the write lock cannot be resolved: no column on the Outreach PoCs tab "
+                f"maps to the restricted role(s) {', '.join(lock.unmapped)} "
+                "(RESTRICTED_COLUMN_ROLES). A header was renamed or a column removed. "
+                "Every write to the tab is refused until each role maps to a column again")
+    return ""
 
 
 def is_restricted_column(index0) -> bool:
-    """True when this 0-based column index falls inside a restricted band.
+    """True when this 0-based column index may not be written on an existing row.
 
-    FAILS CLOSED: an index that cannot be read as a number is treated as
-    restricted, because "I could not work out which column this is" has never
-    been a reason to write to it.
+    FAILS CLOSED, three ways: an index that cannot be read as a number, no
+    lock resolved yet, and a lock with an unmapped role all answer True.
     """
+    lock = _ACTIVE_LOCK
+    if lock is None or lock.unmapped:
+        return True
     try:
-        return int(index0) in RESTRICTED_COLUMN_INDEXES
+        return int(index0) in lock.restricted
     except (TypeError, ValueError):
         return True
 
 
+def restricted_bands() -> list:
+    """The restricted columns as inclusive runs, for TODAY'S layout."""
+    lock = _ACTIVE_LOCK
+    return _runs(lock.restricted) if lock is not None else []
+
+
+def restricted_label() -> str:
+    """The restricted columns as letters, "A:I, O:W, Z:AF" — TODAY'S LAYOUT, for a
+    log line or a sentence. It is never the definition of the lock."""
+    lock = _ACTIVE_LOCK
+    if lock is None:
+        return "(not resolved yet: no tab has been read)"
+    return _runs_label(lock.restricted) or "(none)"
+
+
 def restricted_band_label(index0) -> str:
-    """Which band a column falls in, as "A:I". "" when it falls in none."""
+    """Which run of restricted columns a column falls in, as "A:I". "" for none."""
     try:
         idx = int(index0)
     except (TypeError, ValueError):
         return "(unreadable column index)"
-    for lo, hi in RESTRICTED_COLUMN_BANDS:
+    for lo, hi in restricted_bands():
         if lo <= idx <= hi:
             return f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
     return ""
 
 
 def writable_windows() -> list:
-    """The contiguous unrestricted runs BETWEEN the restricted bands.
+    """The MAPPED columns an existing row may be written in, as inclusive runs.
 
-    With bands A:I, Q:W and Z:AE that is [(9, 15), (23, 24)] — columns J..P
-    and X..Y.
-
-    Columns to the RIGHT of the last band are unrestricted too, but they are not
-    "between" the bands and are deliberately not reported as the window: the
-    window is the gap the sheet's owners left for the bot, and naming an
-    open-ended tail alongside it would make a misalignment harder to spot rather
-    than easier.
+    Only columns that carry a role: a write names a role, so a column with no
+    role cannot be written whatever the lock says.
     """
-    if len(RESTRICTED_COLUMN_BANDS) < 2:
+    lock = _ACTIVE_LOCK
+    if lock is None or lock.unmapped:
         return []
-    out: list = []
-    for (_lo_a, hi_a), (lo_b, _hi_b) in zip(
-        RESTRICTED_COLUMN_BANDS, RESTRICTED_COLUMN_BANDS[1:]
-    ):
-        if lo_b > hi_a + 1:
-            out.append((hi_a + 1, lo_b - 1))
-    return out
+    return _runs(lock.writable())
 
 
 def writable_window_label() -> str:
-    """The writable window as "J:P, X:Y". "" when the bands leave no gap between them."""
+    """The writable columns as letters ("J:N, X:Y" on one layout). "" for none."""
     return ", ".join(
         f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
         for lo, hi in writable_windows()
     )
+
+
+def writable_roles() -> list:
+    """The roles an existing row may be written in, in column order."""
+    lock = _ACTIVE_LOCK
+    if lock is None or lock.unmapped:
+        return []
+    return [lock.role_of[i] for i in lock.writable()]
+
+
+def new_row_writable_indexes() -> frozenset:
+    """The column indexes the bot may fill on a row it is CREATING."""
+    lock = _ACTIVE_LOCK
+    return lock.new_row if (lock is not None and not lock.unmapped) else frozenset()
+
+
+def new_row_locked_overlap() -> str:
+    """What the new-row settings TRY to open that the step or commercial block
+    locks: role names from NEW_ROW_WRITABLE_ROLES, and (once a tab has been
+    read) column letters from NEW_ROW_WRITABLE_RANGES. "" when there is nothing.
+    They are never opened; this is what the boot check warns about."""
+    bad = [r for r in NEW_ROW_WRITABLE_ROLES
+           if r in RESTRICTED_COLUMN_ROLES and r not in IDENTITY_ROLES]
+    lock = _ACTIVE_LOCK
+    if lock is not None and NEW_ROW_WRITABLE_RANGES:
+        identity = {lock.by_role[r] for r in lock.by_role if r in IDENTITY_ROLES}
+        ranged = {i for lo, hi in parse_column_ranges(NEW_ROW_WRITABLE_RANGES)
+                  for i in range(lo, hi + 1)}
+        letters = _runs_label(ranged & (lock.restricted - identity))
+        if letters:
+            bad.append(letters)
+    return ", ".join(bad)
+
+
+def may_write_new_row_column(index0) -> bool:
+    """May the bot fill this column on a row it is CREATING?
+
+    FAILS CLOSED, like `is_restricted_column`: an unreadable index, no lock
+    resolved, or a lock with an unmapped role are all refused. This is the one
+    place the identity block is reachable at all, so it gets the same paranoia
+    as the lock it relaxes.
+    """
+    try:
+        idx = int(index0)
+    except (TypeError, ValueError):
+        return False
+    return idx in new_row_writable_indexes()
 
 
 # A mapped master column that is empty on nearly every row is the signature of a
@@ -2198,8 +2342,8 @@ DM_NO_MEETING_MAX_CONTACTS = _int("DM_NO_MEETING_MAX_CONTACTS", 5)
 
 # -- R13 — NEXT STEPS FOR CONNECTED CONTACTS ----------------------------------
 # One post each weekday naming up to five connected contacts and the one thing
-# to do next for each, read off the Next Steps dropdown (Q) and the cells that
-# step depends on. Saley only REMINDS: Q:W is a restricted band, so there is no
+# to do next for each, read off the Next Steps dropdown and the cells that
+# step depends on. Saley only REMINDS: the step block is restricted, so there is no
 # switch here that makes it write those cells.
 #
 # EVERY NUMBER IN THE RULE'S TIMING TABLE IS ONE OF THESE, because the rule as
@@ -2257,8 +2401,13 @@ NEXT_STEP_CALL_UNTIL_DAYS = _int("NEXT_STEP_CALL_UNTIL_DAYS", 21)
 # chased with calls; the post says a meeting needs setting up. Empty = treat a
 # replied DM like any other DM (the call clock runs). CHECKED BEFORE
 # NEXT_STEP_DM_SENT_MARKERS, always: "Replied" must never read as a plain "sent".
+#
+# "RECEIVED" IS IN THIS LIST AND IN NEXT_STEP_DM_SENT_MARKERS, ON PURPOSE. The
+# dropdown holds blank, Sent and Received, and Received means they answered.
+# This list is checked first, so a Received DM takes the meeting branch and
+# never the call ladder, while still counting as "the DM went out".
 NEXT_STEP_DM_REPLIED_MARKERS: list[str] = _str_list(
-    "NEXT_STEP_DM_REPLIED_MARKERS", "replied,responded",
+    "NEXT_STEP_DM_REPLIED_MARKERS", "replied,responded,received",
 )
 
 # WHAT "LI DM Sent" SAYS WHEN THE DM HAS GONE OUT (12 Oct 2026). Compared
@@ -2267,16 +2416,12 @@ NEXT_STEP_DM_REPLIED_MARKERS: list[str] = _str_list(
 # happened: a DM that was sent and never dated used to stall the person on a
 # request for the date. Empty = nobody ever reaches the call stage.
 NEXT_STEP_DM_SENT_MARKERS: list[str] = _str_list(
-    "NEXT_STEP_DM_SENT_MARKERS", "sent,yes,done",
+    "NEXT_STEP_DM_SENT_MARKERS", "sent,received",
 )
 
-# THE THREE-WEEK DROP, R13's only ending. Days an ask may be named before it
-# is dropped, counted from the day the bot FIRST NAMED that person for that
-# step (never from a sheet date, which is what lets rows with no LI Connected
-# Date and no LI DM Date work like everybody else). On that day the person is
-# named once under "I'll stop reminding about these", and then not again until
-# the sheet moves.
-NEXT_STEP_DROP_AFTER_DAYS = _int("NEXT_STEP_DROP_AFTER_DAYS", 21)
+# (NEXT_STEP_DROP_AFTER_DAYS, a three-week drop, was added and RETIRED on 12 Oct
+# 2026: nobody is dropped while their row still says work is due. R13 rotates
+# inside each tier instead. See the RETIRED block in .env.example.)
 
 # A MEETING DATED TODAY OR LATER, not marked Completed, pauses the rule for
 # that person: reminding somebody to call a contact they are meeting on Friday
@@ -2295,7 +2440,7 @@ NEXT_STEP_PAUSE_FOR_BOOKED_MEETING = _bool(
 EMAIL_LOOKUP_MAX_PER_POST = _int("EMAIL_LOOKUP_MAX_PER_POST", 5)
 
 # MAY THE BOT WRITE A FOUND EMAIL INTO THE SHEET? Off by default. The Email
-# column sits in the restricted identity band (RESTRICTED_COLUMN_RANGES, A:I),
+# column sits in the restricted identity block (RESTRICTED_COLUMN_ROLES),
 # which the bot never writes — this is the SINGLE exception, and it is narrow:
 # only the email role, only on an approver's yes to the post that showed the
 # address, only into a cell that is STILL BLANK when the row is re-read, logged
@@ -3128,30 +3273,30 @@ def validate() -> list[str]:
     # THE WRITE LOCK. Logged whether or not writing is on, because "which columns
     # can the bot touch" is a question people ask about a bot that is currently
     # read-only, and the answer must not depend on a switch somewhere else.
-    if not RESTRICTED_COLUMN_BANDS:
+    if not RESTRICTED_COLUMN_ROLES and not RESTRICTED_COLUMN_RANGES:
         log.warning(
-            "RESTRICTED_COLUMN_RANGES=%r resolved to NO bands — no column is denied to "
-            "the write paths. That is almost certainly a typo: the default is 'A:I,Q:W,Z:AE'. "
-            "Reading is unrestricted either way.",
-            RESTRICTED_COLUMN_RANGES,
+            "RESTRICTED_COLUMN_ROLES is empty and RESTRICTED_COLUMN_RANGES is empty — no "
+            "column is denied to the write paths. That is almost certainly a mistake: "
+            "the default locks the identity, step and commercial blocks by role. "
+            "Reading is unrestricted either way."
         )
     else:
-        window = writable_window_label()
         log.info(
-            "[config] restricted (never written): %s. Writable window between the bands: "
-            "%s. Reading is UNRESTRICTED — this is a write lock only.",
-            ", ".join(
-                f"{column_label(lo)}:{column_label(hi)}" if lo != hi else column_label(lo)
-                for lo, hi in RESTRICTED_COLUMN_BANDS
-            ),
-            window or "(none — the bands leave no gap between them)",
+            "[config] the write lock is BY ROLE: %d restricted role(s) (identity, step "
+            "and commercial blocks)%s. The letters they sit at today, and the writable "
+            "columns, are logged as [gtm.lock] when the tab is first read. Reading is "
+            "UNRESTRICTED — this is a write lock only.",
+            len(RESTRICTED_COLUMN_ROLES),
+            f", plus the letter range(s) {RESTRICTED_COLUMN_RANGES} (they can only lock "
+            "more)" if RESTRICTED_COLUMN_RANGES else "",
         )
-        if not window:
+        missing = [r for r in STEP_ROLES + COMMERCIAL_ROLES if r not in RESTRICTED_COLUMN_ROLES]
+        if missing:
             log.warning(
-                "RESTRICTED_COLUMN_RANGES=%r leaves NO writable window between the bands, "
-                "so every write inside the banded region will be refused. Deadline "
-                "mirroring will report that refusal rather than writing.",
-                RESTRICTED_COLUMN_RANGES,
+                "RESTRICTED_COLUMN_ROLES leaves out %s — the step and commercial blocks "
+                "are cells Saley only reminds about and must never fill. Unless that is "
+                "deliberate, remove the override so the default applies.",
+                ", ".join(missing),
             )
 
     if CADENCE_ENABLED:
@@ -3318,19 +3463,11 @@ def validate() -> list[str]:
     if SHEET_WRITES_ENABLED:
         log.warning(
             "SHEET_WRITES_ENABLED=true — the bot WRITES INTO THE REAL GTM Playbook, in "
-            "the writable window %s of the Outreach PoCs tab. The restricted bands (%s) "
-            "are refused in code and cannot be reached. Every write is echoed in "
-            "channel, recorded in audit.jsonl, and undoable by anyone for %dh.",
-            writable_window_label() or "(none — no window between the bands!)",
-            RESTRICTED_COLUMN_RANGES, SHEET_WRITE_UNDO_HOURS,
+            "the columns of the Outreach PoCs tab that no restricted ROLE covers. The "
+            "identity, step and commercial blocks are refused in code wherever they "
+            "sit. Every write is echoed in channel, recorded in audit.jsonl, and "
+            "undoable by anyone for %dh.", SHEET_WRITE_UNDO_HOURS,
         )
-        if not writable_window_label():
-            log.error(
-                "...but RESTRICTED_COLUMN_RANGES=%r leaves NO writable window, so every "
-                "write will be refused. Fix the bands or set SHEET_WRITES_ENABLED=false "
-                "so the refusal is a decision rather than a surprise.",
-                RESTRICTED_COLUMN_RANGES,
-            )
     else:
         log.info(
             "SHEET_WRITES_ENABLED=false — the bot still reads, extracts and ECHOES what "
@@ -3464,30 +3601,22 @@ def validate() -> list[str]:
         log.info(
             "[config] R13 next steps (a reminder; replies are not read): post at %s "
             "IST; first reminder +%dd, after the previous step +%dd, next email "
-            "+%dd; calls from DM +%dd every %dd until +%dd; an ask is DROPPED after "
-            "%dd of being named; connected=%s dm_sent=%s replied=%s "
+            "+%dd; calls from DM +%dd every %dd until +%dd; nobody is dropped, each "
+            "tier rotates; connected=%s dm_sent=%s replied=%s "
             "pause_for_booked_meeting=%s",
             NEXT_STEP_TIME, NEXT_STEP_FIRST_DAYS, NEXT_STEP_AFTER_PREVIOUS_DAYS,
             NEXT_STEP_AFTER_EMAIL_DAYS, NEXT_STEP_CALL_AFTER_DM_DAYS,
             NEXT_STEP_CALL_EVERY_DAYS, NEXT_STEP_CALL_UNTIL_DAYS,
-            NEXT_STEP_DROP_AFTER_DAYS,
             ",".join(NEXT_STEP_CONNECTED_MARKERS) or "(none)",
             ",".join(NEXT_STEP_DM_SENT_MARKERS) or "(none)",
             ",".join(NEXT_STEP_DM_REPLIED_MARKERS) or "(none)",
             NEXT_STEP_PAUSE_FOR_BOOKED_MEETING,
         )
-        if NEXT_STEP_DROP_AFTER_DAYS < 7:
-            log.warning(
-                "NEXT_STEP_DROP_AFTER_DAYS=%d — R13 would stop reminding about "
-                "somebody inside a week of first naming them, which reads as a bot "
-                "giving up immediately. The agreed number is 21 (three weeks).",
-                NEXT_STEP_DROP_AFTER_DAYS,
-            )
         if not NEXT_STEP_DM_SENT_MARKERS:
             log.warning(
                 "NEXT_STEP_DM_SENT_MARKERS is empty, so R13 never reads a LinkedIn DM "
                 "as sent (except a ticked checkbox) and nobody reaches the call "
-                "stage. The default is 'sent,yes,done'."
+                "stage. The default is 'sent,received'."
             )
         if NEXT_STEP_CALL_UNTIL_DAYS < NEXT_STEP_CALL_AFTER_DM_DAYS:
             log.warning(
@@ -3810,20 +3939,22 @@ def validate() -> list[str]:
         )
     if SHEET_ROW_ADDITIONS_ENABLED:
         log.info(
-            "[config] row additions ON for %s. A new Outreach PoCs row may have its "
-            "identity columns (%s) filled by the bot; an EXISTING row's restricted "
-            "bands (%s) stay locked.",
+            "[config] row additions ON for %s. A new Outreach PoCs row may have these "
+            "roles filled by the bot: %s%s. An EXISTING row's restricted roles stay "
+            "locked.",
             ", ".join(SHEET_APPENDABLE_TABS) or "(no tabs — nothing can be appended)",
-            NEW_ROW_WRITABLE_RANGES, RESTRICTED_COLUMN_RANGES,
+            ", ".join(NEW_ROW_WRITABLE_ROLES) or "(none)",
+            f" (plus the letter range(s) {NEW_ROW_WRITABLE_RANGES})"
+            if NEW_ROW_WRITABLE_RANGES else "",
         )
         overlap = new_row_locked_overlap()
         if overlap:
             log.warning(
-                "NEW_ROW_WRITABLE_RANGES=%r reaches into restricted column(s) %s "
-                "(RESTRICTED_COLUMN_RANGES=%r). A bot that has just discovered a "
-                "company has no business stating which email went out or its closure "
-                "probability. The default is A:P,X:Y.",
-                NEW_ROW_WRITABLE_RANGES, overlap, RESTRICTED_COLUMN_RANGES,
+                "NEW_ROW_WRITABLE_ROLES / NEW_ROW_WRITABLE_RANGES name %s, which the step "
+                "or commercial block locks. They are NOT opened: a bot that has just "
+                "discovered a company has no business stating which email went out or "
+                "its closure probability. Only the identity block is re-opened for a "
+                "new row.", overlap,
             )
     else:
         log.info(

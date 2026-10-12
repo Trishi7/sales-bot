@@ -68,8 +68,9 @@ def pins() -> dict:
         "LI_NO_DM_VERIFY_MX": True,
         "EMAIL_LOOKUP_MAX_PER_POST": int(_example("EMAIL_LOOKUP_MAX_PER_POST")),
         "RESEARCH_CACHE_DAYS": 7, "EMAIL_WRITE_ALLOWED": True, "SHEET_WRITES_ENABLED": True,
-        "NEXT_STEP_CONNECTED_MARKERS": ["connected"], "NEXT_STEP_DROP_AFTER_DAYS": 21,
-        "NEXT_STEP_DM_SENT_MARKERS": ["sent", "yes", "done"],
+        "NEXT_STEP_CONNECTED_MARKERS": ["connected"],
+        "NEXT_STEP_DM_SENT_MARKERS": ["sent", "received"],
+        "NEXT_STEP_DM_REPLIED_MARKERS": ["replied", "responded", "received"],
     }
 
 

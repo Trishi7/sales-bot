@@ -74,10 +74,12 @@ and an inactive row is invisible to every proactive feature — never mentioned,
 chased or counted. Ask about one by name and it still answers in full. See
 [Row activation](#row-activation--which-rows-the-bot-may-raise-unprompted).
 
-**Never writes outside a narrow window.** `RESTRICTED_COLUMN_RANGES` (default
-`A:I,Q:W,Z:AE`) names bands of columns denied to every write path in the code; the
-named columns in the writable window between them are logged at startup so a
-shifted column is visible before a write lands in the wrong place. Reading is
+**Never writes outside a narrow window.** `RESTRICTED_COLUMN_ROLES` names the
+columns denied to every write path in the code **by what they hold, not by
+letter** (the identity block, the step block, the commercial block), so the
+lock follows a column when the team moves it. Where each one sits today, and
+the writable columns left over, are logged at startup (`[gtm.lock]`,
+`[gtm.window]`). A restricted role with no column refuses every write. Reading is
 unrestricted. See [Writes](#writes--deliberately-tiny-and-locked-to-a-window).
 
 **The phase-1 cadence rules (a–j) are retired.** They ran on the old outreach
@@ -1041,9 +1043,15 @@ letter, header, role and whether it falls inside a restricted band.
 #### Its columns: A-AF
 
 The tab carries thirty-two columns (the layout Vaishnavi set on 7 Oct 2026),
-and each one maps to exactly one role. Columns **J-P and X-Y** are the
-[writable windows](#writes--into-the-real-sheet-now-inside-one-window);
-A-I, Q-W and Z-AE are locked.
+and each one maps to exactly one role. **The letters below are the 7 Oct order
+and nothing in the code depends on them**: on 12 Oct the Next Steps column and
+the two LI DM columns were moved, and the mapping and the write lock both
+follow the HEADER. The startup log prints today's letters. Writable on an
+existing row: First Contact, First Contact Type, First Contact Date, Sid - LI
+Addition, LI Connected Date, Meeting Date and Meeting Status
+([the window](#writes--into-the-real-sheet-now-inside-one-window)); the
+identity block, the step block (the LI DM columns included) and the commercial
+block (Priority included) are locked.
 
 | Col | Header | Role | |
 |---|---|---|---|
@@ -1081,8 +1089,8 @@ A-I, Q-W and Z-AE are locked.
 | AF | Priority | `poc_priority` | outside every band; no write path names it |
 
 **`next_steps` is the notes role, and the name is historical.** Until 7 Oct the
-sheet had one column, "Next Steps/Notes" (S), holding free text. It is now two:
-Q "Next Steps" is a dropdown (`outreach_step`, read by rule 13) and Z
+sheet had one column, "Next Steps/Notes", holding free text. It is now two:
+"Next Steps" is a dropdown (`outreach_step`, read by rule 13) and
 "Notes/Remarks" is the free text (`next_steps`, read by rule 9, the last-note
 line and the prospect signature). The role was not renamed because twenty-odd
 readers use it and a meeting note's action list is also called `next_steps`.
@@ -1093,9 +1101,10 @@ never given the notes role, and a header containing "note" or "remark" is never
 given the step role. An override that tries is ignored with a warning. With the
 aliases as shipped, `GTM_COLUMN_MAP` needs no entry for either layout.
 
-**The pre-7 Oct sheet still maps** (24 columns, "Next Steps/Notes" on S): the
-dropdown, the six email columns and Priority are simply absent, and rule 13
-finds nobody.
+**The pre-7 Oct sheet still maps for READING** (24 columns, one "Next
+Steps/Notes" column): the dropdown, the six email columns and Priority are
+simply absent, and rule 13 finds nobody. **Nothing can be written to it**: the
+restricted roles that have no column fail the write lock closed.
 
 **Three columns for first contact, not one**, and the same for the LinkedIn DM.
 *"I emailed her on Tuesday"* is three facts — that it happened, that it was
@@ -1408,7 +1417,7 @@ tabs_found        24 tabs, 12 read, 12 not read
                   'Q4-OND2026-Goal Setting'   5 rows  GOAL SETTING (read-only context)
                   'Outreach Updates'        886 rows  not read — matches no known kind
                   …
-writable_window   J:P, X:Y
+writable_window   J:N, X:Y
 ```
 
 **Every tab, including the ones it does not read.** A tab reported as *not read*
@@ -1612,17 +1621,18 @@ R2 (news-company screen), R3 (events) and R11 (new pipeline company) may each
 **propose** a new row in Master Pipeline, AI Events & Summits or Outreach PoCs.
 An approver's yes appends it; nothing is appended silently.
 
-**On a NEW Outreach PoCs row the bot may fill the identity columns A–I**
-(`NEW_ROW_WRITABLE_RANGES`, default `A:P,X:Y`). **On an existing row A–I stays
-as locked as it has always been.** Q–W (the outreach steps) and Z–AE (the
-commercial block) are refused on a new row too, and the boot log warns, naming
-the columns, if the setting reaches into either. (It was `A:R` until the 7 Oct
-2026 layout; on today's sheet that reaches the Next Steps dropdown.)
+**On a NEW Outreach PoCs row the bot may fill the identity block**
+(`NEW_ROW_WRITABLE_ROLES`: the identity block plus the first-contact and
+connection cells). **On an existing row the identity block stays as locked as
+it has always been.** The step block and the commercial block are refused on a
+new row too, whatever `NEW_ROW_WRITABLE_ROLES` or the optional letter override
+`NEW_ROW_WRITABLE_RANGES` says, and the boot log warns, naming the roles, if
+either reaches into them.
 
-That asymmetry is the point. A:I on an existing row holds work somebody did, and
-the restricted bands exist to protect exactly that. A row the bot is *creating*
+That asymmetry is the point. The identity block on an existing row holds work
+somebody did, and the lock exists to protect exactly that. A row the bot is *creating*
 has no such work in it — every cell is blank because the row did not exist a
-second ago — so filling A–I of a brand-new row destroys nothing, and it is the
+second ago — so filling the identity cells of a brand-new row destroys nothing, and it is the
 only way an appended row is any use at all.
 
 **S–X is absent from the new-row range on purpose.** Those are commercial
@@ -1756,7 +1766,7 @@ enforces that nothing without it can overwrite.
 |---|---|
 | **Reply-loop** | `first_contact` · `first_contact_type` · `first_contact_date` · `sid_li_added` · `li_connected_date` · `li_dm_sent` · `li_dm_date` · `meeting_date` · `meeting_status` — all nine of them columns **J-P and X-Y**, the writable windows. Plus `next_steps` and `prospect_status`, which are *inside* a restricted band: they are listed so the refusal can name the column rather than falling through to "I have no rule for that" |
 | **Command-only** | `closure_prob` · `deal_size` · `deal_status` · `package` |
-| **Never** | anything in a restricted band (`A:I`, `Q:W`, `Z:AE`), and the roles in no tier at all: `outreach_step`, `email_1_sent` … `email_3_date`, `poc_priority` |
+| **Never** | anything whose role is restricted (`RESTRICTED_COLUMN_ROLES`: since 12 Oct 2026 that includes `li_dm_sent` and `li_dm_date`, which a reply could fill until then), and the roles in no tier at all: `outreach_step`, `email_1_sent` … `email_3_date`, `poc_priority` |
 
 That the reply-loop tier and the writable window contain the same nine columns
 is not a coincidence — it is the tier list and the band list agreeing. The bands
@@ -1829,8 +1839,15 @@ correction.
 ### The three locks, still
 
 1. **Read-only sheet ids** — never the mapping sheet, whatever the config says.
-2. **Restricted bands** — never a column in `A:I`, `Q:W` or `Z:AE`. Fails closed: a
-   column index that cannot be read as a number is refused.
+2. **The role lock** — never a column whose role is in `RESTRICTED_COLUMN_ROLES`
+   (identity, step, commercial), wherever it sits. Fails closed three ways: a
+   column index that cannot be read as a number is refused; before the tab has
+   been read nothing may be written; and **if any restricted role maps to no
+   column, every write to the tab is refused** (cells, the Email cell, a new
+   row) and it is logged at ERROR naming the roles. The lock is resolved again
+   on every read of the tab, so writes resume once the header maps again.
+   `RESTRICTED_COLUMN_RANGES` is an optional letter override, empty by default,
+   that is ADDED to the roles: it can lock more and can never unlock.
 3. **The row interlock** — the target row must still name the company the caller
    believes it does. Rows get sorted and inserted between a read and a write, and
    a correct value in the wrong row is worse than no value, because nobody goes
@@ -2216,7 +2233,9 @@ and R10 skip that person.
 **A reminder, not a set of questions (rebuilt 12 Oct 2026).** One post each
 weekday at 15:00 that says what needs doing and who for. It never names a
 cell or a column, never gives a date, never asks for anything to be filled in,
-**Saley does not read replies to it**, and every ask ends after three weeks.
+and **Saley does not read replies to it**. **Nobody is dropped** (the
+three-week drop was removed on 12 Oct 2026): a person keeps coming back, in
+their turn, until the sheet moves.
 `python verify_next_steps.py --show` prints the messages.
 
 **Who is in.** Every Outreach PoCs row where *Sid - LI Addition* says Connected
@@ -2239,9 +2258,9 @@ never lists a person rule 13 reminds about.
 | Send email 1/2 | marked sent, `NEXT_STEP_AFTER_EMAIL_DAYS` (7) ago | send the next email |
 | Send email 3 | marked sent | nothing |
 | Reach by LI DM | LI DM Sent does not say sent | nothing: **the one known gap** |
-| Reach by LI DM / Call the PoC | LI DM Sent says sent (`NEXT_STEP_DM_SENT_MARKERS`) | call them |
-| Reach by LI DM / Call the PoC | LI DM Sent says Replied (`NEXT_STEP_DM_REPLIED_MARKERS`, checked first) | set up a meeting |
-| either | the call ladder ran out | they look unresponsive (once) |
+| Reach by LI DM / Call the PoC | LI DM Sent says Sent (`NEXT_STEP_DM_SENT_MARKERS`, default `sent,received`) | call them |
+| Reach by LI DM / Call the PoC | LI DM Sent says Received (`NEXT_STEP_DM_REPLIED_MARKERS`, default `replied,responded,received`, checked first) | set up a meeting |
+| either | the call ladder ran out | they look unresponsive, in their turn, until Prospect Status says Unresponsive |
 | free text the bot doesn't know | | nothing; the row is skipped and logged |
 
 *Timing.* "Research" and the first email are due `NEXT_STEP_FIRST_DAYS` /
@@ -2257,51 +2276,57 @@ out is read off the LI DM Sent cell**, whole value, normalised ("Not sent" is
 not "sent"; a ticked checkbox counts), not off the LI DM Date as before. "Call
 the PoC" is the call stage whatever LI DM Sent says.
 
+*The LI DM Sent dropdown holds blank, Sent and Received.* Received means they
+answered, so it is the meeting line, never a call and never "the DM has not
+gone out". `received` is in BOTH marker lists on purpose: the replied list is
+checked first and decides, and being in the sent list keeps a Received row
+counted as "the DM went out" everywhere else that asks. Do not reorder the two
+checks.
+
 *The known gap.* Next Steps says "Reach by LI DM" and the DM is not marked
 sent: nothing reminds anybody to send it. The agreed message has no line for
 it and none was invented.
 
 **The order people are picked in** (`nextaction._next_step_order`), five a
-post:
+post. Six tiers:
 
 1. replied to the DM
 2. a call that is due
-3. in their last 3 days before the drop
-4. the next email is due
-5. an email that has not gone out
-6. research, and a blank Next Steps
-7. unresponsive
+3. the next email is due
+4. an email that has not gone out
+5. research, and a blank Next Steps
+6. unresponsive
 
-Inside a tier the **oldest LI Connected Date first**; a tie goes to **R5's
-company score** (`nextaction.company_scores`, which imports R5's weights and
-phrase lists from `prospects.py` and scores each company from all its rows:
+**Inside a tier, whoever was named least recently comes first** (never named
+comes before everybody). That is the rotation: with twelve people in one tier
+and five places, the first post names five, the next the following five, the
+third the last two and then the first three again. After that the **oldest LI
+Connected Date**; a tie goes to **R5's company score**
+(`nextaction.company_scores`, which imports R5's weights and phrase lists from
+`prospects.py` and scores each company from all its rows:
 `prospects.build_queue` cannot be used because it only holds companies that
 still have somebody with no first contact); then sheet order. Rows with no LI
-Connected Date go last in their tier, in sheet order. Priority (AF) is read
-and shown in the preview and is not used for the order. **There is no
-rotation:** the same five are named each day until somebody acts on them or
-they are dropped.
+Connected Date go last among people named equally recently, in sheet order.
+Priority is read and shown in the preview and is not used for the order.
+
+A higher tier still always goes first, so five people who have replied are
+named on every post until somebody sets the meeting up. **R6 ("Connected, no
+DM yet") has no rotation, by design; R13 does.** They are not meant to match.
 
 The rule picks the five itself and hands the drip exactly those people, and
 once today's post has gone, today's people stay today's people (the queue is
 recomputed on every sweep tick).
 
-**The three-week drop is the only ending.** The clock starts the day Saley
-**first names** a person for a step (`first_named` in `next_step_followups`),
-not at any sheet date. After `NEXT_STEP_DROP_AFTER_DAYS` (21) with the step
-unchanged the person is named **once** under the drop line and then not again:
-day 20 is a normal reminder, day 21 the drop line, day 22 nothing. The clock
-restarts when the step's signature changes, and **a dropped person comes back
-when the sheet moves**: dropping ends an ask, not a person. The unresponsive
-line is a drop of the same kind. For a call counted from an LI DM Date the
-call ladder's own end wins and gives the unresponsive line; with no LI DM Date
-there is no ladder to run out, so the three-week drop is the backstop. The
-drop line does not use up the five places: up to five people being dropped
-are listed on top of the five reminders.
+**Nothing ends a reminder except the sheet.** A person leaves the list when
+their row moves: the step changes, the email is marked sent, a meeting is
+booked, or a stop word goes into Prospect Status or Deal Status. The
+unresponsive line is the same: it comes round, in its turn, on every post
+until somebody sets Prospect Status to Unresponsive, which is the stop.
+`NEXT_STEP_DROP_AFTER_DAYS` is retired and ignored.
 
 **The post.** Fixed text from `wording.py` (`NEXT_STEP_GROUPS` is the only
-place the eleven agreed lines live); R13 is in `drip.VERBATIM_TYPES`. A group
-appears only when somebody is in it, in this order, with the drop line last.
+place the ten agreed lines live); R13 is in `drip.VERBATIM_TYPES`. A group
+appears only when somebody is in it, in this order.
 Each person is one line, `- Name (Company)`, and nothing else.
 
 ```
@@ -2320,9 +2345,6 @@ We sent the first email to these people over a week ago — time for the second:
 We need to send out the first email to these people:
 - Arjun Aryaa (Gnani.ai)
 - Oliver Shoulson (PolyAI)
-
-I'll stop reminding about these. It's been three weeks and nothing has moved:
-- Harry Swanson (PolyAI)
 ```
 
 Nothing is posted when nobody is due, when the Next Steps or email columns
@@ -2337,10 +2359,11 @@ is left in the schema, unread and unwritten). A message with a question in it
 is still answered as a question.
 
 **State, written only after a real send** (`bot._record_next_steps`): one row
-a person in `next_step_followups`, holding the step's signature, the day they
-were first named for it, the last day and what for, the call count, and
-`closed` once they have been named under the drop or unresponsive line.
-Everything in the row belongs to the signature, `closed` included.
+a person in `next_step_followups`, holding the step's signature, the last day
+they were named and what for, and the call count. The last day is what the
+rotation sorts on, and it only counts while the signature is the same. The
+`first_named`, `closed` and `closed_date` columns are still in the table and
+are no longer read or written.
 
 | Path | Where it is recorded |
 |---|---|
@@ -2758,11 +2781,11 @@ search and every row written.
 Mandatory is `POC_MANDATORY_FIELDS` (name, designation, li_url). A blank Email,
 Industry, Based or paper link is not a gap.
 
-**Missing fields is remind-only because A:I is read-only.** Company, Industry,
-Name, Designation, Email id, Based, Research Paper Link and LI Url are columns
-B to I, and A:I may not be written on an EXISTING row
-(`RESTRICTED_COLUMN_RANGES`): that band is the team's own record of who a
-person is. A NEW row may be written there (`NEW_ROW_WRITABLE_RANGES`). The one
+**Missing fields is remind-only because the identity block is read-only.**
+Company, Industry, Name, Designation, Email id, Based, Research Paper Link and
+LI Url are the identity block, which may not be written on an EXISTING row
+(`RESTRICTED_COLUMN_ROLES`): it is the team's own record of who a
+person is. A NEW row may be written there (`NEW_ROW_WRITABLE_ROLES`). The one
 exception is the Email cell, behind the existing `email_write` proposal, when
 email is all that was found and `EMAIL_WRITE_ALLOWED` is true.
 
@@ -2943,7 +2966,7 @@ the same thing and neither should get an empty list.
 | ~~R5 repeat counts~~ | `prospect_mentions` | RETIRED 11 Oct 2026: left in the schema, nothing reads or writes it |
 | ~~R5 week companies~~ | `prospect_week` | RETIRED 11 Oct 2026, with "two companies a week": left in the schema, nothing reads or writes it |
 | **R9 ladder** | `meeting_followups` | advanced by the sender; cleared when Notes/Remarks is filled |
-| **R13 reminders** | `next_step_followups` | written by the sender after a real send; the day a person was first named for a step starts the three-week drop; a changed step signature starts the person again, `closed` included |
+| **R13 reminders** | `next_step_followups` | written by the sender after a real send; the last day a person was named is what rotates each tier; a changed step signature starts the person again. `first_named`, `closed` and `closed_date` are still in the table and no longer read or written (12 Oct 2026) |
 | ~~R13 posts~~ | `next_step_posts` | RETIRED 12 Oct 2026 with the reply handling: left in the schema, nothing reads or writes it |
 | **R11 snapshot** | `pipeline_companies` | normalised name, `first_seen`, and a `seeded` flag |
 | Deadlines the bot announced | `deadlines` | unchanged |
@@ -3292,8 +3315,8 @@ Four things fail silently on a live sheet, and all four are in this one report:
 [sheet.world]       Z  Notes/Remarks          -> next_steps        [RESTRICTED]
 [sheet.world]
 [sheet.world] WRITE LOCK
-[sheet.world]   restricted (never written): 'A:I,Q:W,Z:AE'  -> A:I, Q:W, Z:AE
-[sheet.world]   writable window between the bands: J:P, X:Y
+[sheet.world]   restricted (never written), by role; today's letters: A:I, O:W, Z:AF
+[sheet.world]   writable window: J:N, X:Y
 [sheet.world]   reading is UNRESTRICTED — this is a write lock only.
 [sheet.world]   named columns inside the window (9):
 [sheet.world]     J='First Contact' [first_contact]
@@ -3577,9 +3600,9 @@ only after an approver's yes.
    Outreach PoCs, where several rows per company is the normal shape. A
    duplicate is **said out loud** — a silent skip reads as a successful append
    to everybody downstream.
-3. **Which columns**: mapped roles only, and on Outreach PoCs only the new-row
-   bands `A:P,X:Y`. **Q–W and Z–AE are refused on a new row exactly as on an
-   existing one** — a bot that has just discovered a company has no business
+3. **Which columns**: mapped roles only, and on Outreach PoCs only the roles in
+   `NEW_ROW_WRITABLE_ROLES`. **The step block and the commercial block are
+   refused on a new row exactly as on an existing one** — a bot that has just discovered a company has no business
    stating which email went out or its closure probability. `Sr No` is filled with **max + 1**, not count + 1: a tab
    somebody has deleted rows from would otherwise reissue a number.
 4. **The row must be empty, re-read immediately before writing** — not "the
@@ -3925,7 +3948,7 @@ qualifies, it stays silent and logs why.
   x@y.com (<source>)` or `no public email found`. An address the model built
   from a name and a domain is in no snippet, so it is dropped. At most
   `EMAIL_LOOKUP_MAX_PER_POST`; found or not, cached `RESEARCH_CACHE_DAYS`.
-- **The one exception to "A:I is never written".** With
+- **The one exception to "the identity block is never written".** With
   `EMAIL_WRITE_ALLOWED=true` the post ends *"Want me to add the email I found
   to the sheet? Say yes."* and opens ONE proposal (`email_write`) keyed to the
   message. An approver's yes calls `gtm_sheet.write_email`, which re-reads the
@@ -5833,10 +5856,11 @@ python verify_day_order.py                # NFT2-1069: every weekday's order and
 python verify_s1.py                       # cap 5 + R8/R9, the order of the day THREE WAYS (live sweep ticked every 15 min, test day, simulation), R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window
 python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
-python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one A:I write, R3 weekly + the reminder offer
+python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one identity-block write, R3 weekly + the reminder offer
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
-python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the order, the three-week drop, replies not read (--show prints the messages)
+python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the six tiers, the rotation (nobody is dropped), replies not read (--show prints the messages)
+python verify_sheet_locks.py              # the write lock by ROLE: three header orders, a missing header refuses every write, ranges only add, the Email cell and the signed new row (--show prints the startup lock log)
 python verify_rule13.py                   # STALE since 12 Oct 2026 for rule 13's behaviour (see its header); the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test
 python verify_voice_profile.py --offline  # the parts that need neither Discord nor the model

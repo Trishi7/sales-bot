@@ -12,16 +12,16 @@ WHAT IT PROVES
   THE ASKS    the table row by row: research, send the Nth email, send the next one a week later, call,
               replied, unresponsive; a DM marked sent with no date is a call due today; an email marked sent
               with no date moves on; the two silent cases; free text is skipped and logged.
-  MESSAGE     the eleven agreed group lines word for word, one "- Name (Company)" a person, the drop line
-              last, no post when nobody is due or the columns are missing.
-  ORDER       seven tiers with someone in each; oldest connection first; R5's company score on a tie; no-date
-              rows last; five a day picked by the rule; today's people stay today's people.
-  THE DROP    day 20 named, day 21 in the drop line, day 22 absent; a step change resets the clock; a dropped
-              person returns when the sheet moves; the call ladder gives the unresponsive line, a call with no
-              date gives the drop line; the drop line does not use up the five places.
+  MESSAGE     the ten agreed group lines word for word, one "- Name (Company)" a person, no post when nobody
+              is due or the columns are missing.
+  ORDER       six tiers with someone in each; inside a tier never-named people first, then the least recently
+              named, then the oldest connection, R5's company score, sheet order; no-date rows last.
+  ROTATION    nobody is dropped: twelve people in a tier are walked 5, 5, then 2 + 3; a person named 25 days ago
+              is still named; the unresponsive line comes round again; "Received" is the meeting line; a preview
+              writes no state.
   THE BOT     one post under its heading; the state recorded after a real send only; "done" under the post
-              gets nothing at all; a test day and a preview leave every drop clock untouched.
-  NO COLUMN NAME in any rendered message.
+              gets nothing at all; a test day and a preview leave the rotation untouched.
+  NO COLUMN NAME and NO DROP WORDING in any rendered message.
 """
 import os
 import sys
@@ -55,11 +55,14 @@ def show():
         print("**Next steps**\n" + text)
 
     with nsx.pinned():
+        block("The post (the tags line goes under the heading at send)",
+              nsx.post_of(nsx.engine(nsx.example_values())))
+        twelve = [nsx.person(f"P{i:02d}", f"Co {i:02d}", "Send email 1", li=nsx.date(2026, 9, i))
+                  for i in range(1, 13)]
         with nsx.Ledger() as led:
-            harry = [v for v in nsx.example_values() if "Harry Swanson" in v]
-            led.day(harry, nsx.DAY - nsx.timedelta(days=21))
-            text, _res = led.day(nsx.example_values(), nsx.DAY, send=False)
-        block("The post (the tags line goes under the heading at send)", text)
+            for offset in (0, 1, 2):
+                text, _res = led.day(twelve, nsx.DAY + nsx.timedelta(days=offset))
+                block(f"The rotation, run {offset + 1} of 3 (twelve people in one tier)", text)
         block("Every group there is", "\n".join(wording.next_step_post([
             {"who": "Name (Company)", "ask": ask, "n": n} for (ask, n), _line in wording.NEXT_STEP_GROUPS])))
         nodate = [nsx.person(f"Contact {i}", c, "", li=None) for i, c in enumerate(

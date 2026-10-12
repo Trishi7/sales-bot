@@ -663,6 +663,10 @@ Nothing to run by hand; the first boot adds the new columns.
 
 ## Upgrading to RULE 13 (next steps for connected contacts, and the 7 Oct sheet layout)
 
+> **Corrected 12 Oct 2026.** The letter bands below are history. The write lock is by role now and both
+> `RESTRICTED_COLUMN_RANGES` and `NEW_ROW_WRITABLE_RANGES` default to empty: see "Upgrading to "nobody is dropped"
+> and the write lock by role" at the end of this file.
+
 The Outreach PoCs tab changed shape on 7 Oct 2026: 32 columns, A to AF, with
 the Next Steps dropdown on Q, the three emails on R to W, the meeting columns
 on X and Y, and Notes/Remarks on Z. The column bands are letters, so they must
@@ -1201,6 +1205,10 @@ was posted. On a test day the log says the marker and the ledger were NOT touche
 
 ## Upgrading to the R13 rebuild (12 Oct): next steps as a reminder
 
+> **Corrected the same day.** The three-week drop described below was removed: nobody is dropped,
+> `NEXT_STEP_DROP_AFTER_DAYS` is retired and ignored, and `NEXT_STEP_DM_SENT_MARKERS` now defaults to
+> `sent,received`. See "Upgrading to "nobody is dropped" and the write lock by role" at the end of this file.
+
 What changes for the team: the 3 PM "Next steps" post stops asking questions about the sheet. It says what needs
 doing, grouped ("We need to call these PoCs:", "We need to send out the first email to these people:" and so on),
 with one line a person: name and company. It never names a cell and never asks for a date. People who are Connected
@@ -1302,3 +1310,89 @@ be added. On a Tuesday or Friday:
 `bot_rules.yaml`); paste it into the sheet by hand.
 
 `python verify_li_no_dm.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to "nobody is dropped" and the write lock by role (12 Oct, later the same day)
+
+Two changes in one release. **This section corrects two older ones**: the three-week drop in "Upgrading to the R13
+rebuild" above is gone, and the letter bands in "Upgrading to RULE 13" (`RESTRICTED_COLUMN_RANGES=A:I,Q:W,Z:AE`,
+`NEW_ROW_WRITABLE_RANGES=A:P,X:Y`) are no longer how the lock works.
+
+**1. Rule 13: nobody is dropped.** The 3 PM "Next steps" post no longer says "I'll stop reminding about these".
+People keep coming back, in priority order, until their row moves. Inside each group the people named least
+recently go first, so a long group is walked five at a time and then starts again. The "look unresponsive" line now
+repeats, in its turn, until somebody sets Prospect Status to Unresponsive. In **LI DM Sent**, "Received" now means
+they replied (the meeting line), and "Sent" means the DM went out (the call line).
+
+**2. The write lock follows the column, not the letter.** Vaishnavi moved Next Steps and the two LI DM columns on
+12 Oct. The old lock was a list of letters, so after the move it left Next Steps and 1st Email Sent writable. The
+lock is now a list of ROLES (`RESTRICTED_COLUMN_ROLES`): the identity block (Sr No through LI Url, Email included),
+the step block (Next Steps, the three email Sent/Date pairs, LI DM Sent, LI DM Date) and the commercial block
+(Notes/Remarks through Deal Status, and Priority). Two things are locked that were not before: **LI DM Sent and LI
+DM Date** on an existing row (a reply could fill them until now; Saley now asks a person to), and **Priority**. What
+Saley may still fill on an existing row, after a yes: First Contact, First Contact Type, First Contact Date, Sid -
+LI Addition, LI Connected Date, Meeting Date, Meeting Status. The two exceptions are unchanged: a blank Email cell
+(`EMAIL_WRITE_ALLOWED`), and a new signed row.
+
+**If a restricted column's header is renamed to something Saley cannot map, it refuses every write to the tab** and
+logs an ERROR naming the role, until the header maps again (the next read of the tab). Reading is unaffected.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).**
+
+```
+# DELETE these lines if present (retired or now wrong):
+#   NEXT_STEP_DROP_AFTER_DAYS=...            retired, no longer read
+#   RESTRICTED_COLUMN_RANGES=A:I,Q:W,Z:AE     the old letters; harmless (a range only adds), but stale
+#   NEW_ROW_WRITABLE_RANGES=...               the old letters; it cannot open a locked column, but it warns at boot
+
+# OPTIONAL, the defaults are what was specified. If either marker line is already set, change it to this:
+NEXT_STEP_DM_SENT_MARKERS=sent,received
+NEXT_STEP_DM_REPLIED_MARKERS=replied,responded,received
+
+# OPTIONAL, the defaults are the three blocks. Leave both lines out unless you mean to change the lock:
+# RESTRICTED_COLUMN_ROLES=...      (the full default is in .env.example)
+# NEW_ROW_WRITABLE_ROLES=...       (the full default is in .env.example)
+```
+
+The laptop's `.env` has `RESTRICTED_COLUMN_RANGES=A:I,Q:W,Z:AE` and `NEW_ROW_WRITABLE_RANGES=A:R` today; delete
+both lines there, then `python tools/redact_env.py`. Set `GTM_LOG_FULL_SCHEMA=true` for the first start so the
+whole schema is printed.
+
+**Database.** Nothing to migrate. `next_step_followups.first_named`, `closed` and `closed_date` stay in the table
+and are no longer read or written; a person the old rule had closed is named again in their turn.
+
+**What to look for in the boot log.** No `NEXT_STEP_DROP_AFTER_DAYS` warning, and:
+
+```
+[config] R13 next steps (a reminder; replies are not read): post at 15:00 IST; ... nobody is dropped, each tier rotates; connected=connected dm_sent=sent,received replied=replied,responded,received pause_for_booked_meeting=True
+```
+
+Then, when the Outreach PoCs tab is first read, one line per block giving **today's letter for every restricted
+role**, and the writable window as letters and as roles. Read the letters against the sheet:
+
+```
+[gtm.lock] 'Outreach PoCs': restricted, identity block (NEVER written on an existing row): sr_no=<letter> 'Sr No', company=<letter> 'Company/Uni', ...
+[gtm.lock] 'Outreach PoCs': restricted, step block (NEVER written on an existing row): outreach_step=<letter> 'Next Steps', email_1_sent=<letter> '1st Email Sent', ..., li_dm_sent=<letter> 'LI DM Sent', li_dm_date=<letter> 'LI DM Date'
+[gtm.lock] 'Outreach PoCs': restricted, commercial block (NEVER written on an existing row): next_steps=<letter> 'Notes/Remarks', ..., poc_priority=<letter> 'Priority'
+[gtm.window] 'Outreach PoCs': restricted today at <letters>. WRITABLE on an existing row: <letters> (roles: first_contact, first_contact_type, first_contact_date, sid_li_added, li_connected_date, meeting_date, meeting_status) — 7 named column(s): ...
+[gtm.lock] 'Outreach PoCs': a NEW row may fill <letters> (roles: sr_no, company, ..., li_connected_date)
+```
+
+Per the 12 Oct message, `outreach_step` should read O and `li_dm_sent` / `li_dm_date` V and W. The other letters
+were not stated, so read them off this log rather than assuming them. **Stop and fix the sheet header if you see**
+`[gtm.lock] ... THE WRITE LOCK CANNOT BE RESOLVED ... EVERY WRITE TO THIS TAB IS REFUSED`: it names the role whose
+column could not be found.
+
+At 3 PM:
+
+```
+[rules] R13: 33 connected, 21 due -> 5 picked, 16 queued (they come round in turn; nobody is dropped); ...
+```
+
+(the numbers are illustrative).
+
+**The Bot Rules tab.** Rule 13's "What the Bot Shares / Checks" wording changed again (`sheet_wording` in
+`bot_rules.yaml`: people keep coming back in priority order, nobody is dropped, the list moves when the sheet
+moves); paste it into the sheet by hand.
+
+`python verify_next_steps.py --show` and `python verify_sheet_locks.py --show` check both parts offline; the second
+prints the lock log for three header orders.

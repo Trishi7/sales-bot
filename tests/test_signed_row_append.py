@@ -106,7 +106,11 @@ def world(monkeypatch, pocs_tab):
     monkeypatch.setattr(gtm_sheet.SHEETS, "_open", lambda which=None: sh)
     monkeypatch.setattr(config, "SHEET_WRITES_ENABLED", True)
     monkeypatch.setattr(config, "SHEET_APPENDABLE_TABS", ["outreach_pocs"])
-    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", "A:P,X:Y")
+    # THE NEW-ROW SET IS BY ROLE (12 Oct 2026): the contract's list, and no letter range.
+    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_ROLES", list(config.IDENTITY_ROLES) + [
+        "first_contact", "first_contact_type", "first_contact_date", "sid_li_added", "li_connected_date"])
+    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", "")
+    monkeypatch.setattr(config, "RESTRICTED_COLUMN_RANGES", "")
     return pocs_tab, ws, sh
 
 
@@ -291,12 +295,16 @@ def test_the_events_caller_passes_no_fill_serial():
 
 def test_a_url_column_outside_the_new_row_band_is_refused_and_said(world, monkeypatch):
     tab, ws, sh = world
-    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", "A:H")
-    monkeypatch.setattr(config, "_NEW_ROW_INDEXES", None)      # the parsed band is cached; re-parse it
+    # CHANGED 12 Oct 2026: the new-row set is a list of ROLES; this one leaves the LinkedIn URL out
+    # (it used to be the letter band A:H). The append re-reads the tab, which resolves the lock again.
+    monkeypatch.setattr(config, "NEW_ROW_WRITABLE_ROLES",
+                        [r for r in config.NEW_ROW_WRITABLE_ROLES if r != "li_url"])
+    monkeypatch.setattr(config, "_ACTIVE_LOCK", config.resolve_column_lock(
+        tab.role_to_col, tab.headers, canonical=tab.canonical_role_to_col))
     out = _append(tab, note_role="name", note_text=NOTE + chr(10) + "LinkedIn link found by web search: " + VALUES["li_url"])
     assert out["ok"] is True and out["signed"] is True
     assert [r["role"] for r in out["refused"]] == ["li_url"]
     assert "li_url" not in {c["role"] for c in out["written"]}
-    assert "NEW_ROW_WRITABLE_RANGES" in out["refused"][0]["why"]
+    assert "NEW_ROW_WRITABLE_ROLES" in out["refused"][0]["why"]
     assert "LinkedIn link found by web search" in ws.notes[out["note_cell"]]       # the note keeps the link
     assert VALUES["li_url"] not in " ".join(ws.grid[out["sheet_row"] - 1])           # the cell stayed empty

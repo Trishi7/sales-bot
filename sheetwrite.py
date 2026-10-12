@@ -22,7 +22,7 @@ THREE TIERS:
                    are commercial judgements. Somebody mentioning a number in
                    passing is not somebody committing it to the sheet, so they
                    need an explicit instruction.
-    NEVER          anything in a restricted band (A:I, Q:W, Z:AE by default) —
+    NEVER          anything whose ROLE is restricted (RESTRICTED_COLUMN_ROLES) —
                    the identity block, the outreach-step block and the
                    commercial block. Refused in gtm_sheet
                    since V1 and refused again here, because a rule enforced in
@@ -87,9 +87,10 @@ TIER_NEVER = "never"
 
 # THE REPLY LOOP. What a person answering the bot can put into the sheet without
 # having to phrase it as an instruction — the facts a nudge asks about.
-# EVERY ROLE HERE LIVES IN THE WRITABLE WINDOWS (J:P, X:Y) EXCEPT THE LAST TWO, and
-# that is not an accident — it is the tier list and the band list agreeing. The
-# bands are still what enforce it: `plan_writes` checks the column index before
+# THE LOCK OUTRANKS THIS LIST. Since 12 Oct 2026 the LinkedIn DM cells are in
+# the restricted step block, with the two at the end, so a reply cannot write
+# them either; they stay listed so the refusal names the column. The lock is
+# still what enforces it: `plan_writes` checks the column index before
 # it checks the tier, so a role listed here by mistake is refused by the band
 # rather than written.
 REPLY_ROLES: tuple = (
@@ -102,7 +103,7 @@ REPLY_ROLES: tuple = (
     "li_dm_date",
     "meeting_date",
     "meeting_status",
-    # Z and AB, inside the restricted right-hand band. Kept in the tier list so
+    # Inside the restricted commercial block. Kept in the tier list so
     # that the refusal names the COLUMN ("I never write to Notes/Remarks")
     # instead of falling through to "I don't have a rule for that" — the second is
     # true and useless, and it reads as the bot not having listened.
@@ -265,7 +266,14 @@ def plan_writes(
         #     path, because the useful answer here is "I have got that, could
         #     you add it yourself" — refusing generically would lose the
         #     information and read as the bot ignoring them.
-        restricted = idx is not None and config.is_restricted_column(idx)
+        # THE LOCK RESOLVED FOR THIS READ OF THE TAB (by role, so it follows a
+        # column that has been moved). When a restricted role maps to no column
+        # the lock has failed closed and EVERY column counts as restricted.
+        lock = getattr(tab, "lock", None)
+        if lock is None:
+            restricted = idx is not None and config.is_restricted_column(idx)
+        else:
+            restricted = idx is not None and (lock.failed or idx in lock.restricted)
         if restricted or role in CONTACT_ROLES:
             if idx is not None and idx < len(tab.headers):
                 header = tab.headers[idx]
@@ -778,14 +786,16 @@ def _self_test() -> int:
     print("\nplan_writes - the fill rule and the gates")
     import time as _time
 
-    # THE REAL SCHEMA, A-AF (the 7 Oct 2026 layout). A:I identity (restricted)
-    # · J:P the first writable window · Q:W the step block (restricted) · X:Y
-    # the second window · Z:AE the commercial block (restricted) · AF priority.
+    # A REAL HEADER ROW (the 7 Oct 2026 order; the lock is by ROLE, so the order
+    # is only a fixture): the identity block (restricted) · the first-contact
+    # and connection cells (writable) · the step block, LinkedIn DM cells
+    # included (restricted) · the two meeting cells (writable) · the commercial
+    # block and Priority (restricted).
     #
     # NOTE WHAT THIS ARRANGEMENT COSTS: every command-only role
-    # (closure_prob, deal_size, deal_status, package) sits in the RESTRICTED
-    # Z:AE band on the live tab, so no instruction can write one — the bands
-    # outrank the tiers, and the test below asserts exactly that rather than
+    # (closure_prob, deal_size, deal_status, package) is in the RESTRICTED
+    # commercial block, so no instruction can write one — the lock
+    # outranks the tiers, and the test below asserts exactly that rather than
     # pretending otherwise with a friendlier fixture.
     headers = ["Sr No", "Company/Uni", "Industry", "Name", "Designation",
                "Email id", "Based", "Research Paper Link", "LI Url",
@@ -821,9 +831,14 @@ def _self_test() -> int:
           sorted(set(gtm_sheet.RETIRED_POCS_ROLES) & set(tab.canonical_role_to_col)),
           [])
 
-    p1 = plan([{"role": "li_dm_date", "value": "09-09-2026", "supersedes": False}])
+    p1 = plan([{"role": "meeting_date", "value": "09-09-2026", "supersedes": False}])
     check("an EMPTY cell in the window is filled",
-          p1["writes"], {"li_dm_date": "09-09-2026"})
+          p1["writes"], {"meeting_date": "09-09-2026"})
+    # CHANGED 12 Oct 2026: LI DM Sent and LI DM Date are in the restricted step
+    # block. A reply-tier role is no pass through the lock.
+    p1b = plan([{"role": "li_dm_date", "value": "09-09-2026", "supersedes": False}])
+    check("a reply cannot fill LI DM Date (the step block is restricted)",
+          (p1b["writes"], bool(p1b["skipped"])), ({}, True))
 
     p2 = plan([{"role": "meeting_status", "value": "Completed", "supersedes": False}])
     check("a NON-empty cell is left alone without supersedes", p2["writes"], {})
@@ -837,7 +852,7 @@ def _self_test() -> int:
     check("a reply cannot set closure_prob", p4["writes"], {})
     p5 = plan([{"role": "closure_prob", "value": "60%", "supersedes": False}],
               trigger=TRIGGER_COMMAND)
-    check("...and NEITHER CAN A COMMAND: AC is inside the restricted Z:AE band",
+    check("...and NEITHER CAN A COMMAND: Closure Prob% is in the restricted commercial block",
           p5["writes"], {})
     check("...and the refusal names the column",
           any("Closure Prob" in str(sk.get("why", "")) or
@@ -872,7 +887,7 @@ def _self_test() -> int:
                trigger=TRIGGER_COMMAND, text="set next steps to Send email 1")
     check("a command cannot set the Next Steps dropdown", p12["writes"], {})
     p13 = plan([{"role": "next_steps", "value": "call went well", "supersedes": False}])
-    check("a reply cannot fill Notes/Remarks (Z is restricted)", p13["writes"], {})
+    check("a reply cannot fill Notes/Remarks (the commercial block is restricted)", p13["writes"], {})
 
     p11 = plan([{"role": "assets_shared", "value": "Yes", "supersedes": True}])
     check("a RETIRED role has no column and is refused, and named",
@@ -880,7 +895,7 @@ def _self_test() -> int:
 
     many = [{"role": r, "value": "x", "supersedes": True}
             for r in ("first_contact", "first_contact_type", "sid_li_added",
-                      "li_dm_sent", "meeting_date")]
+                      "li_connected_date", "meeting_date")]
     p10 = plan(many, trigger=TRIGGER_COMMAND)
     check("over the cell ceiling -> nothing at all", p10["writes"], {})
     check("...refused whole, and said so",
@@ -889,7 +904,7 @@ def _self_test() -> int:
     print("\necho line")
     line = echo_line(company="Acme", poc="Ann", applied=p1["applied"], asks=[],
                      skipped=[], undo_hours=24)
-    check("names the column and the value", "li dm date" in line.lower(), True)
+    check("names the column and the value", "meeting date" in line.lower(), True)
     check("offers the undo", "undo" in line.lower(), True)
     check("no bullets or headers",
           any(c in line for c in ("**", "- ", '•')), False)

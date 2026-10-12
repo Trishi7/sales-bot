@@ -10,8 +10,8 @@ summary of the PoCs tab (`build_index`):
               mandatory blank        on the sheet, and offer to add them
 
 WHY "GAPS" ONLY REMINDS. Company, Industry, Name, Designation, Email id, Based,
-Research Paper Link and LI Url are columns B to I, and A:I is READ-ONLY on an
-existing row (RESTRICTED_COLUMN_RANGES): the team's own record of who a person
+Research Paper Link and LI Url are the identity block, which is READ-ONLY on an
+existing row (RESTRICTED_COLUMN_ROLES): the team's own record of who a person
 is. A NEW row may be written there, an existing one may not.
 
 THE SHEET CELL IS THE IDENTITY (9 Oct, the live run). The Master Pipeline said

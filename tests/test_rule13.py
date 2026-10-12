@@ -39,19 +39,31 @@ def letter(i):
 # pins
 # ---------------------------------------------------------------------------------------------
 
+IDENTITY = list(config.IDENTITY_ROLES)
+STEP = list(config.STEP_ROLES)
+COMMERCIAL = list(config.COMMERCIAL_ROLES)
+NEW_ROW_DEFAULT = IDENTITY + ["first_contact", "first_contact_type", "first_contact_date", "sid_li_added",
+                              "li_connected_date"]
+
+
 @pytest.fixture
 def bands(monkeypatch):
-    """Pin the write bands to the contract, never to this machine's .env (the laptop's new-row band is A:R)."""
-    def pin(restricted="A:I,Q:W,Z:AE", new_row="A:P,X:Y"):
-        parsed = config.parse_column_ranges(restricted)
-        monkeypatch.setattr(config, "RESTRICTED_COLUMN_RANGES", restricted)
-        monkeypatch.setattr(config, "RESTRICTED_COLUMN_BANDS", parsed)
-        monkeypatch.setattr(config, "RESTRICTED_COLUMN_INDEXES",
-                            frozenset(i for lo, hi in parsed for i in range(lo, hi + 1)))
-        monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", new_row)
-        monkeypatch.setattr(config, "_NEW_ROW_INDEXES", None)     # parsed on first use; re-parse
+    """Pin the write lock to the contract (BY ROLE since 12 Oct 2026), never to this machine's .env (the laptop
+    still carries the old letter ranges), and resolve it against the 7 Oct header order. Call it again to change
+    a setting; it resolves again."""
+    def pin(restricted_ranges="", new_row_ranges="", new_row_roles=None, restricted_roles=None, headers=None):
+        monkeypatch.setattr(config, "RESTRICTED_COLUMN_ROLES",
+                            list(restricted_roles if restricted_roles is not None
+                                 else IDENTITY + STEP + COMMERCIAL))
+        monkeypatch.setattr(config, "RESTRICTED_COLUMN_RANGES", restricted_ranges)
+        monkeypatch.setattr(config, "NEW_ROW_WRITABLE_ROLES",
+                            list(new_row_roles if new_row_roles is not None else NEW_ROW_DEFAULT))
+        monkeypatch.setattr(config, "NEW_ROW_WRITABLE_RANGES", new_row_ranges)
+        return fx.parse([fx.values_row(1)], headers)          # parsing the tab resolves the lock
+    saved = config.active_lock()
     pin()
-    return pin
+    yield pin
+    config.set_active_lock(saved)
 
 
 @pytest.fixture(autouse=True)
@@ -64,7 +76,8 @@ def contract_defaults(monkeypatch):
                  "NEXT_STEP_TIME": "15:00"}.items():
         monkeypatch.setattr(config, k, v)
     monkeypatch.setattr(config, "NEXT_STEP_CONNECTED_MARKERS", ["connected"])
-    monkeypatch.setattr(config, "NEXT_STEP_DM_REPLIED_MARKERS", ["replied", "responded"])
+    monkeypatch.setattr(config, "NEXT_STEP_DM_REPLIED_MARKERS", ["replied", "responded", "received"])
+    monkeypatch.setattr(config, "NEXT_STEP_DM_SENT_MARKERS", ["sent", "received"])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -268,43 +281,59 @@ def sheet(monkeypatch, bands):
 
 
 class TestBands:
+    """THE WRITE LOCK IS BY ROLE (12 Oct 2026). These used to pin the letter bands A:I, Q:W, Z:AE; the roles
+    they protect are the same and LI DM Sent, LI DM Date and Priority joined them. More in verify_sheet_locks.py."""
+
     def test_the_contract_defaults_in_env_example(self):
         text = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env.example"),
                     encoding="utf-8").read()
-        assert re.search(r"^RESTRICTED_COLUMN_RANGES=A:I,Q:W,Z:AE\s*$", text, re.M)
-        assert re.search(r"^NEW_ROW_WRITABLE_RANGES=A:P,X:Y\s*$", text, re.M)
+        assert re.search(r"^RESTRICTED_COLUMN_ROLES=" + ",".join(IDENTITY + STEP + COMMERCIAL) + r"\s*$", text, re.M)
+        assert re.search(r"^NEW_ROW_WRITABLE_ROLES=" + ",".join(NEW_ROW_DEFAULT) + r"\s*$", text, re.M)
+        assert re.search(r"^RESTRICTED_COLUMN_RANGES=\s*$", text, re.M)
+        assert re.search(r"^NEW_ROW_WRITABLE_RANGES=\s*$", text, re.M)
 
     def test_the_code_defaults_when_the_variables_are_empty(self):
-        """A subprocess with both variables blank gets the code defaults, not this machine's .env."""
+        """A subprocess with the letter ranges blank gets the code defaults: no ranges, and the role lists."""
         import subprocess
         import sys
         env = dict(os.environ, RESTRICTED_COLUMN_RANGES="", NEW_ROW_WRITABLE_RANGES="", DISCORD_TOKEN="x",
                    ANTHROPIC_API_KEY="x")
+        env.pop("RESTRICTED_COLUMN_ROLES", None)
+        env.pop("NEW_ROW_WRITABLE_ROLES", None)
         out = subprocess.run(
             [sys.executable, "-c",
              "import config;print('|'.join([config.RESTRICTED_COLUMN_RANGES, config.NEW_ROW_WRITABLE_RANGES, "
-             "config.writable_window_label()]))"],
+             "str(len(config.RESTRICTED_COLUMN_ROLES)), str(len(config.NEW_ROW_WRITABLE_ROLES)), "
+             "str(config.is_restricted_column(9))]))"],
             capture_output=True, text=True, env=env, cwd=os.path.dirname(os.path.dirname(__file__)), timeout=60)
-        assert out.stdout.strip().splitlines()[-1] == "A:I,Q:W,Z:AE|A:P,X:Y|J:P, X:Y", out.stdout + out.stderr
+        # ...and before any tab has been read, every column is restricted.
+        assert out.stdout.strip().splitlines()[-1] == "||25|14|True", out.stdout + out.stderr
 
-    def test_B1_the_window_is_J_to_P_and_X_to_Y(self, bands):
-        assert config.writable_windows() == [(9, 15), (23, 24)]
-        assert config.writable_window_label() == "J:P, X:Y"
+    def test_B1_the_window_is_J_to_N_and_X_to_Y(self, bands):
+        assert config.writable_windows() == [(9, 13), (23, 24)]
+        assert config.writable_window_label() == "J:N, X:Y"
+        assert config.writable_roles() == ["first_contact", "first_contact_type", "first_contact_date",
+                                           "sid_li_added", "li_connected_date", "meeting_date", "meeting_status"]
 
-    def test_B1_the_gtm_window_log_line_names_J_to_P_and_X_Y(self, bands, caplog):
+    def test_B1_the_gtm_window_log_line_names_the_writable_columns(self, bands, caplog):
         tab = fx.parse([fx.values_row(1)])
         with caplog.at_level(logging.INFO):
             gtm_sheet.SHEETS.log_writable_window(tab)
         line = next(r.getMessage() for r in caplog.records if "[gtm.window]" in r.getMessage())
-        assert "restricted A:I, Q:W, Z:AE" in line and "Writable window J:P, X:Y" in line
-        for col, header in (("J", "First Contact"), ("P", "LI DM Date"), ("X", "Meeting Date"), ("Y", "Meeting Status")):
+        assert "restricted today at A:I, O:W, Z:AF" in line and "WRITABLE on an existing row: J:N, X:Y" in line
+        for col, header in (("J", "First Contact"), ("N", "LI Connected Date"), ("X", "Meeting Date"),
+                            ("Y", "Meeting Status")):
             assert f"{col}='{header}'" in line, (col, line)
-        for col in ("Q=", "R=", "W=", "Z=", "AE="):
-            assert col not in line, f"{col} is a restricted column and must not be listed in the window"
+        for col in ("O=", "P=", "Q=", "R=", "W=", "Z=", "AE=", "AF="):
+            assert col not in line, f"{col} is a restricted column and must not be listed as writable"
+        locks = [r.getMessage() for r in caplog.records if "[gtm.lock]" in r.getMessage()]
+        assert any("outreach_step=Q 'Next Steps'" in m and "li_dm_sent=O 'LI DM Sent'" in m for m in locks)
+        assert any("poc_priority=AF 'Priority'" in m for m in locks)
 
     @pytest.mark.parametrize("role,col", [("outreach_step", "Q"), ("email_1_sent", "R"), ("email_3_date", "W"),
-                                          ("next_steps", "Z"), ("deal_status", "AE")])
-    def test_B2_writes_to_Q_R_W_Z_and_AE_are_refused_on_an_existing_row(self, sheet, role, col):
+                                          ("li_dm_sent", "O"), ("li_dm_date", "P"),
+                                          ("next_steps", "Z"), ("deal_status", "AE"), ("poc_priority", "AF")])
+    def test_B2_writes_to_the_step_and_commercial_roles_are_refused_on_an_existing_row(self, sheet, role, col):
         tab, ws = sheet
         out = gtm_sheet.SHEETS.write_cells(row=2, values={role: "x"}, expect_company="Acme Labs")
         assert out["ok"] is False and out["written"] == []
@@ -312,7 +341,7 @@ class TestBands:
         assert out["refused"][0]["column"] == col
         assert ws.updates == [], "a refused role must reach the worksheet as no request at all"
 
-    @pytest.mark.parametrize("role,col", [("first_contact", "J"), ("li_dm_date", "P"), ("meeting_date", "X"),
+    @pytest.mark.parametrize("role,col", [("first_contact", "J"), ("li_connected_date", "N"), ("meeting_date", "X"),
                                           ("meeting_status", "Y")])
     def test_B2_the_window_roles_are_still_writable(self, sheet, role, col):
         tab, ws = sheet
@@ -326,12 +355,11 @@ class TestBands:
         assert [u[0] for u in ws.updates] == ["X2"]
         assert [r["role"] for r in out["refused"]] == ["outreach_step"]
 
-    def test_B3_a_new_row_fills_only_A_to_P_and_X_to_Y(self, bands):
-        for col in range(0, 16):
+    def test_B3_a_new_row_fills_only_the_identity_block_and_the_first_contact_cells(self, bands):
+        for col in range(0, 14):                                    # A..N
             assert config.may_write_new_row_column(col), col
-        for col in (16, 17, 18, 22, 25, 26, 27, 28, 29, 30, 31):      # Q..W, Z..AF
+        for col in range(14, 32):                                   # O..AF: step, meeting, commercial, Priority
             assert not config.may_write_new_row_column(col), col
-        assert config.may_write_new_row_column(23) and config.may_write_new_row_column(24)    # X, Y
 
     def test_B3_append_row_refuses_the_step_notes_and_commercial_roles(self, sheet, monkeypatch):
         tab, ws = sheet
@@ -342,13 +370,15 @@ class TestBands:
         monkeypatch.setattr(gtm_sheet.SHEETS, "_open", lambda *a, **k: FakeSh(wsx))
         out = gtm_sheet.SHEETS.append_row(
             tab, {"company": "Nova Labs", "name": "Someone New", "outreach_step": "Send email 1",
-                  "email_1_sent": "yes", "next_steps": "hello", "closure_prob": "80%"},
+                  "email_1_sent": "yes", "next_steps": "hello", "closure_prob": "80%", "li_dm_sent": "Sent",
+                  "poc_priority": "P1"},
             reason="test", dry_run=True)
         refused = {r["role"] for r in out.get("refused", [])}
         written = {c["role"] for c in out.get("written", [])}
-        assert {"outreach_step", "email_1_sent", "next_steps", "closure_prob"} <= refused
+        locked = {"outreach_step", "email_1_sent", "next_steps", "closure_prob", "li_dm_sent", "poc_priority"}
+        assert locked <= refused
         assert "company" in written and "name" in written
-        assert not (written & {"outreach_step", "email_1_sent", "next_steps", "closure_prob"})
+        assert not (written & locked)
 
     def test_B4_write_cells_on_refuses_the_outreach_pocs_tab(self, sheet, monkeypatch):
         tab, ws = sheet
@@ -364,23 +394,48 @@ class TestBands:
             for trig in (sheetwrite.TRIGGER_REPLY, getattr(sheetwrite, "TRIGGER_SWEEP", sheetwrite.TRIGGER_REPLY)):
                 assert sheetwrite.allowed_for(role, trig) is False, (role, trig)
 
-    def test_B5_plan_writes_turns_a_Q_to_W_or_Z_to_AE_role_into_an_ask_never_a_write(self, bands):
+    def test_B5_plan_writes_turns_a_step_or_commercial_role_into_an_ask_never_a_write(self, bands):
         import sheetwrite
         tab = fx.parse([fx.person(1, name="Priya Rao", company="Acme Labs")])
         row = tab.rows[0]
-        for role in ("outreach_step", "email_1_sent", "email_3_date", "next_steps", "deal_status"):
+        for role in ("outreach_step", "email_1_sent", "email_3_date", "li_dm_sent", "li_dm_date", "next_steps",
+                     "deal_status", "poc_priority"):
             plan = sheetwrite.plan_writes(tab=tab, row=row, fields=[{"role": role, "value": "x", "supersedes": False,
                                                                      "quote": "x"}],
                                           trigger=sheetwrite.TRIGGER_REPLY, reply_text="x")
             assert plan["writes"] == {}, role
 
-    def test_B6_the_startup_warning_names_Q_to_R_for_a_new_row_band_of_A_to_R(self, bands):
-        bands(new_row="A:R")
-        assert config.new_row_locked_overlap() == "Q:R"
+    def test_B6_a_new_row_setting_that_reaches_a_locked_block_is_named_and_not_opened(self, bands):
+        bands(new_row_roles=NEW_ROW_DEFAULT + ["outreach_step", "deal_status"])
+        assert config.new_row_locked_overlap() == "outreach_step, deal_status"
+        assert not config.may_write_new_row_column(16) and not config.may_write_new_row_column(30)
+        bands(new_row_ranges="A:R")                       # the laptop's old letter band
+        assert config.new_row_locked_overlap() == "O:R"
+        assert [config.may_write_new_row_column(c) for c in (13, 14, 15, 16, 17)] == [True, False, False, False,
+                                                                                    False]
 
-    def test_B6_no_warning_for_the_contract_band(self, bands):
-        bands(new_row="A:P,X:Y")
+    def test_B6_no_warning_for_the_contract_lists(self, bands):
+        bands()
         assert config.new_row_locked_overlap() == ""
+
+    def test_a_restricted_role_with_no_column_refuses_every_write(self, sheet, bands, caplog, monkeypatch):
+        _tab, ws = sheet
+        headers = [h if h != "Next Steps" else "Column the bot cannot name" for h in fx.HEADERS_7OCT]
+        getattr(gtm_sheet.SHEETS, "_lock_failures_logged", set()).clear()    # it is logged once per failure
+        with caplog.at_level(logging.ERROR):
+            broken = bands(headers=headers)
+        monkeypatch.setattr(gtm_sheet.SHEETS, "read", lambda *a, **k: {gtm_sheet.POCS: broken})
+        assert broken.lock.unmapped == ("outreach_step",)
+        assert any("outreach_step" in r.getMessage() and "REFUSED" in r.getMessage() for r in caplog.records)
+        out = gtm_sheet.SHEETS.write_cells(row=2, values={"meeting_date": "21-10-2026"}, expect_company="Acme Labs 01")
+        assert out["ok"] is False and ws.updates == []
+
+    def test_a_letter_range_can_only_lock_more(self, bands):
+        bands(restricted_ranges="X:Y")
+        assert config.is_restricted_column(23) and config.is_restricted_column(24)       # now locked too
+        assert config.is_restricted_column(16) and not config.is_restricted_column(9)    # roles unchanged
+        bands(restricted_roles=IDENTITY + STEP + COMMERCIAL, restricted_ranges="")
+        assert not config.is_restricted_column(23)
 
     def test_email_write_still_writes_only_the_email_cell(self, monkeypatch, bands):
         tab = fx.parse([fx.person(1, name="Priya Rao", company="Acme Labs")])
@@ -529,12 +584,17 @@ class TestCallClock:
         tab = fx.parse([dm_person()])
         got = self.walk(db, tab, DM_DAY, date(2026, 10, 30))
         calls = [DM_DAY + D(days=n) for n in (7, 10, 14, 17, 21)]
-        assert got == [(d, "call") for d in calls] + [(DM_DAY + D(days=22), "unresponsive")], got
+        assert got[:5] == [(d, "call") for d in calls], got
+        # CHANGED 12 Oct 2026: the unresponsive reminder is no longer a one-off. Nobody is dropped, so from day
+        # 22 it comes round on every post until Prospect Status says Unresponsive (it was "then never").
+        rest = got[5:]
+        assert rest[0] == (DM_DAY + D(days=22), "unresponsive") and len(rest) > 1, rest
+        assert {a for _d, a in rest} == {"unresponsive"}
 
     def test_C1_a_missed_post_does_not_lose_the_unresponsive_reminder(self, db):
         tab = fx.parse([dm_person()])
         got = self.walk(db, tab, DM_DAY + D(days=28), DM_DAY + D(days=40))          # Mon 19 Oct, 28 days after the DM
-        assert got == [(DM_DAY + D(days=28), "unresponsive")]
+        assert got[0] == (DM_DAY + D(days=28), "unresponsive") and {a for _d, a in got} == {"unresponsive"}
 
     def test_C1_the_numbers_come_from_config(self, db, monkeypatch):
         monkeypatch.setattr(config, "NEXT_STEP_CALL_AFTER_DM_DAYS", 4)
@@ -543,8 +603,9 @@ class TestCallClock:
         got = self.walk(db, fx.parse([dm_person()]), DM_DAY, DM_DAY + D(days=30))
         # Fri 25 Sep (day 4), Tue 29 Sep (day 8), then day 12 is a Saturday: Monday 5 Oct is past it, so the
         # Unresponsive reminder, not a third call
-        assert got == [(DM_DAY + D(days=4), "call"), (DM_DAY + D(days=8), "call"),
-                       (DM_DAY + D(days=14), "unresponsive")], got
+        assert got[:3] == [(DM_DAY + D(days=4), "call"), (DM_DAY + D(days=8), "call"),
+                           (DM_DAY + D(days=14), "unresponsive")], got
+        assert {a for _d, a in got[3:]} <= {"unresponsive"}          # it repeats; nothing closes a person
 
     def test_C2_changing_q_from_dm_to_call_mid_clock_adds_no_reminder_and_the_count_continues(self, db):
         got = self.walk(db, fx.parse([dm_person(step="Reach by LI DM")]), DM_DAY, DM_DAY + D(days=26),
@@ -656,7 +717,7 @@ class TestState:
         e = db.next_step_state()["k1"]
         assert (e["signature"], e["last_date"], e["mentions"], e["calls"]) == (
             "research|2026-09-01", "2026-10-14", 2, 0)
-        assert e["closed"] in (0, False)
+        assert "closed" not in e and "first_named" not in e      # retained columns, no longer read
 
     def test_unreadable_state_fails_closed_to_none_not_an_empty_dict(self, db, monkeypatch):
         def boom(*a, **k):
@@ -928,36 +989,27 @@ class TestStartupValidation:
             config.validate()
         return [r for r in caplog.records]
 
-    def test_B6_a_new_row_band_reaching_into_Q_to_R_warns_and_names_them(self, monkeypatch, bands, caplog):
+    def test_B6_a_new_row_setting_reaching_into_a_locked_block_warns_and_names_it(self, monkeypatch, bands, caplog):
         monkeypatch.setattr(config, "SHEET_ROW_ADDITIONS_ENABLED", True)
-        bands(new_row="A:R")
+        bands(new_row_roles=NEW_ROW_DEFAULT + ["outreach_step"])
         recs = self.run_validate(caplog)
-        warn = [r.getMessage() for r in recs if r.levelno >= logging.WARNING and "NEW_ROW_WRITABLE_RANGES" in r.getMessage()]
+        warn = [r.getMessage() for r in recs if r.levelno >= logging.WARNING and "NEW_ROW_WRITABLE_ROLES" in r.getMessage()]
         assert len(warn) == 1, warn
-        assert "Q:R" in warn[0] and "A:P,X:Y" in warn[0] and "S:X" not in warn[0] and "A:R. " not in warn[0].split("default")[-1]
+        assert "outreach_step" in warn[0] and "NOT opened" in warn[0]
 
-    def test_B6_the_contract_band_does_not_warn(self, monkeypatch, bands, caplog):
+    def test_B6_the_contract_lists_do_not_warn(self, monkeypatch, bands, caplog):
         monkeypatch.setattr(config, "SHEET_ROW_ADDITIONS_ENABLED", True)
-        bands(new_row="A:P,X:Y")
+        bands()
         recs = self.run_validate(caplog)
-        assert not [r for r in recs if r.levelno >= logging.WARNING and "NEW_ROW_WRITABLE_RANGES" in r.getMessage()]
+        assert not [r for r in recs if r.levelno >= logging.WARNING and "NEW_ROW_WRITABLE_ROLES" in r.getMessage()]
 
-    def test_B6_the_warning_checks_the_configured_bands_not_a_literal(self, monkeypatch, bands, caplog):
-        """Restricted S:X (the old layout) with a new-row band that reaches S: the warning follows the setting."""
+    def test_B6_an_old_letter_band_for_new_rows_warns_with_the_letters_it_cannot_open(self, monkeypatch, bands, caplog):
+        """The laptop's .env still says NEW_ROW_WRITABLE_RANGES=A:R: on the 7 Oct order that reaches O to R."""
         monkeypatch.setattr(config, "SHEET_ROW_ADDITIONS_ENABLED", True)
-        bands(restricted="A:I,S:X", new_row="A:T")
-        warn = [r.getMessage() for r in self.run_validate(caplog) if "NEW_ROW_WRITABLE_RANGES" in r.getMessage()
+        bands(new_row_ranges="A:R")
+        warn = [r.getMessage() for r in self.run_validate(caplog) if "NEW_ROW_WRITABLE_ROLES" in r.getMessage()
                 and r.levelno >= logging.WARNING]
-        assert len(warn) == 1 and "S:T" in warn[0], warn
-        bands(restricted="A:I,S:X", new_row="A:R")                  # no overlap with S:X, so silent
-        caplog.clear()
-        assert not [r for r in self.run_validate(caplog) if "NEW_ROW_WRITABLE_RANGES" in r.getMessage()
-                    and r.levelno >= logging.WARNING]
-        bands(restricted="A:I,Q:W,Z:AE", new_row="A:R")
-        caplog.clear()
-        warn2 = [r.getMessage() for r in self.run_validate(caplog) if "NEW_ROW_WRITABLE_RANGES" in r.getMessage()
-                 and r.levelno >= logging.WARNING]
-        assert warn2 and "Q:R" in warn2[0]
+        assert len(warn) == 1 and "O:R" in warn[0], warn
 
     def test_a_next_step_time_that_is_not_hh_mm_falls_back_with_a_warning(self, caplog):
         with caplog.at_level(logging.WARNING):

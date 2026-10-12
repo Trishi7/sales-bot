@@ -36,11 +36,10 @@ SID, VAISHNAVI, TRISHI = 111, 222, 333
 config.TEAM_ROSTER_IDS = [SID, VAISHNAVI, TRISHI]
 config.SALES_APPROVER_IDS = [SID, VAISHNAVI]
 config.SALES_FINAL_SAY_ID = SID
-# THE RESTRICTED BANDS ARE PINNED TO THE CONTRACT (.env.example: A:I,Q:W,Z:AE since the 7 Oct 2026 layout), not
-# read from whatever this machine's .env holds. (Before 7 Oct this pinned A:I,S:X; the sheet grew columns Q-W.)
-config.RESTRICTED_COLUMN_RANGES = "A:I,Q:W,Z:AE"
-config.RESTRICTED_COLUMN_BANDS = config.parse_column_ranges("A:I,Q:W,Z:AE")
-config.RESTRICTED_COLUMN_INDEXES = frozenset(i for lo, hi in config.RESTRICTED_COLUMN_BANDS for i in range(lo, hi + 1))
+# THE LOCK IS PINNED TO THE CONTRACT (.env.example), not read from whatever this machine's .env holds. Since
+# 12 Oct 2026 the contract is a list of ROLES (the identity, step and commercial blocks) and no letter range.
+config.RESTRICTED_COLUMN_ROLES = list(config.IDENTITY_ROLES + config.STEP_ROLES + config.COMMERCIAL_ROLES)
+config.RESTRICTED_COLUMN_RANGES = ""
 config.ROSTER_DISPLAY_NAMES = {str(SID): "Sid", str(VAISHNAVI): "Vaishnavi",
                                str(TRISHI): "Trishi"}
 

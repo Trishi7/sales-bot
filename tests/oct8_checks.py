@@ -430,8 +430,9 @@ async def next_steps_post(test_mode) -> dict:
 
     day = date(2026, 10, 12)
     with World(test_mode, pretend=(day, 15, 5), rules={"R13"},
-               pins={"SALES_ALWAYS_TAG_IDS": [rw.APPROVER], "NEXT_STEP_DROP_AFTER_DAYS": 21,
-                     "NEXT_STEP_DM_SENT_MARKERS": ["sent", "yes", "done"]}) as w:
+               pins={"SALES_ALWAYS_TAG_IDS": [rw.APPROVER],
+                     "NEXT_STEP_DM_SENT_MARKERS": ["sent", "received"],
+                     "NEXT_STEP_DM_REPLIED_MARKERS": ["replied", "responded", "received"]}) as w:
         people = [("Arjun Aryaa", "Gnani.ai", 1), ("Oliver Shoulson", "PolyAI", 1), ("Ariya Rastrow", "Wisprflow.ai", 2),
                   ("Priya Rao", "Acme Labs", 1), ("Dev Shah", "Borealis", 1)]
         rows = []

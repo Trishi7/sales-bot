@@ -444,7 +444,7 @@ _ORDINAL = {1: "first", 2: "second", 3: "third"}
 # THE GROUP LINES, AGREED WORD FOR WORD. THIS IS THE ONLY PLACE THEY LIVE: the
 # post, the preview and the checks all read them from here. The key is
 # (ask, email number); the ORDER of this table is the order the groups appear
-# in a post, and the drop line is always last.
+# in a post.
 NEXT_STEP_GROUPS = (
     (("replied", 0), "The people below have replied to us! We need to set up a meeting with them:"),
     (("call", 0), "We need to call these PoCs:"),
@@ -456,7 +456,6 @@ NEXT_STEP_GROUPS = (
     (("research", 0), "We need to research these PoCs:"),
     (("blank", 0), "We're connected with these people — next thing is to research them:"),
     (("unresponsive", 0), "No reply after the calls. These look unresponsive:"),
-    (("dropped", 0), "I'll stop reminding about these. It's been three weeks and nothing has moved:"),
 )
 _GROUP_LINE = dict(NEXT_STEP_GROUPS)
 _GROUP_ORDER = {key: i for i, (key, _line) in enumerate(NEXT_STEP_GROUPS)}
@@ -554,7 +553,6 @@ def next_step_line(ask: str, *, who: str, n: int = 0, **_ignored) -> str:
         "research": "research them",
         "blank": "connected; research them next",
         "unresponsive": "no reply after the calls; they look unresponsive",
-        "dropped": "three weeks with nothing moved; no more reminders",
     }.get(str(ask or ""))
     if not what or (ask in ("advance", "email_out") and n not in _ORDINAL):
         return ""
@@ -562,7 +560,7 @@ def next_step_line(ask: str, *, who: str, n: int = 0, **_ignored) -> str:
 
 
 NEXT_STEP_ASKS = ("replied", "call", "advance", "email_out", "research", "blank",
-                  "unresponsive", "dropped")
+                  "unresponsive")
 
 
 def next_step_lines_for_check() -> list:
@@ -811,18 +809,21 @@ def _self_test() -> int:
     check("there is no group for a fourth email",
           (next_step_group("advance", n=3), next_step_group("email_out", n=4)), ("", ""))
     post = next_step_post([
-        {"who": "Old Ask (Co)", "ask": "dropped"},
+        {"who": "Gone Quiet (Co)", "ask": "unresponsive"},
         {"who": "A (Co)", "ask": "email_out", "n": 1},
         {"who": "B (Co)", "ask": "replied"},
         {"who": "C (Co)", "ask": "email_out", "n": 1},
     ])
-    check("groups in the agreed order whatever order people arrive in, the drop line last",
+    check("groups in the agreed order whatever order people arrive in",
           post, ["The people below have replied to us! We need to set up a meeting with them:",
                  "- B (Co)", "",
                  "We need to send out the first email to these people:",
                  "- A (Co)", "- C (Co)", "",
-                 "I'll stop reminding about these. It's been three weeks and nothing has moved:",
-                 "- Old Ask (Co)"])
+                 "No reply after the calls. These look unresponsive:",
+                 "- Gone Quiet (Co)"])
+    check("there is no drop line: nobody is dropped (12 Oct 2026)",
+          (next_step_group("dropped"), [l for l in next_step_lines_for_check()
+                                        if "stop reminding" in l or "three weeks" in l]), ("", []))
     check("a person is one line, the name and the company and nothing else",
           next_step_person(who), "- Priya Rao (Acme Labs)")
     check("nobody to name: no lines at all", next_step_post([]), [])

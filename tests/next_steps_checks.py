@@ -69,7 +69,6 @@ def pins() -> dict:
         "NEXT_STEP_CALL_UNTIL_DAYS": int(_example("NEXT_STEP_CALL_UNTIL_DAYS")),
         "NEXT_STEP_DM_REPLIED_MARKERS": _list("NEXT_STEP_DM_REPLIED_MARKERS"),
         "NEXT_STEP_DM_SENT_MARKERS": _list("NEXT_STEP_DM_SENT_MARKERS"),
-        "NEXT_STEP_DROP_AFTER_DAYS": int(_example("NEXT_STEP_DROP_AFTER_DAYS")),
         "NEXT_STEP_PAUSE_FOR_BOOKED_MEETING": True,
         "PROSPECT_VOICE_INDUSTRIES": _list("PROSPECT_VOICE_INDUSTRIES"),
         "PROSPECT_LAB_INDUSTRIES": _list("PROSPECT_LAB_INDUSTRIES"),
@@ -212,8 +211,7 @@ def example_values(day=DAY) -> list:
         person("Ioana Mocanu", "Agoda", "Send email 1", e1="Yes", e1d=day - timedelta(days=9)),
         person("Angelos Perivolaropoulos", "ElevenLabs", "Reach by LI DM", dm_sent="Sent",
                dm_date=day - timedelta(days=8)),
-        person("Ariya Rastrow", "Wisprflow.ai", "Reach by LI DM", dm_sent="Replied"),
-        person("Harry Swanson", "PolyAI", "Send email 2", e1="Yes", e1d=date(2026, 9, 1)),
+        person("Ariya Rastrow", "Wisprflow.ai", "Reach by LI DM", dm_sent="Received"),
     ]
 
 
@@ -228,10 +226,7 @@ We sent the first email to these people over a week ago — time for the second:
 
 We need to send out the first email to these people:
 - Arjun Aryaa (Gnani.ai)
-- Oliver Shoulson (PolyAI)
-
-I'll stop reminding about these. It's been three weeks and nothing has moved:
-- Harry Swanson (PolyAI)"""
+- Oliver Shoulson (PolyAI)"""
 
 GROUP_LINES = {
     "replied": "The people below have replied to us! We need to set up a meeting with them:",
@@ -244,8 +239,8 @@ GROUP_LINES = {
     "research": "We need to research these PoCs:",
     "blank": "We're connected with these people — next thing is to research them:",
     "unresponsive": "No reply after the calls. These look unresponsive:",
-    "dropped": "I'll stop reminding about these. It's been three weeks and nothing has moved:",
 }
+DROP_WORDING = ("stop reminding", "three weeks", "nothing has moved", "dropped", "last chance")
 
 
 # -- the checks -----------------------------------------------------------------------------------------------------------
@@ -341,27 +336,21 @@ def what_is_asked(check):
 
 
 def the_message(check):
-    print("\nTHE MESSAGE — the agreed lines, one name a line, the drop line last")
-    with Ledger() as led:
-        harry = [v for v in example_values() if "Harry Swanson" in v]
-        led.day(harry, DAY - timedelta(days=21))                # first named three weeks ago
-        text, res = led.day(example_values(), DAY, send=False)
+    print("\nTHE MESSAGE — the agreed lines, one name a line")
+    text = post_of(engine(example_values()))
     check("the ticket's example, character for character (the heading and tags go on at send)", keep(text), EXAMPLE)
-    check("five picked for the reminders, and the person dropped comes on top of the five",
-          (len([a for a in res["actions"] if a["ask"] != "dropped"]),
-           [a["poc"] for a in res["actions"] if a["ask"] == "dropped"]), (5, ["Harry Swanson"]))
 
     every = [{"who": f"P{i} (Co)", "ask": ask, "n": n} for i, (ask, n) in enumerate(reversed([
         ("replied", 0), ("call", 0), ("advance", 1), ("advance", 2), ("email_out", 1), ("email_out", 2),
-        ("email_out", 3), ("research", 0), ("blank", 0), ("unresponsive", 0), ("dropped", 0)]))]
+        ("email_out", 3), ("research", 0), ("blank", 0), ("unresponsive", 0)]))]
     lines = wording.next_step_post(every)
     keep("\n".join(lines))
-    check("the eleven group lines, word for word, in the agreed order whatever order people arrive in",
+    check("the ten group lines, word for word, in the agreed order whatever order people arrive in",
           [ln for ln in lines if ln and not ln.startswith("- ")], list(GROUP_LINES.values()))
     check("...they live in wording.py and nowhere else", [line for _k, line in wording.NEXT_STEP_GROUPS],
           list(GROUP_LINES.values()))
     check("a blank line between groups and none after the last", (lines.count(""), lines[-1].startswith("- ")),
-          (10, True))
+          (9, True))
     check("each person is ONE line, '- Name (Company)', and nothing else",
           [ln for ln in "\n".join([text] + lines).split("\n")
            if ln.startswith("- ") and not re.fullmatch(r"- [^():]+( \([^()]+\))+", ln)], [])
@@ -385,42 +374,41 @@ def the_message(check):
 
 
 def the_order(check):
-    print("\nTHE ORDER — seven tiers, oldest connection first, R5's company score on a tie")
+    print("\nTHE ORDER — six tiers; inside a tier whoever was named least recently")
     week = DAY - timedelta(days=8)
     one_each = [
-        person("G Unresponsive", "Co G", "Reach by LI DM", dm_sent="Sent", dm_date=DAY - timedelta(days=22)),
-        person("F Research", "Co F", "Research the PoC"),
-        person("E Email", "Co E", "Send email 2"),
-        person("D Advance", "Co D", "Send email 1", e1="Yes", e1d=week),
-        person("C Lastchance", "Co C", "Research the PoC"),
+        person("F Unresponsive", "Co F", "Reach by LI DM", dm_sent="Sent", dm_date=DAY - timedelta(days=22)),
+        person("E Research", "Co E", "Research the PoC"),
+        person("D Email", "Co D", "Send email 2"),
+        person("C Advance", "Co C", "Send email 1", e1="Yes", e1d=week),
         person("B Call", "Co B", "Call the PoC"),
         person("A Replied", "Co A", "Reach by LI DM", dm_sent="Replied"),
     ]
-    rows = rows_of(one_each)
-    last = next(r for r in rows if r["name"] == "C Lastchance")
-    state = {nextaction._contact_key(last): {
-        "signature": nextaction.step_signature(last), "first_named": dl.iso(DAY - timedelta(days=19)),
-        "last_date": dl.iso(DAY - timedelta(days=1))}}
-    res = engine(one_each, state=state)
+    res = engine(one_each, rule_ids=("R13",))
     report = res["reports"]["R13"]
     order = [e["poc"] for e in report["picked"]] + [e["poc"] for e in report["queued"]]
-    check("someone in every tier: replied, call, last three days before the drop, next email due, "
-          "email not sent, research, unresponsive",
-          order, ["A Replied", "B Call", "C Lastchance", "D Advance", "E Email", "F Research", "G Unresponsive"])
-    check("...and the tiers on the five picked", [a["tier"] for a in sorted(
-        res["actions"], key=lambda a: a["pick_order"])], [1, 2, 3, 4, 5])
+    check("exactly six tiers, with somebody in each: replied, call, next email due, email not sent, "
+          "research, unresponsive",
+          order, ["A Replied", "B Call", "C Advance", "D Email", "E Research", "F Unresponsive"])
+    check("...numbered 1 to 6, and there is no seventh",
+          ([a["tier"] for a in sorted(res["actions"], key=lambda a: a["pick_order"])],
+           (nextaction.TIER_REPLIED, nextaction.TIER_CALL, nextaction.TIER_ADVANCE, nextaction.TIER_EMAIL,
+            nextaction.TIER_RESEARCH, nextaction.TIER_UNRESPONSIVE),
+           [n for n in ("TIER_LAST_CHANCE", "LAST_CHANCE_DAYS", "DROP_LINE_MAX", "ASK_DROPPED")
+            if hasattr(nextaction, n)]),
+          ([1, 2, 3, 4, 5], (1, 2, 3, 4, 5, 6), []))
 
     dated = [person("Newest", "Co", "Send email 1", li=date(2026, 10, 1), n=1),
              person("No Date B", "Co", "Send email 1", li=None, n=2),
              person("Oldest", "Co", "Send email 1", li=date(2026, 9, 3), n=3),
              person("No Date A", "Co", "Send email 1", li=None, n=4),
              person("Middle", "Co", "Send email 1", li=date(2026, 9, 20), n=5)]
-    check("inside a group: oldest LI Connected Date first; rows with no date last, in sheet order",
+    check("equally recently named: oldest LI Connected Date first; rows with no date last, in sheet order",
           [n for n, _a in asks(engine(dated))], ["Oldest", "Middle", "Newest", "No Date B", "No Date A"])
     tie = [person("Plain Pat", "Plain Logistics", "Send email 1", li=date(2026, 9, 3), n=1, industry="Logistics"),
            person("Voice Vic", "Voice Co", "Send email 1", li=date(2026, 9, 3), n=2, industry="AI Voice Agents"),
            person("Lab Lou", "Lab Co", "Send email 1", li=date(2026, 9, 3), n=3, industry="AI Labs (frontier)")]
-    check("the same date: R5's company score decides (voice, then lab, then nothing), not sheet order",
+    check("...the same date: R5's company score decides (voice, then lab, then nothing), then sheet order",
           [n for n, _a in asks(engine(tie))], ["Voice Vic", "Lab Lou", "Plain Pat"])
     import prospects
     scores = nextaction.company_scores(rows_of(tie + [
@@ -429,121 +417,99 @@ def the_order(check):
     check("the company score uses R5's own weights: warm 32, voice 16, lab 8",
           [scores[prospects.company_key(c)] for c in ("Warm Co", "Voice Co", "Lab Co", "Plain Logistics")],
           [prospects.WEIGHTS["warm"], prospects.WEIGHTS["voice"], prospects.WEIGHTS["lab"], 0])
-    src = open(os.path.join(ROOT, "nextaction.py"), encoding="utf-8").read()
-    body = src.split("def company_scores(")[1].split("\ndef ")[0]
-    check("...imported from prospects.py, not copied, and never through build_queue",
-          ("prospects.WEIGHTS" in body, "prospects.RULES" in body, "build_queue(" in body.split('"""')[2]),
-          (True, True, False))
-    many = [person(f"P{i}", f"Co{i}", "Send email 1", li=date(2026, 9, i + 1)) for i in range(8)]
+    rows = rows_of(dated)
+    newest = next(r for r in rows if r["name"] == "Newest")
+    oldest = next(r for r in rows if r["name"] == "Oldest")
+    state = {nextaction._contact_key(oldest): {"signature": nextaction.step_signature(oldest),
+                                               "last_date": dl.iso(DAY - timedelta(days=1))},
+             nextaction._contact_key(newest): {"signature": nextaction.step_signature(newest),
+                                               "last_date": dl.iso(DAY - timedelta(days=3))}}
+    check("never-named people come AHEAD of anybody already named; then the least recently named",
+          [n for n, _a in asks(engine(dated, state=state))],
+          ["Middle", "No Date B", "No Date A", "Newest", "Oldest"])
+    check("Priority (AF) is read and shown, and not used for the order",
+          ("poc_priority" in engine(dated)["actions"][0],
+           "poc_priority" in nextaction._next_step_order.__code__.co_consts), (True, False))
+
+
+def the_rotation(check):
+    print("\nTHE ROTATION — nobody is dropped; each tier is walked, least recently named first")
+    twelve = [person(f"P{i:02d}", f"Co {i:02d}", "Send email 1", li=date(2026, 9, i)) for i in range(1, 13)]
     with Ledger() as led:
-        _t, first = led.day(many, DAY)
-        _t, second = led.day(many, DAY + timedelta(days=1))
-        after = engine(many, DAY, state=led.state())
-    check("five a day, picked by the rule (the drip is handed exactly the people it names)",
-          (len(first["actions"]), len(first["reports"]["R13"]["queued"])), (5, 3))
-    check("Priority (AF) is not used for the order, and is still shown in the preview",
-          ("poc_priority" in first["actions"][0], "tier" in nextaction._next_step_order.__code__.co_names
-           or "priority" not in nextaction._next_step_order.__code__.co_names), (True, True))
-    check("no rotation: the same five the next day, until they act or are dropped",
-          [n for n, _a in asks(second)], [n for n, _a in asks(first)])
-    check("once today's post has gone, today's people stay today's people (asked again for the day they "
-          "were first named)", sorted(n for n, _a in asks(after)), sorted(n for n, _a in asks(first)))
+        runs = []
+        for offset in (0, 1, 2):
+            text, res = led.day(twelve, DAY + timedelta(days=offset))
+            runs.append([n for n, _a in asks(res)])
+            keep(text)
+        after = engine(twelve, DAY + timedelta(days=2), state=led.state())
+        before = dict(led.state())
+        engine(twelve, DAY + timedelta(days=3), state=led.state())
+        post_of(engine(twelve, DAY + timedelta(days=3), state=led.state()))
+        preview_same = led.state() == before
+    check("twelve people in one tier, five a post: 5, then the next 5, then the last 2 and the first 3",
+          runs, [[f"P{i:02d}" for i in range(1, 6)], [f"P{i:02d}" for i in range(6, 11)],
+                 ["P11", "P12", "P01", "P02", "P03"]])
+    check("once today's post has gone, today's people stay today's people",
+          sorted(n for n, _a in asks(after)), sorted(runs[2]))
+    check("a preview (computing the queue, rendering the post) writes no state", preview_same, True)
 
-
-def the_drop(check):
-    print("\nTHE THREE-WEEK DROP — counted from the first naming; the only ending")
-    start = date(2026, 9, 14)
     sol = [person("Sol Solo", "Solo Co", "Send email 1")]
     with Ledger() as led:
-        led.day(sol, start)
-        first = led.state()[next(iter(led.state()))]["first_named"]
-        t20, r20 = led.day(sol, start + timedelta(days=20))
-        t21, r21 = led.day(sol, start + timedelta(days=21))
-        t22, r22 = led.day(sol, start + timedelta(days=22))
-        closed = dict(led.state()[next(iter(led.state()))])
-        # THE SHEET MOVES AFTER THE DROP.
-        moved = [person("Sol Solo", "Solo Co", "Send email 2", e1="Yes", e1d=start)]
-        t_back, r_back = led.day(moved, start + timedelta(days=23))
-        back = dict(led.state()[next(iter(led.state()))])
-    for t in (t20, t21, t22, t_back):
-        keep(t)
-    check("the clock starts the day the bot first names the person (not any sheet date)", first, dl.iso(start))
-    check("day 20: still named normally", t20, GROUP_LINES["email1"] + "\n- Sol Solo (Solo Co)")
-    check("day 21: named once, in the drop line", t21, GROUP_LINES["dropped"] + "\n- Sol Solo (Solo Co)")
-    check("day 22: absent, and no post at all", (t22, asks(r22)), ("", []))
-    check("...recorded as closed that day", (closed["closed"], closed["closed_date"]),
-          (True, dl.iso(start + timedelta(days=21))))
-    check("a dropped person returns when their Next Steps moves on, with a fresh three weeks",
-          (t_back, back["closed"], back["first_named"]),
-          (GROUP_LINES["email2"] + "\n- Sol Solo (Solo Co)", False, dl.iso(start + timedelta(days=23))))
+        led.day(sol, DAY - timedelta(days=25))
+        text, res = led.day(sol, DAY)
+        row = dict(led.state()[next(iter(led.state()))])
+    keep(text)
+    check("named 25 days ago with nothing moved: still named, normally",
+          text, GROUP_LINES["email1"] + "\n- Sol Solo (Solo Co)")
+    check("...and nothing in the state closes them or starts a clock",
+          sorted(row), ["calls", "last_ask", "last_call_date", "last_date", "mentions", "signature"])
 
     with Ledger() as led:
-        led.day(sol, start)
-        changed = [person("Sol Solo", "Solo Co", "Research the PoC")]
-        _t, r = led.day(changed, start + timedelta(days=20))
-        named = dict(led.state()[next(iter(led.state()))])
-        t41, _r = led.day(changed, start + timedelta(days=40))
-        t42, _r = led.day(changed, start + timedelta(days=41))
-    check("a step change on day 20 resets the clock to day 0",
-          (asks(r), r["actions"][0]["days_named"], named["first_named"]),
-          ([("Sol Solo", "research")], None, dl.iso(start + timedelta(days=20))))
-    check("...so the drop comes three weeks after THAT, not after the first step",
-          (t41.split("\n")[0], t42.split("\n")[0]), (GROUP_LINES["research"], GROUP_LINES["dropped"]))
+        led.day(sol, DAY - timedelta(days=5))
+        moved = [person("Sol Solo", "Solo Co", "Send email 2", e1="Yes", e1d=DAY - timedelta(days=4))]
+        others = [person(f"Other {i}", f"Other Co {i}", "Send email 2", li=date(2026, 8, i + 1)) for i in range(6)]
+        for r in rows_of(others):
+            led.db.record_next_step_mention(nextaction._contact_key(r), signature=nextaction.step_signature(r),
+                                            on_date=dl.iso(DAY - timedelta(days=9)), ask="email_out")
+        _t, res = led.day(moved + others, DAY)
+    check("the list moves when the sheet moves: a person whose step changed is new again, and goes first",
+          asks(res)[0], ("Sol Solo", "email_out"))
 
     dm_day = date(2026, 9, 1)
     ladder = [person("Cal Ladder", "Ladder Co", "Reach by LI DM", dm_sent="Sent", dm_date=dm_day)]
     with Ledger() as led:
         seen = []
-        for offset in (7, 10, 13, 16, 19, 21, 22, 23):
+        for offset in (7, 10, 21, 22, 23, 26, 40):
             text, _r = led.day(ladder, dm_day + timedelta(days=offset))
             seen.append((offset, keep(text).split("\n")[0] if text else ""))
-        state = dict(led.state()[next(iter(led.state()))])
-        moved = [person("Cal Ladder", "Ladder Co", "Reach by LI DM", dm_sent="Replied", dm_date=dm_day)]
-        t_back, _r = led.day(moved, dm_day + timedelta(days=24))
-    check("with an LI DM Date the call ladder's end wins: calls to day 21, then the UNRESPONSIVE line once, "
-          "never the drop line",
-          seen, [(7, GROUP_LINES["call"]), (10, GROUP_LINES["call"]), (13, GROUP_LINES["call"]),
-                 (16, GROUP_LINES["call"]), (19, GROUP_LINES["call"]), (21, ""),
-                 (22, GROUP_LINES["unresponsive"]), (23, "")])
-    check("...the unresponsive line is itself a drop (closed), and they too come back if the sheet moves",
-          (state["closed"], t_back.split("\n")[0]), (True, GROUP_LINES["replied"]))
+        marked = [person("Cal Ladder", "Ladder Co", "Reach by LI DM", dm_sent="Sent", dm_date=dm_day,
+                         prospect="Unresponsive")]
+        t_marked, _r = led.day(marked, dm_day + timedelta(days=41))
+    check("the call ladder runs out on day 22, and THE UNRESPONSIVE LINE COMES ROUND AGAIN on later runs",
+          seen, [(7, GROUP_LINES["call"]), (10, GROUP_LINES["call"]), (21, GROUP_LINES["call"]),
+                 (22, GROUP_LINES["unresponsive"]), (23, GROUP_LINES["unresponsive"]),
+                 (26, GROUP_LINES["unresponsive"]), (40, GROUP_LINES["unresponsive"])])
+    check("...until Prospect Status says Unresponsive, which is what ends it", t_marked, "")
 
     nodate = [person("Dee Nodate", "Nodate Co", "Reach by LI DM", dm_sent="Sent")]
     with Ledger() as led:
         seen = []
-        for offset in (0, 1, 3, 20, 21, 22):
-            text, _r = led.day(nodate, start + timedelta(days=offset))
+        for offset in (0, 1, 3, 30):
+            text, _r = led.day(nodate, DAY + timedelta(days=offset))
             seen.append((offset, keep(text).split("\n")[0] if text else ""))
-    check("with NO LI DM Date: a call straight away, every three days, and the three-week DROP line is "
-          "the backstop (there is no ladder to run out)",
-          seen, [(0, GROUP_LINES["call"]), (1, ""), (3, GROUP_LINES["call"]), (20, GROUP_LINES["call"]),
-                 (21, GROUP_LINES["dropped"]), (22, "")])
-    check("...and no rendered line mentions a date, at any point",
+    check('LI DM Sent "Sent" with NO LI DM Date: a call, due today, again every three days, and never dropped',
+          seen, [(0, GROUP_LINES["call"]), (1, ""), (3, GROUP_LINES["call"]), (30, GROUP_LINES["call"])])
+    received = [person("Rae Received", "Co", "Reach by LI DM", dm_sent="Received")]
+    check('LI DM Sent "Received": the meeting line, NOT a call reminder and NOT "the DM has not gone out"',
+          (keep(post_of(engine(received))), ask_of(received)[:2]),
+          (GROUP_LINES["replied"] + "\n- Rae Received (Co)", ("due", "replied")))
+    check('..."received" is in both marker lists, and the replied list is the one checked first',
+          ("received" in config.NEXT_STEP_DM_SENT_MARKERS, "received" in config.NEXT_STEP_DM_REPLIED_MARKERS,
+           nextaction.dm_sent(rows_of(received)[0]), nextaction.dm_replied(rows_of(received)[0])),
+          (True, True, True, True))
+    check("no rendered line mentions a date",
           [t for t in RENDERED if re.search(r"\b\d{1,2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|"
                                             r"\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4}", t)], [])
-
-    nobody = [person("Nell Never", "Never Co", "Send email 1", meeting_date=start - timedelta(days=5))]
-    with Ledger() as led:
-        led.day(nobody, start)
-        t, _r = led.day(nobody, start + timedelta(days=21))
-    check("an ask nobody acts on (a meeting that happened, status still blank): dropped after three weeks",
-          t.split("\n")[0], GROUP_LINES["dropped"])
-
-    many = [person(f"Old{i}", f"Old Co {i}", "Send email 1", li=date(2026, 9, i + 1)) for i in range(7)]
-    fresh = [person(f"New{i}", f"New Co {i}", "Research the PoC") for i in range(6)]
-    with Ledger() as led:
-        for row in rows_of(many):
-            led.db.record_next_step_mention(nextaction._contact_key(row), signature=nextaction.step_signature(row),
-                                            on_date=dl.iso(start), ask="email_out")
-        text, res = led.day(many + fresh, start + timedelta(days=21))
-        text2, res2 = led.day(many + fresh, start + timedelta(days=22))
-    keep(text)
-    check("the drop line does not use up the five places: five reminders AND up to five dropped",
-          (len([a for a in res["actions"] if a["ask"] != "dropped"]),
-           len([a for a in res["actions"] if a["ask"] == "dropped"]), text.split("\n\n")[-1].split("\n")[0]),
-          (5, 5, GROUP_LINES["dropped"]))
-    check("...and the two who did not fit under the drop line are dropped the next day",
-          sorted(n for n, a in asks(res2) if a == "dropped"), ["Old5", "Old6"])
 
 
 def the_bot(check):
@@ -568,7 +534,7 @@ def the_bot(check):
             out["posts"] = [rw.strip_tag(m.content) for m in w.posted[n:]]
             out["tagged"] = post.content.startswith("[TEST")
             state = w.bot.db.next_step_state()
-            out["recorded"] = sorted((k.split("|")[-1], v["first_named"], v["last_ask"]) for k, v in state.items())
+            out["recorded"] = sorted((k.split("|")[-1], v["last_date"], v["last_ask"]) for k, v in state.items())
             with w.bot.db.conn() as c:
                 out["post_rows"] = c.execute("SELECT COUNT(*) FROM next_step_posts").fetchone()[0]
             out["counts_toward_cap"] = [r for r in w.drip_rows()]
@@ -614,15 +580,15 @@ def the_bot(check):
     check("test mode: the same message, tagged", (test["posts"], test["tagged"], live["tagged"]),
           (live["posts"], True, False))
     check("a preview (computing the queue) writes nothing to the reminder state", live["preview_wrote"], False)
-    check("after a real send each person is recorded with the day they were first named and what for",
+    check("after a real send each person is recorded with the day they were named and what for",
           [(n, d) for n, d, _a in live["recorded"]], [(n, dl.iso(DAY)) for n in sorted(
-              ("angelos perivolaropoulos", "ariya rastrow", "arjun aryaa", "harry swanson", "ioana mocanu"))])
+              ("angelos perivolaropoulos", "ariya rastrow", "arjun aryaa", "ioana mocanu", "oliver shoulson"))])
     check("...and nothing is written to next_step_posts any more", live["post_rows"], 0)
     check('"done", "sent it", "ok", "yes" under the post, from a member and an approver: no reply, no '
           "reaction, nothing written, no model call, nothing recorded, no proposal",
           live["after_done"], (0, 0, 0, 0, True, {}))
     check("a real question under the post is still a question", live["question"], False)
-    check("a test day on a live database leaves the reminder state and every drop clock untouched",
+    check("a test day on a live database leaves the rotation untouched",
           live["test_day"], (0, {}))
     check("the reply plumbing is gone from the bot", live["has_reply_plumbing"], [])
     import replies
@@ -635,23 +601,29 @@ def the_bot(check):
 
 
 def no_column_names(check):
-    print("\nNO COLUMN NAME IN ANY MESSAGE")
+    print("\nNO COLUMN NAME AND NO DROP WORDING IN ANY MESSAGE")
     everything = list(RENDERED) + wording.next_step_lines_for_check()
     check("something was rendered to look at", len(RENDERED) > 10, True)
     for name in COLUMN_NAMES:
         check(f'"{name}" appears in no rendered message and no line the post can carry',
               [t for t in everything if name in t], [])
+    check('no rendered message says "stop reminding", or carries any other drop wording',
+          [(w, t[:50]) for t in everything for w in DROP_WORDING if w in t.lower()], [])
 
 
 def settings(check):
     print("\nSETTINGS — the two new ones, the boot check, the rules file")
     src = open(os.path.join(ROOT, "config.py"), encoding="utf-8").read()
-    check("NEXT_STEP_DROP_AFTER_DAYS defaults to 21 in the code and in .env.example",
-          (bool(re.search(r'_int\("NEXT_STEP_DROP_AFTER_DAYS", 21\)', src)), _example("NEXT_STEP_DROP_AFTER_DAYS")),
-          (True, "21"))
-    check("NEXT_STEP_DM_SENT_MARKERS defaults to sent,yes,done in both",
-          (bool(re.search(r'"NEXT_STEP_DM_SENT_MARKERS", "sent,yes,done"', src)),
-           _example("NEXT_STEP_DM_SENT_MARKERS")), (True, "sent,yes,done"))
+    check("NEXT_STEP_DROP_AFTER_DAYS is retired: not read by the code, and only in the RETIRED block",
+          ("NEXT_STEP_DROP_AFTER_DAYS =" in src, hasattr(config, "NEXT_STEP_DROP_AFTER_DAYS"),
+           [ln[:1] for ln in open(os.path.join(ROOT, ".env.example"), encoding="utf-8")
+            if "NEXT_STEP_DROP_AFTER_DAYS=" in ln]), (False, False, ["#"]))
+    check("the DM markers: sent,received and replied,responded,received, in the code and in .env.example",
+          (bool(re.search(r'"NEXT_STEP_DM_SENT_MARKERS", "sent,received"', src)),
+           _example("NEXT_STEP_DM_SENT_MARKERS"),
+           bool(re.search(r'"NEXT_STEP_DM_REPLIED_MARKERS", "replied,responded,received"', src)),
+           _example("NEXT_STEP_DM_REPLIED_MARKERS")),
+          (True, "sent,received", True, "replied,responded,received"))
 
     def warnings(**values):
         with pinned(**values), tapped() as tap:
@@ -666,10 +638,10 @@ def settings(check):
 
     quiet, boot = warnings()
     check("the defaults raise no R13 warning at boot", quiet, [])
-    check("the boot line carries the new numbers",
-          [("DROPPED after 21d" in m, "dm_sent=sent,yes,done" in m) for m in boot], [(True, True)])
-    fast, _b = warnings(NEXT_STEP_DROP_AFTER_DAYS=5)
-    check("a drop under 7 days warns", [("NEXT_STEP_DROP_AFTER_DAYS=5" in m) for m in fast], [True])
+    check("the boot line says nobody is dropped and prints the marker lists",
+          [("nobody is dropped, each tier rotates" in m, "dm_sent=sent,received" in m,
+            "replied=replied,responded,received" in m, "DROPPED" in m) for m in boot],
+          [(True, True, True, False)])
     none, _b = warnings(NEXT_STEP_DM_SENT_MARKERS=[])
     check("an empty NEXT_STEP_DM_SENT_MARKERS warns",
           [("NEXT_STEP_DM_SENT_MARKERS is empty" in m) for m in none], [True])
@@ -679,10 +651,11 @@ def settings(check):
           (order.index("R13") < order.index("R5"), rule.max_items_per_post, rule.counts_toward_cap),
           (True, 5, False))
     wordy = str(getattr(rule, "sheet_wording", "") or "")
-    check("the Bot Rules wording says: a reminder, five a day, three weeks then dropped, never fills cells, "
-          "never replies",
-          [w for w in ("reminder", "5 people", "three weeks", "never fills", "does not reply")
+    check("the Bot Rules wording says: a reminder, five a day, nobody dropped, never fills cells, never replies",
+          [w for w in ("reminder", "5 people", "Nobody is dropped", "never fills", "does not reply")
            if w not in wordy], [])
+    check("...and no longer says anybody is dropped after three weeks",
+          [w for w in ("three weeks", "stop reminding") if w in wordy], [])
     check("...and no longer describes asking for cells",
           [w for w in ("Has it gone out", "mark 1st Email Sent", "set Next Steps to") if w in wordy], [])
 
@@ -693,7 +666,7 @@ def run(check):
         what_is_asked(check)
         the_message(check)
         the_order(check)
-        the_drop(check)
+        the_rotation(check)
     the_bot(check)
     no_column_names(check)
     settings(check)

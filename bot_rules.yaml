@@ -382,8 +382,8 @@ rules:
   # REBUILT AS A REMINDER on 12 Oct 2026).
   #
   # LISTED HERE, BEFORE R5, ON PURPOSE. One contact is named once a day and the
-  # earlier rule keeps them; R13 names 5 people (plus anybody it is dropping
-  # that day) and R5 and R6 would otherwise claim them first.
+  # earlier rule keeps them; R13 names 5 people and R5 would otherwise claim
+  # them first.
   #
   # IT IS A REMINDER. It says what needs doing and who for. It never names a
   # cell, never asks for anything to be filled in, never gives a date, and
@@ -409,17 +409,23 @@ rules:
   #   free text                           skipped and logged; never guessed at
   # A blank date always means "due now". A missing date is never mentioned.
   #
-  # THE ORDER: who replied; calls due; the last 3 days before a drop; the next
-  # email due; an email not sent; research and blank; unresponsive. Inside a
-  # group the OLDEST LI Connected Date first, then R5's company score, and rows
-  # with no date last in sheet order. Priority (AF) is read and not used.
+  # THE ORDER, six tiers: who replied; calls due; the next email due; an email
+  # not sent; research and blank; unresponsive. INSIDE A TIER, A ROTATION:
+  # whoever was named least recently goes first (never-named people ahead of
+  # everybody), then the OLDEST LI Connected Date, then R5's company score, and
+  # rows with no date last in sheet order. The Priority column is read and not
+  # used: the tiers are the priority.
   #
-  # THE THREE-WEEK DROP IS THE ONLY ENDING. Counted from the day Saley FIRST
-  # named the person for that step (NEXT_STEP_DROP_AFTER_DAYS, 21). That day
-  # they are named once under "I'll stop reminding about these" and then not
-  # again. The clock restarts when the row moves, and a dropped person comes
-  # back under the new step. The unresponsive line is a drop of the same kind.
-  # The drop line does not use up the five places.
+  # NOBODY IS DROPPED. People keep coming back in that order until their row
+  # moves: the step changes, a meeting is booked or completed, or Prospect
+  # Status or Deal Status takes the row out. (A three-week drop was agreed on
+  # 12 Oct 2026 and reversed the same day; NEXT_STEP_DROP_AFTER_DAYS is
+  # retired.) The unresponsive line therefore REPEATS, in its turn, until
+  # somebody sets Prospect Status to Unresponsive, which is the action it names.
+  #
+  # SALEY ONLY REMINDS. The step block (Next Steps, the three email Sent/Date
+  # pairs, LI DM Sent, LI DM Date) is locked against every write path by ROLE,
+  # wherever those columns sit on the tab (RESTRICTED_COLUMN_ROLES).
   - id: R13
     name: Next steps for connected contacts
     plain: next steps for the people we're connected with
@@ -434,9 +440,11 @@ rules:
       people whose first, second or third email hasn't gone out, people
       to research, and people who look unresponsive after the calls. Each
       person is one line, name and company. Whoever has waited longest
-      comes first. If nothing moves for three weeks after Saley first
-      names someone for a step, it says once that it will stop reminding
-      about them, and they are dropped until their row changes. A booked
+      comes first, and inside each group the people take turns: whoever
+      was named least recently is named next. Nobody is dropped: a person
+      keeps coming back until their row moves, and the list moves when
+      the sheet moves. Someone who looks unresponsive is named again in
+      their turn until Prospect Status is set to Unresponsive. A booked
       meeting pauses a person; a Completed meeting ends it. Saley never
       fills these cells and does not reply to answers under the post.
       Doesn't count toward the 5 posts a day.
@@ -642,9 +650,9 @@ rules:
   # stalled meeting with the same contact starts at rung 1. Outside the daily
   # cap, and on its own clock: the re-ask clock does not apply.
   #
-  # "NEXT STEPS" HERE MEANS THE NOTES COLUMN, Z "Notes/Remarks" (Vaishnavi, 7
+  # "NEXT STEPS" HERE MEANS THE NOTES COLUMN, "Notes/Remarks" (Vaishnavi, 7
   # Oct: "it means the next steps from notes; i've changed tht column name to
-  # avoid confusion"). It never reads Q, the Next Steps dropdown.
+  # avoid confusion"). It never reads the Next Steps dropdown.
   - id: R9
     name: Meeting done, no next steps
     plain: meetings that happened with no next steps recorded

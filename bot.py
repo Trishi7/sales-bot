@@ -225,8 +225,8 @@ OBJECTIVES_EXCLUDED_TYPES = frozenset({nextaction.R_AI_NEWS})
 _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+")
 
 # NFT2-1065 Q1 — DECIDED BY THE HUMAN ON 7 OCT 2026: YES. On an EXISTING
-# Outreach PoCs row columns A–I and S–X are never edited; a NEW row's Name,
-# Company and LinkedIn URL sit in A–I, and an approved add may write that row,
+# Outreach PoCs row the identity, step and commercial blocks are never edited;
+# a NEW row's Name, Company and LinkedIn URL sit in the identity block, and an approved add may write that row,
 # signed with a note on its Name cell. This one constant still gates both
 # halves: the ONE step that calls `gtm_sheet.append_row` for an approved add
 # (`SalesBot._write_poc_row`) and the offer itself — while it is False
@@ -769,7 +769,7 @@ class SalesBot(discord.Client):
             inactive_rows=(result or {}).get("inactive", 0),
             excluded_rejected=(result or {}).get("excluded", 0),
             explicit_activations=activated,
-            restricted_ranges=config.RESTRICTED_COLUMN_RANGES,
+            restricted_ranges=config.restricted_label(),
             writable_window=config.writable_window_label(),
             sheet_health_lines=len((result or {}).get("updates_all") or []),
         )
@@ -4804,7 +4804,10 @@ class SalesBot(discord.Client):
                     for r in explicit
                 ],
                 "columns_discovered": len(tab.headers),
-                "restricted_column_ranges": config.RESTRICTED_COLUMN_RANGES,
+                # THE LOCK IS BY ROLE; these letters are today's layout.
+                "restricted_column_ranges": config.restricted_label(),
+                "restricted_roles": list(config.RESTRICTED_COLUMN_ROLES),
+                "write_lock_failure": config.lock_failure(),
                 "writable_window": config.writable_window_label() or "(none)",
                 "writable_window_columns": window,
                 "writes_enabled": config.SHEET_WRITES_ENABLED,
@@ -9124,8 +9127,8 @@ class SalesBot(discord.Client):
         When wired it is `gtm_sheet.append_row` and nothing more. A NEW ROW
         MAY CARRY (since 9 Oct) Company, Industry, Name, Designation, Based,
         the research paper link and, only when a search returned a
-        linkedin.com/in url, the LinkedIn URL: all in columns A to I, which the
-        new-row band allows (NEW_ROW_WRITABLE_RANGES) and an existing row does
+        linkedin.com/in url, the LinkedIn URL: all in the identity block, which a
+        new row may fill (NEW_ROW_WRITABLE_ROLES) and an existing row may
         not. Email goes in only when EMAIL_WRITE_ALLOWED is on, the same switch
         that guards the Email cell of an existing row. A value that is blank is
         not sent. `append_row`'s own six checks (appendable tab, duplicate,
@@ -11113,9 +11116,8 @@ class SalesBot(discord.Client):
         R3 — an event listed as "date unclear" is recorded, which is what
         makes that line appear once.
 
-        R13 — each person the post named is recorded: the drop clock, the call
-        count, and the close for anybody under the drop or unresponsive line
-        (`_record_next_steps`).
+        R13 — each person the post named is recorded: the day, which rotates
+        each tier, and the call count (`_record_next_steps`).
 
         After the send, like every other ledger here: a post that was refused
         must not count as a mention.
@@ -11183,10 +11185,10 @@ class SalesBot(discord.Client):
 
         ONLY AFTER A REAL SEND — `_after_send` is not reached when the send was
         refused — and only for the people the post SHOWED. ONE thing is
-        written, each person's row in `next_step_followups`: the day they were
-        named, the day they were FIRST named for this step (the three-week
-        drop is counted from it), their call count, and `closed` for anybody
-        named under the drop line or the unresponsive line.
+        written, each person's row in `next_step_followups`: the step they
+        were named for, the day (which is what rotates each tier: least
+        recently named goes first) and their call count. Nothing closes a
+        person.
 
         THE POST ITSELF IS NO LONGER KEPT (12 Oct 2026). `next_step_posts`
         existed so a reply could be matched to a person; replies to this post
@@ -11200,15 +11202,15 @@ class SalesBot(discord.Client):
 
         THE TEST DAY IS STRICTER THAN R9's LADDER, ON PURPOSE. A test day sends
         through this same path with the real database. On a live database a
-        "make it Monday" would otherwise start, or run down, real people's
-        three-week drop clocks, and close asks nobody was really reminded
-        about. The post itself is identical either way.
+        "make it Monday" would otherwise move the real rotation: five people
+        would be skipped in the next real post because a rehearsal had named
+        them. The post itself is identical either way.
         """
         if (clock.pretending() and not simulation.in_simulation()
                 and not NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB
                 and not str(config.DB_PATH or "").endswith("_test.db")):
-            log.info("[rules] R13: test day on a live database; nobody's reminder state "
-                     "or drop clock is recorded")
+            log.info("[rules] R13: test day on a live database; the rotation is not "
+                     "recorded")
             return 0
         people = []
         for action in drip.shown_contacts(message):
@@ -11220,10 +11222,6 @@ class SalesBot(discord.Client):
                 lambda k=key, a=action, w=ask: self.db.record_next_step_mention(
                     k, signature=str(a.get("signature") or ""), on_date=marker, ask=w))
             people.append((key, ask))
-            if ask in (nextaction.ASK_DROPPED, nextaction.ASK_UNRESPONSIVE):
-                log.info("[rules] R13: %s was named under the %s line; no more reminders "
-                         "about this step (they come back when the sheet moves)", key,
-                         "drop" if ask == nextaction.ASK_DROPPED else "unresponsive")
         if not people:
             return 0
         log.info("[rules] R13: recorded %d person(s) named on %s (%s)", len(people),

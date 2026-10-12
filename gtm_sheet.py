@@ -75,14 +75,18 @@ unmatched is still carried as an "extra" so a question about a column this code
 has never heard of can still be answered. `GTM_COLUMN_MAP` overrides the match
 when wording is genuinely ambiguous.
 
-WRITES ARE DELIBERATELY TINY, AND THE RESTRICTED BANDS MAKE THEM SMALLER.
-`RESTRICTED_COLUMN_RANGES` (default "A:I,Q:W,Z:AE") names bands of columns that no
-write path here may touch; `_refuse_if_restricted()` is checked by every one of
-them, fails closed, and refuses rather than raising. READING IS UNRESTRICTED —
-this is a write lock only. The NAMED columns inside the writable window between
-the bands (J:P and X:Y on the 7 Oct 2026 layout) are logged at startup
-(`log_writable_window`) so a column that has shifted is visible before a write
-lands in the wrong place.
+WRITES ARE DELIBERATELY TINY, AND THE WRITE LOCK MAKES THEM SMALLER.
+`RESTRICTED_COLUMN_ROLES` names, BY ROLE, the columns no write path here may
+touch on an existing row: the identity block, the step block and the commercial
+block (config.py, "THE WRITE LOCK, BY ROLE"). It is resolved against the headers
+actually found each time the tab is read (`config.resolve_column_lock`, called
+from `_parse_values`), so it follows a column wherever it is moved.
+`_refuse_if_restricted()` is checked by every write path, fails closed, and
+refuses rather than raising; when a restricted role maps to NO column every
+write to the tab is refused. READING IS UNRESTRICTED — this is a write lock
+only. The letter each restricted role sits at today, and the writable columns,
+are logged at startup (`log_writable_window`, the [gtm.lock] lines), which is
+how a rearranged sheet is checked at a glance instead of after a bad write.
 
 `write_cells()` is the whole write surface: individual cells in ONE row of the
 canonical tab, one `values.update` per cell, all inside the writable window.
@@ -453,8 +457,8 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
     # one of them holds a date, so a header this list fails to recognise does not
     # degrade the bot's world, it empties it.
     POCS: {
-        # A-I: THE IDENTITY BLOCK. Restricted from writing (A:I), never from
-        # reading. Mapped so the bot can NAME the column when it refuses to
+        # THE IDENTITY BLOCK (config.IDENTITY_ROLES). Restricted from writing BY
+        # ROLE, wherever these columns sit today; never from reading. Mapped so the bot can NAME the column when it refuses to
         # write one — "I never write to Email id" beats "I don't have a rule for that".
         "sr_no": ("sr no", "sr. no.", "s.no", "sno", "serial", "#"),
         "company": ("company uni", "company/uni", "company", "company name",
@@ -480,9 +484,11 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "li_url": ("li url", "linkedin url", "linkedin", "linkedin profile",
                    "li profile", "profile link", "profile"),
 
-        # J-P and X-Y: THE WRITABLE WINDOWS. The only nine columns any write
-        # path can reach (J to P here, the two meeting columns further down),
-        # and the reason RESTRICTED_COLUMN_RANGES is A:I,Q:W,Z:AE.
+        # THE WRITABLE COLUMNS: who made the first contact, the LinkedIn
+        # connection cells, and the two meeting columns further down. They are
+        # writable because no restricted ROLE covers them
+        # (config.RESTRICTED_COLUMN_ROLES); where they sit on the tab does not
+        # matter.
         #
         # WHETHER first contact happened at all / who made it. Distinct from its
         # TYPE (K) and its DATE (L): "yes, by Sid, in March" is three facts in
@@ -518,9 +524,12 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
                        "message sent"),
         "li_dm_date": ("li dm date", "linkedin dm date", "dm date", "dm sent date",
                        "date dm sent", "message sent date"),
-        # Q-W: THE STEP BLOCK. Restricted from writing (Q:W): the team keeps the
-        # outreach sequence by hand, and R13 only ever REMINDS about these
-        # cells. Read freely.
+        # THE STEP BLOCK (config.STEP_ROLES: the Next Steps dropdown, the three
+        # email Sent/Date pairs, and LI DM Sent / LI DM Date above). Restricted
+        # from writing BY ROLE, so the lock follows these columns when the team
+        # moves them (they did, on 12 Oct 2026): the team keeps the outreach
+        # sequence by hand, and R13 only ever REMINDS about these cells. Read
+        # freely.
         #
         # THE STEP DROPDOWN (Q, "Next Steps"): Research the PoC / Send email
         # 1..3 / Reach by LI DM / Call the PoC. NOT the notes role below, which
@@ -537,7 +546,7 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "email_3_sent": ("3rd email sent", "third email sent", "email 3 sent"),
         "email_3_date": ("3rd email date", "third email date", "email 3 date"),
 
-        # X-Y: THE SECOND WRITABLE WINDOW — the two meeting columns.
+        # WRITABLE — the two meeting columns.
         "meeting_date": ("meeting date", "call date", "demo date", "meeting on",
                          "meeting"),
         # A STATE, NOT A DATE — "booked", "completed", "no-show", "rescheduled".
@@ -545,8 +554,9 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         "meeting_status": ("meeting status", "meeting state", "meeting outcome",
                            "meeting done", "meeting?"),
 
-        # Z-AE: THE COMMERCIAL BLOCK. Restricted from writing (Z:AE) because
-        # these are maintained by people and by formulas. Read freely.
+        # THE COMMERCIAL BLOCK (config.COMMERCIAL_ROLES, Priority included).
+        # Restricted from writing BY ROLE because these are maintained by
+        # people and by formulas. Read freely.
         #
         # THE NOTES ROLE (Z, "Notes/Remarks"). The name is historical: until
         # 7 Oct the column was 'Next Steps/Notes'. The dropdown is
@@ -2009,63 +2019,72 @@ class GTMSheets:
             )
 
     def log_writable_window(self, tab: "Tab") -> None:
-        """Name the columns that fall INSIDE the writable window, before any write.
+        """Say, before any write, WHERE THE LOCK SITS TODAY: the letter every
+        restricted role resolved to, and the writable columns as letters and as
+        roles.
 
-        THE POINT IS MISALIGNMENT, NOT PERMISSION. The restricted bands are
-        stated as column LETTERS (A:I, Q:W, Z:AE) and the sheet's columns move: insert
-        one column on the left and every header shifts a place, so the band that
-        used to cover the identity block now covers something else and the gap
-        the bot may write into now points at a column somebody is using.
-
-        Nothing can detect that from the letters alone, so the NAMES in the gap
-        are logged at startup. Somebody reading the boot log sees "writable
-        window J:P, X:Y holds 'First Contact', 'Meeting Date', ..." and knows immediately
-        whether the bands still mean what they meant. A write that lands in the
-        wrong column is discovered here, or it is discovered by the person whose
-        work it overwrote.
+        THE LOCK IS BY ROLE, SO IT FOLLOWS A COLUMN WHEN THE SHEET IS
+        REARRANGED. This log is how that is checked in one glance: after
+        somebody moves columns, the [gtm.lock] lines show each restricted role
+        at its new letter, and the writable list should still read as the
+        first-contact cells, the LinkedIn connection cells and the two meeting
+        cells. A restricted role that maps to no column is logged at ERROR and
+        every write to the tab is refused.
         """
-        windows = config.writable_windows()
-        label = config.writable_window_label()
-        if not windows:
-            log.warning(
-                "[gtm.window] %r: RESTRICTED_COLUMN_RANGES=%r leaves no writable window "
-                "between the bands — every write into the banded region is refused.",
-                tab.title, config.RESTRICTED_COLUMN_RANGES,
-            )
-            return
+        lock = getattr(tab, "lock", None) or config.resolve_column_lock(
+            tab.role_to_col, tab.headers, canonical=tab.canonical_role_to_col)
 
-        col_to_role = {i: r for r, i in tab.canonical_role_to_col.items()}
-        named: list[str] = []
-        for lo, hi in windows:
-            for idx in range(lo, min(hi, len(tab.headers) - 1) + 1):
-                header = str(tab.headers[idx]).strip()
-                if not header:
-                    continue
-                role = col_to_role.get(idx)
-                named.append(
-                    f"{config.column_label(idx)}={header!r}"
-                    + (f" [{role}]" if role else " [no role]")
-                )
+        def at(role):
+            idx = lock.by_role.get(role)
+            if idx is None:
+                return f"{role}=UNMAPPED"
+            header = tab.headers[idx] if idx < len(tab.headers) else ""
+            return f"{role}={config.column_label(idx)} {str(header).strip()!r}"
+
+        for name, roles in (("identity", config.IDENTITY_ROLES), ("step", config.STEP_ROLES),
+                            ("commercial", config.COMMERCIAL_ROLES)):
+            mine = [r for r in roles if r in config.RESTRICTED_COLUMN_ROLES]
+            if mine:
+                log.info("[gtm.lock] %r: restricted, %s block (NEVER written on an existing "
+                         "row): %s", tab.title, name, ", ".join(at(r) for r in mine))
+        other = [r for r in config.RESTRICTED_COLUMN_ROLES
+                 if r not in config.IDENTITY_ROLES + config.STEP_ROLES + config.COMMERCIAL_ROLES]
+        if other:
+            log.info("[gtm.lock] %r: restricted, other roles: %s", tab.title,
+                     ", ".join(at(r) for r in other))
+        if config.RESTRICTED_COLUMN_RANGES:
+            log.info("[gtm.lock] %r: also restricted by letter (RESTRICTED_COLUMN_RANGES): "
+                     "%s. A range can only lock more.", tab.title,
+                     config.RESTRICTED_COLUMN_RANGES)
+        if lock.unmapped:
+            log.error(
+                "[gtm.lock] %r: restricted role(s) %s map to NO column. Every write to "
+                "this tab is refused until they do.", tab.title, ", ".join(lock.unmapped))
+            return
+        writable = lock.writable()
+        named = [f"{config.column_label(i)}={str(tab.headers[i]).strip()!r} [{lock.role_of[i]}]"
+                 for i in writable if i < len(tab.headers)]
         log.info(
-            "[gtm.window] %r: restricted %s (NEVER written). Writable window %s holds "
-            "%d named column(s): %s",
-            tab.title,
-            ", ".join(
-                f"{config.column_label(lo)}:{config.column_label(hi)}"
-                if lo != hi else config.column_label(lo)
-                for lo, hi in config.RESTRICTED_COLUMN_BANDS
-            ) or "(none)",
-            label, len(named),
-            ", ".join(named) or "(no named columns — the window is past the last header)",
+            "[gtm.window] %r: restricted today at %s. WRITABLE on an existing row: %s "
+            "(roles: %s) — %d named column(s): %s", tab.title,
+            config._runs_label(lock.restricted) or "(none)",
+            config._runs_label(writable) or "(none)",
+            ", ".join(lock.role_of[i] for i in writable) or "(none)", len(named),
+            ", ".join(named) or "(none)",
         )
+        new_row = sorted(lock.new_row)
+        log.info("[gtm.lock] %r: a NEW row may fill %s (roles: %s)", tab.title,
+                 config._runs_label(new_row) or "(none)",
+                 ", ".join(lock.role_of.get(i, f"col {config.column_label(i)}")
+                           for i in new_row) or "(none)")
+        if lock.ignored_new:
+            log.warning("[gtm.lock] %r: NEW_ROW_WRITABLE_ROLES names %s, which the step or "
+                        "commercial block locks; not opened.", tab.title,
+                        ", ".join(lock.ignored_new))
         if not named:
             log.warning(
-                "[gtm.window] %r: the writable window %s contains NO named column. Either "
-                "the tab is narrower than the window or the bands have drifted out of "
-                "alignment with the sheet. Check RESTRICTED_COLUMN_RANGES against the "
-                "full schema logged above before enabling writes.",
-                tab.title, label,
-            )
+                "[gtm.window] %r: NO column is writable on an existing row. Every mapped "
+                "column is covered by a restricted role or range.", tab.title)
 
     def writable_window_columns(self, tab: "Tab") -> list[dict]:
         """[{column, header, role}] for every NAMED column inside the writable
@@ -2207,12 +2226,34 @@ class GTMSheets:
         if kind == POCS:
             self._warn_retired_roles(title, headers)
 
-        return Tab(
+        tab = Tab(
             title=title, kind=kind, headers=headers,
             role_to_col=role_to_col, rows=rows, read_at=read_at,
             header_row=hidx + 1, error_cells=error_cells,
             canonical_role_to_col=canonical_role_to_col,
         )
+        if kind == POCS:
+            # THE WRITE LOCK IS RESOLVED HERE, from the headers this read
+            # found, and put in force. Every write path re-reads the tab
+            # before it writes, so the lock is never older than the write.
+            tab.lock = config.resolve_column_lock(
+                role_to_col, headers, canonical=tab.canonical_role_to_col)
+            config.set_active_lock(tab.lock)
+            if tab.lock.unmapped:
+                seen = getattr(self, "_lock_failures_logged", None)
+                if seen is None:
+                    seen = self._lock_failures_logged = set()
+                key = (title, tab.lock.unmapped)
+                if key not in seen:
+                    seen.add(key)
+                    log.error(
+                        "[gtm.lock] %r: THE WRITE LOCK CANNOT BE RESOLVED. No column maps "
+                        "to the restricted role(s) %s (RESTRICTED_COLUMN_ROLES): a header "
+                        "was renamed or a column removed. EVERY WRITE TO THIS TAB IS "
+                        "REFUSED until each of those roles maps to a column again. "
+                        "Headers found: %s", title, ", ".join(tab.lock.unmapped),
+                        ", ".join(repr(str(h)) for h in headers if str(h).strip()))
+        return tab
 
     @staticmethod
     def _warn_retired_roles(title: str, headers: list[str]) -> None:
@@ -2580,8 +2621,10 @@ class GTMSheets:
              is reported, not appended. Said out loud — a silent skip reads as
              a successful append to everybody downstream.
           3. WHICH COLUMNS. Only MAPPED roles, and on Outreach PoCs only the
-             new-row bands A:P and X:Y. Q-W and Z-AE are refused on a new
-             row exactly as they are on an existing one: a bot that has just
+             roles a new row may fill (NEW_ROW_WRITABLE_ROLES: the identity
+             block and the first-contact and connection cells). The step
+             block and the commercial block are refused on a new row
+             exactly as they are on an existing one: a bot that has just
              discovered a company has no business stating its closure
              probability, or which email has gone out.
           4. AN EMPTY ROW, CHECKED IMMEDIATELY BEFORE WRITING. Not "the row
@@ -2650,6 +2693,13 @@ class GTMSheets:
             out["remedy"] = "Add its kind to SHEET_APPENDABLE_TABS if it should grow."
             return out
 
+        if tab.kind == POCS and config.lock_failure():
+            # THE LOCK FAILED CLOSED (see `_refuse_if_restricted`): no new row either.
+            failure = config.lock_failure()
+            log.error("[gtm] REFUSING to append a row to %r: %s", tab.title, failure)
+            out["error"] = f"{failure}. No row was added"
+            return out
+
         company = str(values.get("company") or expect_company or "").strip()
         poc = str(values.get("name") or values.get("poc") or values.get("event") or "").strip()
         dup = self.find_duplicate(tab, company=company, poc=poc)
@@ -2687,9 +2737,11 @@ class GTMSheets:
                 refused.append({
                     "role": role,
                     "why": (
-                        f"column {config.column_label(idx)} is outside "
-                        f"NEW_ROW_WRITABLE_RANGES ({config.NEW_ROW_WRITABLE_RANGES}) — "
-                        "that column is not one a new row may fill"
+                        f"column {config.column_label(idx)} ({role}) is not in "
+                        "NEW_ROW_WRITABLE_ROLES (the NEW_ROW_WRITABLE_RANGES/"
+                        "NEW_ROW_WRITABLE_ROLES settings) — that column is not one a "
+                        "new row may fill"
+                        + (f"; and {config.lock_failure()}" if config.lock_failure() else "")
                     ),
                 })
                 continue
@@ -3035,8 +3087,8 @@ class GTMSheets:
     # Outreach PoCs tab, ONLY inside the writable window between the restricted
     # bands. Three locks, all still here:
     #   1. `_refuse_if_read_only` — never the mapping sheet.
-    #   2. `_refuse_if_restricted` — never a column in A:I, Q:W or Z:AE. Fails
-    #      closed.
+    #   2. `_refuse_if_restricted` — never a column whose ROLE is restricted
+    #      (identity, step, commercial). Fails closed.
     #   3. the row interlock — the target row must still name the company the
     #      caller believes it does.
     # Plus one new one: every write returns the PRIOR values, so an undo can put
@@ -3064,17 +3116,21 @@ class GTMSheets:
     def _refuse_if_restricted(col_index0, *, what: str) -> str:
         """"" when this 0-based column may be written to, else why it may not.
 
-        THE SECOND LOCK, unchanged since V1 and now the one that matters most:
-        the bot writes into the sheet the team actually works in, so the bands
-        are the whole safety story. RESTRICTED_COLUMN_RANGES (A:I, Q:W and
-        Z:AE by default) covers the identity block on the left, the outreach
-        step block in the middle and the commercial block on the right — all
-        maintained by people and by formulas the bot cannot see.
+        THE SECOND LOCK, and the one that matters most: the bot writes into
+        the sheet the team actually works in, so this is the whole safety
+        story. The lock is BY ROLE (config.RESTRICTED_COLUMN_ROLES): the
+        identity block, the outreach step block and the commercial block, all
+        maintained by people and by formulas the bot cannot see, wherever
+        those columns sit on the tab today.
 
         It is checked HERE, in the write path, on the ACTUAL column about to be
         written, and it FAILS CLOSED: an index that cannot be read as a number
-        is refused.
+        is refused, and so is EVERY column when a restricted role maps to no
+        column on the tab (a renamed header must not quietly unlock its cells).
         """
+        failure = config.lock_failure()
+        if failure:
+            return f"REFUSING to {what}: {failure}."
         if not config.is_restricted_column(col_index0):
             return ""
         band = config.restricted_band_label(col_index0)
@@ -3082,10 +3138,14 @@ class GTMSheets:
             letter = _col_letter(int(col_index0))
         except (TypeError, ValueError):
             letter = "?"
+        lock = config.active_lock()
+        role = (lock.role_of.get(int(col_index0), "") if lock is not None
+                and str(col_index0).lstrip("-").isdigit() else "")
         return (
-            f"REFUSING to {what}: column {letter} is inside the restricted band "
-            f"{band or '(unreadable)'} (RESTRICTED_COLUMN_RANGES="
-            f"{config.RESTRICTED_COLUMN_RANGES!r}), which the bot may never write to. "
+            f"REFUSING to {what}: column {letter}"
+            + (f" ({role})" if role else "")
+            + f" is restricted (today's restricted band {band or '(unreadable)'}; the lock "
+            "is by role, RESTRICTED_COLUMN_ROLES), and the bot may never write to it. "
             f"The writable window is {config.writable_window_label() or '(none)'}. "
             f"Reading that column is unaffected."
         )
@@ -3186,6 +3246,14 @@ class GTMSheets:
         if tab is None:
             out["error"] = "there is no Outreach PoCs tab to write to"
             return out
+        # THE LOCK FAILED CLOSED: a restricted role maps to no column on the tab
+        # as it reads right now. Nothing is written to it, by any path, until
+        # every restricted role maps to a column again.
+        failure = config.lock_failure()
+        if failure:
+            log.error("[gtm] REFUSING a write to %r: %s", tab.title, failure)
+            out["error"] = f"{failure}. Nothing was written"
+            return out
 
         mismatch = self._row_mismatch(row=int(row), expect_company=expect_company)
         if mismatch:
@@ -3272,7 +3340,7 @@ class GTMSheets:
                     restore_from: str = "") -> dict:
         """Write ONE email address into ONE row's Email cell — if it is blank.
 
-        THE SINGLE EXCEPTION TO "THE BOT NEVER WRITES A:I". The Email column
+        THE SINGLE EXCEPTION TO "THE BOT NEVER WRITES THE IDENTITY BLOCK". The Email column
         sits in the restricted identity band, and `write_cells` refuses it, as
         it refuses every column there. This method is the only way past, and it
         is deliberately narrow — each of these is checked here, in the write
@@ -3342,6 +3410,14 @@ class GTMSheets:
         if tab is None:
             out["error"] = "there is no Outreach PoCs tab to write to"
             return out
+        # THE LOCK FAILED CLOSED: a restricted role maps to no column on the tab
+        # as it reads right now. Nothing is written to it, by any path, until
+        # every restricted role maps to a column again.
+        failure = config.lock_failure()
+        if failure:
+            log.error("[gtm] REFUSING a write to %r: %s", tab.title, failure)
+            out["error"] = f"{failure}. Nothing was written"
+            return out
         mismatch = self._row_mismatch(row=int(row), expect_company=expect_company)
         if mismatch:
             log.error("[gtm] %s", mismatch)
@@ -3405,7 +3481,8 @@ class GTMSheets:
 
         WHY A SECOND METHOD RATHER THAN A `tab=` ARGUMENT ON THE FIRST.
         `write_cells` carries the Outreach PoCs tab's own safety furniture — the
-        restricted-band refusal (Q:W and Z:AE are the humans' territory) and the
+        restricted-role refusal (the step and commercial blocks are the humans'
+        territory) and the
         company-name interlock that proves the row is still the row somebody
         approved. Neither has any meaning on the Events tab, and threading a tab
         through the original would have meant `if tab is pocs` around both, with
@@ -3423,7 +3500,7 @@ class GTMSheets:
         THE OUTREACH PoCs TAB IS REFUSED OUTRIGHT. It is on the appendable
         list (a new row may be added to it), and this method has no band check,
         so without the refusal a caller handing it that tab could fill a blank
-        cell in Q:W or Z:AE.
+        cell in the step block or the commercial block.
         """
         out: dict = {"ok": False, "written": [], "refused": [], "error": "",
                      "dry_run": False}

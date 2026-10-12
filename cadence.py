@@ -706,10 +706,10 @@ def boot_report_text(
     lines += [
         "WRITE LOCK",
         "-" * 78,
-        f"  restricted (never written): {config.RESTRICTED_COLUMN_RANGES!r}"
-        f"  -> {', '.join(config.column_label(lo) + ':' + config.column_label(hi) for lo, hi in config.RESTRICTED_COLUMN_BANDS) or '(none)'}",
-        f"  writable window between the bands: "
-        f"{config.writable_window_label() or '(none)'}",
+        f"  restricted BY ROLE (never written on an existing row): "
+        f"{len(config.RESTRICTED_COLUMN_ROLES)} role(s); today at {config.restricted_label()}",
+        f"  writable on an existing row: {config.writable_window_label() or '(none)'}"
+        f" ({', '.join(config.writable_roles()) or 'no roles'})",
         "  reading is UNRESTRICTED — this is a write lock only.",
         "",
     ]
@@ -826,10 +826,21 @@ def _self_test() -> int:
         True,
     )
 
-    print("\nrestricted bands (config)")
-    check("A is restricted", config.is_restricted_column(0), True)
-    check("J is writable", config.is_restricted_column(9), False)
-    check("S is restricted", config.is_restricted_column(18), True)
+    print("\nthe write lock, by role (config)")
+    saved_lock = config.active_lock()
+    config.set_active_lock(None)
+    check("before any tab is read, every column is restricted", config.is_restricted_column(9), True)
+    roles = list(config.IDENTITY_ROLES) + ["first_contact"] + list(config.STEP_ROLES) \
+        + ["meeting_date"] + list(config.COMMERCIAL_ROLES)
+    config.set_active_lock(config.resolve_column_lock({r: i for i, r in enumerate(roles)}))
+    check("the identity block is restricted", config.is_restricted_column(roles.index("email")), True)
+    check("First Contact is writable", config.is_restricted_column(roles.index("first_contact")), False)
+    check("the step block is restricted", config.is_restricted_column(roles.index("outreach_step")), True)
+    check("Priority is restricted", config.is_restricted_column(roles.index("poc_priority")), True)
+    config.set_active_lock(config.resolve_column_lock({"name": 0, "first_contact": 1}))
+    check("a restricted role with no column: everything is refused",
+          (config.is_restricted_column(1), bool(config.lock_failure())), (True, True))
+    config.set_active_lock(saved_lock)
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

@@ -8,17 +8,25 @@ config.py helpers reading .env. Separate process from the PM/triage bot.
 - Never read, print, copy or commit .env, *-write.json or any key file. Use .env.example
   for variable names.
 - The bot never contacts anyone outside the team's sales channels.
-- On an EXISTING Outreach PoCs row, columns A–I, Q–W and Z–AE are read-only
-  (RESTRICTED_COLUMN_RANGES; in the 7 Oct 2026 layout Q is the Next Steps dropdown, R–W
-  the three email Sent/Date pairs, Z–AE Notes/Remarks through Deal Status). Writes may be
-  proposed only in J–P and X–Y. Two exceptions, each after an approver's yes: (1) the
-  Email cell (F), via an email_write proposal, only if still blank, behind
-  EMAIL_WRITE_ALLOWED; (2) a NEW row, via a row_add proposal, which may fill only A–P and
-  X–Y (NEW_ROW_WRITABLE_RANGES): Name, Company, and the LinkedIn URL only if a search
+- On an EXISTING Outreach PoCs row, three blocks of columns are read-only, and they are
+  locked BY ROLE (RESTRICTED_COLUMN_ROLES), never by letter, so the lock follows a column
+  when the team moves it: the IDENTITY block (Sr No through LI Url, Email included), the
+  STEP block (the Next Steps dropdown, the three email Sent/Date pairs, LI DM Sent and LI
+  DM Date) and the COMMERCIAL block (Notes/Remarks through Deal Status, and Priority).
+  Writes may be proposed only in what is left: First Contact, First Contact Type, First
+  Contact Date, Sid - LI Addition, LI Connected Date, Meeting Date and Meeting Status.
+  Letters are only ever "today's layout, logged at startup" ([gtm.lock] / [gtm.window]);
+  never hardcode one. RESTRICTED_COLUMN_RANGES is an optional letter override that can
+  only lock MORE. If a restricted role maps to no column, every write to the tab is
+  refused until it maps again. Two exceptions, each after an approver's yes: (1) the
+  Email cell, via an email_write proposal, only if still blank, behind
+  EMAIL_WRITE_ALLOWED; (2) a NEW row, via a row_add proposal, which may fill only the
+  identity block and the first-contact and connection cells (NEW_ROW_WRITABLE_ROLES),
+  never a step or commercial cell: Name, Company, and the LinkedIn URL only if a search
   returned a linkedin.com/in link. Every row the bot adds carries a visible signature
   ("Added by Saley · approved by <approver> · <date IST>" plus the source link) in a cell
   note on the Name cell, never in a data column. Never add a column without asking the
-  human. Rule 13 never writes: it asks people to update Q–W themselves.
+  human. Rule 13 never writes: it asks people to update the step block themselves.
 - Every sheet add or edit goes through an approval proposal. Nothing writes on its own.
 - LinkedIn: public search for a profile link is in scope. Never fetch linkedin.com,
   never pull content from inside a profile, never send connection requests.

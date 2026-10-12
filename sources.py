@@ -190,8 +190,8 @@ ONE spreadsheet sits behind this source now — the sandbox copy is retired and
             window = config.writable_window_label() or "(none)"
             detail += (
                 f" I can write cells in the writable window {window} of the Outreach "
-                f"PoCs tab, and nowhere else — the bands {config.RESTRICTED_COLUMN_RANGES} "
-                f"are refused in code. Every write is echoed here and undoable for "
+                f"PoCs tab, and nowhere else — the identity, step and commercial "
+                f"columns ({config.restricted_label()} today) are refused in code. Every write is echoed here and undoable for "
                 f"{config.SHEET_WRITE_UNDO_HOURS}h. The service account needs EDITOR on "
                 f"the playbook for that; Viewer reads fine and fails on the first write."
             )

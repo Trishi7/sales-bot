@@ -664,8 +664,8 @@ CREATE TABLE IF NOT EXISTS focus (
 
 -- RULE 9's ANSWERS, which the bot may NOT put in the sheet.
 --
--- Notes, package and deal size live in Z-AE, the restricted commercial
--- block. R9 asks for them; when somebody answers, the answer is recorded HERE
+-- Notes, package and deal size live in the restricted commercial block
+-- (locked by role). R9 asks for them; when somebody answers, the answer is recorded HERE
 -- and in the audit log, and the bot says plainly that a human has to put it in
 -- the sheet. Recording it is not a substitute for the sheet and is not
 -- presented as one — it is so the answer is not lost between being given and
@@ -778,16 +778,14 @@ CREATE TABLE IF NOT EXISTS meeting_followups (
 -- `last_date` is the last day they were named (it is how "today's people stay
 -- today's people" is known); `last_ask` is what they were named for.
 --
--- `first_named` IS THE DROP CLOCK (12 Oct 2026; added by a migration). The day
--- the bot first named this person FOR THIS SIGNATURE. NEXT_STEP_DROP_AFTER_DAYS
--- later the ask is dropped. It is separate from `last_date` because the clock
--- must start at the first naming and `last_date` moves with every post.
+-- `last_date` IS ALSO THE ROTATION (12 Oct 2026): inside a tier the person
+-- named least recently for their current step goes first.
 --
--- `closed` / `closed_date` ARE THE DROP: set when the person is named under
--- the drop line, or under the unresponsive line. `closed` BELONGS TO THE
--- SIGNATURE like everything else here: when the step changes the person comes
--- back, with a new `first_named` and a fresh three weeks. (Until 12 Oct it
--- survived a step change, and a closed person never returned.)
+-- `first_named`, `closed` AND `closed_date` ARE RETAINED AND NO LONGER USED
+-- (12 Oct 2026). They carried a three-week drop that was built and removed
+-- the same day: nobody is dropped while their row still says work is due, and
+-- nothing closes a person. The columns are left so an existing database opens
+-- unchanged. NOTHING READS THEM, and new rows leave them at their defaults.
 --
 -- WRITTEN ONLY BY THE SENDER, after a real send. The evaluator is handed a
 -- copy and writes nothing, so a preview cannot move the rotation.
@@ -1121,9 +1119,9 @@ KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls
 # alter an existing table, so an already-created sales_bot.db needs them
 # back-filled. (table, column, DDL) — each added only if missing. Idempotent.
 _MIGRATIONS: list[tuple[str, str, str]] = [
-    # R13: THE DAY A PERSON WAS FIRST NAMED FOR THEIR CURRENT STEP, which is
-    # what the three-week drop is counted from. Blank on rows written before
-    # 12 Oct 2026: their clock starts at their next naming.
+    # R13: RETAINED, NO LONGER USED (12 Oct 2026). It was the clock of a
+    # three-week drop that was removed the day it was added. The migration
+    # stays so a database created without the column still opens the same.
     ("next_step_followups", "first_named", "TEXT NOT NULL DEFAULT ''"),
     # R11: THE DAY A COMPANY WAS LAST SEEN TO HAVE LEFT THE MASTER PIPELINE (or
     # been renamed away). NULL while it is on the tab. A retired row is never
@@ -2745,41 +2743,36 @@ class DB:
     # -- R13: the next-step reminders ---------------------------------------
 
     def next_step_state(self) -> Optional[dict]:
-        """{row_key: {signature, last_date, first_named, mentions, calls,
-        last_call_date, last_ask, closed, closed_date}} for R13, or None when
-        it cannot be read.
+        """{row_key: {signature, last_date, mentions, calls, last_call_date,
+        last_ask}} for R13, or None when it cannot be read.
 
         FAILS CLOSED, AND NOT THE WAY R9's LADDER DOES. An empty dict here would
-        mean "nobody has ever been named": every drop clock would start again
-        and every person already dropped would be reminded about again. None
+        mean "nobody has ever been named": the rotation would start again from
+        the top and the people named yesterday would be named again. None
         means "unknown", and the evaluator posts nothing on it.
         """
         try:
             with self.conn() as c:
                 rows = c.execute(
-                    "SELECT row_key, signature, last_date, first_named, mentions, "
-                    "calls, last_call_date, last_ask, closed, closed_date "
-                    "FROM next_step_followups"
+                    "SELECT row_key, signature, last_date, mentions, "
+                    "calls, last_call_date, last_ask FROM next_step_followups"
                 ).fetchall()
             return {
                 r["row_key"]: {
                     "signature": str(r["signature"] or ""),
                     "last_date": str(r["last_date"] or ""),
-                    "first_named": str(r["first_named"] or ""),
                     "mentions": int(r["mentions"] or 0),
                     "calls": int(r["calls"] or 0),
                     "last_call_date": str(r["last_call_date"] or ""),
                     "last_ask": str(r["last_ask"] or ""),
-                    "closed": bool(r["closed"]),
-                    "closed_date": str(r["closed_date"] or ""),
                 }
                 for r in rows
             }
         except Exception:
             log.exception(
                 "[db] the next-step reminder state could not be read. R13 posts "
-                "nothing until it can: guessing would restart every drop clock and "
-                "remind about people it has already dropped."
+                "nothing until it can: guessing would restart the rotation and name "
+                "yesterday's people again."
             )
             return None
 
@@ -2792,13 +2785,11 @@ class DB:
         change the rotation it was previewing.
 
         A different stored signature means the step changed since the last
-        mention, so EVERYTHING for the old step is dropped first: the counts,
-        the drop clock (`first_named` becomes today) and `closed`. That is how
-        a dropped person comes back when the sheet moves.
+        mention, so the counts for the old step are dropped first.
 
-        `ask` "dropped" or "unresponsive" CLOSES the ask: the person was named
-        under the drop line or the unresponsive line, and is not named again
-        for this signature.
+        NOTHING CLOSES A PERSON (12 Oct 2026). `closed`, `closed_date` and
+        `first_named` are left at whatever the row already holds and are never
+        read; see the table's comment.
         """
         key = str(row_key or "").strip()
         if not key:
@@ -2808,34 +2799,25 @@ class DB:
         what = str(ask or "")
         with self.conn() as c:
             row = c.execute(
-                "SELECT signature, first_named, mentions, calls, last_call_date, closed, "
-                "closed_date FROM next_step_followups WHERE row_key = ?", (key,)
+                "SELECT signature, mentions, calls, last_call_date "
+                "FROM next_step_followups WHERE row_key = ?", (key,)
             ).fetchone()
             same = bool(row) and str(row["signature"] or "") == sig
             mentions = (int(row["mentions"] or 0) if same else 0) + 1
             calls = int(row["calls"] or 0) if same else 0
             last_call = str(row["last_call_date"] or "") if same else ""
-            first = (str(row["first_named"] or "") if same else "") or day
-            closed = int(row["closed"] or 0) if same else 0
-            closed_date = str(row["closed_date"] or "") if same else ""
             if what == "call":
                 calls += 1
                 last_call = day
-            if what in ("unresponsive", "dropped"):
-                closed, closed_date = 1, day
             c.execute(
                 "INSERT INTO next_step_followups (row_key, signature, last_date, "
-                "first_named, mentions, calls, last_call_date, last_ask, closed, "
-                "closed_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "mentions, calls, last_call_date, last_ask) VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(row_key) DO UPDATE SET "
                 "signature = excluded.signature, last_date = excluded.last_date, "
-                "first_named = excluded.first_named, "
                 "mentions = excluded.mentions, calls = excluded.calls, "
                 "last_call_date = excluded.last_call_date, last_ask = excluded.last_ask, "
-                "closed = excluded.closed, closed_date = excluded.closed_date, "
                 "updated_at = CURRENT_TIMESTAMP",
-                (key, sig, day, first, mentions, calls, last_call, what, closed,
-                 closed_date),
+                (key, sig, day, mentions, calls, last_call, what),
             )
 
     def open_proposal(self, *, proposal_key: str, kind: str, tab: str,
@@ -3200,7 +3182,7 @@ class DB:
         """Record what somebody said came out of a meeting.
 
         THIS IS NOT THE SHEET AND IS NEVER PRESENTED AS IT. Next steps, package
-        and deal size live in Z-AE, the restricted commercial block, and the bot
+        and deal size live in the restricted commercial block, and the bot
         does not write there — on any row, with any approval. What this table is
         for is that the answer is not LOST between being given in a channel and
         being typed into the sheet by a person. `in_sheet` stays 0 until

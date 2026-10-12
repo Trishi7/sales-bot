@@ -50,27 +50,27 @@ def test_the_message_is_the_agreed_lines_and_one_name_a_line():
     _run(nsx.the_message)
 
 
-def test_the_order_is_seven_tiers_then_the_oldest_connection():
+def test_the_order_is_six_tiers_then_whoever_was_named_least_recently():
     _run(nsx.the_order)
 
 
-def test_the_three_week_drop_is_the_only_ending():
-    """Day 20 named, day 21 in the drop line, day 22 absent; a step change resets it."""
-    _run(nsx.the_drop)
+def test_nobody_is_dropped_and_each_tier_rotates():
+    """Twelve people, five a post: 5, the next 5, then the last 2 and the first 3."""
+    _run(nsx.the_rotation)
 
 
 def test_the_send_path_records_state_and_replies_are_not_read():
     _run(nsx.the_bot, pin=False)
 
 
-def test_no_rendered_message_names_a_column():
+def test_no_rendered_message_names_a_column_or_carries_drop_wording():
     """Runs the groups that render messages first, so there is something to sweep."""
     with nsx.pinned():
         quiet = lambda *a, **k: None  # noqa: E731
         nsx.RENDERED.clear()
         nsx.who_is_in(quiet)
         nsx.the_message(quiet)
-        nsx.the_drop(quiet)
+        nsx.the_rotation(quiet)
     _run(nsx.no_column_names, pin=False)
 
 

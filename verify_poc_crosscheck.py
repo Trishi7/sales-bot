@@ -70,7 +70,11 @@ def say(title):
 PINS = {"POC_MANDATORY_FIELDS": ["name", "designation", "li_url"], "POC_SUGGEST_MAX_PER_COMPANY": 3,
         "POC_FILL_MAX_ROWS_PER_COMPANY": 5, "NEW_COMPANY_AFTER_WORKING_DAYS": 1, "NEW_COMPANY_WINDOW_DAYS": 7,
         "EMAIL_WRITE_ALLOWED": False, "SHEET_WRITES_ENABLED": True,
-        "RESTRICTED_COLUMN_RANGES": "A:I,Q:W,Z:AE", "NEW_ROW_WRITABLE_RANGES": "A:P,X:Y"}
+        # THE LOCK IS BY ROLE (12 Oct 2026): the contract's role lists, and no letter range.
+        "RESTRICTED_COLUMN_ROLES": list(config.IDENTITY_ROLES + config.STEP_ROLES + config.COMMERCIAL_ROLES),
+        "NEW_ROW_WRITABLE_ROLES": list(config.IDENTITY_ROLES) + [
+            "first_contact", "first_contact_type", "first_contact_date", "sid_li_added", "li_connected_date"],
+        "RESTRICTED_COLUMN_RANGES": "", "NEW_ROW_WRITABLE_RANGES": ""}
 INDUSTRY = {"Oogam AI": "Voice AI", "Underdog AI": "AI Labs", "Limbic AI": "Mental Health AI",
             "Fullhouse Labs": "Voice AI"}        # "Blank Co" has no Industry on the Master Pipeline
 
@@ -469,9 +473,9 @@ async def the_write():
         tab = gtm_sheet.SHEETS.tab(gtm_sheet.POCS)
         roles = ("company", "industry", "name", "designation", "email", "based", "paper_links", "li_url")
         idx = [tab.canonical_role_to_col[r] for r in roles]
-        check("the fields are columns B to I: writable on a NEW row, read-only on an existing one",
-              ("".join(chr(65 + i) for i in idx), [config.may_write_new_row_column(i) for i in idx],
-               [i in config.RESTRICTED_COLUMN_INDEXES for i in idx]), ("BCDEFGHI", [True] * 8, [True] * 8))
+        check("the fields are the identity block: writable on a NEW row, read-only on an existing one",
+              ([config.may_write_new_row_column(i) for i in idx],
+               [config.is_restricted_column(i) for i in idx]), ([True] * 8, [True] * 8))
 
     with Stage(["Fullhouse Labs"], pins={"EMAIL_WRITE_ALLOWED": True}) as s:
         await s.wednesday()

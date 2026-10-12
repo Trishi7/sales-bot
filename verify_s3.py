@@ -189,8 +189,13 @@ POC_HEADERS = ["Sr No", "Company/Uni", "Industry", "Name", "Designation", "Email
                "First Contact Type", "First Contact Date", "Sid - LI Addition",
                "LI Connected Date", "LI DM Sent", "LI DM Date", "Meeting Date",
                "Meeting Status", "Next Steps/Notes", "Package", "Prospect Status",
-               "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status"]
-COL = {h: i for i, h in enumerate(POC_HEADERS)}
+               "Closure Prob%", "Estd. Deal Size (USD)", "Deal Status",
+               # ADDED 12 Oct 2026. The write lock is by ROLE and fails closed: a tab with no Next Steps,
+               # email or Priority column refuses every write. They go at the END so that no cell this
+               # script names by letter moves (the order is not what the lock reads).
+               "Next Steps", "1st Email Sent", "1st Email Date", "2nd Email Sent", "2nd Email Date",
+               "3rd Email Sent", "3rd Email Date", "Priority"]
+COL ={h: i for i, h in enumerate(POC_HEADERS)}
 DELIV_HEADERS = ["Action Item", "Priority", "Status", "Tentative Deadline",
                  "Functional Dependency", "Remarks", "Link/Destination"]
 EVENT_HEADERS = ["Event", "Date", "Last day for registration", "Registered?", "Link",
@@ -1094,8 +1099,8 @@ async def main() -> None:
     print(f"real date {dl.iso(dl.real_today_ist())} | the pretend week starts "
           f"{dl.iso(MON)} | cap {config.DAILY_MESSAGE_CAP} | window "
           f"{config.SALES_DRIP_START}-{config.SALES_DRIP_END} | EMAIL_WRITE_ALLOWED "
-          f"{config.EMAIL_WRITE_ALLOWED} | restricted bands "
-          f"{config.RESTRICTED_COLUMN_RANGES}")
+          f"{config.EMAIL_WRITE_ALLOWED} | restricted roles "
+          f"{len(config.RESTRICTED_COLUMN_ROLES)} (identity, step, commercial)")
     if want("i") or want("ii") or want("iii"):
         await the_monday()
     if want("iv"):
