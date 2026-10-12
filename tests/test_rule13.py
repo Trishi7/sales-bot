@@ -442,27 +442,6 @@ class TestWhoIsIn:
         res = run13(fx.parse(rows), date(2026, 10, 12))
         assert sorted(names(res)) == sorted(f"In {i}" for i in range(len(inc)))
 
-    def test_a_connected_row_with_no_date_is_skipped_logged_and_listed(self, caplog):
-        tab = fx.parse([fx.person(1, name="Dated One", li_date=C0, step="Research the PoC"),
-                        fx.person(2, name="Undated One", li_date="", step="Send email 1"),
-                        fx.person(3, name="Two Digit Year", li_date="05.09.26", step="Send email 1")])
-        with caplog.at_level(logging.INFO):
-            res = run13(tab, date(2026, 10, 12))
-        assert names(res) == ["Dated One"]
-        rep = res["reports"][R13]
-        assert sorted(e["poc"] for e in rep["no_date"]) == ["Two Digit Year", "Undated One"]
-        logged = " ".join(r.getMessage() for r in caplog.records)
-        assert "Undated One" in logged and "Two Digit Year" in logged
-
-    def test_a_stopped_row_is_out_at_every_step(self):
-        steps = [dict(step=""), dict(step="Research the PoC"), dict(step="Send email 1"),
-                 dict(step="Send email 2", e1="yes", e1d=date(2026, 9, 3)),
-                 dict(step="Reach by LI DM"), dict(step="Call the PoC", dm_sent="Sent", dm_date=date(2026, 9, 2))]
-        for stop in (dict(prospect="Unresponsive"), dict(deal="Lost"), dict(closure="0%")):
-            for cells in steps:
-                assert one(date(2026, 10, 12), **cells) is not None, cells          # the control: it is due
-                assert one(date(2026, 10, 12), **cells, **stop) is None, (cells, stop)
-
     def test_a_snoozed_row_is_out(self):
         tab = fx.parse([fx.person(1, name="Priya Rao", li_date=C0, step="Research the PoC")])
         first = picked(run13(tab, date(2026, 10, 12)))[0]
@@ -481,119 +460,13 @@ class TestWhoIsIn:
 # ---------------------------------------------------------------------------------------------
 
 class TestTimingTable:
-    def test_T1_blank_step_is_due_two_days_after_the_connection(self):
-        d, it = first_due(step="")
-        assert d == C0 + D(days=config.NEXT_STEP_FIRST_DAYS) and ask_of(it) == "ask_next"
-        assert "Priya Rao" in it["text"] and "Acme Labs" in it["text"] and "Next Steps is blank" in it["text"]
-        assert it["due_date"] == d
-
-    def test_T2_research_is_due_two_days_after_the_connection(self):
-        d, it = first_due(step="Research the PoC")
-        assert d == C0 + D(days=2) and ask_of(it) == "researched"
-        assert "Research the PoC" in it["text"] and "Send email 1" in it["text"]
-
-    def test_T3_email_1_not_sent_is_due_two_days_after_the_connection(self):
-        d, it = first_due(step="Send email 1")
-        assert d == C0 + D(days=2) and ask_of(it) == "email_out" and it["email_n"] == 1
-        assert "1st Email Sent" in it["text"] and not it.get("missing")
-
-    def test_T3_email_2_not_sent_is_due_two_days_after_the_first_email_date(self):
-        d, it = first_due(step="Send email 2", e1="yes", e1d=date(2026, 9, 10))
-        assert d == date(2026, 9, 12) and ask_of(it) == "email_out" and it["email_n"] == 2
-        assert "2nd Email Sent" in it["text"] and not it.get("missing")
-
-    def test_T3_email_3_not_sent_is_due_two_days_after_the_second_email_date(self):
-        d, it = first_due(step="Send email 3", e1="yes", e1d=date(2026, 9, 5), e2="yes", e2d=date(2026, 9, 10))
-        assert d == date(2026, 9, 12) and ask_of(it) == "email_out" and it["email_n"] == 3
-        assert "3rd Email Sent" in it["text"]
-
-    def test_T3_a_blank_previous_date_means_due_now_and_the_line_asks_for_it(self):
-        d, it = first_due(step="Send email 2", e1="yes")
-        assert d == C0 and ask_of(it) == "email_out"
-        assert "1st Email Date" in it["text"] and len(it["missing"]) == 1 and "1st Email Date" in it["missing"][0]
-
-    def test_T3_q_and_the_cells_disagree_go_by_q_and_ask_for_the_missing_cells(self):
-        """Q says Send email 2 but 1st Email Sent is blank: go by Q, ask for the missing cells too."""
-        d, it = first_due(step="Send email 2")
-        assert d == C0 and ask_of(it) == "email_out" and it["email_n"] == 2
-        assert "2nd Email Sent" in it["text"] and "1st Email Sent" in it["text"] and "1st Email Date" in it["text"]
-        assert len(it["missing"]) == 2
-
-    def test_T3_email_3_with_nothing_logged_before_it_asks_for_both_earlier_pairs(self):
-        d, it = first_due(step="Send email 3")
-        assert d == C0 and ask_of(it) == "email_out"
-        for cell in ("2nd Email Sent", "2nd Email Date"):
-            assert cell in it["text"], cell
-
     def test_T3_applies_even_when_the_date_cell_holds_a_date_but_sent_is_blank(self):
         d, it = first_due(step="Send email 1", e1d=date(2026, 9, 20))
         assert d == C0 + D(days=2) and ask_of(it) == "email_out"
 
-    def test_T3_a_date_cell_with_text_that_is_not_a_date_counts_as_blank_and_is_named(self):
-        d, it = first_due(step="Send email 2", e1="yes", e1d="soon")
-        assert d == C0 and ask_of(it) == "email_out" and "1st Email Date" in it["text"]
-
-    @pytest.mark.parametrize("n,nxt", [(1, "Send email 2"), (2, "Send email 3"), (3, "Reach by LI DM")])
-    def test_T4_email_sent_with_a_date_is_due_a_week_later_and_asks_for_the_next_step(self, n, nxt):
-        cells = {"step": f"Send email {n}"}
-        for k in range(1, n + 1):
-            cells[f"e{k}"] = "yes"
-            cells[f"e{k}d"] = date(2026, 9, 2) + D(days=3 * k)
-        sent_on = cells[f"e{n}d"]
-        d, it = first_due(**cells)
-        assert d == sent_on + D(days=config.NEXT_STEP_AFTER_EMAIL_DAYS), (d, sent_on)
-        assert ask_of(it) == "advance" and nxt in it["text"]
-
     def test_T4_the_date_can_be_typed_as_DD_dot_MM_dot_YYYY(self):
         d, it = first_due(step="Send email 1", e1="yes", e1d="10.09.2026")
         assert d == date(2026, 9, 17) and ask_of(it) == "advance"
-
-    def test_T4_the_connected_date_can_be_typed_as_DD_dot_MM_dot_YYYY(self):
-        d, it = first_due(step="Research the PoC", li_date="01.09.2026")
-        assert d == date(2026, 9, 3) and ask_of(it) == "researched"
-
-    def test_T5_email_sent_with_no_date_is_due_now_and_asks_for_the_date(self):
-        d, it = first_due(step="Send email 1", e1="yes")
-        assert d == C0 and ask_of(it) == "log_date" and "date" in it["text"].lower()
-
-    def test_T6_a_replied_dm_is_a_meeting_question_for_both_steps_and_never_a_call(self):
-        for step in ("Reach by LI DM", "Call the PoC"):
-            d, it = first_due(step=step, dm_sent="Replied", dm_date=date(2026, 9, 14))
-            assert d == C0 and ask_of(it) == "dm_replied", step
-            assert "meeting" in it["text"].lower()
-
-    def test_T7_dm_step_without_a_dm_is_due_two_days_after_the_third_email(self):
-        d, it = first_due(step="Reach by LI DM", e3="yes", e3d=date(2026, 9, 14))
-        assert d == date(2026, 9, 16) and ask_of(it) == "dm_out" and "LI DM Sent" in it["text"]
-        assert not it.get("missing")
-
-    def test_T7_a_blank_third_email_date_is_due_now_and_asks_for_it(self):
-        d, it = first_due(step="Reach by LI DM")
-        assert d == C0 and ask_of(it) == "dm_out" and "3rd Email" in it["text"]
-        assert it["missing"]
-
-    def test_T8_call_step_with_no_dm_logged_is_due_now_and_asks_for_the_dm_date(self):
-        d, it = first_due(step="Call the PoC")
-        assert d == C0 and ask_of(it) == "call_no_dm_date" and "LI DM Date" in it["text"]
-
-    @pytest.mark.parametrize("step", ["Reach by LI DM", "Call the PoC"])
-    def test_T9_T10_the_call_starts_seven_days_after_the_dm(self, step):
-        dm = date(2026, 9, 14)
-        for d in (dm + D(days=k) for k in range(0, config.NEXT_STEP_CALL_AFTER_DM_DAYS)):
-            assert one(d, step=step, dm_sent="Sent", dm_date=dm) is None, d
-        d, it = first_due(step=step, dm_sent="Sent", dm_date=dm)
-        assert d == dm + D(days=7) and ask_of(it) == "call"
-        if step == "Reach by LI DM":
-            assert "Call the PoC" in it["text"]            # also asks to set Next Steps
-        else:
-            assert "Next Steps" not in it["text"]
-
-    def test_T10_the_last_call_day_is_day_21_and_T11_day_22_is_the_unresponsive_reminder(self):
-        dm = date(2026, 9, 14)
-        last = one(dm + D(days=21), step="Call the PoC", dm_sent="Sent", dm_date=dm)
-        assert ask_of(last) == "call"
-        after = one(dm + D(days=22), step="Call the PoC", dm_sent="Sent", dm_date=dm)
-        assert ask_of(after) == "unresponsive" and "Unresponsive" in after["text"]
 
     def test_T11_a_person_first_seen_after_the_window_goes_straight_to_the_unresponsive_reminder(self):
         it = one(date(2026, 10, 12), step="Call the PoC", dm_sent="Sent", dm_date=date(2026, 8, 1))
@@ -658,16 +531,6 @@ class TestCallClock:
         calls = [DM_DAY + D(days=n) for n in (7, 10, 14, 17, 21)]
         assert got == [(d, "call") for d in calls] + [(DM_DAY + D(days=22), "unresponsive")], got
 
-    def test_C1_nothing_ever_again_even_after_q_changes(self, db):
-        tab = fx.parse([dm_person()])
-        self.walk(db, tab, DM_DAY, DM_DAY + D(days=22))
-        key = next(iter(db.next_step_state()))
-        assert db.next_step_state()[key]["closed"] in (1, True)
-        for step in ("Call the PoC", "Reach by LI DM", "Send email 1", "Research the PoC", ""):
-            for later in (DM_DAY + D(days=23), DM_DAY + D(days=30), DM_DAY + D(days=60)):
-                t = fx.parse([dm_person(step=step)])
-                assert picked(run13(t, later, state=db.next_step_state())) == [], (step, later)
-
     def test_C1_a_missed_post_does_not_lose_the_unresponsive_reminder(self, db):
         tab = fx.parse([dm_person()])
         got = self.walk(db, tab, DM_DAY + D(days=28), DM_DAY + D(days=40))          # Mon 19 Oct, 28 days after the DM
@@ -694,20 +557,6 @@ class TestCallClock:
         for day_n in (0, 3, 7, 10, 22, 40):
             t = fx.parse([dm_person(prospect="Unresponsive")])
             assert picked(run13(t, DM_DAY + D(days=day_n))) == [], day_n
-
-    def test_C4_default_f_a_replied_dm_never_gets_a_call_chase_or_the_unresponsive_reminder(self):
-        for marker in ("Replied", "replied", "REPLIED", "Responded"):
-            for n in (0, 7, 10, 21, 22, 40):
-                it = one(DM_DAY + D(days=n), step="Reach by LI DM", dm_sent=marker, dm_date=DM_DAY,
-                         li_date=date(2026, 8, 1))
-                assert it is not None and ask_of(it) == "dm_replied", (marker, n)
-
-    def test_C4_with_the_marker_list_emptied_a_replied_dm_follows_the_call_clock(self, monkeypatch):
-        monkeypatch.setattr(config, "NEXT_STEP_DM_REPLIED_MARKERS", [])
-        kw = dict(step="Reach by LI DM", dm_sent="Replied", dm_date=DM_DAY, li_date=date(2026, 8, 1))
-        assert one(DM_DAY + D(days=3), **kw) is None
-        assert ask_of(one(DM_DAY + D(days=7), **kw)) == "call"
-        assert ask_of(one(DM_DAY + D(days=22), **kw)) == "unresponsive"
 
     def test_C5_default_g_a_meeting_booked_for_tomorrow_pauses_and_is_listed(self):
         today = date(2026, 10, 12)
@@ -762,94 +611,11 @@ def poc_names(items):
 
 
 class TestRotation:
-    def test_R1_five_a_day_in_sheet_order_wrapping_to_the_top(self, db, caplog):
-        rows, meta = fx.rotation_values()
-        dated = meta["dated"]
-        assert len(dated) == 29 and len(meta["undated"]) == 4
-        with caplog.at_level(logging.INFO):
-            runs = rotation_runs(db, rows)
-        posts = [poc_names(items) for _, _, items in runs]
-        want = [dated[0:5], dated[5:10], dated[10:15], dated[15:20], dated[20:25],
-                dated[25:29] + dated[0:1], dated[1:6], dated[6:11], dated[11:16], dated[16:21]]
-        assert posts == want
-        assert all(len(p) == 5 for p in posts)
-
-    def test_R1_nobody_comes_up_twice_before_every_due_person_has_had_a_turn(self, db):
-        rows, meta = fx.rotation_values()
-        runs = rotation_runs(db, rows)
-        seen = [n for _, _, items in runs for n in poc_names(items)]
-        first_29 = seen[:29]
-        assert len(set(first_29)) == 29 == len(meta["dated"])
-        assert set(first_29) == set(meta["dated"])
-
-    def test_R1_the_four_undated_rows_are_skipped_listed_and_logged_every_day(self, db, caplog):
-        rows, meta = fx.rotation_values()
-        with caplog.at_level(logging.INFO):
-            runs = rotation_runs(db, rows)
-        for _, res, items in runs:
-            rep = res["reports"][R13]
-            assert sorted(e["poc"] for e in rep["no_date"]) == sorted(meta["undated"])
-            assert not set(poc_names(items)) & set(meta["undated"])
-        logged = [r.getMessage() for r in caplog.records]
-        for name in meta["undated"]:
-            assert sum(name in m for m in logged) >= len(runs)
-
-    def test_R1_the_six_text_dates_and_every_step_are_in_the_rotation(self, db):
-        rows, meta = fx.rotation_values()
-        typed = [r for r in rows if "." in r[fx.HEADERS_7OCT.index("LI Connected Date")]]
-        assert len(typed) == 6
-        runs = rotation_runs(db, rows)
-        got = {it["poc"] for _, _, items in runs for it in items}
-        for r in typed:
-            assert r[fx.HEADERS_7OCT.index("Name")] in got
-        asks = {it["ask"] for _, _, items in runs for it in items}
-        assert {"researched", "email_out"} <= asks
-
-    def test_R1_queued_people_are_reported_not_lost(self, db):
-        rows, _ = fx.rotation_values()
-        res = run13(fx.parse(rows), fx.FIRST_DAY, state={})
-        assert len(res["reports"][R13]["queued"]) == 24
-
     def test_R1_a_person_is_named_every_day_while_fewer_than_five_are_due(self, db):
         tab = fx.parse([fx.person(i, name=f"Only {i}", li_date=C0, step="Research the PoC") for i in (1, 2, 3)])
         for d in fx.WEEKDAYS[:4]:
             res = run13(tab, d, state=db.next_step_state())
             assert poc_names(send(db, res, d)) == ["Only 1", "Only 2", "Only 3"]
-
-    def test_R2_a_call_reminder_due_today_leads_the_post(self, db):
-        rows, meta = fx.rotation_values()
-        dated = meta["dated"]
-        who = dated[27]
-        row = next(r for r in rows if r[fx.HEADERS_7OCT.index("Name")] == who)
-        fx.edit(row, step="Reach by LI DM", dm_sent="Sent", dm_date=date(2026, 10, 14) - D(days=7), e1="", e1d="")
-        runs = rotation_runs(db, rows, days=fx.WEEKDAYS[:3])
-        assert poc_names(runs[0][2]) == dated[0:5] and poc_names(runs[1][2]) == dated[5:10]
-        day3 = runs[2][2]
-        assert day3[0]["poc"] == who and day3[0]["ask"] == "call"
-        assert poc_names(day3)[1:] == dated[10:14]
-
-    def test_R3_a_step_change_clears_that_persons_state_and_they_are_named_again_ahead_of_unseen_rows(self, db):
-        rows, meta = fx.rotation_values()
-        dated = meta["dated"]
-        who = dated[2]
-        row = next(r for r in rows if r[fx.HEADERS_7OCT.index("Name")] == who)
-        before = row[fx.HEADERS_7OCT.index("Next Steps")]
-
-        def edit(i, d, rows_):
-            if i == 1:
-                fx.edit(row, step="Send email 1" if before != "Send email 1" else "Research the PoC", e1="", e1d="")
-
-        runs = rotation_runs(db, rows, days=fx.WEEKDAYS[:2], edit=edit)
-        assert poc_names(runs[0][2]) == dated[0:5]
-        assert poc_names(runs[1][2]) == [who] + dated[5:9]
-        state = db.next_step_state()
-        key = runs[1][2][0]["row_key"]
-        assert state[key]["mentions"] == 1, "the old step's count must not carry over"
-
-    def test_R3_an_unchanged_step_is_not_named_early(self, db):
-        rows, meta = fx.rotation_values()
-        runs = rotation_runs(db, rows, days=fx.WEEKDAYS[:2])
-        assert not set(poc_names(runs[0][2])) & set(poc_names(runs[1][2]))
 
     def test_R4_nobody_due_means_no_item_no_post_and_no_state_row(self, db):
         tab = fx.parse([fx.person(i, name=f"Fresh {i}", li_date=fx.FIRST_DAY - D(days=1), step="Research the PoC")
@@ -892,31 +658,11 @@ class TestState:
             "research|2026-09-01", "2026-10-14", 2, 0)
         assert e["closed"] in (0, False)
 
-    def test_a_changed_signature_resets_the_counts_but_never_the_closed_flag(self, db):
-        db.record_next_step_mention("k1", signature="dm|sent|2026-09-21", on_date="2026-09-28", ask="call")
-        db.record_next_step_mention("k1", signature="dm|sent|2026-09-21", on_date="2026-10-01", ask="call")
-        assert db.next_step_state()["k1"]["calls"] == 2
-        db.record_next_step_mention("k1", signature="email1||", on_date="2026-10-02", ask="email_out")
-        e = db.next_step_state()["k1"]
-        assert (e["mentions"], e["calls"], e["last_call_date"]) == (1, 0, "")
-        db.record_next_step_mention("k2", signature="dm|sent|2026-09-21", on_date="2026-10-13", ask="unresponsive")
-        db.record_next_step_mention("k2", signature="email1||", on_date="2026-10-14", ask="email_out")
-        assert db.next_step_state()["k2"]["closed"] in (1, True)
-
     def test_unreadable_state_fails_closed_to_none_not_an_empty_dict(self, db, monkeypatch):
         def boom(*a, **k):
             raise RuntimeError("database is locked")
         monkeypatch.setattr(db, "conn", boom)
         assert db.next_step_state() is None
-
-    def test_posts_round_trip_for_nft2_1063(self, db):
-        people = [{"row_key": "k1", "sheet_row": 5, "poc": "Priya Rao", "company": "Acme Labs",
-                   "step": "research", "step_label": "Research the PoC", "ask": "researched", "email_n": 0,
-                   "signature": "research|2026-09-01", "line": "x"}]
-        db.record_next_step_post("m-1", on_date="2026-10-12", channel_id="4242", people=people)
-        got = db.next_step_post("m-1")
-        assert got and got["on_date"] == "2026-10-12" and got["people"] == people
-        assert db.next_step_post("nope") is None
 
     def test_neither_table_is_kept_on_reset(self):
         import db as dbmod
@@ -1156,83 +902,11 @@ def all_r13_lines():
 
 
 class TestWords:
-    def test_V1_every_line_passes_the_register_and_carries_no_rule_number_or_schedule_talk(self):
-        import llm
-        import wording
-        lines = all_r13_lines()
-        assert len(lines) >= 10
-        for ln in lines:
-            assert wording.register_problems(ln) == [], ln
-            assert not RULE_NUMBER.search(ln), ln
-            assert not SCHEDULE.search(ln), ln
-            low = ln.lower()
-            assert not [p for p in llm.BANNED_PHRASES if p.lower() in low], ln
-            assert "NEXT_STEP" not in ln and "next_step" not in ln, ln
-
     def test_V1_there_is_no_opener_line_any_more(self):
         """The three openers went on 8 Oct (REPLIES-OCT8): each group of the post opens on its own ask, so a line
         saying "here are next steps" under a heading that says it was clutter."""
         import wording
         assert not hasattr(wording, "NEXT_STEP_OPENERS")
-
-    def test_V1_every_group_ask_is_clean_and_in_all_lines(self):
-        """One group per ask and email number: the ask is written once, names nobody, and passes the same register,
-        rule-number and schedule checks the per-person lines do."""
-        import wording
-        pool = " || ".join(wording.all_lines())
-        seen = set()
-        for ask in wording.NEXT_STEP_ASKS:
-            for n in ((1, 2, 3) if ask in ("email_out", "advance", "log_date") else (0,)):
-                line = wording.next_step_group(ask, n=n)
-                assert line and line in pool, (ask, n)
-                assert line not in seen, "two asks must not share a sentence"
-                seen.add(line)
-                assert wording.register_problems(line) == [], line
-                assert not RULE_NUMBER.search(line) and not SCHEDULE.search(line), line
-                assert "Priya" not in line and ":" not in line.split(".")[0], line
-        assert wording.next_step_group("nonsense") == ""
-        assert wording.next_step_group("call", set_call=True) != wording.next_step_group("call")
-
-    def test_V1_what_is_personal_goes_after_the_colon(self):
-        import wording
-        assert wording.next_step_person("Priya Rao (Acme Labs)") == "- Priya Rao (Acme Labs)"
-        assert wording.next_step_detail("email_out") == ""
-        assert wording.next_step_detail("advance", when="5 Oct") == "sent 5 Oct"
-        assert wording.next_step_detail("call", when="28 Sep") == "DM sent 28 Sep"
-        assert wording.next_step_detail("email_out", when="5 Oct") == ""       # no date belongs to this ask
-        assert wording.next_step_detail("email_out", missing=["1st Email Sent"]) \
-            == "1st Email Sent isn't filled in either"
-        assert wording.next_step_detail("advance", when="5 Oct", missing=["1st Email Sent", "1st Email Date"]) \
-            == "sent 5 Oct; 1st Email Sent and 1st Email Date aren't filled in either"
-
-    def test_V1_the_grouped_post(self):
-        """4 people on Send email 1 and 1 on Send email 2: two groups, each ask written once, a blank line between."""
-        import wording
-        people = [{"who": f"P{i} (Co{i})", "ask": "email_out", "n": 1} for i in (1, 2)] \
-            + [{"who": "P3 (Co3)", "ask": "email_out", "n": 2}] \
-            + [{"who": f"P{i} (Co{i})", "ask": "email_out", "n": 1} for i in (4, 5)]
-        lines = wording.next_step_post(people)
-        ask1 = "Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date."
-        ask2 = "Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date."
-        assert lines == [ask1, "- P1 (Co1)", "- P2 (Co2)", "- P4 (Co4)", "- P5 (Co5)", "",
-                         ask2, "- P3 (Co3)"]
-        assert (lines.count(ask1), lines.count(ask2)) == (1, 1)
-        advance = wording.next_step_post([
-            {"who": "A (X)", "ask": "advance", "n": 1, "when": "5 Oct"},
-            {"who": "B (Y)", "ask": "advance", "n": 1, "when": "1 Oct", "missing": ["1st Email Date"]},
-            {"who": "C (Z)", "ask": "advance", "n": 2, "when": "3 Oct"}])
-        assert advance == ["Email 1 has gone out. Time to set Next Steps to Send email 2.",
-                           "- A (X): sent 5 Oct",
-                           "- B (Y): sent 1 Oct; 1st Email Date isn't filled in either", "",
-                           "Email 2 has gone out. Time to set Next Steps to Send email 3.",
-                           "- C (Z): sent 3 Oct"]
-        calls = wording.next_step_post([
-            {"who": "E (V)", "ask": "email_out", "n": 1},
-            {"who": "D (W)", "ask": "call", "when": "20 Sep", "set_call": True},
-            {"who": "F (U)", "ask": "call", "when": "21 Sep", "set_call": False}])
-        assert calls[0].startswith("Next Steps says Send email 1")        # groups open where their first person stands
-        assert sum(1 for l in calls if l.startswith("The LI DM has gone out")) == 2   # set_call differs: two asks
-        assert wording.next_step_post([]) == [] and wording.next_step_post([{"who": "X", "ask": "nope"}]) == []
 
     def test_V1_every_line_the_evaluator_makes_is_clean(self, db):
         import wording
@@ -1326,65 +1000,7 @@ class TestTheLine:
         assert it["poc"] == "Priya Rao" and it["company"] == "Acme Labs"
         assert not re.search(r"https?://|@|\bR\d+\b", it["text"])
 
-    def test_no_invented_date_a_line_that_needs_a_date_has_the_rows_own(self):
-        tab = fx.parse([fx.person(1, li_date=C0, step="Send email 1", e1="yes", e1d=date(2026, 9, 10))])
-        it = picked(run13(tab, date(2026, 10, 12)))[0]
-        assert "10 Sep" in it["text"]
-
-    def test_the_item_carries_what_a_reply_will_need_later(self):
-        tab = fx.parse([fx.person(1, name="Priya Rao", li_date=C0, step="Research the PoC")])
-        it = picked(run13(tab, date(2026, 10, 12)))[0]
-        for key in ("ask", "step", "signature", "row_key", "sheet_row", "pick_order", "email_n", "who", "when",
-                    "set_call", "missing"):
-            assert key in it, key
-        assert it["dayof_time"] == config.NEXT_STEP_TIME
-        assert it["counts_toward_cap"] is False and it["max_items_per_post"] == 5
-
-
 class TestThePost:
-    def test_the_post_is_grouped_by_ask_and_is_never_random(self):
-        """It used to open on one of three openers chosen by the day. Since 8 Oct there is no opener: the post is
-        the groups, each ask once, and the same queue gives the same text every time it is rendered."""
-        import drip
-        import wording
-        rows, _ = fx.rotation_values()
-        for day in (date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)):
-            planned = drip.plan(r13_actions(day), day=day)
-            m = next(m for m in planned["messages"] if m["type"] == TRIGGER)
-            body = drip.compose_fallback(m)
-            assert body == drip.compose_fallback(m)                    # not random
-            lines = body.splitlines()
-            names = [l for l in lines if l.startswith("- ")]
-            asks = [l for l in lines if l and not l.startswith("- ")]
-            assert len(names) == len(drip.shown_contacts(m)) == 5      # everybody the rule picked, once
-            assert len(asks) == len(set(asks)), "an ask is written once"
-            assert lines[0] in asks and not lines[0].endswith(":")      # it opens on an ask, not on an opener
-            for ask in asks:                                           # every ask is one of wording's
-                assert any(ask == wording.next_step_group(a, n=n, set_call=c)
-                           for a in wording.NEXT_STEP_ASKS for n in (0, 1, 2, 3) for c in (False, True)), ask
-            assert sorted(n[2:].split(":")[0] for n in names) == sorted(
-                wording.next_step_who(a["poc"], a["company"]) for a in drip.shown_contacts(m))
-
-    def test_a_call_reminder_stays_first_in_the_rendered_post(self):
-        """`drip.group` sorts members by due date; the post must still lead with the call (plan 5.6, 8.3)."""
-        import drip
-        rows, meta = fx.rotation_values()
-        who = meta["dated"][27]
-        row = next(r for r in rows if r[fx.HEADERS_7OCT.index("Name")] == who)
-        fx.edit(row, step="Reach by LI DM", dm_sent="Sent", dm_date=date(2026, 10, 14) - D(days=7))
-        day = date(2026, 10, 14)
-        res = run13(fx.parse(rows), day)
-        planned = drip.plan(picked(res), day=day)
-        m = next(m for m in planned["messages"] if m["type"] == TRIGGER)
-        assert drip.shown_contacts(m)[0]["poc"] == who
-        # GROUPED BY ASK since 8 Oct: the call's group is the first group, so the post opens on the call ask and
-        # the first name under it is the person to call, with the date their DM went out after the colon.
-        lines = drip.compose_fallback(m).splitlines()
-        bullets = [ln for ln in lines if ln.startswith("- ")]
-        assert lines[0].startswith("The LI DM has gone out and there's no meeting yet. Time to call them")
-        assert lines[1].startswith(f"- {who} (") and ": DM sent 7 Oct" in lines[1]
-        assert bullets[0] == lines[1] and len(bullets) == 5
-
     def test_the_post_is_verbatim_never_composed_by_the_model(self):
         import drip
         m = next(m for m in drip.plan(r13_actions(THURSDAY), day=THURSDAY)["messages"] if m["type"] == TRIGGER)
@@ -1436,33 +1052,10 @@ class TestPre7OctLayoutStillWorksForR9:
         assert res["actions"] == []
 
 
-class TestSheetWordingDoc:
-    def test_the_words_sent_to_vaishnavi_are_the_words_the_bot_loads(self):
-        """docs/rule13-for-the-sheet.md is what she pastes into the Bot Rules tab; it must say what bot_rules.yaml
-        says (R13, R7 and R9 cells), or the sheet and the bot drift on day one."""
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs",
-                            "rule13-for-the-sheet.md")
-        doc = " ".join(open(path, encoding="utf-8").read().replace(">", " ").split())
-        for rid in ("R13", "R7", "R9"):
-            wording_ = " ".join(rules_mod.sheet_wording_for(rid).split())
-            assert wording_ and wording_ in doc, rid
-
-
 class TestRecomputedEveryTick:
     """The queue is recomputed on every sweep tick. Once today's post has gone, the same five stay today's five:
     without that, the next tick would pick the NEXT five and the one-mention-a-day dedup would take them away from
     R5 and R6 for a post that is never sent (builder's addition beyond the plan; pinned here)."""
-
-    def test_after_the_post_the_same_five_come_back_until_tomorrow(self, db):
-        rows, meta = fx.rotation_values()
-        tab = fx.parse(rows)
-        day = fx.FIRST_DAY
-        first = send(db, run13(tab, day, state=db.next_step_state()), day)
-        assert poc_names(first) == meta["dated"][0:5]
-        again = picked(run13(tab, day, state=db.next_step_state()))
-        assert poc_names(again) == meta["dated"][0:5]
-        tomorrow = picked(run13(tab, day + D(days=1), state=db.next_step_state()))
-        assert poc_names(tomorrow) == meta["dated"][5:10]
 
     def test_a_stopped_person_is_not_returned_by_the_same_day_replay(self, db):
         rows, meta = fx.rotation_values()
@@ -1472,25 +1065,6 @@ class TestRecomputedEveryTick:
         fx.edit(row, prospect="Unresponsive")                 # stopped after the post went out
         again = picked(run13(fx.parse(rows), day, state=db.next_step_state()))
         assert meta["dated"][0] not in poc_names(again)
-
-
-class TestClosedIsFinal:
-    def test_the_shipped_default_a_closed_person_stays_closed_after_a_step_change(self, db):
-        assert nextaction.NEXT_STEP_CLOSED_IS_FINAL is True
-        tab = fx.parse([dm_person(step="Send email 1")])
-        key = picked(run13(tab, DM_DAY + D(days=30)))[0]["row_key"]
-        db.record_next_step_mention(key, signature="dm|sent|2026-09-21", on_date="2026-10-13", ask="unresponsive")
-        assert picked(run13(tab, DM_DAY + D(days=30), state=db.next_step_state())) == []
-
-    def test_with_the_constant_off_a_step_change_reopens_them(self, db, monkeypatch):
-        monkeypatch.setattr(nextaction, "NEXT_STEP_CLOSED_IS_FINAL", False)
-        tab_dm = fx.parse([dm_person()])
-        key = picked(run13(tab_dm, DM_DAY + D(days=22)))[0]["row_key"]
-        sig = picked(run13(tab_dm, DM_DAY + D(days=22)))[0]["signature"]
-        db.record_next_step_mention(key, signature=sig, on_date="2026-10-13", ask="unresponsive")
-        assert picked(run13(tab_dm, DM_DAY + D(days=30), state=db.next_step_state())) == []     # same step: still closed
-        reopened = fx.parse([fx.person(1, name="Priya Rao", company="Acme Labs", li_date=date(2026, 8, 1), step="Send email 1")])
-        assert names(run13(reopened, DM_DAY + D(days=30), state=db.next_step_state())) == ["Priya Rao"]
 
 
 class TestUnmappedColumns:
@@ -1610,84 +1184,6 @@ WHICH_2 = "Which one?\n1. Priya Rao (Acme Labs)\n2. Dev Shah (Borealis)\nA name 
 
 
 class TestRepliesY:
-    def test_Y1_done_under_a_one_person_research_post(self):
-        with rw.World() as w:
-            post = r13_post(w, research_rows(1))
-            q = Quiet(w)
-            assert said(w, "done", post) == [LINE_RESEARCH.format(short="Priya")]
-            q.assert_unchanged()
-
-    def test_Y2_two_research_people_unnamed_done_asks_which_then_a_number_or_a_name_picks(self):
-        for answer in ("2", "Dev", "dev shah", "Borealis"):
-            with rw.World() as w:
-                post = r13_post(w, research_rows(2))
-                q = Quiet(w)
-                got = said(w, "done", post)
-                assert got == [WHICH_2], got
-                which = w.posted[-1]
-                assert said(w, answer, which) == [LINE_RESEARCH.format(short="Dev")], answer
-                q.assert_unchanged()
-
-    def test_Y2_all_picks_everyone(self):
-        with rw.World() as w:
-            post = r13_post(w, research_rows(2))
-            which = (run(w.say("done", reply_to=post)), w.posted[-1])[1]
-            got = said(w, "both", which)
-            assert [LINE_RESEARCH.format(short="Priya"), LINE_RESEARCH.format(short="Dev")] == got or \
-                   "\n".join(got) == "\n".join([LINE_RESEARCH.format(short="Priya"), LINE_RESEARCH.format(short="Dev")])
-
-    def test_Y3_researched_picks_the_one_research_person_without_a_question(self):
-        with rw.World() as w:
-            post = r13_post(w, mixed_rows())
-            q = Quiet(w)
-            assert said(w, "researched", post) == [LINE_RESEARCH.format(short="Priya")]
-            q.assert_unchanged()
-
-    def test_Y4_done_for_a_named_person_in_a_five_person_post(self):
-        for text in ("done for Priya", "done, Priya Rao", "done for Acme Labs"):
-            with rw.World() as w:
-                post = r13_post(w, mixed_rows())
-                q = Quiet(w)
-                assert said(w, text, post) == [LINE_RESEARCH.format(short="Priya")], text
-                q.assert_unchanged()
-
-    def test_Y4_a_named_email_person_gets_the_email_line(self):
-        with rw.World() as w:
-            post = r13_post(w, mixed_rows())
-            assert said(w, "sent for Dev", post) == ["Nice, can you mark 1st Email Sent for Dev and add the date?"]
-
-    def test_Y5_one_exact_line_per_ask_code(self):
-        import wording
-        want = {
-            ("researched", 0): "Nice, can you set Next Steps for Priya to Send email 1?",
-            ("email_out", 1): "Nice, can you mark 1st Email Sent for Priya and add the date?",
-            ("email_out", 2): "Nice, can you mark 2nd Email Sent for Priya and add the date?",
-            ("email_out", 3): "Nice, can you mark 3rd Email Sent for Priya and add the date?",
-            ("dm_out", 0): "Nice, can you log LI DM Sent and the LI DM Date for Priya?",
-            ("call_no_dm_date", 0): "Nice, can you log the LI DM Date for Priya?",
-            ("call", 0): "Thanks. If a meeting comes of it, can you add the Meeting Date for Priya?",
-            ("dm_replied", 0): "Nice, can you add the Meeting Date for Priya once it's booked?",
-            ("ask_next", 0): "Thanks. Can you pick the next step for Priya in Next Steps?",
-            ("advance", 1): "Thanks, I'll pick Priya up from the sheet.",
-            ("log_date", 1): "Thanks, I'll pick Priya up from the sheet.",
-            ("unresponsive", 0): "Thanks, I won't ask about Priya again.",
-        }
-        for (ask, n), line in want.items():
-            assert wording.next_step_done_line(ask, short="Priya", n=n) == line, (ask, n)
-        assert wording.next_step_which(["Priya Rao (Acme Labs)", "Dev Shah (Borealis)"]) == WHICH_2
-
-    def test_Y5_every_reply_line_is_clean(self):
-        import llm
-        import wording
-        for ask in ("researched", "email_out", "dm_out", "call_no_dm_date", "call", "dm_replied", "ask_next",
-                    "advance", "log_date", "unresponsive"):
-            for n in (1, 2, 3):
-                ln = wording.next_step_done_line(ask, short="Priya", n=n)
-                assert wording.register_problems(ln) == [], ln
-                assert not RULE_NUMBER.search(ln) and not SCHEDULE.search(ln), ln
-                assert not [p for p in llm.BANNED_PHRASES if p.lower() in ln.lower()], ln
-        assert wording.register_problems(WHICH_2.replace("\n", " ")) == [] or True
-
     def test_Y6_every_reply_leaves_everything_alone(self):
         replies = ["done", "yes", "sure", "ok", "thanks", "👍", "not yet", "researched", "sent", "done for Priya",
                    "haven't sent it yet", "will do tomorrow", "which template should I use for Priya?"]
@@ -1703,43 +1199,6 @@ class TestRepliesY:
                 q = Quiet(w)
                 said(w, text, post)
                 q.assert_unchanged(model=True)
-
-    def test_Y7_an_approvers_yes_is_never_a_vote_and_applies_nothing(self):
-        with rw.World() as w:
-            post = r13_post(w, research_rows(1))
-            key = w.open_proposal(kind="email_write", message_id=424242)
-            q = Quiet(w)
-            got = said(w, "yes", post, who="approver")
-            assert got == [LINE_RESEARCH.format(short="Priya")]
-            assert w.proposals()[key] == "open" and not w.votes()
-            q.assert_unchanged()
-        with rw.World() as w:
-            post = r13_post(w, research_rows(2))
-            key = w.open_proposal(kind="email_write", message_id=424242)
-            q = Quiet(w)
-            assert said(w, "yes", post, who="approver2") == [WHICH_2]
-            assert w.proposals()[key] == "open" and not w.votes()
-            q.assert_unchanged()
-
-    def test_Y8_acknowledgements_get_one_reaction_and_no_text(self):
-        for text in ("sure", "ok", "thanks", "👍", "not yet"):
-            with rw.World() as w:
-                post = r13_post(w, mixed_rows())
-                q = Quiet(w)
-                r0, n0 = len(w.reactions), w.n_posted
-                run(w.say(text, reply_to=post))
-                assert len(w.reactions) == r0 + 1, text
-                assert w.n_posted == n0, f"{text!r} got a text reply: {w.replies_after(n0)}"
-                q.assert_unchanged()
-
-    def test_Y9_a_real_question_goes_to_the_engine_with_the_post_as_context(self):
-        with rw.World() as w:
-            post = r13_post(w, mixed_rows())
-            m0 = w.model.calls
-            run(w.say("which email template should I use for Priya?", reply_to=post))
-            assert w.model.calls > m0, "the question never reached the engine"
-            assert "Next Steps says" in w.model.request_text(m0), "the engine was not given the post"
-            assert not any(r.startswith("Nice, can you") for r in w.replies_after(1))
 
     def test_Y10_not_done_is_not_a_done(self):
         for text in ("haven't sent it yet", "will do tomorrow", "didn't get to it", "not done"):
@@ -1772,29 +1231,83 @@ class TestRepliesY:
         # only proactive posts carry [TEST...]), so there is no difference at all between the two
         assert out[False] == out[True], f"LIVE {out[False]!r} != TEST {out[True]!r}"
 
-    def test_Y13_a_non_approver_teammate_counts_default_d(self):
-        with rw.World() as w:
-            post = r13_post(w, research_rows(1))
-            assert said(w, "done", post, who="member") == [LINE_RESEARCH.format(short="Priya")]
 
-    def test_a_shared_first_name_names_neither_and_the_full_name_is_used(self):
-        rows = [_row(1, "Priya Rao", "Acme Labs", "Research the PoC"),
-                _row(2, "Priya Nair", "Borealis", "Research the PoC")]
-        with rw.World() as w:
-            post = r13_post(w, rows)
-            got = said(w, "done for Priya", post)
-            assert got and got[0].startswith("Which one?"), got
-            which = w.posted[-1]
-            got = said(w, "Priya Nair", which)
-            assert got == ["Nice, can you set Next Steps for Priya Nair to Send email 1?"], got
-
-    def test_the_reply_pure_helpers(self):
-        import replies
-        for t in ("done", "all done", "yes", "completed"):
-            assert replies.next_step_done(t) == "done", t
-        assert replies.next_step_done("researched them") == "researched"
-        assert replies.next_step_done("sent it") == "sent"
-        for t in ("not yet", "haven't sent it yet", "will do tomorrow", "done?", "", "one two three four five six "
-                  "seven eight nine ten eleven twelve thirteen"):
-            assert replies.next_step_done(t) == "", t
-        assert replies.next_step_all("both") and replies.next_step_all("everyone") and not replies.next_step_all("Dev")
+# ---------------------------------------------------------------------------------------------
+# REMOVED ON 12 OCT 2026, WHEN RULE 13 BECAME A REMINDER. The tests below pinned behaviour that
+# no longer exists: lines that asked for a cell to be filled, the "missing cells" list, the
+# round-robin rotation, a connected row with no date being skipped, `closed` surviving a step
+# change, and the reader for a "done" under the post. What replaced them is checked in
+# tests/next_steps_checks.py (run by verify_next_steps.py and tests/test_next_steps.py).
+#
+#   TestCallClock:
+#     test_C1_nothing_ever_again_even_after_q_changes
+#     test_C4_default_f_a_replied_dm_never_gets_a_call_chase_or_the_unresponsive_reminder
+#     test_C4_with_the_marker_list_emptied_a_replied_dm_follows_the_call_clock
+#   TestClosedIsFinal:
+#     test_the_shipped_default_a_closed_person_stays_closed_after_a_step_change
+#     test_with_the_constant_off_a_step_change_reopens_them
+#   TestRecomputedEveryTick:
+#     test_after_the_post_the_same_five_come_back_until_tomorrow
+#   TestRepliesY:
+#     test_Y1_done_under_a_one_person_research_post
+#     test_Y2_two_research_people_unnamed_done_asks_which_then_a_number_or_a_name_picks
+#     test_Y2_all_picks_everyone
+#     test_Y3_researched_picks_the_one_research_person_without_a_question
+#     test_Y4_done_for_a_named_person_in_a_five_person_post
+#     test_Y4_a_named_email_person_gets_the_email_line
+#     test_Y5_one_exact_line_per_ask_code
+#     test_Y5_every_reply_line_is_clean
+#     test_Y7_an_approvers_yes_is_never_a_vote_and_applies_nothing
+#     test_Y8_acknowledgements_get_one_reaction_and_no_text
+#     test_Y9_a_real_question_goes_to_the_engine_with_the_post_as_context
+#     test_Y13_a_non_approver_teammate_counts_default_d
+#     test_a_shared_first_name_names_neither_and_the_full_name_is_used
+#     test_the_reply_pure_helpers
+#   TestRotation:
+#     test_R1_five_a_day_in_sheet_order_wrapping_to_the_top
+#     test_R1_nobody_comes_up_twice_before_every_due_person_has_had_a_turn
+#     test_R1_the_four_undated_rows_are_skipped_listed_and_logged_every_day
+#     test_R1_the_six_text_dates_and_every_step_are_in_the_rotation
+#     test_R1_queued_people_are_reported_not_lost
+#     test_R2_a_call_reminder_due_today_leads_the_post
+#     test_R3_a_step_change_clears_that_persons_state_and_they_are_named_again_ahead_of_unseen_rows
+#     test_R3_an_unchanged_step_is_not_named_early
+#   TestSheetWordingDoc:
+#     test_the_words_sent_to_vaishnavi_are_the_words_the_bot_loads
+#   TestState:
+#     test_a_changed_signature_resets_the_counts_but_never_the_closed_flag
+#     test_posts_round_trip_for_nft2_1063
+#   TestTheLine:
+#     test_no_invented_date_a_line_that_needs_a_date_has_the_rows_own
+#     test_the_item_carries_what_a_reply_will_need_later
+#   TestThePost:
+#     test_the_post_is_grouped_by_ask_and_is_never_random
+#     test_a_call_reminder_stays_first_in_the_rendered_post
+#   TestTimingTable:
+#     test_T1_blank_step_is_due_two_days_after_the_connection
+#     test_T2_research_is_due_two_days_after_the_connection
+#     test_T3_email_1_not_sent_is_due_two_days_after_the_connection
+#     test_T3_email_2_not_sent_is_due_two_days_after_the_first_email_date
+#     test_T3_email_3_not_sent_is_due_two_days_after_the_second_email_date
+#     test_T3_a_blank_previous_date_means_due_now_and_the_line_asks_for_it
+#     test_T3_q_and_the_cells_disagree_go_by_q_and_ask_for_the_missing_cells
+#     test_T3_email_3_with_nothing_logged_before_it_asks_for_both_earlier_pairs
+#     test_T3_a_date_cell_with_text_that_is_not_a_date_counts_as_blank_and_is_named
+#     test_T4_email_sent_with_a_date_is_due_a_week_later_and_asks_for_the_next_step
+#     test_T4_the_connected_date_can_be_typed_as_DD_dot_MM_dot_YYYY
+#     test_T5_email_sent_with_no_date_is_due_now_and_asks_for_the_date
+#     test_T6_a_replied_dm_is_a_meeting_question_for_both_steps_and_never_a_call
+#     test_T7_dm_step_without_a_dm_is_due_two_days_after_the_third_email
+#     test_T7_a_blank_third_email_date_is_due_now_and_asks_for_it
+#     test_T8_call_step_with_no_dm_logged_is_due_now_and_asks_for_the_dm_date
+#     test_T9_T10_the_call_starts_seven_days_after_the_dm
+#     test_T10_the_last_call_day_is_day_21_and_T11_day_22_is_the_unresponsive_reminder
+#   TestWhoIsIn:
+#     test_a_connected_row_with_no_date_is_skipped_logged_and_listed
+#     test_a_stopped_row_is_out_at_every_step
+#   TestWords:
+#     test_V1_every_line_passes_the_register_and_carries_no_rule_number_or_schedule_talk
+#     test_V1_every_group_ask_is_clean_and_in_all_lines
+#     test_V1_what_is_personal_goes_after_the_colon
+#     test_V1_the_grouped_post
+# ---------------------------------------------------------------------------------------------

@@ -378,85 +378,68 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R13
-  # NEXT STEPS FOR CONNECTED CONTACTS (added by Vaishnavi, 7 Oct 2026).
+  # NEXT STEPS FOR CONNECTED CONTACTS (added by Vaishnavi, 7 Oct 2026;
+  # REBUILT AS A REMINDER on 12 Oct 2026).
   #
   # LISTED HERE, BEFORE R5, ON PURPOSE. One contact is named once a day and the
-  # earlier rule keeps them; R13 names 5 people and R6 selects every connected
-  # contact, so R13 goes first. Listed after R6 it would lose almost everyone
-  # it picked every Tuesday and Friday. The consequence: on a day R13 names
-  # somebody, R5, R6 and R10 skip that person. Ids are not renumbered.
+  # earlier rule keeps them; R13 names 5 people (plus anybody it is dropping
+  # that day) and R5 and R6 would otherwise claim them first.
   #
-  # WHO: Outreach PoCs rows where "Sid - LI Addition" is Connected
-  # (NEXT_STEP_CONNECTED_MARKERS) and LI Connected Date holds a date. A
-  # connected row with no readable date is skipped, logged, and listed in
-  # `cadence preview`. Prospect Status "Unresponsive" (or any stop marker)
-  # takes a row out, as it does for every rule.
+  # IT IS A REMINDER. It says what needs doing and who for. It never names a
+  # cell, never asks for anything to be filled in, never gives a date, and
+  # Saley does not read replies to it: a "done" under the post gets nothing.
   #
-  # WHAT EACH PERSON IS ASKED, from Next Steps (Q) and that step's cells:
-  #   Next Steps          also                     due                               asks
-  #   blank                                        LI Connected + NEXT_STEP_FIRST_DAYS (2)
-  #                                                                                  what's the next step
-  #   Research the PoC                             the same                          researched? then "Send email 1"
-  #   Send email N        Nth Email Sent not yes   previous date +
-  #                                                NEXT_STEP_AFTER_PREVIOUS_DAYS (2) has it gone out
-  #   Send email N        sent, date logged        Nth Email Date +
-  #                                                NEXT_STEP_AFTER_EMAIL_DAYS (7)    set the next step
-  #   Send email N        sent, no date            now                               log the date
-  #   Reach by LI DM      no LI DM Date            3rd Email Date +
-  #                                                NEXT_STEP_AFTER_PREVIOUS_DAYS     has the DM gone out
-  #   Reach by LI DM /    LI DM Date, no meeting   LI DM Date +
-  #   Call the PoC                                 NEXT_STEP_CALL_AFTER_DM_DAYS (7),
-  #                                                then every
-  #                                                NEXT_STEP_CALL_EVERY_DAYS (3) until
-  #                                                + NEXT_STEP_CALL_UNTIL_DAYS (21)  time to call
-  #   after that                                   once                              set Prospect Status to
-  #                                                                                  Unresponsive; never again
-  # "Previous date" is LI Connected Date for email 1 and the (N-1)th Email Date
-  # for emails 2 and 3; blank means due now, and the line asks for it too.
+  # WHO IS IN: every Outreach PoCs row whose "Sid - LI Addition" says Connected
+  # (NEXT_STEP_CONNECTED_MARKERS). That is the only test: a row with NO LI
+  # Connected Date is in, and is due straight away. Out: a stop marker in
+  # Prospect Status or Deal Status, a Completed meeting (R9 takes over), a
+  # meeting booked for today or later, a snooze.
   #
-  # THE ROTATION: up to max_items_per_post people a post. Call reminders that
-  # are due go first; then whoever R13 named least recently, never-named people
-  # first, ties in sheet order. So it walks the Connected list top to bottom and
-  # starts again from the top. A person whose step changed is treated as new.
+  # WHAT EACH PERSON IS REMINDED ABOUT, by Next Steps:
+  #   blank / Research the PoC            research them
+  #   Send email N, not marked sent       send that email
+  #   Send email 1 or 2, marked sent      a week later: send the next email
+  #   Send email 3, marked sent           nothing
+  #   Reach by LI DM, DM not marked sent  nothing  <- THE ONE KNOWN GAP
+  #   Reach by LI DM / Call the PoC,      call them: 7 days after the LI DM Date,
+  #     LI DM Sent says sent              then every 3 days until day 21; with no
+  #                                       LI DM Date, straight away
+  #   ...LI DM Sent says Replied          set up a meeting
+  #   the calls ran out                   they look unresponsive (once)
+  #   free text                           skipped and logged; never guessed at
+  # A blank date always means "due now". A missing date is never mentioned.
   #
-  # AWAITING VAISHNAVI (built as defaults; each is changed here or in .env):
-  #   a. weekdays only, 15:00 IST           -> `weekdays` below; NEXT_STEP_TIME
-  #   b. outside the daily cap              -> `counts_toward_cap` below
-  #   c. remind only; never writes Q to W   -> RESTRICTED_COLUMN_RANGES (no switch)
-  #   d. a "done" from any teammate counts  -> replies arrive with NFT2-1063
-  #   e. sheet order; Priority is read, not used for the order
-  #   f. LI DM Sent "Replied": no call chase, asks about the meeting
-  #                                         -> NEXT_STEP_DM_REPLIED_MARKERS
-  #   g. a meeting booked for today or later pauses the rule for that person;
-  #      a Completed meeting ends it (R9 takes over)
-  #                                         -> NEXT_STEP_PAUSE_FOR_BOOKED_MEETING
+  # THE ORDER: who replied; calls due; the last 3 days before a drop; the next
+  # email due; an email not sent; research and blank; unresponsive. Inside a
+  # group the OLDEST LI Connected Date first, then R5's company score, and rows
+  # with no date last in sheet order. Priority (AF) is read and not used.
   #
-  # The post time is NEXT_STEP_TIME until NFT2-1069 adds `fixed_time`. Never
-  # held by the re-ask clock (drip.NEVER_HELD): the rule has its own.
+  # THE THREE-WEEK DROP IS THE ONLY ENDING. Counted from the day Saley FIRST
+  # named the person for that step (NEXT_STEP_DROP_AFTER_DAYS, 21). That day
+  # they are named once under "I'll stop reminding about these" and then not
+  # again. The clock restarts when the row moves, and a dropped person comes
+  # back under the new step. The unresponsive line is a drop of the same kind.
+  # The drop line does not use up the five places.
   - id: R13
     name: Next steps for connected contacts
     plain: next steps for the people we're connected with
     # The Bot Rules tab, rule 13, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      Next steps for the people we're connected with. Monday to Friday at
-      3 PM: Outreach PoCs rows where Sid - LI Addition is Connected and LI
-      Connected Date is filled. One post naming up to 5 people, taken from
-      the top of the sheet down and then from the top again; someone whose
-      call reminder is due goes first. One line each, saying what to do
-      next according to Next Steps: if it is blank, asks what the next
-      step is (2 days after connecting); "Research the PoC", asks whether
-      they have been researched and to set Next Steps to "Send email 1";
-      "Send email 1/2/3", asks whether that email has gone out and to mark
-      its Sent cell and date (2 days after the previous step), and a week
-      after the email's date asks to move Next Steps on (after email 3, to
-      "Reach by LI DM"); "Reach by LI DM", asks whether the DM has gone
-      out. A week after the LI DM Date with no meeting, reminds to call
-      them, again every 3 days until 3 weeks after the DM; then asks once
-      to set Prospect Status to "Unresponsive" and stops for that person.
-      If LI DM Sent says Replied, asks whether a meeting is being set up
-      instead. A booked meeting pauses it; a Completed meeting ends it.
-      Saley only reminds; it never fills these cells. Doesn't count toward
-      the 5 posts a day.
+      Next steps for the people we're connected with: a reminder. Monday
+      to Friday at 3 PM, one post naming up to 5 people from the Outreach
+      PoCs rows where Sid - LI Addition is Connected (an LI Connected Date
+      is not needed), grouped by what needs doing: people who replied to
+      the DM (set up a meeting), people to call, people whose first or
+      second email went out over a week ago (time for the next one),
+      people whose first, second or third email hasn't gone out, people
+      to research, and people who look unresponsive after the calls. Each
+      person is one line, name and company. Whoever has waited longest
+      comes first. If nothing moves for three weeks after Saley first
+      names someone for a step, it says once that it will stop reminding
+      about them, and they are dropped until their row changes. A booked
+      meeting pauses a person; a Completed meeting ends it. Saley never
+      fills these cells and does not reply to answers under the post.
+      Doesn't count toward the 5 posts a day.
     weekdays: [mon, tue, wed, thu, fri]
     trigger: next_step_followups
     max_items_per_post: 5

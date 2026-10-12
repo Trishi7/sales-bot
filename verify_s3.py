@@ -683,10 +683,14 @@ async def the_monday() -> None:
     check("with rule 13 covering all seven, a Monday posts no R7 at all", none["posts"].get("R7"), None)
     covered_sheet({"1", "2", "3"})
     for row in GRIDS["Outreach PoCs"][1:]:
-        row[COL["LI Connected Date"]] = ""          # Connected, but no date: rule 13 skips them
+        row[COL["LI Connected Date"]] = ""          # Connected, but no date
     nodate = await live_path(MON)
-    check("Connected with NO LI Connected Date is not covered: all seven are R7's again (five listed, two over)",
-          ("(+2 more next Monday)" in "\n".join(nodate["posts"].get("R7") or [])), True)
+    listed = [l.split(" — ")[0].split(". ", 1)[1]
+              for l in "\n".join(nodate["posts"].get("R7") or []).splitlines() if re.match(r"^\d+\. ", l)]
+    # CHANGED 12 Oct 2026: rule 13 takes every Connected row now, dated or not, so the three Connected
+    # people stay rule 13's with their dates blanked. It used to hand all seven back to R7.
+    check("Connected with NO LI Connected Date is still rule 13's: R7 lists the same four and none of those three",
+          listed, ["Dee Evans", "Eve Rao", "Fay Lin", "Gil Shah"])
     monday_sheet()
     RULES.clear()
     RULES.update({"R4", "R7", "R10"})

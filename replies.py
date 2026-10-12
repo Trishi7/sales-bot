@@ -380,126 +380,10 @@ def pick_numbered(text: str, n: int) -> Optional[int]:
     return picks[0] if 1 <= picks[0] <= int(n or 0) else None
 
 
-# -- a reply to the next-steps post (rule 13) --------------------------------
-#
-# "DONE" UNDER A NEXT-STEPS POST IS AN ANSWER TO ITS QUESTION ("has it gone
-# out?", "have they been researched?"), so it is read here and not as a vote
-# or an acknowledgement. Three kinds, because which people a word can be about
-# depends on it: "researched" can only answer a research line, "sent" an email
-# or DM line, and "done" any of them.
-NEXT_STEP_DONE = ("done", "all done", "did", "did it", "yes", "yep", "yeah", "yup",
-                  "completed", "finished")
-NEXT_STEP_RESEARCHED = ("researched", "research done")
-NEXT_STEP_SENT = ("sent", "sent it", "went out", "gone out", "emailed")
-# ONE OF THESE AND IT IS NOT A "DONE": "not sent yet", "will do tomorrow",
-# "haven't". Apostrophes are deleted before matching (`_words`).
-NEXT_STEP_NOT = ("not", "no", "yet", "havent", "didnt", "wont", "will", "tomorrow",
-                 "later", "soon")
-# Past this many words it is a sentence with facts in it ("sent to Priya on 5
-# Oct, meeting Friday"), and those belong to the extractor.
-NEXT_STEP_MAX_WORDS = 12
-NEXT_STEP_ALL = ("all", "both", "everyone", "all of them", "both of them")
-# Which asks each kind of "done" can be answering.
-NEXT_STEP_FITS = {
-    "researched": ("researched",),
-    "sent": ("email_out", "log_date", "dm_out"),
-}
-
-
-def _has_phrase(words: list, phrases) -> bool:
-    """Is any of `phrases` in `words`, as whole words in order?"""
-    for phrase in phrases:
-        part = phrase.split()
-        if any(words[i:i + len(part)] == part for i in range(len(words) - len(part) + 1)):
-            return True
-    return False
-
-
-def next_step_done(text: str) -> str:
-    """"researched" / "sent" / "done" when the message says the step is done,
-    else "".
-
-    "" FOR A QUESTION, A LONG MESSAGE, OR ANYTHING WITH A "NOT" IN IT. The
-    line that follows asks somebody to update the sheet; sending it to
-    "haven't sent it yet" would be asking them to record something that has
-    not happened.
-    """
-    if "?" in str(text or ""):
-        return ""
-    words = _words(text)
-    if not words or len(words) > NEXT_STEP_MAX_WORDS:
-        return ""
-    if any(w in NEXT_STEP_NOT for w in words):
-        return ""
-    if _has_phrase(words, NEXT_STEP_RESEARCHED):
-        return "researched"
-    if _has_phrase(words, NEXT_STEP_SENT):
-        return "sent"
-    if _has_phrase(words, NEXT_STEP_DONE):
-        return "done"
-    return ""
-
-
-def next_step_all(text: str) -> bool:
-    """"all", "both", "everyone" — the answer to "Which one?" that means each
-    of them. Only when that is all the message says."""
-    if "?" in str(text or ""):
-        return False
-    words = _words(text)
-    return bool(words) and _consume(
-        words, tuple(NEXT_STEP_ALL) + tuple(_NUMBER_FILLERS) + ("of", "them")
-    ) is not None and _has_phrase(words, NEXT_STEP_ALL)
-
-
-def _name_words(value) -> list:
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split()
-
-
-def next_step_shorts(people: list) -> list:
-    """How each person in a post is named in a reply line: the first name; the
-    full name when two people in the post share a first name; the company when
-    the row has no name."""
-    firsts = [(_name_words(p.get("poc")) or [""])[0] for p in people]
-    out = []
-    for person, first in zip(people, firsts):
-        name = str(person.get("poc") or "").strip()
-        if not name:
-            out.append(str(person.get("company") or "").strip() or "them")
-        elif firsts.count(first) > 1:
-            out.append(name)
-        else:
-            out.append(name.split()[0])
-    return out
-
-
-def next_step_named(text: str, people: list) -> list:
-    """The indexes of the people in `people` the message names: by full name,
-    by first name, or by company, as whole words.
-
-    A FIRST NAME TWO PEOPLE SHARE NAMES NEITHER. Picking the first "Priya" on
-    the list would send somebody to update the wrong row.
-    """
-    words = _name_words(text)
-    firsts = [(_name_words(p.get("poc")) or [""])[0] for p in people]
-    hits = []
-    for i, person in enumerate(people):
-        full = _name_words(person.get("poc"))
-        company = _name_words(person.get("company"))
-        first_ok = bool(firsts[i]) and firsts.count(firsts[i]) == 1
-        if (full and _has_phrase(words, [" ".join(full)])) \
-                or (company and _has_phrase(words, [" ".join(company)])) \
-                or (first_ok and firsts[i] in words):
-            hits.append(i)
-    return hits
-
-
-def next_step_candidates(kind: str, people: list) -> list:
-    """The indexes of the people a "done" of this kind can be about, when it
-    names nobody: those whose ask fits the word, or everybody when none does
-    (and for a plain "done")."""
-    fits = NEXT_STEP_FITS.get(kind)
-    hits = [i for i, p in enumerate(people) if fits and p.get("ask") in fits]
-    return hits or list(range(len(people)))
+# (THE READER FOR A REPLY TO THE NEXT-STEPS POST WAS HERE until 12 Oct 2026:
+# next_step_done / _all / _shorts / _named / _candidates. That post is now a
+# reminder and replies to it are not read, so they were removed with their
+# tests. See `bot._statement_under_next_steps`.)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -675,39 +559,6 @@ def _self_test() -> int:
                           ("yes", 2, None), ("the second one for Acme", 2, None),
                           ("2?", 2, None), ("", 2, None), ("1 and 2", 2, None)]:
         check(f"pick_numbered({text!r}, {n})", pick_numbered(text, n), want)
-
-    print("\na reply to the next-steps post")
-    for text, want in [("done", "done"), ("Done!", "done"), ("yes", "done"),
-                       ("yep all done", "done"), ("researched", "researched"),
-                       ("research done for Priya", "researched"), ("sent", "sent"),
-                       ("sent it yesterday", "sent"), ("emailed him", "sent"),
-                       ("done for Priya", "done"), ("sure", ""), ("ok", ""),
-                       ("thanks", ""), ("not yet", ""), ("haven't sent it yet", ""),
-                       ("will do tomorrow", ""), ("no", ""), ("is it done?", ""),
-                       ("which email template should I use for Priya?", ""),
-                       ("sent to Priya on 5 Oct and the meeting is on Friday at "
-                        "three in the afternoon", ""), ("", "")]:
-        check(f"next_step_done({text!r})", next_step_done(text), want)
-    for text, want in [("all", True), ("both", True), ("everyone", True),
-                       ("all of them", True), ("both please", True),
-                       ("all done", False), ("both?", False), ("Priya", False)]:
-        check(f"next_step_all({text!r})", next_step_all(text), want)
-    crew = [{"poc": "Priya Rao", "company": "Acme Labs", "ask": "researched"},
-            {"poc": "Dev Shah", "company": "Borealis", "ask": "email_out"},
-            {"poc": "Priya Nair", "company": "Cinder", "ask": "email_out"},
-            {"poc": "", "company": "Delta Works", "ask": "dm_out"}]
-    check("a full name names one person", next_step_named("done for Priya Rao", crew), [0])
-    check("a shared first name names nobody", next_step_named("done for Priya", crew), [])
-    check("a first name", next_step_named("Dev is done", crew), [1])
-    check("a company", next_step_named("sent for delta works", crew), [3])
-    check("'devote' is not Dev", next_step_named("devote time", crew), [])
-    check("the short names", next_step_shorts(crew),
-          ["Priya Rao", "Dev", "Priya Nair", "Delta Works"])
-    check("researched fits the research line", next_step_candidates("researched", crew), [0])
-    check("sent fits the email and DM lines", next_step_candidates("sent", crew), [1, 2, 3])
-    check("done fits everybody", next_step_candidates("done", crew), [0, 1, 2, 3])
-    check("a word that fits nobody falls back to everybody",
-          next_step_candidates("researched", crew[1:]), [0, 1, 2])
 
     print("\nwhat the model is handed")
     one = with_parent("and for Globex?", [

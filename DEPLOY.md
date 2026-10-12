@@ -1198,3 +1198,48 @@ was posted. On a test day the log says the marker and the ledger were NOT touche
 `bot_rules.yaml`); paste it into the sheet by hand.
 
 `python verify_news_screen.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R13 rebuild (12 Oct): next steps as a reminder
+
+What changes for the team: the 3 PM "Next steps" post stops asking questions about the sheet. It says what needs
+doing, grouped ("We need to call these PoCs:", "We need to send out the first email to these people:" and so on),
+with one line a person: name and company. It never names a cell and never asks for a date. People who are Connected
+with no LI Connected Date now appear. The people who have waited longest come first. If nothing moves for three weeks
+after Saley first names somebody for a step, it says once that it will stop reminding about them; they come back when
+their row changes. **Saley no longer answers "done" under the post**: update the sheet instead.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Two new variables; the defaults are what was
+specified, so the lines are optional:
+
+```
+NEXT_STEP_DROP_AFTER_DAYS=21
+NEXT_STEP_DM_SENT_MARKERS=sent,yes,done
+```
+
+Check `NEXT_STEP_DM_SENT_MARKERS` against what the team actually types in **LI DM Sent**: a value that is not on
+the list (and is not a ticked checkbox) is not read as sent, and that person never reaches the call stage. Then, on
+the laptop, `python tools/redact_env.py`. Nothing changed its default and nothing is retired.
+
+**Database.** One new column, `next_step_followups.first_named`, added on start. Rows written before this release
+have it blank, so everybody's three-week clock starts at their next naming. A person the old rule had closed after
+the Unresponsive reminder stays closed until their row changes. `next_step_posts` is left in place and no longer
+written.
+
+**What to look for in the boot log:**
+
+```
+[config] R13 next steps (a reminder; replies are not read): post at 15:00 IST; first reminder +2d, after the previous step +2d, next email +7d; calls from DM +7d every 3d until +21d; an ask is DROPPED after 21d of being named; connected=connected dm_sent=sent,yes,done replied=replied,responded pause_for_booked_meeting=True
+```
+
+A warning follows if `NEXT_STEP_DROP_AFTER_DAYS` is under 7 or `NEXT_STEP_DM_SENT_MARKERS` is empty. At 3 PM:
+
+```
+[rules] R13: 33 connected, 21 due -> 5 picked, 16 queued; 0 dropped today (of 0 at three weeks); ...
+```
+
+(the numbers are illustrative).
+
+**The Bot Rules tab.** Rule 13's "What the Bot Shares / Checks" wording is new end to end (`sheet_wording` in
+`bot_rules.yaml`); paste it into the sheet by hand.
+
+`python verify_next_steps.py --show` checks all of it offline and prints the messages.

@@ -561,18 +561,20 @@ async def d21_thanks_not_a_reply_nothing_open(check, test_mode):
 
 @case
 async def d22_yes_to_an_r13_post_is_not_a_vote(check, test_mode):
-    """'yes' to 'Has it gone out?' is an answer about something else; an email offer is open elsewhere."""
+    """'yes' under the next-steps post is not a vote on anything; an email offer is open elsewhere.
+    (12 Oct 2026: that post is a reminder and replies to it are not read at all.)"""
     import nextaction
     with World(test_mode) as w:
         email_post = w.bot_says("Want me to add the email I found to the sheet? Say yes.")
         key = await _open_email(w, email_post)
-        r13 = drip_post(w, "**Next steps**\n• Person 01 (Acme Labs 01): Next Steps says Send email 2. Has it gone out? "
-                           "If so, mark 2nd Email Sent and the date.", nextaction.R_NEXT_STEPS, slot=2)
+        r13 = drip_post(w, "**Next steps**\nWe need to send out the second email to these people:\n"
+                           "- Person 01 (Acme Labs 01)", nextaction.R_NEXT_STEPS, slot=2)
         m = Mark(w)
         await w.say("yes", reply_to=r13)
         check("D22: not a vote; the email offer elsewhere is untouched", (m.d("votes"), w.proposals()[key]), (0, "open"))
         check("D22: nothing was written", w.sheet.writes, [])
-        check("D22: not acknowledged with a reaction (the post asks a question; 'yes' answers it)", m.reacted, [])
+        check("D22: no reaction and no reply: replies to the next-steps post are not read", (m.reacted, m.said),
+              ([], []))
         return w.snapshot()
 
 
@@ -1200,17 +1202,21 @@ async def s_routing_of_the_two_asks(check, test_mode):
 
 
 @case
-async def h_the_rule13_hook_exists_and_does_nothing_harmful(check, test_mode):
-    """5.6: `_maybe_next_step_reply(message, text, ctx)` is a stub that returns False and touches nothing."""
+async def h_the_rule13_reply_reader_is_gone_and_done_gets_nothing(check, test_mode):
+    """12 Oct 2026: the next-steps post is a reminder. `_maybe_next_step_reply` was removed, and "done" under the
+    post gets no reply, no reaction, no vote, no write and no model call."""
+    import nextaction
     with World(test_mode) as w:
-        check("hook: the stub exists", hasattr(w.bot, "_maybe_next_step_reply"), True)
-        m = rw.HMsg(w, w.chan, "done", APPROVER)
-        got = w.bot._maybe_next_step_reply(m, "done", {"drip": {"action_type": "next_step_followups"},
-                                                      "root_id": "1"})
-        if inspect.isawaitable(got):
-            got = await got
-        check("hook: returns False (the Rule 13 owner fills it in later)", got, False)
-        check("hook: touched nothing", (w.n_posted, w.votes(), w.sheet.writes, w.counts()["model"]), (0, [], [], 0))
+        check("hook: the reply reader is gone",
+              [n for n in ("_maybe_next_step_reply", "_is_next_step_reply") if hasattr(w.bot, n)], [])
+        post = drip_post(w, "**Next steps**\nWe need to research these PoCs:\n- Person 01 (Acme Labs 01)",
+                         nextaction.R_NEXT_STEPS, slot=2)
+        before = w.n_posted
+        await w.say("done", reply_to=post)
+        await w.say("done for Person 01", who="member", reply_to=post)
+        check("hook: 'done' under the post touches nothing",
+              (w.n_posted - before, w.reactions, w.votes(), w.sheet.writes, w.counts()["model"]),
+              (0, [], [], [], 0))
         return {}
 
 

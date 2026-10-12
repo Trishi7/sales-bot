@@ -379,8 +379,10 @@ def rule_7(check) -> None:
             return [a["poc"] for a in nextaction.run(today=MON, rows=[row], day_rules=r7_rule)["actions"]]
 
         dm = cell(MON - timedelta(days=11))
-        check("Connected but NO LI Connected Date: Rule 13 skips them, so R7 lists them",
-              listed(poc(20, "Lumen", "Lia Das", li_dm_date=dm, sid_li_added="Connected")), ["Lia Das"])
+        # CHANGED 12 Oct 2026: Rule 13 takes every Connected row now, dated or not, so R7
+        # leaves this one alone too. It used to list her.
+        check("Connected but NO LI Connected Date: Rule 13's as well now, so R7 does not list them",
+              listed(poc(20, "Lumen", "Lia Das", li_dm_date=dm, sid_li_added="Connected")), [])
         check("a date but not marked Connected: R7 lists them",
               listed(poc(21, "Mason", "Max Roy", li_dm_date=dm,
                          li_connected_date=cell(MON - timedelta(days=20)))), ["Max Roy"])

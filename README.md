@@ -663,9 +663,10 @@ any news on ElevenLabs?" is answered as "any news on ElevenLabs?", as its own
 question). "no rush" and "no worries" contain "no" and are **not** a no: under
 an open offer they leave it open (`replies.ack_is_vote`).
 
-**Rule 13's replies.** `bot._maybe_next_step_reply` is the hook for a reply to
-the next-steps post ("done"); it is a stub that changes nothing until
-RULE13.md section 14 is built.
+**Rule 13's post is a reminder and replies to it are not read** (12 Oct 2026).
+A statement under it ("done", "sent", "ok") gets no reply and no reaction
+(`bot._statement_under_next_steps`); a question under it is answered like any
+other question.
 
 `python verify_replies.py` runs the decision table through the real
 `on_message`, in live and test mode.
@@ -2212,138 +2213,148 @@ and R10 skip that person.
 
 ### Rule 13: next steps for connected contacts
 
-Added by Vaishnavi on 7 Oct 2026. It **replaces rule 7** (`enabled: false` in
-the file; the evaluator is kept) and leaves rule 6 as the email check, whose
-line no longer says "no DM logged".
+**A reminder, not a set of questions (rebuilt 12 Oct 2026).** One post each
+weekday at 15:00 that says what needs doing and who for. It never names a
+cell or a column, never gives a date, never asks for anything to be filled in,
+**Saley does not read replies to it**, and every ask ends after three weeks.
+`python verify_next_steps.py --show` prints the messages.
 
-**Who is in.** Outreach PoCs rows where *Sid - LI Addition* is Connected
-(`NEXT_STEP_CONNECTED_MARKERS`) and *LI Connected Date* reads as a date, that
-the stop and snooze gates let through. A Connected row with no readable date is
-skipped, logged, and listed in `cadence preview`. Prospect Status
-"Unresponsive" stops a row, as for every rule.
+**Who is in.** Every Outreach PoCs row where *Sid - LI Addition* says Connected
+(`NEXT_STEP_CONNECTED_MARKERS`), that the stop and snooze gates let through.
+That is the only test. **A row with no LI Connected Date is in** (until 12 Oct
+it was skipped and only listed in `cadence preview`); it is due straight away
+and is still listed in the preview as undated. Out: a stop marker in Prospect
+Status or Deal Status, a Completed meeting (rule 9 takes over for good), and a
+meeting dated today or later while `NEXT_STEP_PAUSE_FOR_BOOKED_MEETING` is
+true. `nextaction.covered_by_next_steps` follows the same test, so rule 7
+never lists a person rule 13 reminds about.
 
-**What each person is asked**, from the Next Steps dropdown (Q) and the cells
-that step turns on. Every number is a setting; calendar days.
+**What each person is reminded about** (`nextaction.next_step_for`):
 
-| Next Steps (Q) | Also | Due | Saley asks |
-|---|---|---|---|
-| blank | | LI Connected + `NEXT_STEP_FIRST_DAYS` (2) | what the next step is |
-| Research the PoC | | the same | have they been researched? then set Next Steps to "Send email 1" |
-| Send email N | Nth Email Sent not yes | previous date + `NEXT_STEP_AFTER_PREVIOUS_DAYS` (2) | has it gone out? then mark Nth Email Sent and the date |
-| Send email N | sent, date logged | Nth Email Date + `NEXT_STEP_AFTER_EMAIL_DAYS` (7) | set Next Steps to "Send email N+1" (after 3: "Reach by LI DM") |
-| Send email N | sent, no date | now | log the date |
-| Reach by LI DM | no LI DM Date | 3rd Email Date + `NEXT_STEP_AFTER_PREVIOUS_DAYS` | has the DM gone out? |
-| Call the PoC | no LI DM Date | now | have they been called? and log the LI DM Date |
-| Reach by LI DM / Call the PoC | LI DM Sent says Replied (`NEXT_STEP_DM_REPLIED_MARKERS`) | now | is a meeting being set up? No call reminders |
-| Reach by LI DM / Call the PoC | LI DM Date, no meeting | LI DM Date + `NEXT_STEP_CALL_AFTER_DM_DAYS` (7), then every `NEXT_STEP_CALL_EVERY_DAYS` (3) until + `NEXT_STEP_CALL_UNTIL_DAYS` (21) | time to call them |
-| after that | | once | set Prospect Status to "Unresponsive"; then never again for that person |
+| Next Steps says | And | The reminder |
+|---|---|---|
+| blank | | research them |
+| Research the PoC | | research them |
+| Send email 1/2/3 | that email isn't marked sent | send that email |
+| Send email 1/2 | marked sent, `NEXT_STEP_AFTER_EMAIL_DAYS` (7) ago | send the next email |
+| Send email 3 | marked sent | nothing |
+| Reach by LI DM | LI DM Sent does not say sent | nothing: **the one known gap** |
+| Reach by LI DM / Call the PoC | LI DM Sent says sent (`NEXT_STEP_DM_SENT_MARKERS`) | call them |
+| Reach by LI DM / Call the PoC | LI DM Sent says Replied (`NEXT_STEP_DM_REPLIED_MARKERS`, checked first) | set up a meeting |
+| either | the call ladder ran out | they look unresponsive (once) |
+| free text the bot doesn't know | | nothing; the row is skipped and logged |
 
-"Previous date" is LI Connected Date for email 1 and the (N-1)th Email Date for
-emails 2 and 3. **A blank previous date means due now**, and the line asks for
-the missing cell as well. **When the dropdown and the cells disagree** (Next
-Steps says "Send email 2", 1st Email Sent is blank) the rule goes by the
-dropdown and also asks for the missing cell. The dropdown is compared
-normalised ("Send Email 1" is "Send email 1"; "Call PoC" is "Call the PoC");
-any other value is skipped, logged and listed in the preview. A meeting dated
-today or later pauses the rule for that person
-(`NEXT_STEP_PAUSE_FOR_BOOKED_MEETING`); a Completed meeting ends it and rule 9
-takes over.
+*Timing.* "Research" and the first email are due `NEXT_STEP_FIRST_DAYS` /
+`NEXT_STEP_AFTER_PREVIOUS_DAYS` (2) after the previous step's date. Calls start
+`NEXT_STEP_CALL_AFTER_DM_DAYS` (7) after the LI DM Date and repeat every
+`NEXT_STEP_CALL_EVERY_DAYS` (3) until `NEXT_STEP_CALL_UNTIL_DAYS` (21).
 
-**Who is picked: a rotation.** Up to `max_items_per_post` (5) people a post.
-Call reminders that are due go first, because that clock runs out; then the
-people named least recently, never-named first, ties in sheet order. So it
-walks the Connected list from the top down and starts again from the top.
-There is no per-person "every two days": a person comes back when the rotation
-reaches them, and keeps coming back until their step changes. Priority (AF) is
-read and shown in the preview and is not used for the order. The evaluator
-picks the five itself (every other rule hands over everything and lets the post
-take what fits), so the cross-rule dedup cannot choose a different five.
+*A blank date means due now, and is never mentioned.* A connected row with no
+LI Connected Date, an email marked sent with no date (the step counts as done
+and the next email is due), and a DM marked sent with no date (the call is due
+straight away) all work without a date in the sheet. **Whether the DM has gone
+out is read off the LI DM Sent cell**, whole value, normalised ("Not sent" is
+not "sent"; a ticked checkbox counts), not off the LI DM Date as before. "Call
+the PoC" is the call stage whatever LI DM Sent says.
 
-**State: two tables, written only after a real send.** `next_step_followups`
-holds each person's step signature, the last day they were named, the
-call-reminder count and whether the Unresponsive reminder went out.
-`next_step_posts` holds, per Discord message id, who the post named and what
-each was asked. The evaluator is pure: it is handed the state and writes
-nothing. A step that changed is handled by ignoring the stale entry, so
-`cadence preview` and every question leave both tables untouched. If the state
-cannot be read the rule names nobody (an empty state would restart the
-rotation and chase people already closed). Once today's post has gone, the
-queue keeps returning the same people for the rest of the day, so the tick
-after the post cannot pick five more and dedup them out of rules 5 and 6. The
-preview then shows the people already named, and a line may read "named in
-today's post" (a call reminder recomputes as waiting once it is recorded);
-someone whose Unresponsive reminder went out today is still listed today and
-drops out tomorrow. If the tab has no Next Steps or email columns mapped (the
-pre-7 Oct layout, a renamed header), the rule names nobody, logs a warning and
-the preview says which columns are missing: a column the bot cannot see is not
-a blank cell.
+*The known gap.* Next Steps says "Reach by LI DM" and the DM is not marked
+sent: nothing reminds anybody to send it. The agreed message has no line for
+it and none was invented.
 
-| Path | Where the rotation is recorded |
+**The order people are picked in** (`nextaction._next_step_order`), five a
+post:
+
+1. replied to the DM
+2. a call that is due
+3. in their last 3 days before the drop
+4. the next email is due
+5. an email that has not gone out
+6. research, and a blank Next Steps
+7. unresponsive
+
+Inside a tier the **oldest LI Connected Date first**; a tie goes to **R5's
+company score** (`nextaction.company_scores`, which imports R5's weights and
+phrase lists from `prospects.py` and scores each company from all its rows:
+`prospects.build_queue` cannot be used because it only holds companies that
+still have somebody with no first contact); then sheet order. Rows with no LI
+Connected Date go last in their tier, in sheet order. Priority (AF) is read
+and shown in the preview and is not used for the order. **There is no
+rotation:** the same five are named each day until somebody acts on them or
+they are dropped.
+
+The rule picks the five itself and hands the drip exactly those people, and
+once today's post has gone, today's people stay today's people (the queue is
+recomputed on every sweep tick).
+
+**The three-week drop is the only ending.** The clock starts the day Saley
+**first names** a person for a step (`first_named` in `next_step_followups`),
+not at any sheet date. After `NEXT_STEP_DROP_AFTER_DAYS` (21) with the step
+unchanged the person is named **once** under the drop line and then not again:
+day 20 is a normal reminder, day 21 the drop line, day 22 nothing. The clock
+restarts when the step's signature changes, and **a dropped person comes back
+when the sheet moves**: dropping ends an ask, not a person. The unresponsive
+line is a drop of the same kind. For a call counted from an LI DM Date the
+call ladder's own end wins and gives the unresponsive line; with no LI DM Date
+there is no ladder to run out, so the three-week drop is the backstop. The
+drop line does not use up the five places: up to five people being dropped
+are listed on top of the five reminders.
+
+**The post.** Fixed text from `wording.py` (`NEXT_STEP_GROUPS` is the only
+place the eleven agreed lines live); R13 is in `drip.VERBATIM_TYPES`. A group
+appears only when somebody is in it, in this order, with the drop line last.
+Each person is one line, `- Name (Company)`, and nothing else.
+
+```
+**Next steps**
+@Vaishnavi @Sid
+
+The people below have replied to us! We need to set up a meeting with them:
+- Ariya Rastrow (Wisprflow.ai)
+
+We need to call these PoCs:
+- Angelos Perivolaropoulos (ElevenLabs)
+
+We sent the first email to these people over a week ago — time for the second:
+- Ioana Mocanu (Agoda)
+
+We need to send out the first email to these people:
+- Arjun Aryaa (Gnani.ai)
+- Oliver Shoulson (PolyAI)
+
+I'll stop reminding about these. It's been three weeks and nothing has moved:
+- Harry Swanson (PolyAI)
+```
+
+Nothing is posted when nobody is due, when the Next Steps or email columns
+cannot be found on the tab (the log names the columns), or when the reminder
+state cannot be read.
+
+**Replies are not read.** A "done" under the post gets nothing: no reply, no
+reaction, nothing recorded, nothing written
+(`bot._statement_under_next_steps`). The reader that used to answer "done"
+with a request to fill a cell was removed, with `next_step_posts` (the table
+is left in the schema, unread and unwritten). A message with a question in it
+is still answered as a question.
+
+**State, written only after a real send** (`bot._record_next_steps`): one row
+a person in `next_step_followups`, holding the step's signature, the day they
+were first named for it, the last day and what for, the call count, and
+`closed` once they have been named under the drop or unresponsive line.
+Everything in the row belongs to the signature, `closed` included.
+
+| Path | Where it is recorded |
 |---|---|
 | `cadence preview`, `--dry-run-drip`, any question | nowhere: read only |
 | live | `DB_PATH` |
 | `SALES_TEST_MODE=true` | `DB_PATH`, like every other ledger: point it at a `*_test.db` first |
 | a simulation | the sandbox copy, which is discarded |
-| a test day ("make it Monday") | `DB_PATH` only when it ends in `_test.db`. On any other database the post goes out and the log says `[rules] R13: test day on a live database; rotation not recorded` |
+| a test day ("make it Monday") | `DB_PATH` only when it ends in `_test.db`. On any other database the post goes out and nothing is recorded, so a rehearsal cannot start or run down anybody's three-week clock |
 
-The last row is stricter than rule 9's ladder on purpose: a rehearsal on a live
-database must not move who the next real post names.
+**Timing.** Weekdays at `NEXT_STEP_TIME` (15:00 IST), a fixed-time post
+outside the daily cap and never held by the re-ask clock.
 
-**The post.** One message for the whole rule, headed "Next steps", addressed by
-the tags line like the other Outreach PoCs rules (no owner, no hard-coded id).
-It is fixed text from `wording.py`, **grouped by ask** since 8 Oct
-(`wording.next_step_post`): each ask is written once and the people it applies
-to are listed under it, "- Name (Company)", with anything personal (the date an
-email or DM went out, cells the row lacks) after a colon. One group per ask and
-email number; groups keep the order the rule picked people in, so call
-reminders come first; a blank line between groups. There is no opener line any
-more. It is **never composed by the
-model**, so it costs no model call and no search, and is word for word the same
-live, in test mode, on a test day and in a simulation. No rule number, no
-schedule talk.
-
-```
-**Next steps**
-@Vaishnavi
-Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
-- Arjun Aryaa (Gnani.ai)
-- Oliver Shoulson (PolyAI)
-
-Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date.
-- Ariya Rastrow (Wisprflow.ai)
-```
-
-**Timing.** Weekdays at `NEXT_STEP_TIME` (15:00 IST), a fixed-time post like
-R1's news: no window slot, outside the cap (`counts_toward_cap: false` in the
-file), never held by the re-ask clock (`drip.NEVER_HELD`). The live sender
-posts on a sweep tick, so "15:00" means the first tick at or after 15:00: keep
-`COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` at 15. The catch-up guard that spaces
-posts does not hold this one, and this one does not delay the next spaced post
-(`drip.ON_TIME_TYPES`).
-
-**Saley only reminds.** Q to W are a restricted band and the new roles are in
-no write tier, so no reply, command or approval can make the bot fill them.
-
-**What a reply to the post does today.** The reply handling ("done" → "Nice,
-can you set Next Steps for Priya to Send email 1?") arrives with NFT2-1063.
-Until then a reply goes down the ordinary path: it may get an ordinary answer,
-or a "which company?" question. Nothing is written and no rule 13 state
-changes. One guard is in place now: an approver's "yes" replied to a next-steps
-post is **not** read as a yes to whatever proposal happens to be open
-(`[approvals] … replies to a next-steps post — not a vote`).
-
-**Awaiting Vaishnavi** (built as defaults; each changes without a code change
-unless marked):
-
-| | Default built | Where it changes |
-|---|---|---|
-| a | Weekdays only, 15:00 IST | `bot_rules.yaml` R13 `weekdays`; `NEXT_STEP_TIME` |
-| b | Outside the daily cap | `bot_rules.yaml` R13 `counts_toward_cap` |
-| c | Remind only; never writes Q to W | `RESTRICTED_COLUMN_RANGES` holds the lock; there is no switch |
-| d | A "done" from any teammate counts | nothing built yet (NFT2-1063) |
-| e | Sheet order; Priority read, not used | `nextaction._next_step_order` (code) |
-| f | LI DM Sent "Replied": no call chase, asks about the meeting | `NEXT_STEP_DM_REPLIED_MARKERS` (empty = treat like any DM) |
-| g | A booked meeting pauses; a Completed one ends | `NEXT_STEP_PAUSE_FOR_BOOKED_MEETING` |
+**Saley only reminds.** Q to W are a restricted band; no setting makes the bot
+fill them.
 
 ### The rules that need saying out loud
 
@@ -2812,8 +2823,8 @@ the same thing and neither should get an empty list.
 | ~~R5 repeat counts~~ | `prospect_mentions` | RETIRED 11 Oct 2026: left in the schema, nothing reads or writes it |
 | ~~R5 week companies~~ | `prospect_week` | RETIRED 11 Oct 2026, with "two companies a week": left in the schema, nothing reads or writes it |
 | **R9 ladder** | `meeting_followups` | advanced by the sender; cleared when Notes/Remarks is filled |
-| **R13 rotation** | `next_step_followups` | written by the sender after a real send; a changed step signature starts the person again; `closed` is never reset |
-| **R13 posts** | `next_step_posts` | who each post named and what each was asked, by message id |
+| **R13 reminders** | `next_step_followups` | written by the sender after a real send; the day a person was first named for a step starts the three-week drop; a changed step signature starts the person again, `closed` included |
+| ~~R13 posts~~ | `next_step_posts` | RETIRED 12 Oct 2026 with the reply handling: left in the schema, nothing reads or writes it |
 | **R11 snapshot** | `pipeline_companies` | normalised name, `first_seen`, and a `seeded` flag |
 | Deadlines the bot announced | `deadlines` | unchanged |
 | Sheet-health dedup | `quality_flags` | unchanged |
@@ -5702,7 +5713,8 @@ python verify_s2.py                       # AI news: PoC slots, "More AI News", 
 python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one A:I write, R3 weekly + the reminder offer
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
-python verify_rule13.py                   # the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
+python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the order, the three-week drop, replies not read (--show prints the messages)
+python verify_rule13.py                   # STALE since 12 Oct 2026 for rule 13's behaviour (see its header); the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test
 python verify_voice_profile.py --offline  # the parts that need neither Discord nor the model
 python verify_llm_audit.py                # every API call site, measured (system size, caching, tools)

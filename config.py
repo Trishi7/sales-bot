@@ -2232,11 +2232,29 @@ NEXT_STEP_CALL_EVERY_DAYS = _int("NEXT_STEP_CALL_EVERY_DAYS", 3)
 NEXT_STEP_CALL_UNTIL_DAYS = _int("NEXT_STEP_CALL_UNTIL_DAYS", 21)
 
 # "LI DM Sent" VALUES THAT MEAN THE PERSON ANSWERED. Such a contact is not
-# chased with calls; the line asks whether a meeting is being set up. Empty =
-# treat a replied DM like any other DM (the call clock runs).
+# chased with calls; the post says a meeting needs setting up. Empty = treat a
+# replied DM like any other DM (the call clock runs). CHECKED BEFORE
+# NEXT_STEP_DM_SENT_MARKERS, always: "Replied" must never read as a plain "sent".
 NEXT_STEP_DM_REPLIED_MARKERS: list[str] = _str_list(
     "NEXT_STEP_DM_REPLIED_MARKERS", "replied,responded",
 )
+
+# WHAT "LI DM Sent" SAYS WHEN THE DM HAS GONE OUT (12 Oct 2026). Compared
+# normalised, on the cell's WHOLE value, so "Not sent" is not "sent"; a ticked
+# checkbox counts too. This replaced reading LI DM Date to decide the DM had
+# happened: a DM that was sent and never dated used to stall the person on a
+# request for the date. Empty = nobody ever reaches the call stage.
+NEXT_STEP_DM_SENT_MARKERS: list[str] = _str_list(
+    "NEXT_STEP_DM_SENT_MARKERS", "sent,yes,done",
+)
+
+# THE THREE-WEEK DROP, R13's only ending. Days an ask may be named before it
+# is dropped, counted from the day the bot FIRST NAMED that person for that
+# step (never from a sheet date, which is what lets rows with no LI Connected
+# Date and no LI DM Date work like everybody else). On that day the person is
+# named once under "I'll stop reminding about these", and then not again until
+# the sheet moves.
+NEXT_STEP_DROP_AFTER_DAYS = _int("NEXT_STEP_DROP_AFTER_DAYS", 21)
 
 # A MEETING DATED TODAY OR LATER, not marked Completed, pauses the rule for
 # that person: reminding somebody to call a contact they are meeting on Friday
@@ -3390,21 +3408,38 @@ def validate() -> list[str]:
             NEW_COMPANY_WINDOW_DAYS, NEXT_ACTION_WEEKEND_SHIFT,
         )
         log.info(
-            "[config] R13 next steps: post at %s IST; first ask +%dd, after the "
-            "previous step +%dd, after an email +%dd; calls from DM +%dd every %dd "
-            "until +%dd; connected=%s replied=%s pause_for_booked_meeting=%s",
+            "[config] R13 next steps (a reminder; replies are not read): post at %s "
+            "IST; first reminder +%dd, after the previous step +%dd, next email "
+            "+%dd; calls from DM +%dd every %dd until +%dd; an ask is DROPPED after "
+            "%dd of being named; connected=%s dm_sent=%s replied=%s "
+            "pause_for_booked_meeting=%s",
             NEXT_STEP_TIME, NEXT_STEP_FIRST_DAYS, NEXT_STEP_AFTER_PREVIOUS_DAYS,
             NEXT_STEP_AFTER_EMAIL_DAYS, NEXT_STEP_CALL_AFTER_DM_DAYS,
             NEXT_STEP_CALL_EVERY_DAYS, NEXT_STEP_CALL_UNTIL_DAYS,
+            NEXT_STEP_DROP_AFTER_DAYS,
             ",".join(NEXT_STEP_CONNECTED_MARKERS) or "(none)",
+            ",".join(NEXT_STEP_DM_SENT_MARKERS) or "(none)",
             ",".join(NEXT_STEP_DM_REPLIED_MARKERS) or "(none)",
             NEXT_STEP_PAUSE_FOR_BOOKED_MEETING,
         )
+        if NEXT_STEP_DROP_AFTER_DAYS < 7:
+            log.warning(
+                "NEXT_STEP_DROP_AFTER_DAYS=%d — R13 would stop reminding about "
+                "somebody inside a week of first naming them, which reads as a bot "
+                "giving up immediately. The agreed number is 21 (three weeks).",
+                NEXT_STEP_DROP_AFTER_DAYS,
+            )
+        if not NEXT_STEP_DM_SENT_MARKERS:
+            log.warning(
+                "NEXT_STEP_DM_SENT_MARKERS is empty, so R13 never reads a LinkedIn DM "
+                "as sent (except a ticked checkbox) and nobody reaches the call "
+                "stage. The default is 'sent,yes,done'."
+            )
         if NEXT_STEP_CALL_UNTIL_DAYS < NEXT_STEP_CALL_AFTER_DM_DAYS:
             log.warning(
                 "NEXT_STEP_CALL_UNTIL_DAYS=%d is below NEXT_STEP_CALL_AFTER_DM_DAYS=%d, "
-                "so R13 never sends a call reminder: it goes straight to asking for "
-                "Prospect Status 'Unresponsive'. The defaults are 21 and 7.",
+                "so R13 never sends a call reminder: it goes straight to the "
+                "unresponsive line. The defaults are 21 and 7.",
                 NEXT_STEP_CALL_UNTIL_DAYS, NEXT_STEP_CALL_AFTER_DM_DAYS,
             )
         if not NEXT_STEP_CONNECTED_MARKERS:

@@ -430,7 +430,8 @@ async def next_steps_post(test_mode) -> dict:
 
     day = date(2026, 10, 12)
     with World(test_mode, pretend=(day, 15, 5), rules={"R13"},
-               pins={"SALES_ALWAYS_TAG_IDS": [rw.APPROVER]}) as w:
+               pins={"SALES_ALWAYS_TAG_IDS": [rw.APPROVER], "NEXT_STEP_DROP_AFTER_DAYS": 21,
+                     "NEXT_STEP_DM_SENT_MARKERS": ["sent", "yes", "done"]}) as w:
         people = [("Arjun Aryaa", "Gnani.ai", 1), ("Oliver Shoulson", "PolyAI", 1), ("Ariya Rastrow", "Wisprflow.ai", 2),
                   ("Priya Rao", "Acme Labs", 1), ("Dev Shah", "Borealis", 1)]
         rows = []
@@ -445,56 +446,63 @@ async def next_steps_post(test_mode) -> dict:
         post = w.posted[-1]
         body = strip_tag(post.content)
         before = w.counts()
-        await w.say("done for Arjun", who="member", reply_to=post)
-        one = strip_tag(w.posted[-1].content)
-        await w.say("sent", who="member", reply_to=post)
-        which = strip_tag(w.posted[-1].content)
-        await w.say("take ur time", who="member", reply_to=post)
+        state = w.bot.db.next_step_state()
+        for text in ("done for Arjun", "sent", "take ur time"):
+            await w.say(text, who="member", reply_to=post)
         after = w.counts()
-        return {"body": body, "one": one, "which": which, "tagged": post.content.startswith("[TEST"),
+        with w.bot.db.conn() as c:
+            kept = c.execute("SELECT COUNT(*) FROM next_step_posts").fetchone()[0]
+        return {"body": body, "tagged": post.content.startswith("[TEST"),
+                "replies": after["replies"] - before["replies"],
                 "reactions": after["reactions"] - before["reactions"], "model": after["model"] - before["model"],
                 "votes": after["votes"] - before["votes"], "writes": len(w.sheet.writes),
-                "people": [p.get("poc") for p in (w.bot.db.next_step_post(str(post.id)) or {}).get("people") or []]}
+                "state_same": w.bot.db.next_step_state() == state, "post_rows": kept,
+                "named": sorted(k.split("|")[-1] for k in state)}
 
 
 async def next_steps(check) -> dict:
     import wording
     live, test = await _both(next_steps_post)
     lines = live["body"].splitlines()
-    ask1 = "Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date."
-    ask2 = "Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date."
-    check("Next steps: the heading, then the tags line", (lines[0], lines[1]),
-          ("**Next steps**", f"<@{rw.APPROVER}>"))
-    check("Next steps: two groups, each ask written once",
-          (lines.count(ask1), lines.count(ask2), [l for l in lines[2:] if l and not l.startswith("- ")]),
-          (1, 1, [ask1, ask2]))
-    check("Next steps: the post, as the human asked for it", lines[2:],
-          [ask1, "- Arjun Aryaa (Gnani.ai)", "- Oliver Shoulson (PolyAI)", "- Priya Rao (Acme Labs)",
-           "- Dev Shah (Borealis)", "", ask2, "- Ariya Rastrow (Wisprflow.ai)"])
-    check("Next steps: no opener line, and no line repeats the ask after a name",
+    # CHANGED 12 Oct 2026: the post is a reminder. Each group opens on its agreed line, which names no cell and
+    # asks for nothing to be filled in; it used to open on "Next Steps says Send email 1. Has it gone out? ...".
+    line1 = "We need to send out the first email to these people:"
+    line2 = "We need to send out the second email to these people:"
+    check("Next steps: the heading, the tags line, then a blank line", (lines[0], lines[1], lines[2]),
+          ("**Next steps**", f"<@{rw.APPROVER}>", ""))
+    check("Next steps: two groups, each line written once",
+          (lines.count(line1), lines.count(line2), [l for l in lines[3:] if l and not l.startswith("- ")]),
+          (1, 1, [line1, line2]))
+    check("Next steps: the post, as the human asked for it", lines[3:],
+          [line1, "- Arjun Aryaa (Gnani.ai)", "- Oliver Shoulson (PolyAI)", "- Priya Rao (Acme Labs)",
+           "- Dev Shah (Borealis)", "", line2, "- Ariya Rastrow (Wisprflow.ai)"])
+    check("Next steps: no opener line, and nothing after a name on its line",
           ([o for o in ("A few next steps", "Next steps for some", "Where a few") if o in live["body"]],
-           [l for l in lines if l.startswith("- ") and "Next Steps says" in l]), ([], []))
-    check("Next steps: the post still records who it named, for the 'done' replies",
-          sorted(live["people"]), sorted(["Arjun Aryaa", "Oliver Shoulson", "Ariya Rastrow", "Priya Rao", "Dev Shah"]))
-    check("Next steps: 'done for Arjun' gets Arjun's line",
-          live["one"], wording.next_step_done_line("email_out", short="Arjun", n=1))
-    check("Next steps: 'sent' with nobody named asks which one, listing the people",
-          (live["which"].startswith("Which one?"), "Arjun Aryaa (Gnani.ai)" in live["which"]), (True, True))
-    check("Next steps: 'take ur time' under the post is one reaction; nothing was written, voted or asked of a model",
-          (live["reactions"], live["writes"], live["votes"], live["model"]), (1, 0, 0, 0))
+           [l for l in lines if l.startswith("- ") and (":" in l or "Next Steps" in l)]), ([], []))
+    check("Next steps: no cell or column is named anywhere in the post",
+          [c for c in ("Email Sent", "Email Date", "Next Steps", "LI DM", "Prospect Status", "Meeting Date")
+           if c in live["body"]], [])
+    check("Next steps: who was named is recorded for the drop clock, and the post itself is no longer kept",
+          (live["named"], live["post_rows"]),
+          (sorted(n.lower() for n in ("Arjun Aryaa", "Oliver Shoulson", "Ariya Rastrow", "Priya Rao", "Dev Shah")), 0))
+    # CHANGED 12 Oct 2026: "done for Arjun" used to get Arjun's "can you mark 1st Email Sent" line, "sent" used
+    # to ask "Which one?", and "take ur time" got one reaction. Replies to this post are not read any more.
+    check("Next steps: 'done for Arjun', 'sent' and 'take ur time' under the post get NOTHING: no reply, no "
+          "reaction, nothing written, voted, recorded or asked of a model",
+          (live["replies"], live["reactions"], live["writes"], live["votes"], live["model"], live["state_same"]),
+          (0, 0, 0, 0, 0, True))
     check("Next steps: test mode posts the same text with the [TEST] tag",
-          (test["body"], test["one"], live["tagged"], test["tagged"]), (live["body"], live["one"], False, True))
+          (test["body"], live["tagged"], test["tagged"]), (live["body"], False, True))
 
     advance = wording.next_step_post([
-        {"who": "Priya Rao (Acme Labs)", "ask": "advance", "n": 1, "when": "5 Oct"},
-        {"who": "Dev Shah (Borealis)", "ask": "advance", "n": 1, "when": "1 Oct"},
-        {"who": "Mei Lin (Cinder)", "ask": "call", "when": "28 Sep", "set_call": True},
+        {"who": "Mei Lin (Cinder)", "ask": "call"},
+        {"who": "Priya Rao (Acme Labs)", "ask": "advance", "n": 1},
+        {"who": "Dev Shah (Borealis)", "ask": "advance", "n": 1},
     ])
-    check("an 'advance' group: the ask once, each person's own date after the colon; a call group the same",
-          advance, ["Email 1 has gone out. Time to set Next Steps to Send email 2.",
-                    "- Priya Rao (Acme Labs): sent 5 Oct", "- Dev Shah (Borealis): sent 1 Oct", "",
-                    "The LI DM has gone out and there's no meeting yet. Time to call them, and set Next Steps to "
-                    "Call the PoC.", "- Mei Lin (Cinder): DM sent 28 Sep"])
+    check("a call group and an 'advance' group: each agreed line once, the names under it and no date",
+          advance, ["We need to call these PoCs:", "- Mei Lin (Cinder)", "",
+                    "We sent the first email to these people over a week ago \u2014 time for the second:",
+                    "- Priya Rao (Acme Labs)", "- Dev Shah (Borealis)"])
     return live
 
 

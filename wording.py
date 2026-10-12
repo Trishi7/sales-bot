@@ -423,65 +423,69 @@ def reply_lines_for_check() -> list:
     return out
 
 
-# -- the next-step follow-ups (rule 13) --------------------------------------
+# -- the next-step reminders (rule 13) ----------------------------------------
 #
-# ONE POST, UP TO FIVE PEOPLE, ONE LINE EACH: who, and the one thing to do in
-# the sheet. Saley only reminds here; it never fills these cells, so every line
-# is a question or a request and none says "I've updated".
+# A REMINDER, NOT A QUESTION (12 Oct 2026). One post, up to five people. It
+# says what needs doing and who for. It never names a cell or a column, never
+# gives a date, never asks anybody to fill anything in, and Saley does not
+# read replies to it.
 #
-# NO RULE NUMBER, NO SCHEDULE TALK, NO SETTING NAME. A line says what the sheet
-# shows and what to do about it, never how often the bot will ask again.
+# NO RULE NUMBER, NO SCHEDULE TALK, NO SETTING NAME.
 #
-# THE CELL AND STEP NAMES ARE THE SHEET'S OWN, held once, so a renamed header
-# or dropdown option is one edit and the post, the preview and the reply lines
-# cannot disagree about what a cell is called.
+# THE STEP NAMES ARE THE SHEET'S OWN, held once. They are used by the rule's
+# log and `cadence preview` lines, never by the post.
 STEP_RESEARCH = "Research the PoC"
 STEP_EMAILS = ("Send email 1", "Send email 2", "Send email 3")
 STEP_DM = "Reach by LI DM"
 STEP_CALL = "Call the PoC"
-CELL_STEP = "Next Steps"
-CELL_DM_SENT = "LI DM Sent"
-CELL_DM_DATE = "LI DM Date"
-CELL_STATUS = "Prospect Status"
-STATUS_UNRESPONSIVE = "Unresponsive"
 _NTH = {1: "1st", 2: "2nd", 3: "3rd"}
+_ORDINAL = {1: "first", 2: "second", 3: "third"}
 
-# THE POST IS GROUPED BY ASK (8 Oct). It used to be one line a person, each
-# repeating the whole ask ("Next Steps says Send email 1. Has it gone out? If
-# so, mark 1st Email Sent and the date." four times over). Now the ask is
-# written ONCE and the people it applies to are listed under it:
+# THE GROUP LINES, AGREED WORD FOR WORD. THIS IS THE ONLY PLACE THEY LIVE: the
+# post, the preview and the checks all read them from here. The key is
+# (ask, email number); the ORDER of this table is the order the groups appear
+# in a post, and the drop line is always last.
+NEXT_STEP_GROUPS = (
+    (("replied", 0), "The people below have replied to us! We need to set up a meeting with them:"),
+    (("call", 0), "We need to call these PoCs:"),
+    (("advance", 1), "We sent the first email to these people over a week ago — time for the second:"),
+    (("advance", 2), "We sent the second email to these people over a week ago — time for the third:"),
+    (("email_out", 1), "We need to send out the first email to these people:"),
+    (("email_out", 2), "We need to send out the second email to these people:"),
+    (("email_out", 3), "We need to send out the third email to these people:"),
+    (("research", 0), "We need to research these PoCs:"),
+    (("blank", 0), "We're connected with these people — next thing is to research them:"),
+    (("unresponsive", 0), "No reply after the calls. These look unresponsive:"),
+    (("dropped", 0), "I'll stop reminding about these. It's been three weeks and nothing has moved:"),
+)
+_GROUP_LINE = dict(NEXT_STEP_GROUPS)
+_GROUP_ORDER = {key: i for i, (key, _line) in enumerate(NEXT_STEP_GROUPS)}
+
+# THE POST:
 #
 #     **Next steps**
-#     @Vaishnavi
-#     Next Steps says Send email 1. Has it gone out? If so, mark 1st Email Sent and the date.
+#     @Vaishnavi @Sid
+#
+#     We need to call these PoCs:
+#     - Angelos Perivolaropoulos (ElevenLabs)
+#
+#     We need to send out the first email to these people:
 #     - Arjun Aryaa (Gnani.ai)
 #     - Oliver Shoulson (PolyAI)
 #
-#     Next Steps says Send email 2. Has it gone out? If so, mark 2nd Email Sent and the date.
-#     - Ariya Rastrow (Wisprflow.ai)
-#
-# THERE IS NO OPENER LINE ANY MORE. The three openers ("A few next steps on
-# people we're connected with:" and two more) sat between the tags and the
-# list; with each group now opening on its own ask, an opener above them was a
-# third line saying "here are next steps" under a heading that already says
-# it. The heading and the tags line stay.
+# No opener sentence: the heading already says what this is, and every group
+# opens on its own line. A blank line between groups, none after the last.
 
 
 def email_sent_cell(n) -> str:
-    """"1st Email Sent" — the header of the Nth email's sent cell."""
+    """"1st Email Sent" — the header of the Nth email's sent cell. For the
+    rule's own log lines; never in a post."""
     return f"{_NTH.get(int(n), str(n))} Email Sent"
 
 
 def email_date_cell(n) -> str:
     """"1st Email Date"."""
     return f"{_NTH.get(int(n), str(n))} Email Date"
-
-
-def step_after_email(n) -> str:
-    """What Next Steps moves to once email N is out: the next email, and the
-    LinkedIn DM after the third."""
-    n = int(n)
-    return STEP_EMAILS[n] if 1 <= n < len(STEP_EMAILS) else STEP_DM
 
 
 def next_step_who(name: str, company: str) -> str:
@@ -492,232 +496,85 @@ def next_step_who(name: str, company: str) -> str:
     return name or company or "(unnamed row)"
 
 
-def _also_missing(missing) -> str:
-    """" 1st Email Sent and 1st Email Date aren't filled in either." — the
-    cells the step in Next Steps implies and the row does not have."""
-    cells = [str(m).strip() for m in (missing or ()) if str(m).strip()]
-    if not cells:
-        return ""
-    if len(cells) == 1:
-        return f" {cells[0]} isn't filled in either."
-    return f" {', '.join(cells[:-1])} and {cells[-1]} aren't filled in either."
+def _group_key(ask: str, n: int = 0) -> tuple:
+    ask = str(ask or "")
+    return (ask, int(n or 0) if ask in ("advance", "email_out") else 0)
 
 
-def next_step_group(ask: str, *, n: int = 0, set_call: bool = False) -> str:
-    """The ask a GROUP of people shares, written once above their names.
-
-    One group per ask and email number (and, for a call, per whether Next
-    Steps still has to be set to Call the PoC), so every person under it is
-    being asked exactly this. Nothing personal is in it: a date or a missing
-    cell belongs to one person and goes on that person's line
-    (`next_step_detail`). An unknown `ask` returns "".
-    """
-    n = int(n or 0)
-    if ask == "ask_next":
-        return (f"{CELL_STEP} is blank. What's the next step? Usually it's "
-                f"{STEP_RESEARCH}.")
-    if ask == "researched":
-        return (f"{CELL_STEP} says {STEP_RESEARCH}. Have they been researched? "
-                f"If so, set {CELL_STEP} to {STEP_EMAILS[0]}.")
-    if ask == "email_out":
-        return (f"{CELL_STEP} says Send email {n}. Has it gone out? If so, mark "
-                f"{email_sent_cell(n)} and the date.")
-    if ask == "advance":
-        return f"Email {n} has gone out. Time to set {CELL_STEP} to {step_after_email(n)}."
-    if ask == "log_date":
-        return (f"{email_sent_cell(n)} is marked, but there's no date. Can you log "
-                f"when email {n} went out?")
-    if ask == "dm_out":
-        return (f"{CELL_STEP} says {STEP_DM}. Has the DM gone out? If so, log "
-                f"{CELL_DM_SENT} and the date.")
-    if ask == "call":
-        return ("The LI DM has gone out and there's no meeting yet. Time to call them"
-                + (f", and set {CELL_STEP} to {STEP_CALL}." if set_call else "."))
-    if ask == "call_no_dm_date":
-        return (f"{CELL_STEP} says {STEP_CALL}. Have they been called? Please log "
-                f"the {CELL_DM_DATE} too.")
-    if ask == "dm_replied":
-        return "They replied to the LI DM. Is a meeting being set up?"
-    if ask == "unresponsive":
-        return (f"Still no meeting after the calls. Please set {CELL_STATUS} to "
-                f"{STATUS_UNRESPONSIVE} and I'll stop asking about them.")
-    return ""
+def next_step_group(ask: str, *, n: int = 0) -> str:
+    """The agreed line a GROUP of people shares, written once above their
+    names. "" for an ask (or an email number) there is no line for, so a
+    caller cannot post a half-formed group."""
+    return _GROUP_LINE.get(_group_key(ask, n), "")
 
 
-def next_step_detail(ask: str, *, when: str = "", missing=()) -> str:
-    """What is PERSONAL to one person, for after the colon on their line: the
-    date their email or DM went out, and any cells their row lacks. "" when
-    there is nothing, and then the line is just the name."""
-    bits = []
-    when = str(when or "").strip()
-    if when and ask == "advance":
-        bits.append(f"sent {when}")
-    elif when and ask == "call":
-        bits.append(f"DM sent {when}")
-    cells = [str(m).strip() for m in (missing or ()) if str(m).strip()]
-    if len(cells) == 1:
-        bits.append(f"{cells[0]} isn't filled in either")
-    elif cells:
-        bits.append(f"{', '.join(cells[:-1])} and {cells[-1]} aren't filled in either")
-    return "; ".join(bits)
-
-
-def next_step_person(who: str, detail: str = "") -> str:
-    """"- Arjun Aryaa (Gnani.ai)", or "- Arjun Aryaa (Gnani.ai): sent 5 Oct"."""
-    return f"- {who}" + (f": {detail}" if detail else "")
+def next_step_person(who: str) -> str:
+    """"- Arjun Aryaa (Gnani.ai)". ONE LINE A PERSON, AND NOTHING ELSE ON IT: no
+    date, no cell, no "isn't filled in either"."""
+    return f"- {who}"
 
 
 def next_step_post(people) -> list:
     """The lines of the next-steps post under its heading and tags.
 
-    `people` are dicts in the order the rule picked them, each with `who`,
-    `ask`, `n`, `when`, `missing`, `set_call`. A GROUP IS OPENED WHERE ITS
-    FIRST PERSON STANDS, so the post keeps the rule's order: call reminders
-    are picked first and so their group comes first. A blank line between
-    groups; none after the last.
+    `people` are dicts with `who`, `ask` and `n`, in the order the rule picked
+    them. THE GROUPS APPEAR IN THE AGREED ORDER (`NEXT_STEP_GROUPS`), whatever
+    order the people arrive in, and only when somebody is in them; inside a
+    group people keep the rule's order. THE DROP LINE IS ALWAYS LAST. A blank
+    line between groups; none after the last. [] with nobody to name, and then
+    nothing is posted.
     """
-    order, groups = [], {}
+    groups: dict = {}
     for person in people or ():
-        ask, n = str(person.get("ask") or ""), int(person.get("n") or 0)
-        key = (ask, n, bool(person.get("set_call")) if ask == "call" else False)
-        sentence = next_step_group(ask, n=n, set_call=key[2])
-        if not sentence:
+        key = _group_key(person.get("ask"), person.get("n") or 0)
+        if key not in _GROUP_LINE:
             continue
-        if key not in groups:
-            groups[key] = (sentence, [])
-            order.append(key)
-        groups[key][1].append(next_step_person(
-            str(person.get("who") or "").strip() or "(unnamed row)",
-            next_step_detail(ask, when=person.get("when") or "",
-                             missing=person.get("missing") or ())))
+        groups.setdefault(key, []).append(next_step_person(
+            str(person.get("who") or "").strip() or "(unnamed row)"))
     lines: list = []
-    for key in order:
-        sentence, names = groups[key]
+    for key in sorted(groups, key=_GROUP_ORDER.get):
         if lines:
             lines.append("")
-        lines.append(sentence)
-        lines.extend(names)
+        lines.append(_GROUP_LINE[key])
+        lines.extend(groups[key])
     return lines
 
 
-def next_step_line(ask: str, *, who: str, step_label: str = "", n: int = 0,
-                   when: str = "", missing=(), set_call: bool = False) -> str:
-    """One person's ask as a single sentence: what the preview, the log and the
-    report show for that person. THE POST ITSELF IS GROUPED (`next_step_post`).
-
-    `ask` is the evaluator's code for what the row needs; `n` the email number;
-    `when` a date from the row, already written the way a person would ("5
-    Oct"); `missing` the cells to ask for as well. Everything in the line comes
-    from the row or from the names above. An unknown `ask` returns "" so a
-    caller cannot post a half-formed line.
-    """
+def next_step_line(ask: str, *, who: str, n: int = 0, **_ignored) -> str:
+    """One person's reminder as a single phrase, for `cadence preview`, the
+    log and the report: "Priya Rao (Acme Labs): send the first email". THE POST
+    ITSELF IS GROUPED (`next_step_post`). An unknown `ask` returns ""."""
     n = int(n or 0)
-    if ask == "ask_next":
-        line = (f"{who}: {CELL_STEP} is blank. What's the next step? Usually it's "
-                f"{STEP_RESEARCH}.")
-    elif ask == "researched":
-        line = (f"{who}: {CELL_STEP} says {STEP_RESEARCH}. Have they been "
-                f"researched? If so, set {CELL_STEP} to {STEP_EMAILS[0]}.")
-    elif ask == "email_out":
-        line = (f"{who}: {CELL_STEP} says Send email {n}. Has it gone out? If so, "
-                f"mark {email_sent_cell(n)} and the date.")
-    elif ask == "advance":
-        line = (f"{who}: email {n} went out on {when}. Time to set {CELL_STEP} to "
-                f"{step_after_email(n)}.")
-    elif ask == "log_date":
-        line = (f"{who}: {email_sent_cell(n)} is marked, but there's no date. Can "
-                f"you log when email {n} went out?")
-    elif ask == "dm_out":
-        line = (f"{who}: {CELL_STEP} says {STEP_DM}. Has the DM gone out? If so, "
-                f"log {CELL_DM_SENT} and the date.")
-    elif ask == "call":
-        line = (f"{who}: the LI DM went out on {when} and there's no meeting yet. "
-                "Time to call them"
-                + (f", and set {CELL_STEP} to {STEP_CALL}." if set_call else "."))
-    elif ask == "call_no_dm_date":
-        line = (f"{who}: {CELL_STEP} says {STEP_CALL}. Have they been called? "
-                f"Please log the {CELL_DM_DATE} too.")
-    elif ask == "dm_replied":
-        line = f"{who}: they replied to the LI DM. Is a meeting being set up?"
-    elif ask == "unresponsive":
-        line = (f"{who}: still no meeting after the calls. Please set {CELL_STATUS} "
-                f"to {STATUS_UNRESPONSIVE} and I'll stop asking about them.")
-    else:
+    what = {
+        "replied": "they replied; set up a meeting",
+        "call": "call them",
+        "advance": f"the {_ORDINAL.get(n, '')} email went out over a week ago; "
+                   f"send the {_ORDINAL.get(n + 1, 'next')} one",
+        "email_out": f"send the {_ORDINAL.get(n, '')} email",
+        "research": "research them",
+        "blank": "connected; research them next",
+        "unresponsive": "no reply after the calls; they look unresponsive",
+        "dropped": "three weeks with nothing moved; no more reminders",
+    }.get(str(ask or ""))
+    if not what or (ask in ("advance", "email_out") and n not in _ORDINAL):
         return ""
-    return line + _also_missing(missing)
+    return f"{who}: {what}"
 
 
-# -- the reply to "done" under a next-steps post ------------------------------
-#
-# SOMEBODY SAID THE STEP IS DONE; THIS ASKS FOR THE ONE SHEET UPDATE THAT STEP
-# NEEDS. Saley still writes nothing: the line is a request, built from what the
-# post recorded, with the same cell names the post used.
-CELL_MEETING_DATE = "Meeting Date"
-
-
-def next_step_done_line(ask: str, *, short: str, n: int = 0) -> str:
-    """The line for one person after a "done". `ask` is what the post asked
-    about them; `short` how they are named (a first name, usually); `n` the
-    email number. "" for an ask this has no line for."""
-    n = int(n or 0)
-    if ask == "researched":
-        return f"Nice, can you set {CELL_STEP} for {short} to {STEP_EMAILS[0]}?"
-    if ask == "email_out":
-        return f"Nice, can you mark {email_sent_cell(n)} for {short} and add the date?"
-    if ask == "dm_out":
-        return f"Nice, can you log {CELL_DM_SENT} and the {CELL_DM_DATE} for {short}?"
-    if ask == "call_no_dm_date":
-        return f"Nice, can you log the {CELL_DM_DATE} for {short}?"
-    if ask == "call":
-        return (f"Thanks. If a meeting comes of it, can you add the "
-                f"{CELL_MEETING_DATE} for {short}?")
-    if ask == "dm_replied":
-        return f"Nice, can you add the {CELL_MEETING_DATE} for {short} once it's booked?"
-    if ask == "ask_next":
-        return f"Thanks. Can you pick the next step for {short} in {CELL_STEP}?"
-    if ask in ("advance", "log_date"):
-        return f"Thanks, I'll pick {short} up from the sheet."
-    if ask == "unresponsive":
-        return f"Thanks, I won't ask about {short} again."
-    return ""
-
-
-def next_step_which(people) -> str:
-    """"Which one?" with the people it could be, numbered, when a "done" under
-    a post naming several people names none of them."""
-    lines = ["Which one?"]
-    lines += [f"{i}. {who}" for i, who in enumerate(people or (), 1)]
-    lines.append("A name or a number is fine.")
-    return "\n".join(lines)
-
-
-NEXT_STEP_ASKS = ("ask_next", "researched", "email_out", "advance", "log_date",
-                  "dm_out", "call", "call_no_dm_date", "dm_replied", "unresponsive")
+NEXT_STEP_ASKS = ("replied", "call", "advance", "email_out", "research", "blank",
+                  "unresponsive", "dropped")
 
 
 def next_step_lines_for_check() -> list:
-    """Every shape a next-steps line can take, with stand-in values."""
+    """Every line a next-steps post can carry, and every preview phrase, with
+    stand-in values."""
     who = next_step_who("Priya Rao", "Acme Labs")
-    out = []
+    out = [line for _key, line in NEXT_STEP_GROUPS]
     for ask in NEXT_STEP_ASKS:
-        for n in ((1, 2, 3) if ask in ("email_out", "advance", "log_date") else (0,)):
-            out.append(next_step_line(ask, who=who, n=n, when="5 Oct"))
-            # ...and the same ask as the grouped post writes it.
-            out.append(next_step_group(ask, n=n))
-            out.append(next_step_person(who, next_step_detail(ask, when="5 Oct")))
-    out.append(next_step_group("call", set_call=True))
-    out.append(next_step_person(who, next_step_detail(
-        "email_out", missing=[email_sent_cell(1), email_date_cell(1)])))
-    out.append(next_step_line("call", who=who, when="5 Oct", set_call=True))
-    out.append(next_step_line("email_out", who=who, n=2,
-                              missing=[email_sent_cell(1)]))
-    out.append(next_step_line("dm_out", who="Acme Labs",
-                              missing=[email_sent_cell(3), email_date_cell(3)]))
-    for ask in NEXT_STEP_ASKS:
-        for n in ((1, 2, 3) if ask == "email_out" else (0,)):
-            out.append(next_step_done_line(ask, short="Priya", n=n))
-    out.append(next_step_which(["Priya Rao (Acme Labs)", "Dev Shah (Borealis)"]))
-    return out
+        for n in ((1, 2) if ask == "advance" else (1, 2, 3) if ask == "email_out" else (0,)):
+            out.append(next_step_line(ask, who=who, n=n))
+    out.append(next_step_person(who))
+    return [x for x in out if x]
 
 
 # -- every line, rendered, for the register check ----------------------------
@@ -865,36 +722,36 @@ def _self_test() -> int:
     who = next_step_who("Priya Rao", "Acme Labs")
     check("who", who, "Priya Rao (Acme Labs)")
     check("who, no name", next_step_who("", "Acme Labs"), "Acme Labs")
-    check("email 1 not out",
+    check("the first email, not out (ordinal words, not digits)",
           next_step_line("email_out", who=who, n=1),
-          "Priya Rao (Acme Labs): Next Steps says Send email 1. Has it gone out? "
-          "If so, mark 1st Email Sent and the date.")
-    check("after email 3 comes the DM", step_after_email(3), STEP_DM)
-    check("after email 1 comes email 2", step_after_email(1), "Send email 2")
-    check("one missing cell",
-          next_step_line("dm_replied", who=who, missing=["3rd Email Date"]).endswith(
-              " 3rd Email Date isn't filled in either."), True)
-    check("two missing cells",
-          next_step_line("dm_out", who=who,
-                         missing=["3rd Email Sent", "3rd Email Date"]).endswith(
-              " 3rd Email Sent and 3rd Email Date aren't filled in either."), True)
+          "Priya Rao (Acme Labs): send the first email")
     check("an unknown ask is no line", next_step_line("wat", who=who), "")
-    check("after a done on research",
-          next_step_done_line("researched", short="Priya"),
-          "Nice, can you set Next Steps for Priya to Send email 1?")
-    check("after a done on email 2",
-          next_step_done_line("email_out", short="Priya", n=2),
-          "Nice, can you mark 2nd Email Sent for Priya and add the date?")
-    check("every ask has a done line",
-          [a for a in NEXT_STEP_ASKS if not next_step_done_line(a, short="Priya", n=1)],
-          [])
-    check("which one",
-          next_step_which(["Priya Rao (Acme Labs)", "Dev Shah (Borealis)"]),
-          "Which one?\n1. Priya Rao (Acme Labs)\n2. Dev Shah (Borealis)\n"
-          "A name or a number is fine.")
-    check("every ask has a line",
-          [a for a in NEXT_STEP_ASKS if not next_step_line(a, who=who, n=1, when="5 Oct")],
-          [])
+    check("every ask has a preview line",
+          [a for a in NEXT_STEP_ASKS if not next_step_line(a, who=who, n=1)], [])
+    check("every ask has its agreed group line",
+          [a for a in NEXT_STEP_ASKS if not next_step_group(a, n=1)], [])
+    check("there is no group for a fourth email",
+          (next_step_group("advance", n=3), next_step_group("email_out", n=4)), ("", ""))
+    post = next_step_post([
+        {"who": "Old Ask (Co)", "ask": "dropped"},
+        {"who": "A (Co)", "ask": "email_out", "n": 1},
+        {"who": "B (Co)", "ask": "replied"},
+        {"who": "C (Co)", "ask": "email_out", "n": 1},
+    ])
+    check("groups in the agreed order whatever order people arrive in, the drop line last",
+          post, ["The people below have replied to us! We need to set up a meeting with them:",
+                 "- B (Co)", "",
+                 "We need to send out the first email to these people:",
+                 "- A (Co)", "- C (Co)", "",
+                 "I'll stop reminding about these. It's been three weeks and nothing has moved:",
+                 "- Old Ask (Co)"])
+    check("a person is one line, the name and the company and nothing else",
+          next_step_person(who), "- Priya Rao (Acme Labs)")
+    check("nobody to name: no lines at all", next_step_post([]), [])
+    columns = ("Email Sent", "Email Date", "Next Steps", "LI DM", "Prospect Status",
+               "Meeting Date")
+    check("no line a post can carry names a column",
+          [(c, l) for l in next_step_lines_for_check() for c in columns if c in l], [])
     import re as _re
     schedule = _re.compile(r"\b(every|daily|days?|weekly|3 ?pm|15:00|R\d+|rule \d+)\b",
                            _re.IGNORECASE)

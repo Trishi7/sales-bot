@@ -1,5 +1,11 @@
 """RULE 13 (Next Steps follow-ups) AND THE 7 OCT SHEET LAYOUT — the bot-level checks. Offline, made-up names.
 
+STALE SINCE 12 OCT 2026, AND IT STOPS PART-WAY. Rule 13 was rebuilt as a reminder: no rotation, no lines asking for
+a cell, no reply handling, a three-week drop. This script still asserts the rotation table, the old wording and the
+"done" replies, so several checks fail and it then raises. THE RULE'S BEHAVIOUR IS NOW CHECKED BY
+verify_next_steps.py (tests/next_steps_checks.py). What is still worth porting from here: (a) the role map and the
+[gtm.window] line, (c) the one post four ways, (S1) to (S4) and (P3).
+
     python verify_rule13.py                       everything below, offline
     python verify_rule13.py --real-sheet --date 2026-10-08
                                                   THE FINAL DRY RUN: exactly ONE read-only read of the real

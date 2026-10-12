@@ -1805,7 +1805,9 @@ def shown_contacts(message: dict) -> list:
     if kind == nextaction.R_DM_NO_MEETING:
         return dm_no_meeting_order(actions)[:max(1, int(config.DM_NO_MEETING_MAX_CONTACTS))]
     if kind == nextaction.R_NEXT_STEPS:
-        return next_step_order(actions)[:cap]
+        # NO CAP HERE: the rule picked the five, and the people under the drop
+        # line come on top of them (`nextaction._r_next_step_followups`).
+        return next_step_order(actions)
     return actions[:cap]
 
 
@@ -1929,14 +1931,12 @@ def points_of(message: dict) -> Optional[dict]:
         people = shown_contacts(message)
         if not people:
             return None
-        # THE WHOLE POST IS FIXED TEXT FROM wording.py, GROUPED BY ASK (8
-        # Oct): each ask written once, the people it applies to listed under
-        # it, in the order the rule picked them. No opener and no close: every
-        # group opens on its own ask.
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py: each group's agreed
+        # line once, in the agreed order, with "- Name (Company)" under it and
+        # the drop line last. No opener, no close, no date, no cell name.
         lines = wording.next_step_post([
             {"who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
-             "ask": a.get("ask"), "n": a.get("email_n"), "when": a.get("when"),
-             "missing": a.get("missing"), "set_call": a.get("set_call")}
+             "ask": a.get("ask"), "n": a.get("email_n")}
             for a in people])
         if not lines:
             return None
@@ -2773,10 +2773,9 @@ def _self_test() -> int:
     check("silent on a Saturday",
           plan(steps, day=date(2026, 9, 12))["messages"], [])
     check("posted as written, never composed", is_verbatim(m13[0]), True)
-    check("the post: the ask once, then one name a line, in pick order",
+    check("the post: the group's agreed line once, then one name a line, in pick order",
           compose_fallback(m13[0]),
-          "Next Steps says Send email 1. Has it gone out? If so, mark 1st Email "
-          "Sent and the date.\n"
+          "We need to send out the first email to these people:\n"
           "- Priya Rao (Acme Labs)\n"
           "- Dev Shah (Borealis)\n"
           "- Mei Lin (Cinder)")

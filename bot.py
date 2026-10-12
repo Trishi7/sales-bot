@@ -339,6 +339,12 @@ class ScreenCancelled(Exception):
     cancelled: see `SalesBot._known_company_index`."""
 
 
+# A message that opens the way a question does, with or without its "?".
+_STARTS_LIKE_A_QUESTION_RE = re.compile(
+    r"^\s*(who|whom|whose|what|when|where|why|how|which|can|could|would|should|is|are|"
+    r"was|were|do|does|did|will|any|tell me|show me)\b", re.IGNORECASE)
+
+
 def _looks_like_question(text: str) -> bool:
     """Heuristic: does this read like a question worth handing to the engine?
     Deliberately liberal — the engine answers honestly ("I couldn't find…") when
@@ -1654,11 +1660,15 @@ class SalesBot(discord.Client):
                              "answered as its own question (%r)", message.id, rest[:80])
                     text = rest
                     self._as_its_own_question(ctx)
-            # A REPLY TO THE NEXT-STEPS POST IS READ FIRST. "Yes" and "done"
-            # there answer the post's own question, so they must reach its
-            # reader before the acknowledgement path and before the vote.
-            if self._is_next_step_reply(ctx) \
-                    and await self._maybe_next_step_reply(message, text, ctx):
+            # THE NEXT-STEPS POST IS A REMINDER AND REPLIES TO IT ARE NOT READ
+            # (12 Oct 2026). "Done" under it gets NOTHING: no reply, no
+            # reaction, nothing recorded, nothing written. This sits before the
+            # acknowledgement path, which would otherwise give it a thumbs-up.
+            # A real question typed under the post is still a question.
+            if self._statement_under_next_steps(ctx, text):
+                log.info("[query] msg=%s is a reply under the next-steps post; that "
+                         "post is a reminder and replies to it are not read — nothing "
+                         "is said, recorded or written", message.id)
                 return True
             # "FIND A DIFFERENT PERSON" UNDER R11's LIST is that list again with
             # other people, never the general people-search answer.
@@ -7238,12 +7248,6 @@ class SalesBot(discord.Client):
         if await self._maybe_accept_offer(message, text, ctx):
             return True
 
-        # A REPLY TO THE NEXT-STEPS POST has its own reader (RULE13 section 14).
-        # It already ran in `_handle_query`; here it returns the same False.
-        if (ctx.get("drip") or {}).get("action_type") == nextaction.R_NEXT_STEPS \
-                and await self._maybe_next_step_reply(message, text, ctx):
-            return True
-
         is_reply = bool(ctx["direct_is_bot"])
         trigger = sheetwrite.TRIGGER_REPLY if is_reply else sheetwrite.TRIGGER_COMMAND
 
@@ -7717,104 +7721,22 @@ class SalesBot(discord.Client):
         return True
 
     @staticmethod
-    def _is_next_step_reply(ctx: dict) -> bool:
-        """Is this a direct reply to a next-steps post, or to the "Which one?"
-        line the bot asked under one?"""
+    def _statement_under_next_steps(ctx: dict, text: str) -> bool:
+        """Is this a direct reply to a next-steps post that asks nothing?
+
+        THE REPLY HANDLING FOR THAT POST WAS REMOVED ON 12 OCT 2026 (it used to
+        answer "done" with a request to fill a cell). The post is a reminder;
+        what the team does about it happens in the sheet, and the bot reads
+        the sheet, not the thread. So a statement under it is left alone. A
+        message with a question in it is not a statement and is answered like
+        any other question.
+        """
         if not ctx.get("direct_is_bot"):
             return False
-        return ((ctx.get("drip") or {}).get("action_type") == nextaction.R_NEXT_STEPS
-                or (ctx.get("said") or {}).get("kind") == "next_step_which")
-
-    async def _maybe_next_step_reply(self, message, text: str, ctx: dict) -> bool:
-        """A reply to the next-steps post ("done", "researched", "sent").
-
-        SOMEBODY SAYING THE STEP IS DONE GETS ONE FIXED LINE asking for the
-        sheet update that step needs ("Nice, can you set Next Steps for Priya
-        to Send email 1?"). Anyone on the team may say it: all it triggers is a
-        reminder.
-
-        IT WRITES NOTHING AND DECIDES NOTHING. No sheet write, no proposal, no
-        vote, no model call, no sheet read, no change to rule 13's state: the
-        person comes back by rotation until the cell itself changes. The line
-        is built from what the post recorded (`db.next_step_post`), so the
-        person and the step are the ones the post named, never a guess from
-        its text.
-
-        WHO IT IS ABOUT: whoever the reply names; otherwise the only person in
-        the post whose line the word can answer; otherwise it asks "Which
-        one?" and remembers the list, so "2" or a name answers it.
-
-        "SURE", "OK", "THANKS", "NOT YET" GET ONE REACTION AND NOTHING ELSE.
-        They are not a "done". Anything else — a question, a sentence with
-        facts in it — returns False and is handled as any reply is, with the
-        post as its context.
-        """
-        if not self._is_next_step_reply(ctx):
+        if (ctx.get("drip") or {}).get("action_type") != nextaction.R_NEXT_STEPS:
             return False
-        said = ctx.get("said") or {}
-        answering_which = said.get("kind") == "next_step_which"
-        root = str((said.get("root_id") if answering_which else ctx.get("root_id")) or "")
-        post = await asyncio.to_thread(self.db.next_step_post, root) if root else None
-        people = list((post or {}).get("people") or [])
-        if not people:
-            # No record: a test day on a live database keeps none.
-            return False
-        shorts = replies.next_step_shorts(people)
-
-        picked: list = []
-        if answering_which:
-            keys = [str(k) for k in (said.get("which") or [])]
-            listed = [i for k in keys for i, p in enumerate(people)
-                      if str(p.get("row_key")) == k]
-            number = replies.pick_numbered(text, len(listed))
-            if number:
-                picked = [listed[number - 1]]
-            else:
-                named = [i for i in replies.next_step_named(text, people) if i in listed]
-                picked = named or (listed if replies.next_step_all(text) else [])
-            if not picked:
-                return False
-        else:
-            kind = replies.next_step_done(text)
-            if not kind:
-                names = self._bot_names()
-                if replies.is_ack(text, names) or replies.is_bare_vote(text, names):
-                    self._mark_route(message, "next_step_reply")
-                    await self._react(
-                        message, reason="an acknowledgement under a next-steps post")
-                    return True
-                return False
-            picked = replies.next_step_named(text, people) \
-                or replies.next_step_candidates(kind, people)
-            if len(picked) > 1 and not replies.next_step_named(text, people):
-                self._mark_route(message, "next_step_reply")
-                sent = await self._reply(
-                    message,
-                    wording.next_step_which([
-                        wording.next_step_who(people[i].get("poc"),
-                                              people[i].get("company"))
-                        for i in picked]),
-                    reason="a done under a next-steps post that names nobody")
-                self._remember_said(
-                    sent, kind="next_step_which", root_id=root,
-                    which=[str(people[i].get("row_key")) for i in picked])
-                return True
-
-        lines = [
-            wording.next_step_done_line(
-                str(people[i].get("ask") or ""), short=shorts[i],
-                n=int(people[i].get("email_n") or 0))
-            for i in picked
-        ]
-        lines = [line for line in lines if line]
-        if not lines:
-            return False
-        self._mark_route(message, "next_step_reply")
-        await self._reply(message, "\n".join(lines), reason="next-steps reply")
-        log.info("[rules] R13 reply: msg=%s answered about %s; nothing written",
-                 getattr(message, "id", "?"),
-                 ", ".join(str(people[i].get("row_key")) for i in picked))
-        return True
+        body = " ".join(str(text or "").split())
+        return "?" not in body and not _STARTS_LIKE_A_QUESTION_RE.match(body)
 
     async def _maybe_focus_command(
         self, message: discord.Message, text: str
@@ -10390,8 +10312,9 @@ class SalesBot(discord.Client):
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
-            # R2's agreed shape has a blank line between the tags and the list.
-            gap=message.get("type") == nextaction.R_NEWS_SCREEN,
+            # R2's and R13's agreed shapes have a blank line between the tags
+            # and the list.
+            gap=message.get("type") in (nextaction.R_NEWS_SCREEN, nextaction.R_NEXT_STEPS),
         )
         opener_text = body
         # THE HEADING GOES ON LAST, ABOVE THE TAGS LINE: one bold line per
@@ -11032,9 +10955,9 @@ class SalesBot(discord.Client):
         R3 — an event listed as "date unclear" is recorded, which is what
         makes that line appear once.
 
-        R13 — each person the post named is recorded, which is what moves the
-        rotation on, counts the call reminders and closes a contact after the
-        Unresponsive reminder (`_record_next_steps`).
+        R13 — each person the post named is recorded: the drop clock, the call
+        count, and the close for anybody under the drop or unresponsive line
+        (`_record_next_steps`).
 
         After the send, like every other ledger here: a post that was refused
         must not count as a mention.
@@ -11101,11 +11024,15 @@ class SalesBot(discord.Client):
         """Record who an R13 post named. How many people were recorded.
 
         ONLY AFTER A REAL SEND — `_after_send` is not reached when the send was
-        refused — and only for the people the post SHOWED. Two things are
-        written: each person's place in the rotation (`next_step_followups`),
-        and the post itself with what each person was asked
-        (`next_step_posts`), so a reply to it can be matched to a person and a
-        step without parsing the post's text.
+        refused — and only for the people the post SHOWED. ONE thing is
+        written, each person's row in `next_step_followups`: the day they were
+        named, the day they were FIRST named for this step (the three-week
+        drop is counted from it), their call count, and `closed` for anybody
+        named under the drop line or the unresponsive line.
+
+        THE POST ITSELF IS NO LONGER KEPT (12 Oct 2026). `next_step_posts`
+        existed so a reply could be matched to a person; replies to this post
+        are not read any more, so nothing writes that table.
 
         WHERE IT WRITES, BY PATH:
           live, and SALES_TEST_MODE     DB_PATH (test mode is live with another
@@ -11115,48 +11042,36 @@ class SalesBot(discord.Client):
 
         THE TEST DAY IS STRICTER THAN R9's LADDER, ON PURPOSE. A test day sends
         through this same path with the real database. On a live database a
-        "make it Monday" would otherwise move the real rotation: five people
-        would be skipped in the next real post because a rehearsal had named
-        them. The post itself is identical either way.
+        "make it Monday" would otherwise start, or run down, real people's
+        three-week drop clocks, and close asks nobody was really reminded
+        about. The post itself is identical either way.
         """
         if (clock.pretending() and not simulation.in_simulation()
                 and not NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB
                 and not str(config.DB_PATH or "").endswith("_test.db")):
-            log.info("[rules] R13: test day on a live database; rotation not recorded")
+            log.info("[rules] R13: test day on a live database; nobody's reminder state "
+                     "or drop clock is recorded")
             return 0
         people = []
         for action in drip.shown_contacts(message):
             key = str(action.get("row_key") or "").strip()
             if not key:
                 continue
+            ask = str(action.get("ask") or "")
             await asyncio.to_thread(
-                lambda k=key, a=action: self.db.record_next_step_mention(
-                    k, signature=str(a.get("signature") or ""), on_date=marker,
-                    ask=str(a.get("ask") or "")))
-            people.append({
-                "row_key": key, "sheet_row": action.get("sheet_row"),
-                "poc": action.get("poc", ""), "company": action.get("company", ""),
-                "step": action.get("step", ""),
-                "step_label": action.get("step_label", ""),
-                "ask": action.get("ask", ""), "email_n": action.get("email_n", 0),
-                "signature": action.get("signature", ""),
-                "line": action.get("text", ""),
-            })
-            if action.get("ask") == "unresponsive":
-                log.info("[rules] R13: %s was asked to be marked Unresponsive; I "
-                         "stop asking about them", key)
+                lambda k=key, a=action, w=ask: self.db.record_next_step_mention(
+                    k, signature=str(a.get("signature") or ""), on_date=marker, ask=w))
+            people.append((key, ask))
+            if ask in (nextaction.ASK_DROPPED, nextaction.ASK_UNRESPONSIVE):
+                log.info("[rules] R13: %s was named under the %s line; no more reminders "
+                         "about this step (they come back when the sheet moves)", key,
+                         "drop" if ask == nextaction.ASK_DROPPED else "unresponsive")
         if not people:
             return 0
-        await asyncio.to_thread(
-            lambda: self.db.record_next_step_post(
-                str(getattr(sent, "id", "") or ""), on_date=marker,
-                channel_id=str(getattr(getattr(sent, "channel", None), "id", "") or ""),
-                people=people))
         log.info("[rules] R13: recorded %d person(s) named on %s (%s)", len(people),
-                 marker, ", ".join(p["row_key"] for p in people))
+                 marker, ", ".join(k for k, _a in people))
         state.audit("next_step_post", reason="one R13 post went out", date=marker,
-                    people=[p["row_key"] for p in people],
-                    asks=[p["ask"] for p in people])
+                    people=[k for k, _a in people], asks=[a for _k, a in people])
         return len(people)
 
     async def _advance_meeting_ladder(self, message: dict, *, marker: str) -> int:

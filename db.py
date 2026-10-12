@@ -775,11 +775,19 @@ CREATE TABLE IF NOT EXISTS meeting_followups (
 -- named (the Next Steps value and that step's cells); `mentions`, `calls` and
 -- `last_call_date` belong to THAT signature and start again when it changes,
 -- which is what "a person keeps coming back until their step changes" means.
--- `last_date` orders the rotation: least recently named goes first.
+-- `last_date` is the last day they were named (it is how "today's people stay
+-- today's people" is known); `last_ask` is what they were named for.
 --
--- `closed` IS NEVER RESET BY A STEP CHANGE. It is set when the reminder to mark
--- the contact Unresponsive goes out, and from then on the rule never names
--- them, whatever the cells later say.
+-- `first_named` IS THE DROP CLOCK (12 Oct 2026; added by a migration). The day
+-- the bot first named this person FOR THIS SIGNATURE. NEXT_STEP_DROP_AFTER_DAYS
+-- later the ask is dropped. It is separate from `last_date` because the clock
+-- must start at the first naming and `last_date` moves with every post.
+--
+-- `closed` / `closed_date` ARE THE DROP: set when the person is named under
+-- the drop line, or under the unresponsive line. `closed` BELONGS TO THE
+-- SIGNATURE like everything else here: when the step changes the person comes
+-- back, with a new `first_named` and a fresh three weeks. (Until 12 Oct it
+-- survived a step change, and a closed person never returned.)
 --
 -- WRITTEN ONLY BY THE SENDER, after a real send. The evaluator is handed a
 -- copy and writes nothing, so a preview cannot move the rotation.
@@ -796,10 +804,12 @@ CREATE TABLE IF NOT EXISTS next_step_followups (
     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- R13: WHAT EACH POST SAID, by Discord message id. A reply to the post ("done")
--- has to be matched to a person and a step, and the post's text is not a
--- reliable place to read those back from. `people` is a JSON list in post
--- order. Read by the reply handling (NFT2-1063); written with the state above.
+-- R13: WHAT EACH POST SAID, by Discord message id.
+--
+-- RETIRED 12 Oct 2026. It existed so a reply to the post ("done") could be
+-- matched to a person; the post is now a reminder and replies to it are not
+-- read. The table is left so an existing database opens unchanged; NOTHING
+-- READS OR WRITES IT.
 CREATE TABLE IF NOT EXISTS next_step_posts (
     message_id TEXT PRIMARY KEY,
     on_date    TEXT NOT NULL,
@@ -1111,6 +1121,10 @@ KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls
 # alter an existing table, so an already-created sales_bot.db needs them
 # back-filled. (table, column, DDL) — each added only if missing. Idempotent.
 _MIGRATIONS: list[tuple[str, str, str]] = [
+    # R13: THE DAY A PERSON WAS FIRST NAMED FOR THEIR CURRENT STEP, which is
+    # what the three-week drop is counted from. Blank on rows written before
+    # 12 Oct 2026: their clock starts at their next naming.
+    ("next_step_followups", "first_named", "TEXT NOT NULL DEFAULT ''"),
     # R11: THE DAY A COMPANY WAS LAST SEEN TO HAVE LEFT THE MASTER PIPELINE (or
     # been renamed away). NULL while it is on the tab. A retired row is never
     # returned as new; it is kept so the decision is made once, not every run.
@@ -2731,26 +2745,27 @@ class DB:
     # -- R13: the next-step reminders ---------------------------------------
 
     def next_step_state(self) -> Optional[dict]:
-        """{row_key: {signature, last_date, mentions, calls, last_call_date,
-        last_ask, closed, closed_date}} for R13, or None when it cannot be read.
+        """{row_key: {signature, last_date, first_named, mentions, calls,
+        last_call_date, last_ask, closed, closed_date}} for R13, or None when
+        it cannot be read.
 
         FAILS CLOSED, AND NOT THE WAY R9's LADDER DOES. An empty dict here would
-        mean "nobody has ever been named": the rotation would start again from
-        the top of the sheet and every contact already closed as Unresponsive
-        would be chased again. None means "unknown", and the evaluator posts
-        nothing on it.
+        mean "nobody has ever been named": every drop clock would start again
+        and every person already dropped would be reminded about again. None
+        means "unknown", and the evaluator posts nothing on it.
         """
         try:
             with self.conn() as c:
                 rows = c.execute(
-                    "SELECT row_key, signature, last_date, mentions, calls, "
-                    "last_call_date, last_ask, closed, closed_date "
+                    "SELECT row_key, signature, last_date, first_named, mentions, "
+                    "calls, last_call_date, last_ask, closed, closed_date "
                     "FROM next_step_followups"
                 ).fetchall()
             return {
                 r["row_key"]: {
                     "signature": str(r["signature"] or ""),
                     "last_date": str(r["last_date"] or ""),
+                    "first_named": str(r["first_named"] or ""),
                     "mentions": int(r["mentions"] or 0),
                     "calls": int(r["calls"] or 0),
                     "last_call_date": str(r["last_call_date"] or ""),
@@ -2763,8 +2778,8 @@ class DB:
         except Exception:
             log.exception(
                 "[db] the next-step reminder state could not be read. R13 posts "
-                "nothing until it can: guessing would restart the rotation and "
-                "chase people it has already closed."
+                "nothing until it can: guessing would restart every drop clock and "
+                "remind about people it has already dropped."
             )
             return None
 
@@ -2777,8 +2792,13 @@ class DB:
         change the rotation it was previewing.
 
         A different stored signature means the step changed since the last
-        mention, so the counts for the old step are dropped first. `closed`
-        survives that on purpose.
+        mention, so EVERYTHING for the old step is dropped first: the counts,
+        the drop clock (`first_named` becomes today) and `closed`. That is how
+        a dropped person comes back when the sheet moves.
+
+        `ask` "dropped" or "unresponsive" CLOSES the ask: the person was named
+        under the drop line or the unresponsive line, and is not named again
+        for this signature.
         """
         key = str(row_key or "").strip()
         if not key:
@@ -2788,74 +2808,35 @@ class DB:
         what = str(ask or "")
         with self.conn() as c:
             row = c.execute(
-                "SELECT signature, mentions, calls, last_call_date, closed, closed_date "
-                "FROM next_step_followups WHERE row_key = ?", (key,)
+                "SELECT signature, first_named, mentions, calls, last_call_date, closed, "
+                "closed_date FROM next_step_followups WHERE row_key = ?", (key,)
             ).fetchone()
             same = bool(row) and str(row["signature"] or "") == sig
             mentions = (int(row["mentions"] or 0) if same else 0) + 1
             calls = int(row["calls"] or 0) if same else 0
             last_call = str(row["last_call_date"] or "") if same else ""
-            closed = int(row["closed"] or 0) if row else 0
-            closed_date = str(row["closed_date"] or "") if row else ""
+            first = (str(row["first_named"] or "") if same else "") or day
+            closed = int(row["closed"] or 0) if same else 0
+            closed_date = str(row["closed_date"] or "") if same else ""
             if what == "call":
                 calls += 1
                 last_call = day
-            if what == "unresponsive":
+            if what in ("unresponsive", "dropped"):
                 closed, closed_date = 1, day
             c.execute(
                 "INSERT INTO next_step_followups (row_key, signature, last_date, "
-                "mentions, calls, last_call_date, last_ask, closed, closed_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(row_key) DO UPDATE SET "
+                "first_named, mentions, calls, last_call_date, last_ask, closed, "
+                "closed_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(row_key) DO UPDATE SET "
                 "signature = excluded.signature, last_date = excluded.last_date, "
+                "first_named = excluded.first_named, "
                 "mentions = excluded.mentions, calls = excluded.calls, "
                 "last_call_date = excluded.last_call_date, last_ask = excluded.last_ask, "
                 "closed = excluded.closed, closed_date = excluded.closed_date, "
                 "updated_at = CURRENT_TIMESTAMP",
-                (key, sig, day, mentions, calls, last_call, what, closed, closed_date),
+                (key, sig, day, first, mentions, calls, last_call, what, closed,
+                 closed_date),
             )
-
-    def record_next_step_post(self, message_id, *, on_date: str, channel_id="",
-                              people=None) -> None:
-        """Remember who an R13 post named, and what each was asked."""
-        mid = str(message_id or "").strip()
-        if not mid:
-            return
-        with self.conn() as c:
-            c.execute(
-                "INSERT OR REPLACE INTO next_step_posts (message_id, on_date, "
-                "channel_id, people) VALUES (?, ?, ?, ?)",
-                (mid, str(on_date or ""), str(channel_id or ""),
-                 json.dumps(list(people or []), ensure_ascii=False)),
-            )
-
-    def next_step_post(self, message_id) -> Optional[dict]:
-        """{message_id, on_date, channel_id, people} for one R13 post, or None."""
-        mid = str(message_id or "").strip()
-        if not mid:
-            return None
-        try:
-            with self.conn() as c:
-                row = c.execute(
-                    "SELECT message_id, on_date, channel_id, people "
-                    "FROM next_step_posts WHERE message_id = ?", (mid,)
-                ).fetchone()
-        except Exception:
-            log.exception("[db] next_step_posts could not be read")
-            return None
-        if row is None:
-            return None
-        try:
-            people = json.loads(row["people"] or "[]")
-        except ValueError:
-            people = []
-        return {
-            "message_id": str(row["message_id"]),
-            "on_date": str(row["on_date"] or ""),
-            "channel_id": str(row["channel_id"] or ""),
-            "people": people if isinstance(people, list) else [],
-        }
-
-    # -- permission before every write: proposals ---------------------------
 
     def open_proposal(self, *, proposal_key: str, kind: str, tab: str,
                       sheet_row, row_key: str, company: str, poc: str,
