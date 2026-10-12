@@ -2208,7 +2208,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
 | **R6** | Connected, no DM yet, and the email check (LI DM Sent blank; 5 names + up to 5 with email news) | Tue, Fri | `li_no_dm` | 5 | yes |
-| **R7** | DM sent, no meeting — never a person R13 covers | Mon | `dm_no_meeting` | 5 | yes |
+| **R7** | No meeting booked yet — the escalation behind R13, rotating | Mon | `dm_no_meeting` | 3 | yes |
 | **R8** | Meeting preparation | **anchored**, 10:00 | `meeting_prep` | 3 | **no** |
 | **R9** | Meeting done, no next steps | **anchored**, 10:00 | `meeting_followup` | 3 | **no** |
 | **R10** | Closure support | Mon | `closure_support` | 5 | yes |
@@ -2378,6 +2378,105 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 7: no meeting booked yet, the escalation behind rule 13
+
+**Rebuilt 13 Oct 2026.** Rule 13 does the chasing: from a week after the DM
+its call line says "We need to call these PoCs" every weekday. Rule 7 says, on
+Mondays, that the chasing is not working. `python verify_dm_no_meeting.py
+--show` prints the messages.
+
+*Why it was rebuilt.* It ran every Monday and named nobody. Its own code
+handed its people to rule 13 (`covered_by_next_steps`), and since 12 Oct that
+is every row marked Connected, which is every row that has been DM'd. At its
+old 7 days it would also have fired on exactly rule 13's call condition, where
+rule 13 names the same people every weekday and one person is named once a day.
+
+**Who is in** (`nextaction.dm_no_meeting_state`), four columns in this order:
+
+1. **LI DM Sent says Sent** (`DM_NO_MEETING_DM_SENT_MARKERS`). The cell, not
+   the date: until 13 Oct the rule decided a DM had gone out by finding an LI
+   DM Date. Replied (`DM_NO_MEETING_DM_REPLIED_MARKERS`, checked first) is
+   rule 13's meeting line; blank is no DM.
+2. **LI DM Date holds a date.** No date, no lookup: nothing is measured for
+   the row, and rule 13 still reminds about that person.
+3. **Meeting Status is blank or TBD** (`DM_NO_MEETING_STATUS_OPEN`). Completed
+   is out for good, whatever that list says.
+4. **The gap**, one of two ways:
+
+   | Meeting Date | Measured from | To | Threshold |
+   |---|---|---|---|
+   | blank | LI DM Date | today | `DM_NO_MEETING_DAYS` (21) |
+   | filled in | LI DM Date | Meeting Date | `DM_NO_MEETING_BOOKED_GAP_DAYS` (7) |
+
+   A person is in from the day the gap reaches the number: day 20 is not yet,
+   day 21 is in. Booking a meeting is not an exit: with the status still open
+   the person moves to the second block until it says Completed.
+
+**Out:** Meeting Status Completed; Deal Status Won or Lost and every other stop
+marker, as for every rule; and **Deal Status On Hold, for this rule only**.
+`DEAL_ON_HOLD_MARKERS` is not in `CLOSURE_STOP_MARKERS` (that would change all
+thirteen rules), so it is checked inside rule 7 and nowhere else: a parked
+deal is still rule 13's to remind about.
+
+**It reads the whole tab**, not only the active rows, as rules 6 and 13 do.
+
+**Three people a post** (`DM_NO_MEETING_MAX_CONTACTS`), shared across both
+blocks. **The order is a rotation** (`nextaction.dm_no_meeting_order`):
+
+1. least recently named first; somebody never named goes ahead of everybody;
+2. then longest since the DM;
+3. then sheet order.
+
+`PROSPECT_ROLE_ORDER` is no longer a tie-break here: it is rule 5's seniority
+order. **Nobody is dropped on a timer.** A person keeps coming round until the
+sheet moves. Fewer than three qualify, fewer are named; there is no padding
+and no "+N more next Monday" line.
+
+**Rule 13 comes first.** It is listed before rule 7 in `bot_rules.yaml`, so it
+keeps anybody both rules pick on a Monday (rule 7 is not exempt from the
+one-mention-a-day rule). Rule 7 skips those people *before* it picks its
+three (`ctx["taken"]` in `nextaction.run`), so the next person moves up
+rather than the post coming out short.
+
+**The post.** Fixed text from `wording.py` (`dm_no_meeting_post`); rule 7 is in
+`drip.VERBATIM_TYPES`, is one post whatever the owners, and is never held by
+the re-ask clock. A numbered list, then one line under it saying what those
+people have in common. One line a person: name and company. No day count, no
+date, no note, no cell name. The second block is the one exception: it shows
+the Meeting Date.
+
+```
+**No meeting booked yet**
+@Vaishnavi @Sid
+
+1. Ariya Rastrow (Wisprlow.ai)
+2. Prof. Karim Ouazzane (London Metropolitan University)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+
+3. Eleonore Lumer (PolyAI) — 24 Oct
+
+This meeting is set for more than a week after the DM went out.
+```
+
+A block with nobody in it does not appear, including its sentence. **The number
+in each sentence follows its setting** (`wording.days_span`): weeks when the
+value divides evenly by 7, otherwise days, so `DM_NO_MEETING_DAYS=10` reads
+"more than 10 days ago". With two or more people in the second block the
+sentence reads "These meetings are set for…". Nothing is posted when nobody
+qualifies (no "all clear" line), when the tab comes back empty, or when the
+rotation state cannot be read; the last two are logged at ERROR.
+
+**Replies are not read.** Nothing is asked, so nothing is parsed: a statement
+under the post gets no reply, no reaction and no write
+(`bot._statement_under_next_steps`). The three composed openers, the three
+closing questions and the "DM sent N days ago, last note" line are deleted.
+
+**State, written only after a real send** (`bot._record_dm_no_meeting`): one
+row a person in `dm_no_meeting_mentions`, holding the last day they were
+named. A preview writes nothing; a test day on a database that is not a
+`*_test.db` writes nothing; a simulation writes to its sandbox copy.
 
 ### Rule 6: connected, no DM yet, and the email check
 
@@ -2721,10 +2820,9 @@ in voice AI" (the best company in that industry) and "what's left to contact?"
 not catch still goes to the model and its tracker tools, which have their own
 order.
 
-**R7 shows days since the DM and the last note logged.** Those two are what a
-person needs to decide whether to chase again or leave it: *"no reply after 9
-days, last note: waiting on their legal"* is a sentence somebody can act on;
-*"follow up with Acme"* is not.
+**R7 shows a name and a company and nothing else** (13 Oct 2026; it used to show
+the days since the DM and the last note). See
+[Rule 7](#rule-7-no-meeting-booked-yet-the-escalation-behind-rule-13).
 
 **R8 skips touches already in the past.** A meeting booked with three days'
 notice gets the T-3 and day-of touches and **never a late T-5** — sending "five
@@ -2929,7 +3027,9 @@ isn't X due". It is NOT the answer to "what do we need to do today?" or
 
 **Grouped by rule**, which is the change that matters. Each section names the
 rule and prints the reason line its evaluator wrote, so the output can be
-checked against `bot_rules.yaml` line by line without opening the code:
+checked against `bot_rules.yaml` line by line without opening the code. (The
+sample below is from before 13 Oct 2026: the layout of a preview block is the
+same, but R7's own lines no longer carry the days or the note.)
 
 ```
 **R7 · DM sent, no meeting** — 5 item(s), 5/post to the channel
@@ -2967,6 +3067,7 @@ the same thing and neither should get an empty list.
 | ~~R5 week companies~~ | `prospect_week` | RETIRED 11 Oct 2026, with "two companies a week": left in the schema, nothing reads or writes it |
 | **R9 ladder** | `meeting_followups` | advanced by the sender; cleared when Notes/Remarks is filled |
 | **R13 reminders** | `next_step_followups` | written by the sender after a real send; the last day a person was named is what rotates each tier; a changed step signature starts the person again. `first_named`, `closed` and `closed_date` are still in the table and no longer read or written (12 Oct 2026) |
+| **R7's rotation** | `dm_no_meeting_mentions` | written by the sender after a real send: the last day a person was named, which is what moves the three names on from one Monday to the next. Nothing here ends a person |
 | ~~R13 posts~~ | `next_step_posts` | RETIRED 12 Oct 2026 with the reply handling: left in the schema, nothing reads or writes it |
 | **R11 snapshot** | `pipeline_companies` | normalised name, `first_seen`, and a `seeded` flag |
 | Deadlines the bot announced | `deadlines` | unchanged |
@@ -3399,7 +3500,7 @@ answerable — *"yes, done"* means something. A document is not.
 
 | Day | 14:00 | 16:00 | 18:00 | 20:00 |
 |---|---|---|---|---|
-| Monday | R4 Deliverables | R7 DM sent, no meeting | R1 AI news | R10 Closure support |
+| Monday | R4 Deliverables | R7 No meeting booked yet | R1 AI news | R10 Closure support |
 | Tuesday | R5 Prospects | R6 LinkedIn connected, no DM | R2 News screen | R1 AI news |
 | Wednesday | R11 New company PoCs | R1 AI news | R3 AI events | |
 | Thursday | R5 Prospects | R1 AI news | R12 Sales packages | |
@@ -3670,9 +3771,11 @@ Each docstring says what broke and how it was caught — a regression test named
 
 ---
 
-### The daily cap — 5 counted posts, every weekday
+### The daily cap — 7 counted posts, every weekday
 
-`DAILY_MESSAGE_CAP`, default **5**, the same on every weekday. The per-weekday
+`DAILY_MESSAGE_CAP`, default **7** (5 until 13 Oct 2026, when R7 came back as
+a Monday post), the same on every weekday. What a day actually fills is still
+the four slots of the posting window. The per-weekday
 table (`DAILY_MESSAGE_CAP_BY_DAY`) is **retired**: it gave Monday and Tuesday
 four and the rest three, and it was one of three places that each had their own
 idea of whether the day was full.
@@ -3919,11 +4022,10 @@ blank; the link line is there only when the row has one. **No repeats:** the
 same Action Item appears once (the checklist sometimes carries one on two
 rows), and each link appears once in the whole message.
 
-**R7 — DM sent, no meeting.** At most `DM_NO_MEETING_MAX_CONTACTS` (5)
-**contacts** — it used to cap by company and show neither the days nor the
-note. Longest since the DM first; ties by `PROSPECT_ROLE_ORDER` (founder
-first), then sheet order. One line each — `name — company — DM sent N days ago
-— last note` — and `(+N more next Monday)` for the rest.
+**R7 — DM sent, no meeting.** *Replaced on 13 Oct 2026*: see
+[Rule 7](#rule-7-no-meeting-booked-yet-the-escalation-behind-rule-13). (S3 made
+it list `DM_NO_MEETING_MAX_CONTACTS` contacts with the days since the DM and
+the last note, founders first on a tie, and "+N more next Monday".)
 
 **R10 — closure support.** When Prospect Status (or Closure Prob%) is blank on
 *every* active row the rule cannot run, and a silent Monday read exactly like
@@ -5860,6 +5962,7 @@ python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
 python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the six tiers, the rotation (nobody is dropped), replies not read (--show prints the messages)
+python verify_dm_no_meeting.py            # R7, the escalation behind R13: who is in (four columns), On Hold out for R7 only, the rotation, the two blocks, the sentence that follows the setting, nothing recorded by a preview or a test day (--show prints the messages)
 python verify_sheet_locks.py              # the write lock by ROLE: three header orders, a missing header refuses every write, ranges only add, the Email cell and the signed new row (--show prints the startup lock log)
 python verify_rule13.py                   # STALE since 12 Oct 2026 for rule 13's behaviour (see its header); the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test

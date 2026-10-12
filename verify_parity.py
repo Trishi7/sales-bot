@@ -376,13 +376,22 @@ async def real_path(day: date) -> dict:
     channel_id = config.digest_channel_id()
     bot.get_channel = lambda cid: FakeChannel(cid)
     planned = await bot._plan_drip(today=day, already=[])
-    times = [m["send_at"] for m in (planned or {}).get("messages") or []]
+    times = [(m["send_at"], bool(m.get("pinned"))) for m in (planned or {}).get("messages") or []]
     step = timedelta(minutes=drip.min_gap_minutes() + 1)
     at = None
-    for want in times + [None]:
-        base = want or (at + step if at else datetime.combine(day, time(23, 0), dl.IST))
-        at = base if at is None else max(base, at + step)
-        at = min(at, datetime.combine(day, time(23, 58), dl.IST))
+    spaced = None                                  # when the last SPACED post was ticked
+    for want, pinned in times + [(None, False)]:
+        # THE GAP IS BETWEEN SPACED POSTS ONLY. A fixed-time post (R13 at 15:00) sits between two of them, and
+        # stepping a whole gap on from IT pushed the day's last post past 20:00 once Monday had four posts
+        # (13 Oct 2026, when R7 started posting again).
+        base = want or ((at or datetime.combine(day, time(23, 0), dl.IST)) + step)
+        if at is not None:
+            base = max(base, at + timedelta(minutes=1))
+        if spaced is not None and not pinned:
+            base = max(base, spaced + step) if want is None else max(base, min(want, spaced + step))
+        at = min(base, datetime.combine(day, time(23, 58), dl.IST))
+        if not pinned:
+            spaced = at
         clock.set_time_of_day(at.timetz().replace(tzinfo=None), by="verify_parity")
         await bot._maybe_send_drip()
     clock.clear_time_override(why="verify_parity")
@@ -611,7 +620,7 @@ def bot_rules_wording() -> None:
     print()
     check("the Daily cap row is the agreed sentence (rule 13 added next-step follow-ups on 7 Oct 2026)",
           rules_mod.global_rule("daily_cap"),
-          "Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent "
+          "Max 7 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent "
           "news and answers to questions don't count.")
     check("bot_rules.yaml R4 plain", r4.plain, want)
     check("bot_rules.yaml R4 description", r4.description, want)

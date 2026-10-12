@@ -84,7 +84,7 @@ All five are owned by Vaishnavi and Sid. Their shared dependencies are: legal co
 
 All times IST. First post at 2:00 PM; later posts 2 hours apart, the last at 8 PM; AI-news checks hourly 11 AM–11 PM, silent unless important.
 
-**Daily cap:** Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent news and answers to questions don't count. The cap is the same on every weekday; the longest day has 4 posts in its order. Each outreach post carries at most 5 contacts; overflow rolls the same way. The approvals sweep and the follow-up to a "yes" don't count either.
+**Daily cap:** Max 7 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent news and answers to questions don't count. The cap is the same on every weekday; the longest day has 4 posts in its order. Each outreach post carries at most 5 contacts; overflow rolls the same way. The approvals sweep and the follow-up to a "yes" don't count either.
 
 **Reminders:** a reminder somebody asked for posts once, at the minute it was asked for, in the channel it was asked in. If its date has already passed it posts once as soon as Saley sees it, marked "(this was due <date>)". Never twice.
 
@@ -94,7 +94,7 @@ All times IST. First post at 2:00 PM; later posts 2 hours apart, the last at 8 P
 
 | Day | Posts, in order |
 |---|---|
-| Monday | 2 PM deliverables checklist · 4 PM DM sent, no meeting · 6 PM AI news · 8 PM closure support |
+| Monday | 2 PM deliverables checklist · 4 PM no meeting booked yet · 6 PM AI news · 8 PM closure support |
 | Tuesday | 2 PM prospects to contact · 4 PM LinkedIn connected with no DM after 3 days · 6 PM news companies screened for the pipeline · 8 PM AI news |
 | Wednesday | 2 PM new companies in the pipeline (asks first) · 4 PM AI news · 6 PM AI events & summits (what falls in the next 14 days) |
 | Thursday | 2 PM prospects to contact · 4 PM AI news · 6 PM sales package status |
@@ -114,7 +114,7 @@ All times IST. First post at 2:00 PM; later posts 2 hours apart, the last at 8 P
 5. **Prospects to contact (Tuesday and Thursday).** Every Outreach PoCs row where First Contact is FALSE or blank and no stop rule applies — not only rows already being worked. 5 contacts per post, in the role order from §5, two companies a week. For a contact with no email on the sheet, search once and show "email found: x@y.com (source)" or "no public email found"; never guess an address from a pattern. If an email was found, ask whether to add it: on a yes, write only that Email cell and only if it is still blank. If the same contacts come up three times with no update, ask whether to skip them.
    On request, Saley finds current PoCs at a named company or department the same way as rule 11.
 6. **LinkedIn connected, no DM after 3 days (Tuesday and Friday).** The email check: say whether an email is on file. If not, search for a verified public email and say where it was found, or that none was found. It does not chase the DM; rule 13 owns the step reminders.
-7. **DM sent, no meeting after 7 days (Monday).** People we DM'd more than 7 days ago who haven't booked a meeting: days since the DM and the last note logged, at most 5 a post; if more qualify, end with "(+N more next Monday)". Rule 13 comes first: never list anyone it covers (Sid - LI Addition is Connected and LI Connected Date is filled) — they get rule 13's call reminders instead.
+7. **No meeting booked yet (Monday).** Every Monday, second in the day's order: people we DM'd more than three weeks ago who still have no meeting, plus anyone whose meeting is booked more than a week after the DM. Three people a post, name and company only. Nobody is dropped: a person keeps coming round until the meeting is Completed or the deal is Won, Lost or On Hold. Rule 13 comes first: anyone it names that day is not listed here.
 8. **Meeting preparation (5 days before, 3 days before, day of).** Every touch posts at 10 AM, outside the day's order. Check the meeting is ready (deck, package, demo) and share recent news about the person and the company. If a meeting is booked with less than 5 days' notice, skip the touches already missed. If it's rescheduled, the reminders follow the new date.
 9. **Meeting done, no next steps (3 days after, then every 3 days).** Posts at 10 AM, outside the day's order. Ask for next steps, the package discussed and an estimated deal size. First follow-up in the channel, next two by DM, then one escalation to Sid, then stop — one step each time a follow-up goes out. "No next steps" means the Notes/Remarks cell is blank (never the Next Steps dropdown). Filling in Notes/Remarks ends it, and a new meeting starts again from the first step.
 10. **Closure support (Monday).** Deals at deal / demo / quote stage with closure probability above 50%: ask what's needed for the next stage, and share relevant news. If Prospect Status or Closure Prob% is empty on every active row, say so — "No closure support this week — Prospect Status and Closure Prob% are empty in the GTM sheet. Fill them in and I'll pick it up next Monday." If the columns have values but no deal qualifies, stay silent.

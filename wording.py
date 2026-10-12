@@ -653,6 +653,107 @@ def li_no_dm_lines_for_check() -> list:
             LI_NO_DM_ADD_QUESTION]
 
 
+# -- no meeting booked yet (rule 7) --------------------------------------------
+#
+# THE POST, AGREED 13 Oct 2026. A numbered list, then ONE line under it saying
+# what those people have in common. The explanation goes UNDER the list.
+#
+#     **No meeting booked yet**
+#     @Vaishnavi @Sid
+#
+#     1. Ariya Rastrow (Wisprlow.ai)
+#     2. Prof. Karim Ouazzane (London Metropolitan University)
+#
+#     We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+#
+#     3. Eleonore Lumer (PolyAI) — 24 Oct
+#
+#     This meeting is set for more than a week after the DM went out.
+#
+# ONE LINE A PERSON: name and company. No day count, no date, no note, no cell
+# name. The second block is the one exception: it shows the Meeting Date,
+# because that date is the point of the line. NOTHING IS ASKED, so there is no
+# closing question; replies to this post are not read.
+DM_NO_MEETING_NONE = ("We sent them a DM more than {span} ago and don't have a meeting set up "
+                      "with them.")
+DM_NO_MEETING_BOOKED = "This meeting is set for more than {span} after the DM went out."
+# The agreed sentence is about ONE meeting. With two or more people in the
+# block only the subject changes.
+DM_NO_MEETING_BOOKED_MANY = "These meetings are set for more than {span} after the DM went out."
+DM_NO_MEETING_BLOCKS = ("none", "booked")
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def days_span(days) -> str:
+    """"3 weeks" for 21, "a week" for 7, "10 days" for 10. THE NUMBER IN R7's
+    SENTENCE FOLLOWS THE SETTING: weeks when the value divides evenly by 7,
+    otherwise days. A post that said seven days when it waited twenty-one
+    would simply be wrong."""
+    days = max(0, int(days or 0))
+    if days and days % 7 == 0:
+        return "a week" if days == 7 else f"{days // 7} weeks"
+    return "a day" if days == 1 else f"{days} days"
+
+
+def short_date(iso) -> str:
+    """"24 Oct" from "2026-10-24"; "" for anything that is not a date."""
+    parts = str(iso or "").strip().split("-")
+    try:
+        year, month, day = (int(x) for x in parts)
+        return f"{day} {_MONTH_ABBR[month - 1]}" if 1 <= day <= 31 and year > 0 else ""
+    except (ValueError, IndexError):
+        return ""
+
+
+def dm_no_meeting_post(people, *, days, gap_days) -> list:
+    """The lines of R7's post under its heading and tags.
+
+    `people` are dicts with `who`, `block` (one of DM_NO_MEETING_BLOCKS) and,
+    for "booked", `meeting_iso`. `days` is DM_NO_MEETING_DAYS and `gap_days`
+    DM_NO_MEETING_BOOKED_GAP_DAYS: each block's sentence states its own number.
+
+    THE TWO BLOCKS APPEAR IN THE AGREED ORDER whatever order people arrive in,
+    and inside a block people keep the order they came in. The numbering runs
+    straight through both. A BLOCK WITH NOBODY IN IT DOES NOT APPEAR,
+    INCLUDING ITS SENTENCE. [] with nobody to name, and then nothing is posted.
+    """
+    blocks: dict = {name: [] for name in DM_NO_MEETING_BLOCKS}
+    for person in people or ():
+        block = str(person.get("block") or "none")
+        blocks.get(block, blocks["none"]).append(person)
+    lines: list = []
+    n = 0
+    for name in DM_NO_MEETING_BLOCKS:
+        if not blocks[name]:
+            continue
+        if lines:
+            lines.append("")
+        for person in blocks[name]:
+            n += 1
+            line = f"{n}. {str(person.get('who') or '').strip() or '(unnamed row)'}"
+            when = short_date(person.get("meeting_iso")) if name == "booked" else ""
+            if when:
+                line += " \u2014 " + when
+            lines.append(line)
+        lines.append("")
+        if name == "none":
+            lines.append(DM_NO_MEETING_NONE.format(span=days_span(days)))
+        else:
+            lines.append((DM_NO_MEETING_BOOKED if len(blocks[name]) == 1
+                          else DM_NO_MEETING_BOOKED_MANY).format(span=days_span(gap_days)))
+    return lines
+
+
+def dm_no_meeting_lines_for_check() -> list:
+    """Every fixed line R7's post can carry, with stand-in values."""
+    who = next_step_who("Priya Rao", "Acme Labs")
+    return dm_no_meeting_post(
+        [{"who": who, "block": "none"}, {"who": who, "block": "booked", "meeting_iso": "2026-10-24"},
+         {"who": who, "block": "booked", "meeting_iso": "2026-10-27"}], days=21, gap_days=7) + [
+        DM_NO_MEETING_BOOKED.format(span=days_span(10)),
+        DM_NO_MEETING_NONE.format(span=days_span(10))]
+
+
 # -- every line, rendered, for the register check ----------------------------
 
 
@@ -675,6 +776,7 @@ def all_lines() -> list:
         undo_failed("the sheet refused it"), undone("Acme", "stage back to DM sent"),
         *reply_lines_for_check(),
         *next_step_lines_for_check(),
+        *[l for l in dm_no_meeting_lines_for_check() if l],
     ]
 
 
@@ -839,6 +941,24 @@ def _self_test() -> int:
     check("no line names a setting",
           [l for l in next_step_lines_for_check() if _re.search(r"[A-Z]{3,}_[A-Z_]+", l)],
           [])
+
+    print("\nno meeting booked yet (rule 7) - two blocks, one numbering")
+    both = dm_no_meeting_post(
+        [{"who": "B (Co)", "block": "booked", "meeting_iso": "2026-10-24"},
+         {"who": "A (Co)", "block": "none"}], days=21, gap_days=7)
+    check("the blocks come in the agreed order, numbered straight through, each sentence under its list",
+          both, ["1. A (Co)", "", DM_NO_MEETING_NONE.format(span="3 weeks"), "",
+                 "2. B (Co) \u2014 24 Oct", "", DM_NO_MEETING_BOOKED.format(span="a week")])
+    check("only the second block: the first block and its sentence are both absent",
+          dm_no_meeting_post([{"who": "B (Co)", "block": "booked", "meeting_iso": "2026-10-24"}],
+                             days=21, gap_days=7),
+          ["1. B (Co) \u2014 24 Oct", "", DM_NO_MEETING_BOOKED.format(span="a week")])
+    check("the number follows the setting: weeks when it divides by 7, otherwise days",
+          [days_span(n) for n in (21, 14, 7, 10, 1)], ["3 weeks", "2 weeks", "a week", "10 days", "a day"])
+    check("nobody -> no lines at all", dm_no_meeting_post([], days=21, gap_days=7), [])
+    check("nothing is asked, and no column is named",
+          [l for l in dm_no_meeting_lines_for_check()
+           if "?" in l or "LI DM" in l or "Meeting Status" in l or "Next Steps" in l], [])
 
     print("\nALL PASSED" if not failures else f"\n{failures} FAILED")
     return 1 if failures else 0

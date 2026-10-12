@@ -7727,7 +7727,9 @@ class SalesBot(discord.Client):
 
     @staticmethod
     def _statement_under_next_steps(ctx: dict, text: str) -> bool:
-        """Is this a direct reply to a next-steps post that asks nothing?
+        """Is this a direct reply to a next-steps post that asks nothing? (Or
+        to R7's "No meeting booked yet" post, since 13 Oct 2026: it asks
+        nothing either, so nothing under it is parsed.)
 
         THE REPLY HANDLING FOR THAT POST WAS REMOVED ON 12 OCT 2026 (it used to
         answer "done" with a request to fill a cell). The post is a reminder;
@@ -7738,7 +7740,8 @@ class SalesBot(discord.Client):
         """
         if not ctx.get("direct_is_bot"):
             return False
-        if (ctx.get("drip") or {}).get("action_type") != nextaction.R_NEXT_STEPS:
+        if (ctx.get("drip") or {}).get("action_type") not in (
+                nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING):
             return False
         body = " ".join(str(text or "").split())
         return "?" not in body and not _STARTS_LIKE_A_QUESTION_RE.match(body)
@@ -10331,10 +10334,10 @@ class SalesBot(discord.Client):
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
-            # R2's, R13's and R6's agreed shapes have a blank line between the
-            # tags and the list.
+            # R2's, R13's, R6's and R7's agreed shapes have a blank line between
+            # the tags and the list.
             gap=message.get("type") in (nextaction.R_NEWS_SCREEN, nextaction.R_NEXT_STEPS,
-                                        nextaction.R_LI_NO_DM),
+                                        nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING),
         )
         opener_text = body
         # THE HEADING GOES ON LAST, ABOVE THE TAGS LINE: one bold line per
@@ -11179,6 +11182,47 @@ class SalesBot(discord.Client):
                          len(info.get("held") or []), at)
         elif kind == nextaction.R_NEXT_STEPS:
             await self._record_next_steps(message, sent=sent, marker=marker)
+        elif kind == nextaction.R_DM_NO_MEETING:
+            await self._record_dm_no_meeting(message, marker=marker)
+
+    async def _record_dm_no_meeting(self, message: dict, *, marker: str) -> int:
+        """Record who an R7 post named. How many people were recorded.
+
+        ONLY AFTER A REAL SEND, and only for the people the post SHOWED. One
+        thing is written, each person's row in `dm_no_meeting_mentions`: the
+        day, which is what rotates the list (least recently named goes first).
+        Nothing closes a person.
+
+        WHERE IT WRITES, BY PATH, is R13's rule exactly
+        (`_record_next_steps`, NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB): live and
+        SALES_TEST_MODE write DB_PATH; a simulation writes its sandbox copy,
+        which is discarded; a test day ("make it Monday") writes only when
+        DB_PATH is a *_test.db, so a rehearsal cannot move who the next real
+        Monday names. A preview never reaches this at all.
+        """
+        if (clock.pretending() and not simulation.in_simulation()
+                and not NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB
+                and not str(config.DB_PATH or "").endswith("_test.db")):
+            log.info("[rules] R7: test day on a live database; the rotation is not "
+                     "recorded")
+            return 0
+        people = []
+        for action in drip.shown_contacts(message):
+            key = str(action.get("row_key") or "").strip()
+            if not key:
+                continue
+            block = str(action.get("block") or "")
+            await asyncio.to_thread(
+                lambda k=key, b=block: self.db.record_dm_no_meeting_mention(
+                    k, on_date=marker, block=b))
+            people.append(key)
+        if not people:
+            return 0
+        log.info("[rules] R7: recorded %d person(s) named on %s (%s)", len(people),
+                 marker, ", ".join(people))
+        state.audit("dm_no_meeting_post", reason="one R7 post went out", date=marker,
+                    people=people)
+        return len(people)
 
     async def _record_next_steps(self, message: dict, *, sent, marker: str) -> int:
         """Record who an R13 post named. How many people were recorded.
@@ -11654,6 +11698,12 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[rules] R13's rotation state could not be read")
             next_step_state = None
+        # R7's ROTATION, with the same rule: None names nobody.
+        try:
+            dm_no_meeting_state = await asyncio.to_thread(self.db.dm_no_meeting_state)
+        except Exception:
+            log.exception("[rules] R7's rotation state could not be read")
+            dm_no_meeting_state = None
 
         result = await asyncio.to_thread(
             lambda: nextaction.run(
@@ -11668,6 +11718,7 @@ class SalesBot(discord.Client):
                 prospect_rows=list(tab.rows),
                 events_unclear_seen=unclear_seen,
                 next_step_state=next_step_state,
+                dm_no_meeting_state=dm_no_meeting_state,
                 # R11's CROSS-CHECK: a SUMMARY of every row on the tab (a count
                 # and the mandatory roles left blank, per company), built here
                 # so the engine is handed no row and stays pure.

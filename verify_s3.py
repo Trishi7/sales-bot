@@ -91,7 +91,10 @@ SETTINGS = {
     "REMINDER_DEFAULT_TIME": "14:00", "SHEET_WRITE_UNDO_HOURS": 24,
     # the settings under test
     "DELIVERABLE_NEAR_DAYS": 3, "DELIVERABLE_DEFAULT_OWNER": "Vaishnavi",
-    "DM_NO_MEETING_DAYS": 7, "DM_NO_MEETING_MAX_CONTACTS": 5,
+    # R7 as rebuilt on 13 Oct 2026 (it was 7 days and 5 contacts).
+    "DM_NO_MEETING_DAYS": 21, "DM_NO_MEETING_MAX_CONTACTS": 3, "DM_NO_MEETING_BOOKED_GAP_DAYS": 7,
+    "DM_NO_MEETING_DM_SENT_MARKERS": ["sent"], "DM_NO_MEETING_DM_REPLIED_MARKERS": ["replied"],
+    "DM_NO_MEETING_STATUS_OPEN": ["", "tbd"],
     "CLOSURE_SUPPORT_MIN": 50, "PROSPECT_COMPANIES_PER_WEEK": 1,
     "PROSPECT_VOICE_INDUSTRIES": ["AI Voice Agents", "AI Voice/Productivity Tools"],
     "PROSPECT_LAB_INDUSTRIES": ["AI Labs"],
@@ -566,23 +569,23 @@ def monday_sheet() -> None:
 
     set_sheet(
         pocs=[
-            # R7: seven contacts whose DM has had no meeting for 9 to 30 days.
+            # R7: seven contacts DM'd 9 to 30 days ago with no meeting; four of them three weeks or more.
             poc(1, "Acme AI", "Ada Lovelace", "CTO", First_Contact="TRUE",
-                LI_DM_Date=ago(30), **{"Next Steps/Notes": "waiting on their legal"}),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(30), **{"Next Steps/Notes": "waiting on their legal"}),
             poc(2, "Borealis", "Bo Chen", "Founder", First_Contact="TRUE",
-                LI_DM_Date=ago(25)),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(25)),
             poc(3, "Cinder", "Cy Diaz", "Research Scientist", First_Contact="TRUE",
-                LI_DM_Date=ago(21), **{"Next Steps/Notes": "asked for the deck"}),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(21), **{"Next Steps/Notes": "asked for the deck"}),
             poc(4, "Cinder", "Dee Evans", "Co-Founder", First_Contact="TRUE",
-                LI_DM_Date=ago(21)),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(21)),
             poc(5, "Echo Labs", "Eve Rao", "CEO", First_Contact="TRUE",
-                LI_DM_Date=ago(14), **{"Next Steps/Notes": "out until the 25th"}),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(14), **{"Next Steps/Notes": "out until the 25th"}),
             poc(6, "Fathom", "Fay Lin", "Head of ML", First_Contact="TRUE",
-                LI_DM_Date=ago(10)),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(10)),
             poc(7, "Gantry", "Gil Shah", "VP Eng", First_Contact="TRUE",
-                LI_DM_Date=ago(9)),
+                LI_DM_Sent="Sent", LI_DM_Date=ago(9)),
             # ...and one whose DM is too recent to chase.
-            poc(8, "Harbor", "Hal Iyer", "CTO", First_Contact="TRUE", LI_DM_Date=ago(3)),
+            poc(8, "Harbor", "Hal Iyer", "CTO", First_Contact="TRUE", LI_DM_Sent="Sent", LI_DM_Date=ago(3)),
         ],
         deliverables=[
             ["Pulse Product Overview Document", "P1", "In progress",
@@ -646,32 +649,30 @@ async def the_monday() -> None:
     check("no remarks anywhere", "waiting on pricing" in body, False)
     same("R4", live, test, sim)
 
-    print("\n   (ii) R7 — DM SENT, NO MEETING, as posted by the live sweep:")
+    print("\n   (ii) R7 — NO MEETING BOOKED YET, as posted by the live sweep:")
     show(live, "R7")
     body = "\n".join(live["posts"].get("R7") or [])
     numbered = [l for l in body.splitlines() if re.match(r"^\d+\. ", l)]
-    check("7 contacts were eligible; 5 are listed",
-          (len(nextaction.EVALUATORS[nextaction.R_DM_NO_MEETING](
-              rules_mod.by_id("R7"), {"today": MON, "rows": read_sheet()[gtm_sheet.POCS].rows,
-                                      "snoozes": {}})), len(numbered)), (7, 5))
-    check("longest since the DM first; on the 21-day tie the founder leads",
-          [l.split(" — ")[0].split(". ", 1)[1] for l in numbered],
-          ["Ada Lovelace", "Bo Chen", "Dee Evans", "Cy Diaz", "Eve Rao"])
-    check("each line: name — company — DM sent N days ago — last note",
-          numbered[0], "1. Ada Lovelace — Acme AI — DM sent 30 days ago — waiting on "
-                       "their legal")
-    check("a contact with no note says so",
-          numbered[1], "2. Bo Chen — Borealis — DM sent 25 days ago — no note logged")
-    check("contacts, not companies: both people at Cinder are listed",
-          sum("— Cinder —" in l for l in numbered), 2)
-    check("the overflow line", "(+2 more next Monday)" in body, True)
-    check("the DM sent 3 days ago is not chased", "Hal Iyer" in body, False)
+    # REBUILT 13 Oct 2026. It was: seven eligible at 7 days, five listed with the days and the last note,
+    # founders first on a tie, "+2 more next Monday".
+    rows = read_sheet()[gtm_sheet.POCS].rows
+    check("4 of the 8 were DM'd three weeks or more ago; 3 are listed",
+          (len([r for r in rows if nextaction.dm_no_meeting_state(r, today=MON)["status"] == "in"]),
+           len(numbered)), (4, 3))
+    check("longest since the DM first; on the 21-day tie sheet order decides, not seniority",
+          numbered, ["1. Ada Lovelace (Acme AI)", "2. Bo Chen (Borealis)", "3. Cy Diaz (Cinder)"])
+    check("the one line under the list says what they have in common",
+          body.splitlines()[-1],
+          "We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.")
+    check("no days, no note, no overflow line and no question",
+          [w for w in ("days ago", "waiting on their legal", "asked for the deck", "next Monday", "?")
+           if w in body], [])
+    check("a DM 14 days old is still rule 13's to chase", "Eve Rao" in body, False)
     same("R7", live, test, sim)
 
-    # RULE 13 COMES FIRST (NFT2-1069). The same Monday and the same seven DM'd contacts, but now Rule 13 covers some
-    # of them: "Sid - LI Addition" says Connected and LI Connected Date is filled in. R7 lists only the others, and
-    # when Rule 13 covers all seven it posts nothing at all.
-    def covered_sheet(rows_covered: set) -> None:
+    # RULE 13 COMES FIRST. The same Monday and the same DM'd contacts, with Rule 13 running too and some of them
+    # marked Connected: Rule 13 names those, and R7 skips them and moves the next person up.
+    def connected_sheet(rows_covered: set) -> None:
         monday_sheet()
         grid = GRIDS["Outreach PoCs"]
         for row in grid[1:]:
@@ -679,27 +680,21 @@ async def the_monday() -> None:
                 row[COL["Sid - LI Addition"]] = "Connected"
                 row[COL["LI Connected Date"]] = cell(MON - timedelta(days=40))
 
+    def listed(run):
+        return [l.split(". ", 1)[1].split(" (")[0]
+                for l in "\n".join(run["posts"].get("R7") or []).splitlines() if re.match(r"^\d+\. ", l)]
+
     RULES.clear()
-    RULES.add("R7")
-    covered_sheet({"1", "2", "3"})
+    RULES.update({"R13", "R7"})
+    connected_sheet({"1", "2", "3"})
     some = await live_path(MON)
-    listed = [l.split(" — ")[0].split(". ", 1)[1]
-              for l in "\n".join(some["posts"].get("R7") or []).splitlines() if re.match(r"^\d+\. ", l)]
-    check("with rule 13 covering three of the seven (Connected, with an LI Connected Date), R7 lists the other "
-          "four and none of those three", listed, ["Dee Evans", "Eve Rao", "Fay Lin", "Gil Shah"])
-    covered_sheet({"1", "2", "3", "4", "5", "6", "7"})
+    check("rule 13 names three of the four (they are Connected), so R7 lists the fourth and none of those three",
+          listed(some), ["Dee Evans"])
+    connected_sheet({"1", "2", "3", "4"})
     none = await live_path(MON)
-    check("with rule 13 covering all seven, a Monday posts no R7 at all", none["posts"].get("R7"), None)
-    covered_sheet({"1", "2", "3"})
-    for row in GRIDS["Outreach PoCs"][1:]:
-        row[COL["LI Connected Date"]] = ""          # Connected, but no date
-    nodate = await live_path(MON)
-    listed = [l.split(" — ")[0].split(". ", 1)[1]
-              for l in "\n".join(nodate["posts"].get("R7") or []).splitlines() if re.match(r"^\d+\. ", l)]
-    # CHANGED 12 Oct 2026: rule 13 takes every Connected row now, dated or not, so the three Connected
-    # people stay rule 13's with their dates blanked. It used to hand all seven back to R7.
-    check("Connected with NO LI Connected Date is still rule 13's: R7 lists the same four and none of those three",
-          listed, ["Dee Evans", "Eve Rao", "Fay Lin", "Gil Shah"])
+    check("with rule 13 naming all four, a Monday posts no R7 at all", none["posts"].get("R7"), None)
+    # (RULES only filters which posts this script sends: the queue always runs every Monday rule, rule 13
+    # included, so "R7 without rule 13" cannot be staged here. tests/dm_no_meeting_checks.py covers it.)
     monday_sheet()
     RULES.clear()
     RULES.update({"R4", "R7", "R10"})
@@ -1072,7 +1067,7 @@ async def the_wednesday() -> None:
 def the_wording() -> None:
     say("(w) THE WORDING FOR THE SHEET — printed from the rules the bot loads")
     rules_mod.reload()
-    for rid in ("R3", "R4", "R5", "R7", "R10"):      # R7's says rule 13 comes first (it is back on Mondays)
+    for rid in ("R3", "R4", "R5", "R7", "R10"):      # R7's says rule 13 comes first
         text = rules_mod.sheet_wording_for(rid)
         print(f"\n   Bot Rules tab — rule {rid[1:]}, column \"What the Bot Shares / "
               "Checks\":")
@@ -1088,9 +1083,11 @@ def the_wording() -> None:
            if x not in strategy], [])
     # RULE 7 IS BACK ON MONDAYS (NFT2-1069, 8 Oct), behind rule 13: the strategy describes the Monday list again,
     # with its overflow phrase, and says who rule 13 takes first. On 7 Oct it read "Replaced by rule 13".
-    check("...and for rule 7: the Monday list, its overflow line, and rule 13 first",
+    # 13 Oct 2026: rule 7 was rebuilt as the escalation behind rule 13. Nothing rotated before, so the overflow
+    # phrase was never true and is gone; three a post, nobody dropped.
+    check("...and for rule 7: the Monday list, no overflow line, nobody dropped, and rule 13 first",
           ("Replaced by rule 13" in strategy, "+N more next Monday" in strategy,
-           "Rule 13 comes first" in strategy), (False, True, True))
+           "Nobody is dropped" in strategy, "Rule 13 comes first" in strategy), (False, False, True, True))
     check("...and no longer says \"every other Wednesday\"",
           "every other Wednesday" in strategy, False)
 

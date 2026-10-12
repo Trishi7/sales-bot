@@ -1396,3 +1396,65 @@ moves); paste it into the sheet by hand.
 
 `python verify_next_steps.py --show` and `python verify_sheet_locks.py --show` check both parts offline; the second
 prints the lock log for three header orders.
+
+## Upgrading to the R7 rebuild (13 Oct): no meeting booked yet
+
+What changes for the team: the Monday 4 PM post, which has been silent, comes back headed **"No meeting booked
+yet"**. It is a numbered list of up to three people, name and company only, with one line under it: "We sent them
+a DM more than 3 weeks ago and don't have a meeting set up with them." Anyone whose meeting is booked more than a
+week after the DM gets a second short block showing the meeting date. Nobody is dropped: people come round in
+turn, Monday after Monday, until the Meeting Status says Completed or the Deal Status says Won, Lost or On Hold.
+Rule 13 comes first, so anybody its 3 PM post names that Monday is not listed. **Saley does not read replies to
+this post**: update the sheet instead.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Three defaults changed. A default only applies
+when the line is absent, so **if a line is already there, change it**:
+
+```
+DM_NO_MEETING_DAYS=21
+DM_NO_MEETING_MAX_CONTACTS=3
+DAILY_MESSAGE_CAP=7
+```
+
+The laptop's `.env` has `DM_NO_MEETING_DAYS=7`, `DM_NO_MEETING_MAX_CONTACTS=5` and `DAILY_MESSAGE_CAP=15` today.
+Left at 7, rule 7 would pick people on the day rule 13 starts asking for a call and stay silent; the boot log warns
+about it. `DAILY_MESSAGE_CAP=15` already allows the Monday post; whether to bring it down to 7 is your call.
+
+Four new variables; the defaults are what was specified, so the lines are optional:
+
+```
+DM_NO_MEETING_BOOKED_GAP_DAYS=7
+DM_NO_MEETING_DM_SENT_MARKERS=sent
+DM_NO_MEETING_DM_REPLIED_MARKERS=replied
+DM_NO_MEETING_STATUS_OPEN=,tbd
+```
+
+Keep the leading comma in `DM_NO_MEETING_STATUS_OPEN`: the empty entry is the blank cell. Check
+`DM_NO_MEETING_DM_SENT_MARKERS` against what the team actually picks in **LI DM Sent**: a value that is not on the
+list is not read as sent. Nothing is retired. Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** One new table, `dm_no_meeting_mentions` (the contact, the last day rule 7 named them, a count), created
+on start. It is the rotation: written only after a real send, never by a preview, and never by a test day on a
+database that is not a `*_test.db`. It starts empty, so the first Monday names the three people DM'd longest ago.
+
+**What to look for in the boot log:**
+
+```
+[config] R7 no meeting booked yet (Mondays, the escalation behind R13; replies are not read): in 21d after the LI DM Date with no Meeting Date, or with a Meeting Date more than 7d after the DM; LI DM Sent sent=sent replied=replied (checked first); Meeting Status open=(blank),tbd; out on Deal Status on hold=on hold,onhold,on-hold,paused,parked,deferred (R7 only); 3 name(s) a post, least recently named first, nobody is dropped
+```
+
+A warning follows if `DM_NO_MEETING_DAYS` is at or below `NEXT_STEP_CALL_AFTER_DM_DAYS`, or if
+`DM_NO_MEETING_DM_SENT_MARKERS` is empty. The `DAILY_MESSAGE_CAP` warning now starts above 7 (it was above 6). On
+Monday, when the queue is computed:
+
+```
+[rules] R7: 670 row(s) read (the whole tab); 5 qualify (5 with no Meeting Date, 0 with a meeting booked late); 2 named by an earlier rule today and skipped; 3 picked, 0 waiting their turn (nobody is dropped); out: ...
+```
+
+(the numbers are illustrative). After the post: `[rules] R7: recorded 3 person(s) named on <date>`.
+
+**The Bot Rules tab, by hand.** Rule 7's "What the Bot Shares / Checks" wording is new end to end
+(`sheet_wording` in `bot_rules.yaml`), and the Global Rules "Daily cap" row now says "Max 7 posts a day"
+(`daily_cap`). Both are pasted into the sheet by hand; `docs/rules-for-the-sheet-oct8.md` has the rule 7 text.
+
+`python verify_dm_no_meeting.py --show` checks all of it offline and prints the messages.

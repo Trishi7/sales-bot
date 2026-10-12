@@ -242,9 +242,10 @@ class TestHeaderMapping:
         res = nextaction.run(today=date(2026, 10, 12), rows=list(tab.rows), day_rules=[rules_mod.by_id("R9")])
         assert res["actions"] == []
 
-    def test_H4_last_note_and_prospect_signature_read_Z_not_Q(self):
+    def test_H4_the_notes_role_reads_the_notes_column_not_the_dropdown(self):
+        # (`nextaction.last_note` read this for R7's line until 13 Oct 2026; R7 shows no note now.)
         row = fx.parse([fx.person(1, step="Send email 1", notes="legal is reviewing")]).rows[0]
-        assert nextaction.last_note(row) == "legal is reviewing"
+        assert nextaction._text(row, "next_steps") == "legal is reviewing"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -776,29 +777,38 @@ class TestShippedRules:
         tab = fx.parse([fx.person(1, name="Priya Rao", li_date=date(2026, 8, 1), dm_sent="Sent",
                                   dm_date=MONDAY - D(days=20), step="Call the PoC")])
         res = nextaction.run(today=MONDAY, rows=list(tab.rows), day_rules=rules_mod.for_day(MONDAY),
-                             next_step_state={})
+                             next_step_state={}, dm_no_meeting_state={})
+        # CHANGED 13 Oct 2026: R7 is the escalation behind R13 and no longer reads `covered_by_next_steps`. It
+        # produces nothing here because R13, listed first, names the person today and R7 skips them.
         assert not [a for a in res["actions"] if a["rule_id"] == "R7"]
         assert not res["by_rule"].get("R7")
         assert [a["poc"] for a in res["by_rule"].get("R13") or []] == ["Priya Rao"]
         assert nextaction.covered_by_next_steps(tab.rows[0]) is True
 
-    def test_O1_R7_lists_a_dm_d_person_rule_13_does_not_cover(self):
-        """The other half: the same row with "Sid - LI Addition" not saying Connected is nobody's but R7's."""
+    def test_O1_R7_lists_a_dm_d_person_rule_13_does_not_cover(self, monkeypatch):
+        """The other half: the same row with "Sid - LI Addition" not saying Connected is nobody's but R7's.
+        (13 Oct 2026: three weeks after the DM, not one; read off LI DM Sent, not the date.)"""
+        monkeypatch.setattr(config, "DM_NO_MEETING_DAYS", 21)
+        monkeypatch.setattr(config, "DM_NO_MEETING_DM_SENT_MARKERS", ["sent"])
+        monkeypatch.setattr(config, "DM_NO_MEETING_DM_REPLIED_MARKERS", ["replied"])
+        monkeypatch.setattr(config, "DM_NO_MEETING_STATUS_OPEN", ["", "tbd"])
         tab = fx.parse([fx.person(1, name="Priya Rao", li_date=date(2026, 8, 1), dm_sent="Sent",
-                                  dm_date=MONDAY - D(days=20), step="Call the PoC")])
+                                  dm_date=MONDAY - D(days=21), step="Call the PoC")])
         row = dict(tab.rows[0], sid_li_added="")
         assert nextaction.covered_by_next_steps(row) is False
-        res = nextaction.run(today=MONDAY, rows=[row], day_rules=rules_mod.for_day(MONDAY), next_step_state={})
+        res = nextaction.run(today=MONDAY, rows=[row], day_rules=rules_mod.for_day(MONDAY), next_step_state={},
+                             dm_no_meeting_state={})
         assert [a["poc"] for a in res["by_rule"].get("R7") or []] == ["Priya Rao"]
         assert not res["by_rule"].get("R13")
 
-    def test_O1_rule_13_and_rule_7_read_one_check(self):
-        """"Reuse Rule 13's own eligibility check; don't copy it": both evaluators call the same functions."""
+    def test_O1_rule_7_no_longer_reads_rule_13s_check(self):
+        """Until 13 Oct 2026 R7 called `covered_by_next_steps` and left those people to R13; since 12 Oct that was
+        every DM'd row, so R7 named nobody. It is the escalation behind R13 now, and only the dedup separates them."""
         import inspect
         r13 = inspect.getsource(nextaction._r_next_step_followups)
-        r7 = inspect.getsource(nextaction._r_dm_no_meeting)
+        r7 = inspect.getsource(nextaction._r_dm_no_meeting) + inspect.getsource(nextaction.dm_no_meeting_state)
         assert "marked_connected(" in r13 and "has_connected_date(" in r13
-        assert "covered_by_next_steps(" in r7
+        assert "covered_by_next_steps(" not in r7
         assert "NEXT_STEP_CONNECTED_MARKERS" not in r13 and "NEXT_STEP_CONNECTED_MARKERS" not in r7
         assert "sid_li_added" not in r7 and "li_connected_date" not in r7
 
@@ -846,8 +856,8 @@ class TestShippedRules:
     def test_R7_sheet_wording_says_rule_13_comes_first(self):
         """It was the one-line "Replaced by rule 13" sentence until 8 Oct, when R7 came back on Mondays."""
         text = rules_mod.sheet_wording_for("R7")
-        assert "Rule 13 comes first" in text and "never listed here" in text
-        assert "every Monday" in text and "replaced" not in text.lower()
+        assert "Rule 13 comes first" in text and "not listed here" in text
+        assert "Every Monday" in text and "replaced" not in text.lower()
 
 
 # ---------------------------------------------------------------------------------------------

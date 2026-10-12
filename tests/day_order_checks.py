@@ -48,12 +48,14 @@ WEEK = (MON, TUE, WED, THU, FRI)
 PINS = {
     "SALES_DRIP_START": "14:00", "SALES_DRIP_END": "20:00",
     "MESSAGE_GAP_MINUTES": 120, "MESSAGE_GAP_MIN_MINUTES": 120, "MESSAGE_JITTER_MINUTES": 0,
-    "DAILY_MESSAGE_CAP": 5, "DRIP_WEEKDAYS_ONLY": True, "SUNDAY_RULE_IDS": ["R4"], "DRIP_REASK_DAYS": 2,
+    "DAILY_MESSAGE_CAP": 7, "DRIP_WEEKDAYS_ONLY": True, "SUNDAY_RULE_IDS": ["R4"], "DRIP_REASK_DAYS": 2,
     "MEETING_DAYOF_TIME": "10:00", "NEXT_STEP_TIME": "15:00", "MEETING_PREP_DAYS_BEFORE": ["5", "3"],
     "MEETING_FOLLOWUP_AFTER_DAYS": 3, "MEETING_FOLLOWUP_EVERY_DAYS": 3,
     "MEETING_FOLLOWUP_LADDER": ["channel", "dm", "dm", "escalation"], "SALES_DMS_ENABLED": False,
     "NEW_COMPANY_AFTER_WORKING_DAYS": 1, "NEW_COMPANY_WINDOW_DAYS": 7,
-    "DM_NO_MEETING_DAYS": 7, "LI_NO_DM_DAYS": 3, "CLOSURE_SUPPORT_MIN": 50,
+    "DM_NO_MEETING_DAYS": 21, "DM_NO_MEETING_BOOKED_GAP_DAYS": 7, "DM_NO_MEETING_MAX_CONTACTS": 3,
+    "DM_NO_MEETING_DM_SENT_MARKERS": ["sent"], "DM_NO_MEETING_DM_REPLIED_MARKERS": ["replied"],
+    "DM_NO_MEETING_STATUS_OPEN": ["", "tbd"], "LI_NO_DM_DAYS": 3, "CLOSURE_SUPPORT_MIN": 50,
     "NEXT_ACTION_WEEKEND_SHIFT": True, "EVENTS_WINDOW_DAYS": 14,
     "NEXT_STEP_CONNECTED_MARKERS": ["connected"], "NEXT_STEP_FIRST_DAYS": 2,
     "NEWS_FEED_KEEP_DAYS": 7,
@@ -118,7 +120,8 @@ def world(day: date, *, without=()) -> dict:
     rows = [
         poc(2, "Prospect Co", "Pia Rao", first_contact="FALSE"),                               # R5
         poc(3, "Linked Co", "Lev Shah", li_connected_date=cell(day - timedelta(days=6))),      # R6 (not "Connected")
-        poc(4, "Echo Labs", "Eve Rao", li_dm_date=cell(day - timedelta(days=11))),             # R7
+        poc(4, "Echo Labs", "Eve Rao", li_dm_sent="Sent",
+            li_dm_date=cell(day - timedelta(days=25))),                                        # R7
         poc(5, "Gantry Systems", "Gil Shah", meeting_date=cell(day)),                          # R8, on the day
         poc(6, "Ibex AI", "Ian Bose", meeting_date=cell(day + timedelta(days=3))),             # R8, 3 days before
         poc(7, "Harbor Robotics", "Hal Iyer", meeting_date=cell(day - timedelta(days=5)),
@@ -133,7 +136,7 @@ def world(day: date, *, without=()) -> dict:
     gone = {n for rule in without for n in drop.get(rule, [])}
     rows = [r for r in rows if r["_row"] not in gone]
     return {
-        "today": day, "rows": rows, "prospect_rows": rows, "next_step_state": {},
+        "today": day, "rows": rows, "prospect_rows": rows, "next_step_state": {}, "dm_no_meeting_state": {},
         "deliverables": [] if "R4" in without else [
             {"_row": 2, "_extra": {}, "action_item": "MSA template", "priority": "P1", "status": "",
              "deadline": f"{(day + timedelta(days=2)).day}-{(day + timedelta(days=2)).strftime('%b')}",
@@ -221,8 +224,8 @@ def every_weekday(check) -> None:
                   [(False, True), (True, False)])
             check(f"{name}: nothing after 20:00",
                   [p for p in posts(planned) if p[1] > "20:00"], [])
-        check("the longest day has four spaced posts, under the cap of five",
-              (max(len(v) for v in SPACED.values()), config.DAILY_MESSAGE_CAP), (4, 5))
+        check("the longest day has four spaced posts, under the cap of seven",
+              (max(len(v) for v in SPACED.values()), config.DAILY_MESSAGE_CAP), (4, 7))
 
 
 def moving_up(check) -> None:
@@ -286,10 +289,13 @@ def the_gap(check) -> None:
               (posts(crowded, pinned_only=False), gaps(crowded)), (SPACED[MON], [120, 120, 120]))
         check("...the other two are not sent today (they would land at 22:00 and 00:00)",
               sorted((g["rule_id"], g["rolled_why"]) for g in crowded["rolled"]),
-              [("R12", "cap"), ("R5", "window")])
+              # CHANGED 13 Oct 2026: with the cap at 7 (it was 5) the sixth group is no longer over the cap;
+              # the four-slot window is what holds both of them.
+              [("R12", "window"), ("R5", "window")])
         check("...and the plan says why in plain words",
               [g["why"] for g in crowded["rolled"] if g["rolled_why"] == "window"],
-              ["it would land at 22:00, after 20:00, so it waits for the next day its rule runs"])
+              ["it would land at 22:00, after 20:00, so it waits for the next day its rule runs",
+               "it would land at 00:00, after 20:00, so it waits for the next day its rule runs"])
 
         # A POST THAT LEFT ON A SWEEP TICK A FEW MINUTES AFTER ITS SLOT keeps the day on its slots.
         whole = plan(MON)
@@ -356,42 +362,46 @@ def the_gap(check) -> None:
 
 
 def rule_7(check) -> None:
-    """R7 on Mondays: never a person Rule 13 covers; anyone else it still lists."""
+    """R7 on Mondays, the escalation behind Rule 13 (13 Oct 2026): a person Rule 13 names that day is skipped."""
     with pinned():
         got = queue(MON)
         r7 = [a for a in got["by_rule"].get("R7", [])]
         r13 = [a for a in got["by_rule"].get("R13", [])]
-        check("R7 runs on a Monday, and lists the DM'd person Rule 13 does not cover",
+        check("R7 runs on a Monday, and lists the person DM'd more than three weeks ago with no meeting",
               [(a["company"], a["poc"]) for a in r7], [("Echo Labs", "Eve Rao")])
-        check("...never the DM'd person Rule 13 covers (Connected, with an LI Connected Date)",
+        check("...not the person DM'd 11 days ago, who is still inside Rule 13's call reminders",
               [a["poc"] for a in r7 if a["poc"] == "Kai Menon"], [])
         check("...who is named by Rule 13 instead",
               "Kai Menon" in [a["poc"] for a in r13], True)
         rows = world(MON)["rows"]
         kai = next(r for r in rows if r["name"] == "Kai Menon")
         eve = next(r for r in rows if r["name"] == "Eve Rao")
-        check("the two rules ask ONE function who is covered",
+        check("Rule 13's own test still says who is connected",
               (nextaction.covered_by_next_steps(kai), nextaction.covered_by_next_steps(eve)), (True, False))
 
-        r7_rule = [rules_mod.by_id("R7")]
+        def listed(row, rule_ids=("R7",)):
+            got = nextaction.run(today=MON, rows=[row], prospect_rows=[row], next_step_state={},
+                                 dm_no_meeting_state={}, day_rules=[rules_mod.by_id(r) for r in rule_ids])
+            return [(a["rule_id"], a["poc"]) for a in got["actions"]]
 
-        def listed(row):
-            return [a["poc"] for a in nextaction.run(today=MON, rows=[row], day_rules=r7_rule)["actions"]]
-
-        dm = cell(MON - timedelta(days=11))
-        # CHANGED 12 Oct 2026: Rule 13 takes every Connected row now, dated or not, so R7
-        # leaves this one alone too. It used to list her.
-        check("Connected but NO LI Connected Date: Rule 13's as well now, so R7 does not list them",
-              listed(poc(20, "Lumen", "Lia Das", li_dm_date=dm, sid_li_added="Connected")), [])
-        check("a date but not marked Connected: R7 lists them",
-              listed(poc(21, "Mason", "Max Roy", li_dm_date=dm,
-                         li_connected_date=cell(MON - timedelta(days=20)))), ["Max Roy"])
-        check("Connected with a date: never R7's, however old the DM",
-              listed(connected(22, "Nimbus", "Nia Sen", MON, li_dm_date=cell(MON - timedelta(days=60)))), [])
-        check("a different spelling of Connected is still covered (' connected ')",
-              listed(connected(23, "Orbit", "Oz Kar", MON, li_dm_date=dm, sid_li_added=" connected ")), [])
-        check("a meeting booked: not R7's either way",
-              listed(poc(24, "Pine", "Pam Jha", li_dm_date=dm, meeting_date=cell(MON + timedelta(days=2)))), [])
+        dm = dict(li_dm_sent="Sent", li_dm_date=cell(MON - timedelta(days=25)))
+        # CHANGED 13 Oct 2026: R7 no longer leaves every Connected row to Rule 13 (that was every DM'd row, so
+        # it named nobody). Alone it lists a Connected person; on the day, Rule 13 is listed first and keeps them.
+        check("Connected, DM'd 25 days ago: R7's by its own test",
+              listed(connected(20, "Lumen", "Lia Das", MON, **dm)), [("R7", "Lia Das")])
+        check("...and when Rule 13 names them the same day, Rule 13 keeps them and R7 names nobody",
+              listed(connected(20, "Lumen", "Lia Das", MON, **dm), ("R13", "R7")), [("R13", "Lia Das")])
+        check("not marked Connected: R7 lists them",
+              listed(poc(21, "Mason", "Max Roy", **dm)), [("R7", "Max Roy")])
+        check("LI DM Sent blank: not R7's, whatever the date says (the cell decides)",
+              listed(poc(22, "Nimbus", "Nia Sen", li_dm_date=dm["li_dm_date"])), [])
+        check("a meeting booked two days after the DM: not R7's",
+              listed(poc(24, "Pine", "Pam Jha", meeting_date=cell(MON - timedelta(days=23)), **dm)), [])
+        check("a meeting booked a long way after the DM, status still open: R7's second block",
+              [a["block"] for a in nextaction.run(
+                  today=MON, rows=[], next_step_state={}, dm_no_meeting_state={},
+                  prospect_rows=[poc(25, "Quill", "Quin Das", meeting_date=cell(MON + timedelta(days=2)), **dm)],
+                  day_rules=[rules_mod.by_id("R7")])["actions"]], ["booked"])
         check("R7 is Mondays only",
               [d.strftime("%a") for d in WEEK + (SAT, SUN) if "R7" in [r.id for r in rules_mod.for_day(d)]],
               ["Mon"])
@@ -627,13 +637,13 @@ def settings(check) -> None:
         m = re.search(rf'^{name} = _int\("{name}", (\d+)\)', source, re.M)
         return int(m.group(1)) if m else None
 
-    check(".env.example: gap 120, floor 120, jitter 0, window 14:00 to 20:00, cap 5",
+    check(".env.example: gap 120, floor 120, jitter 0, window 14:00 to 20:00, cap 7",
           [env(n) for n in ("MESSAGE_GAP_MINUTES", "MESSAGE_GAP_MIN_MINUTES", "MESSAGE_JITTER_MINUTES",
                             "SALES_DRIP_START", "SALES_DRIP_END", "DAILY_MESSAGE_CAP")],
-          ["120", "120", "0", "14:00", "20:00", "5"])
+          ["120", "120", "0", "14:00", "20:00", "7"])
     check("config.py: the same defaults in code",
           [code(n) for n in ("MESSAGE_GAP_MINUTES", "MESSAGE_GAP_MIN_MINUTES", "MESSAGE_JITTER_MINUTES",
-                             "DAILY_MESSAGE_CAP")], [120, 120, 0, 5])
+                             "DAILY_MESSAGE_CAP")], [120, 120, 0, 7])
     check("config.py: SALES_DRIP_END falls back to 20:00", ').strip() or "20:00"' in source, True)
     check(".env.example: fixed times 10:00 (meetings) and 15:00 (next steps); R11 after 1 working day, window 7",
           [env(n) for n in ("MEETING_DAYOF_TIME", "NEXT_STEP_TIME", "NEW_COMPANY_AFTER_WORKING_DAYS",
@@ -676,14 +686,14 @@ def wording(check) -> None:
     strategy = open(os.path.join(ROOT, "sales_strategy.md"), encoding="utf-8").read()
     check("sales_strategy.md: the weekly schedule is the team's order",
           all(p in strategy for p in (
-              "2 PM deliverables checklist · 4 PM DM sent, no meeting · 6 PM AI news · 8 PM closure support",
+              "2 PM deliverables checklist · 4 PM no meeting booked yet · 6 PM AI news · 8 PM closure support",
               "2 PM new companies in the pipeline (asks first) · 4 PM AI news · 6 PM AI events")), True)
     check("...and nothing in it gives the news a fixed time or says R7 is replaced",
           [p for p in ("One post at 2:00 PM", "planned first", "Replaced by rule 13",
                        "Friday 2 PM to Monday 2 PM") if p in strategy], [])
     sheet_doc = open(os.path.join(ROOT, "docs", "rules-for-the-sheet-oct8.md"), encoding="utf-8").read()
     check("docs/rules-for-the-sheet-oct8.md has the Weekly Schedule tab and each changed rule",
-          [p for p in ("Weekly Schedule tab", "Rule 7 (DM sent, no meeting)", "Rule 8 (Meeting preparation)",
+          [p for p in ("Weekly Schedule tab", "Rule 7 (No meeting booked yet)", "Rule 8 (Meeting preparation)",
                        "Rule 9 (Meeting done, no next steps)", "Rule 11 (New company in the Master Pipeline)",
                        "Rule 1 (AI news)") if p not in sheet_doc], [])
     for rule in ("R1", "R7", "R8", "R9", "R11"):

@@ -23,8 +23,9 @@ THE THIRTEEN, with the trigger name the file uses:
      R4  deliverables           Mon                 P1 only, due this week or passed
      R5  prospects              Tue, Thu            first contact FALSE or blank
      R6  li_no_dm               Tue, Fri            connected > 3d, no DM: the email check
-     R7  dm_no_meeting          Mon                 DM > 7d, no meeting, and not a
-                                                    person R13 covers
+     R7  dm_no_meeting          Mon                 DM > 21d and no meeting, or one
+                                                    booked > 7d after the DM; 3 a
+                                                    post, rotating, behind R13
      R8  meeting_prep           anchored, 10:00     T-5, T-3, and on the day
      R9  meeting_followup       anchored, 10:00     done + 3d, no next steps, laddered
     R10  closure_support        Mon                 deal/demo/quote AND closure > 50
@@ -122,7 +123,7 @@ TYPE_LABELS = {
     R_DELIVERABLES: "Deliverables due",
     R_PROSPECTS: "Prospects to contact",
     R_LI_NO_DM: "Connected, no DM yet",
-    R_DM_NO_MEETING: "DM sent, no meeting",
+    R_DM_NO_MEETING: "No meeting booked yet",
     R_MEETING_PREP: "Meeting prep",
     R_MEETING_FOLLOWUP: "Meeting done, no next steps",
     R_CLOSURE_SUPPORT: "Closure support",
@@ -290,18 +291,6 @@ def _date(row: dict, role: str) -> Optional[date]:
     return gtm_sheet.sheet_date(row.get(role))
 
 
-def last_note(row: dict) -> str:
-    """The most recent thing written against this row, for R7's line.
-
-    The notes column (Notes/Remarks; "Next Steps/Notes" before 7 Oct 2026),
-    because that is where a person records what happens next; the sheet has no
-    dated note column, so "most recent" is really "the most specific thing
-    anybody wrote". `next_steps` is that column's role — never the Next Steps
-    dropdown, which is `outreach_step`.
-    """
-    return _text(row, "next_steps")
-
-
 def last_touch(row: dict) -> tuple[Optional[date], str]:
     """The most recent thing that happened on this row, and which column said so.
 
@@ -461,11 +450,12 @@ def row_gate(row: dict, *, today: date, snoozes: dict) -> tuple:
 
 
 # -- who Rule 13 covers --------------------------------------------------------
-# ONE CHECK, TWO READERS. Rule 13 names the people we are connected with, and
-# Rule 7 (DM sent, no meeting) must never list a person Rule 13 covers
-# (Vaishnavi, 7 Oct: "rule 13 supercedes this"; the team, 8 Oct: R7 comes back
-# on Mondays for everybody else). Both rules read the functions below, so the
-# two can never drift into disagreeing about who is "connected".
+# Rule 13 names the people we are connected with. UNTIL 13 Oct 2026 Rule 7 read
+# `covered_by_next_steps` and listed nobody Rule 13 covered; since 12 Oct that
+# was every connected row, so Rule 7 named nobody at all. Rule 7 no longer
+# reads it: it is the escalation BEHIND Rule 13, and the only thing between
+# them is the one-mention-a-day dedup (`run`). The functions stay because
+# Rule 13 and the questions about who is connected read them.
 
 
 def connected_markers() -> set:
@@ -494,6 +484,8 @@ def covered_by_next_steps(row: dict, markers: Optional[set] = None) -> bool:
     Rule 7 could still list such a person. Rule 13 now takes every connected
     row; if this still asked for the date, the no-date rows would be reminded
     about by Rule 13 AND listed by Rule 7.
+
+    RULE 7 DOES NOT READ THIS ANY MORE (13 Oct 2026): see `_r_dm_no_meeting`.
     """
     return marked_connected(row, markers)
 
@@ -1129,58 +1121,235 @@ def _r_li_no_dm(rule, ctx) -> list:
     return out
 
 
+# -- R7: no meeting booked yet ------------------------------------------------
+# THE ESCALATION BEHIND R13 (rebuilt 13 Oct 2026). R13 does the chasing: from a
+# week after the DM its call tier says "We need to call these PoCs" every
+# weekday. R7 says, on Mondays, that the chasing is not working.
+
+DM_BLOCK_NONE = "none"          # no Meeting Date at all
+DM_BLOCK_BOOKED = "booked"      # a Meeting Date, a long way after the DM
+
+
+def _days_between(start: date, end: date) -> int:
+    """Calendar days from `start` to `end`. R7's ONLY date arithmetic, in one
+    place so a check can prove a row with no LI DM Date is never measured."""
+    return (end - start).days
+
+
+def _marks(names) -> set:
+    return {gtm_sheet.normalise_header(str(m)) for m in (names or []) if str(m).strip()}
+
+
+def dm_no_meeting_state(row: dict, *, today: date) -> dict:
+    """Is ONE row R7's, and in which block? PURE.
+
+    Returns {"status", "block", "why", "dm", "meeting"}; `status` is "in",
+    "not_yet" or one of the reasons it is out ("replied", "not_sent",
+    "no_date", "completed", "status", "on_hold").
+
+    FOUR COLUMNS, IN THIS ORDER, and a row that fails one is not looked at
+    again:
+
+      1. LI DM SENT MUST SAY SENT. The cell, not the date: until 13 Oct this
+         rule decided a DM had gone out by finding an LI DM Date. The REPLIED
+         markers are checked FIRST (a reply is R13's meeting line, never this
+         rule's); blank is no DM at all. R7's own marker lists.
+      2. LI DM DATE MUST HOLD A DATE. NO DATE, NO LOOKUP: nothing is measured
+         for the row. R13 still reminds about that person.
+      3. MEETING STATUS MUST BE OPEN: blank or TBD (DM_NO_MEETING_STATUS_OPEN).
+         Completed is out for good, whatever that list says.
+      4. THE GAP, one of two ways:
+           no Meeting Date   LI DM Date -> today         DM_NO_MEETING_DAYS
+           a Meeting Date    LI DM Date -> Meeting Date  DM_NO_MEETING_BOOKED_GAP_DAYS
+         In from the day the gap REACHES the number: day 20 is not yet, day 21
+         is in. Booking a meeting is not an exit: with the status still open
+         the person moves to the second block until it says Completed.
+
+    DEAL STATUS ON HOLD IS OUT, FOR THIS RULE ONLY. Won and Lost stop every
+    rule through CLOSURE_STOP_MARKERS (`row_gate`, which the caller runs
+    first). DEAL_ON_HOLD_MARKERS is deliberately NOT in that list: adding it
+    would change all thirteen rules, and a parked deal is still R13's to remind
+    about. So it is checked here and nowhere else.
+    """
+    out = {"status": "", "block": "", "why": "", "dm": None, "meeting": None}
+
+    def say(status, why, **more):
+        out.update(status=status, why=why, **more)
+        return out
+
+    cell = row.get("li_dm_sent")
+    said = _norm(cell)
+    if said and said in _marks(config.DM_NO_MEETING_DM_REPLIED_MARKERS):
+        return say("replied", "LI DM Sent says they replied: R13's meeting line")
+    if not (said in _marks(config.DM_NO_MEETING_DM_SENT_MARKERS)
+            or gtm_sheet.parse_flag(cell) is True):
+        return say("not_sent", "LI DM Sent is blank" if not said
+                   else f"LI DM Sent says {_text(row, 'li_dm_sent')!r}, which is not a sent marker")
+    dm = _date(row, "li_dm_date")
+    if dm is None:
+        return say("no_date", "no LI DM Date, so nothing is measured")
+    status = _text(row, "meeting_status")
+    if gtm_sheet.is_meeting_completed(status):
+        return say("completed", "the meeting is Completed", dm=dm)
+    opens = {gtm_sheet.normalise_header(str(m)) for m in (config.DM_NO_MEETING_STATUS_OPEN or [])}
+    if _norm(status) not in opens:
+        return say("status", f"Meeting Status says {status!r}, which is not open", dm=dm)
+    if is_on_hold(row):
+        return say("on_hold", f"Deal Status says {_text(row, 'deal_status')!r} (on hold)", dm=dm)
+    meeting = _date(row, "meeting_date")
+    if meeting is None:
+        need = max(0, int(config.DM_NO_MEETING_DAYS))
+        gap = _days_between(dm, today)
+        if gap < need:
+            return say("not_yet", f"DM {gap}d ago, DM_NO_MEETING_DAYS is {need}", dm=dm)
+        return say("in", f"DM sent {dl.format_date(dm)}, {gap}d ago, no Meeting Date "
+                         f"(DM_NO_MEETING_DAYS is {need})", block=DM_BLOCK_NONE, dm=dm)
+    need = max(0, int(config.DM_NO_MEETING_BOOKED_GAP_DAYS))
+    gap = _days_between(dm, meeting)
+    if gap < need:
+        return say("not_yet", f"meeting {dl.format_date(meeting)}, {gap}d after the DM: "
+                              f"booked promptly (DM_NO_MEETING_BOOKED_GAP_DAYS is {need})",
+                   dm=dm, meeting=meeting)
+    return say("in", f"DM sent {dl.format_date(dm)}, meeting {dl.format_date(meeting)}, "
+                     f"{gap}d later, status still open (DM_NO_MEETING_BOOKED_GAP_DAYS is "
+                     f"{need})", block=DM_BLOCK_BOOKED, dm=dm, meeting=meeting)
+
+
+def dm_no_meeting_order(person: dict) -> tuple:
+    """R7's ORDER, in one place.
+
+      1. LEAST RECENTLY NAMED FIRST; never named ("") goes ahead of everybody.
+         This is the rotation: nothing drops any more, so without it the same
+         three names would be posted every Monday for ever.
+      2. then LONGEST SINCE THE DM;
+      3. then sheet order.
+
+    NOT PROSPECT_ROLE_ORDER (it was the tie-break until 13 Oct): that is R5's
+    seniority order and has no bearing on whether a meeting is overdue.
+    """
+    return (str(person.get("last_date") or ""), dl.iso(person["dm"]),
+            int(person.get("sheet_row") or 0))
+
+
 def _r_dm_no_meeting(rule, ctx) -> list:
-    """R7 — DM sent more than DM_NO_MEETING_DAYS ago, still no meeting. Mondays.
+    """R7 — DM'd three weeks ago and no meeting, or a meeting booked a long way
+    after the DM. Mondays. See `dm_no_meeting_state` for who is in.
 
-    NEVER A PERSON RULE 13 COVERS. Rule 13's call reminders took this rule's
-    place on 7 Oct; on 8 Oct the team brought it back on Mondays for everybody
-    Rule 13 does NOT cover. `covered_by_next_steps` is Rule 13's own check
-    (Connected, with an LI Connected Date), read here rather than copied, so
-    one person is never chased by both and never falls between the two.
+    IT READS THE WHOLE TAB (`ctx["prospect_rows"]`), for the reason R6 and R13
+    give: a DM'd row need not have passed the activation gate.
 
-    SHOWS DAYS SINCE THE DM AND THE LAST NOTE LOGGED, because those two are what
-    a person needs to decide whether to chase again or leave it. "No reply after
-    9 days, last note: waiting on their legal" is a sentence somebody can act
-    on; "follow up with Acme" is not.
+    IT HANDS ON EXACTLY THE PEOPLE THE POST NAMES: the first
+    DM_NO_MEETING_MAX_CONTACTS in `dm_no_meeting_order`, shared across both
+    blocks. Fewer qualify, fewer are named; there is no padding and no "+N
+    more" line. NOBODY IS DROPPED ON A TIMER: a person stays until the sheet
+    moves.
+
+    A PERSON AN EARLIER-LISTED RULE NAMES TODAY IS SKIPPED BEFORE THE THREE ARE
+    PICKED (`ctx["taken"]`, in practice R13's five). The dedup in `run` would
+    remove them anyway (R13 is listed first and wins the contact; R7 is NOT
+    exempt), but picking first and deduping after would post two names on a
+    day five qualify.
+
+    `ctx["dm_no_meeting_state"]` is {contact_key: {"last_date"}} from the
+    caller. NONE MEANS UNREADABLE AND NAMES NOBODY, like R13: an empty dict
+    would start the rotation again from the top. PURE: the state is only
+    read; the sender records who was named, after a real send.
+
+    ONCE TODAY'S POST HAS GONE, TODAY'S PEOPLE STAY TODAY'S PEOPLE. The queue
+    is recomputed on every sweep tick; without this the three just recorded
+    would go to the back and three others would be handed on.
     """
     today = ctx["today"]
-    days = max(0, int(config.DM_NO_MEETING_DAYS))
-    markers = connected_markers()
-    covered = 0
-    out = []
-    for row in ctx.get("rows") or ():
-        ok, _reason, until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
+    rule_id = getattr(rule, "id", "") or "R7"
+    source = ctx.get("prospect_rows")
+    rows = list((source if source is not None else ctx.get("rows")) or ())
+    report = {"rows": len(rows), "qualify": 0, "none": 0, "booked": 0, "taken": 0,
+              "out": {}, "picked": [], "queued": [], "state": "ok"}
+    ctx.setdefault("reports", {})[rule_id] = report
+    if not rows:
+        log.error("[rules] %s: the Outreach PoCs tab came back with NO ROWS, so nothing is "
+                  "posted. An empty tab is not the same as nobody waiting on a meeting.",
+                  rule_id)
+        return []
+    state = ctx.get("dm_no_meeting_state")
+    if state is None:
+        report["state"] = "unreadable"
+        log.error("[rules] %s: the rotation state was not supplied or could not be read, "
+                  "so nobody is named. Guessing would start the rotation from the top.",
+                  rule_id)
+        return []
+
+    taken = ctx.get("taken") or set()
+    snoozes = ctx.get("snoozes") or {}
+    today_iso = dl.iso(today)
+    people: list = []
+    named_today: list = []
+    for row in rows:
+        ok, _reason, until = row_gate(row, today=today, snoozes=snoozes)
         if not ok:
             continue
-        sent = _date(row, "li_dm_date")
-        if sent is None:
+        found = dm_no_meeting_state(row, today=today)
+        if found["status"] != "in":
+            report["out"][found["status"]] = report["out"].get(found["status"], 0) + 1
             continue
-        if _date(row, "meeting_date") is not None:
-            continue
-        if covered_by_next_steps(row, markers):
-            covered += 1
-            continue
-        due = _due(sent, days)
-        if due > today:
-            continue
-        elapsed = (today - sent).days
-        note = last_note(row)
+        key = _contact_key(row)
+        last = str((state.get(key) or {}).get("last_date") or "")
+        person = {"row": row, "key": key, "found": found, "dm": found["dm"],
+                  "sheet_row": row.get("_row"), "last_date": last, "until": until}
+        report[found["block"]] += 1
+        if last == today_iso:
+            named_today.append(person)
+        elif key in taken:
+            report["taken"] += 1
+        else:
+            people.append(person)
+    report["qualify"] = len(people) + len(named_today) + report["taken"]
+
+    cap = max(1, int(config.DM_NO_MEETING_MAX_CONTACTS))
+    ranked = sorted(people, key=dm_no_meeting_order)
+    picked, queued = ranked[:cap], ranked[cap:]
+    if named_today:
+        picked, queued = sorted(named_today, key=dm_no_meeting_order), ranked
+        report["posted_today"] = True
+    log.info("[rules] %s: %d row(s) read (the whole tab); %d qualify (%d with no Meeting "
+             "Date, %d with a meeting booked late); %d named by an earlier rule today and "
+             "skipped; %d picked, %d waiting their turn (nobody is dropped); out: %s",
+             rule_id, len(rows), report["qualify"], report["none"], report["booked"],
+             report["taken"], len(picked), len(queued),
+             ", ".join(f"{n} {why}" for why, n in sorted(report["out"].items())) or "nobody")
+
+    out = []
+    for order, person in enumerate(picked):
+        row, found = person["row"], person["found"]
+        who = wording.next_step_who(_text(row, "name"), _text(row, "company"))
+        entry = {"sheet_row": row.get("_row"), "poc": _text(row, "name"),
+                 "company": _text(row, "company"), "block": found["block"],
+                 "last_named": person["last_date"]}
+        report["picked"].append(entry)
         out.append(_item(
-            rule=rule, trigger=R_DM_NO_MEETING, today=today, due=until or due,
-            why=(f"R7 (Mondays): DM sent {dl.format_date(sent)}, {elapsed}d ago, "
-                 f"more than DM_NO_MEETING_DAYS ({days}), no meeting date"),
-            text=(f"{_describe(row)} — {elapsed} day(s) since the DM, no meeting booked. "
-                  + (f"Last note: {note}" if note else "No note logged against it")),
+            rule=rule, trigger=R_DM_NO_MEETING, today=today, due=person["until"] or today,
+            why=("R7: already named in today's post" if named_today else
+                 f"R7 (Mondays): {found['why']}; "
+                 + (f"last named {person['last_date']}" if person["last_date"]
+                    else "never named")
+                 + f"; {order + 1} of {len(picked)} in the post, {len(queued)} waiting "
+                   f"their turn"),
+            text=f"{who}: " + ("a meeting is booked a long way after the DM"
+                               if found["block"] == DM_BLOCK_BOOKED
+                               else "DM'd, no meeting booked"),
             company=_text(row, "company"), poc=_text(row, "name"),
             designation=_text(row, "designation"), sheet_row=row.get("_row"),
-            row_key=_contact_key(row), contact_key=_contact_key(row),
-            extra={"days_since_dm": elapsed, "last_note": note,
-                   "role_rank": _role_rank(_text(row, "designation"))},
+            row_key=person["key"], contact_key=person["key"],
+            extra={"pick_order": order, "who": who, "block": found["block"],
+                   # THE MEETING DATE, for the second block's line only: that
+                   # date is the point of the line. Nothing else is shown.
+                   "meeting_iso": dl.iso(found["meeting"]) if found["meeting"] else ""},
         ))
-    if covered:
-        log.info("[rules] %s: %d DM'd contact(s) with no meeting are Rule 13's "
-                 "(Connected, with an LI Connected Date) and are left to it; "
-                 "%d listed here", getattr(rule, "id", "") or "R7", covered, len(out))
+    for person in queued:
+        report["queued"].append({
+            "sheet_row": person["row"].get("_row"), "poc": _text(person["row"], "name"),
+            "company": _text(person["row"], "company"), "block": person["found"]["block"],
+            "last_named": person["last_date"]})
     return out
 
 
@@ -2210,6 +2379,7 @@ def run(
     prospect_rows: Optional[list] = None, events_unclear_seen=None,
     next_step_state: Optional[dict] = None,
     poc_company_index: Optional[dict] = None,
+    dm_no_meeting_state: Optional[dict] = None,
 ) -> dict:
     """THE QUEUE. Everything the thirteen rules make due today, deduped and ranked.
 
@@ -2233,6 +2403,9 @@ def run(
     LEFT AT None, R13 NAMES NOBODY: None is what an unreadable table returns,
     and a caller that has no state to give must not be handed a rotation that
     starts from the top. Pass {} to say "nobody has been named yet".
+
+    `dm_no_meeting_state` is R7's rotation state from
+    `db.dm_no_meeting_state()`, with the same rule: None names nobody.
     """
     today = today or dl.today_ist()
     rows = list(rows or [])
@@ -2258,6 +2431,13 @@ def run(
         # R13's ROTATION STATE. None (unreadable) is kept as None on purpose.
         "next_step_state": (dict(next_step_state)
                             if next_step_state is not None else None),
+        # R7's ROTATION STATE. None (unreadable) is kept as None, like R13's.
+        "dm_no_meeting_state": (dict(dm_no_meeting_state)
+                                if dm_no_meeting_state is not None else None),
+        # THE CONTACTS EARLIER-LISTED RULES HAVE NAMED SO FAR TODAY, filled in
+        # as the rules run (below). A rule that picks a fixed few (R7) reads it
+        # so it does not spend a place on somebody the dedup will take away.
+        "taken": set(),
         # What an evaluator wants the preview to say about the rows it left out.
         "reports": {},
         # THE LIVE FOCUS, or None. Read by R5 only — a focus is about who to
@@ -2303,6 +2483,10 @@ def run(
             continue
         by_rule[rule.id] = items
         produced.extend(items)
+        # A rule that `yields` (R6) takes a contact from nobody, so its people
+        # are not "taken".
+        ctx["taken"].update(it.get("contact_key") for it in items
+                            if it.get("contact_key") and not it.get("yields"))
         rules_run.append({
             "id": rule.id, "name": rule.name, "ran": True,
             "why": (f"runs {rule.weekday_label()}" if not rule.anchored
@@ -2685,31 +2869,67 @@ def _self_test() -> int:
     check("R7 is back on Mondays in the shipped file",
           ("R7" in [r.id for r in rules_mod.for_day(MON)],
            "R7" in [r.id for r in rules_mod.for_day(TUE)]), (True, False))
-    r7 = row(li_dm_date="10-09-2026", next_steps="waiting on legal")
-    got = run(today=MON, rows=[r7], day_rules=[rules_mod.by_id("R7")])["actions"]
-    check("DM 11d ago, no meeting -> due", len(got), 1)
-    check("...shows days since the DM", "11 day(s) since the DM" in got[0]["text"], True)
-    check("...and the last note", "waiting on legal" in got[0]["text"], True)
-    # RULE 13 COMES FIRST: its own check decides who R7 leaves alone.
+    # R7 IS THE ESCALATION BEHIND R13 (rebuilt 13 Oct 2026). MON is 21 Sep 2026,
+    # so a DM on 31 Aug is 21 days old and one on 1 Sep is 20.
+    config.DM_NO_MEETING_DAYS, config.DM_NO_MEETING_BOOKED_GAP_DAYS = 21, 7
+    config.DM_NO_MEETING_MAX_CONTACTS = 3
+    config.DM_NO_MEETING_DM_SENT_MARKERS = ["sent"]
+    config.DM_NO_MEETING_DM_REPLIED_MARKERS = ["replied"]
+    config.DM_NO_MEETING_STATUS_OPEN = ["", "tbd"]
+    r7_rule = [rules_mod.by_id("R7")]
+
+    def r7_run(rows, state=None, **kw):
+        got = run(today=MON, rows=[], prospect_rows=rows, day_rules=kw.pop("day_rules", r7_rule),
+                  dm_no_meeting_state={} if state is None else state, **kw)["actions"]
+        return sorted(got, key=lambda a: a["pick_order"])      # the queue is ranked; the post is not
+
+    def dm(**kw):
+        kw.setdefault("li_dm_sent", "Sent")
+        kw.setdefault("li_dm_date", "31-08-2026")
+        return row(**kw)
+    got = r7_run([dm(name="Ann", company="Acme", next_steps="waiting on legal")])
+    check("Sent, DM 21d ago, no meeting, blank status -> in, first block",
+          [(a["poc"], a["block"]) for a in got], [("Ann", DM_BLOCK_NONE)])
+    check("...and nothing about days or the note travels on the line",
+          ("day" in got[0]["text"], "legal" in got[0]["text"], "last_note" in got[0]), (False, False, False))
+    check("20 days -> not yet", r7_run([dm(li_dm_date="01-09-2026")]), [])
+    check("Replied, blank and an unknown value -> out",
+          [len(r7_run([dm(li_dm_sent=v)])) for v in ("Replied", "", "in progress")], [0, 0, 0])
+    check("no LI DM Date -> out", r7_run([dm(li_dm_date="")]), [])
+    check("Meeting Status TBD is the same as blank; Completed is out",
+          [len(r7_run([dm(meeting_status=v)])) for v in ("TBD", "tbd", "Completed")], [1, 1, 0])
+    check("a meeting 5 days after the DM -> out; 10 days after -> in, second block",
+          ([a["block"] for a in r7_run([dm(meeting_date="05-09-2026")])],
+           [a["block"] for a in r7_run([dm(meeting_date="10-09-2026", meeting_status="TBD")])]),
+          ([], [DM_BLOCK_BOOKED]))
+    check("Deal Status On Hold is out of R7, and is still not a stop for any other rule",
+          (r7_run([dm(deal_status="On Hold")]), stop_reason(dm(deal_status="On Hold"))), ([], ""))
+    check("Won and Unresponsive are out, as everywhere",
+          [len(r7_run([dm(**kw)])) for kw in ({"deal_status": "Won"}, {"prospect_status": "Unresponsive"})],
+          [0, 0])
     marker = (config.NEXT_STEP_CONNECTED_MARKERS or ["Connected"])[0]
-    r7_r13 = row(li_dm_date="10-09-2026", sid_li_added=marker,
-                 li_connected_date="01-09-2026")
-    check("a DM'd person Rule 13 covers is Rule 13's, not R7's",
-          (covered_by_next_steps(r7_r13),
-           len(run(today=MON, rows=[r7_r13],
-                   day_rules=[rules_mod.by_id("R7")])["actions"])), (True, 0))
-    r7_nodate = row(li_dm_date="10-09-2026", sid_li_added=marker)
-    # CHANGED 12 Oct 2026: Rule 13 now takes every connected row, dated or not,
-    # so Rule 7 leaves the no-date ones alone too (it used to list them).
-    check("Connected with NO date is Rule 13's as well, so R7 does not list them",
-          (covered_by_next_steps(r7_nodate),
-           len(run(today=MON, rows=[r7_nodate],
-                   day_rules=[rules_mod.by_id("R7")])["actions"])), (True, 0))
-    r7_notconn = row(li_dm_date="10-09-2026", li_connected_date="01-09-2026")
-    check("a date but not marked Connected is not covered either",
-          (covered_by_next_steps(r7_notconn),
-           len(run(today=MON, rows=[r7_notconn],
-                   day_rules=[rules_mod.by_id("R7")])["actions"])), (False, 1))
+    # CHANGED 13 Oct 2026: R7 no longer hands every Connected row to R13 (that
+    # was every DM'd row, so R7 named nobody). Only the dedup stands between them.
+    conn = dm(sid_li_added=marker, li_connected_date="01-08-2026")
+    check("a Connected person is still Rule 13's by its own test, and R7 now lists them too",
+          (covered_by_next_steps(conn), len(r7_run([conn]))), (True, 1))
+    seven = [dm(_row=10 + i, name=f"P{i}", company=f"Co{i}", li_dm_date=f"{20 + i:02d}-08-2026")
+             for i in range(1, 8)]
+    first = r7_run(seven)
+    check("three a post: longest since the DM first, then sheet order",
+          [a["poc"] for a in first], ["P1", "P2", "P3"])
+    named = {a["contact_key"]: {"last_date": "2026-09-14"} for a in first}
+    second = r7_run(seven, named)
+    check("never named goes ahead of named", [a["poc"] for a in second], ["P4", "P5", "P6"])
+    named.update({a["contact_key"]: {"last_date": "2026-09-15"} for a in second})
+    check("...and the queue wraps: the last one, then the first two again",
+          [a["poc"] for a in r7_run(seven, named)], ["P7", "P1", "P2"])
+    today_named = {a["contact_key"]: {"last_date": dl.iso(MON)} for a in first}
+    check("once today's post has gone, today's people stay today's people",
+          [a["poc"] for a in r7_run(seven, today_named)], ["P1", "P2", "P3"])
+    check("an unreadable rotation state names nobody",
+          run(today=MON, rows=[], prospect_rows=seven, day_rules=r7_rule)["actions"], [])
+    check("an empty tab posts nothing", r7_run([]), [])
 
     print("\nR8 meeting prep — touches, and the past ones skipped")
     def preps(meeting_iso, today):
@@ -2992,10 +3212,11 @@ def _self_test() -> int:
     check("no active rows at all -> silent",
           run(today=MON, rows=[], day_rules=[rules_mod.by_id("R10")])["actions"], [])
 
-    print("\nR7 — the role rank travels with the item")
-    got = run(today=MON, rows=[row(li_dm_date="10-09-2026", designation="Co-Founder")],
-              day_rules=[rules_mod.by_id("R7")])["actions"]
-    check("a founder ranks first", got[0]["role_rank"], _role_rank("Founder"))
+    print("\nR7 — seniority is not part of its order any more")
+    got = run(today=MON, rows=[], dm_no_meeting_state={}, day_rules=[rules_mod.by_id("R7")],
+              prospect_rows=[row(li_dm_sent="Sent", li_dm_date="31-08-2026",
+                                 designation="Co-Founder")])["actions"]
+    check("no role rank travels with the item", "role_rank" in got[0], False)
 
     print("\nR5 — every never-contacted row, not only the active ones")
     never = row(_row=20, company="Zeta", name="Zed", designation="Founder")

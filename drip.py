@@ -116,7 +116,10 @@ RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES, nextaction.R_NEXT_STEPS,
                              # R6 (12 Oct 2026): ONE post, four blocks numbered straight
                              # through. Split by owner the numbering, the two caps and
                              # the closing question would each be per person's slice.
-                             nextaction.R_LI_NO_DM})
+                             nextaction.R_LI_NO_DM,
+                             # R7 (13 Oct 2026): ONE post, three people across two
+                             # blocks, numbered straight through.
+                             nextaction.R_DM_NO_MEETING})
 
 
 def group_key(action: dict) -> str:
@@ -471,9 +474,12 @@ NEVER_COUNTED = frozenset({
 # rule's rotation. Under the re-ask clock a post every weekday would be held
 # every other day as "asked recently" and reworded as "one last nudge" on the
 # days it did go.
+#
+# R7 TOO (13 Oct 2026): who it names each Monday is its own rotation, and
+# nothing in its post is a question to re-ask.
 NEVER_HELD = frozenset({
     nextaction.R_AI_NEWS, nextaction.R_MEETING_PREP, nextaction.R_MEETING_FOLLOWUP,
-    nextaction.R_NEXT_STEPS,
+    nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING,
 })
 
 # A POST THAT WENT OUT THIS CLOSE TO ITS SLOT WENT "ON TIME". The live sweep
@@ -1204,7 +1210,7 @@ HEADINGS = {
     # part of the rendered block (`prospects.post_parts`), like R11's opener.
     "R5": "",
     "R6": "Connected, no DM yet",
-    "R7": "DM sent, no meeting yet",
+    "R7": "No meeting booked yet",
     "R8": "Meeting prep for {company}",
     "R9": "Follow-up on the {company} meeting",
     "R10": "Closure support",
@@ -1288,7 +1294,11 @@ VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             # R6 (12 Oct): four blocks, their order, the numbering
                             # and the closing question are the agreed shape
                             # (`wording.li_no_dm_post`).
-                            nextaction.R_LI_NO_DM})
+                            nextaction.R_LI_NO_DM,
+                            # R7 (13 Oct): two blocks, their order, the continuous
+                            # numbering and both sentences are the agreed shape
+                            # (`wording.dm_no_meeting_post`).
+                            nextaction.R_DM_NO_MEETING})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1639,32 +1649,25 @@ def render_deliverables(items: list, *, today: Optional[date] = None,
     return lines
 
 
-# -- R7: DM sent, no meeting — contacts, longest wait first -------------------
-
-DM_NO_MEETING_OPENERS = (
-    "DM sent, no meeting booked yet — {n}:",
-    "Still waiting on a meeting with {n}:",
-    "No meeting yet after the DM — {n}:",
-)
-DM_NO_MEETING_CLOSES = (
-    "Chase any of these again, or leave them? Tell me which.",
-    "If any of these has moved, say so and I'll take it off.",
-    "Worth another nudge on any of them? Say skip to leave one.",
-)
-NOTE_MAX_CHARS = 110
+# -- R7: no meeting booked yet — three people, two blocks, fixed wording -------
+# (Until 13 Oct 2026 this was a composed post: three openers, three closing
+# questions, and a line per person with the days since the DM and the last
+# note. All of it is gone. The post is `wording.dm_no_meeting_post`, nothing
+# is asked, and replies to it are not read.)
 
 
 def _rank_of(action: dict) -> int:
     """An item's role rank; unranked sorts last. (0 is the BEST rank — founder
-    — so this cannot be written `rank or 10_000`.)"""
+    — so this cannot be written `rank or 10_000`.) R5's order reads it."""
     rank = action.get("role_rank")
     return 10_000 if rank is None else int(rank)
 
 
 def dm_no_meeting_order(actions: list) -> list:
-    """R7's contacts in the order they are listed: LONGEST SINCE THE DM FIRST;
-    on a tie the more senior role (PROSPECT_ROLE_ORDER — founder first), then
-    sheet order. One contact once."""
+    """R7's people in the order the RULE picked them (`pick_order`, which is
+    `nextaction.dm_no_meeting_order`: least recently named, then longest since
+    the DM, then sheet order). One contact once. Nothing here reorders them:
+    the rotation lives in the rule, with the state it reads."""
     seen: set = set()
     rows: list = []
     for a in actions or []:
@@ -1673,36 +1676,9 @@ def dm_no_meeting_order(actions: list) -> list:
             continue
         seen.add(key)
         rows.append(a)
-    return sorted(rows, key=lambda a: (-int(a.get("days_since_dm") or 0),
-                                       _rank_of(a),
-                                       int(a.get("sheet_row") or 0)))
-
-
-def render_dm_no_meeting(actions: list, *, limit: Optional[int] = None) -> tuple:
-    """(lines, extra, total) for R7.
-
-        1. Ada Lovelace — Acme AI — DM sent 21 days ago — waiting on their legal
-        2. Bo Chen — Borealis — DM sent 14 days ago — no note logged
-        (+2 more next Monday)
-
-    AT MOST DM_NO_MEETING_MAX_CONTACTS **CONTACTS**. It used to be capped by
-    COMPANY — five companies, however many people at each — and listed the
-    company and one name, with no days and no note: the two things somebody
-    needs to decide whether to chase.
-    """
-    cap = max(1, int(config.DM_NO_MEETING_MAX_CONTACTS if limit is None else limit))
-    rows = dm_no_meeting_order(actions)
-    lines: list = []
-    for i, a in enumerate(rows[:cap], 1):
-        days = int(a.get("days_since_dm") or 0)
-        note = " ".join(str(a.get("last_note") or "").split())
-        if len(note) > NOTE_MAX_CHARS:
-            note = note[:NOTE_MAX_CHARS - 1].rstrip() + "…"
-        who = str(a.get("poc") or "").strip() or "(no name on the row)"
-        lines.append(f"{i}. {who} — {str(a.get('company') or '').strip()} — DM sent "
-                     f"{_plural(days, 'day')} ago — {note or 'no note logged'}")
-    extra = [f"(+{len(rows) - cap} more next Monday)"] if len(rows) > cap else []
-    return lines, extra, len(rows)
+    return sorted(rows, key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        int(a.get("sheet_row") or 0)))
 
 
 # -- R5: PoCs to contact — one company, the same five, fixed wording ----------
@@ -1882,7 +1858,7 @@ def nothing_to_say(message: dict) -> bool:
     every Wednesday for the research layer, and in a week with no event close
     enough to mention and nothing new found, there is nothing to post. The
     sender then spends the slot silently rather than posting a heading."""
-    if message.get("type") == nextaction.R_NEXT_STEPS:
+    if message.get("type") in (nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING):
         # Cannot happen (nobody due means no item, so no group); if it ever
         # did, an opener with nobody under it must not be posted.
         return not shown_contacts(message)
@@ -1947,13 +1923,20 @@ def points_of(message: dict) -> Optional[dict]:
         return {"header": lines[0], "lines": lines[1:], "extra": [], "close": "",
                 "opener_in_block": True}
     if kind == nextaction.R_DM_NO_MEETING:
-        lines, extra, total = render_dm_no_meeting(actions)
+        people = shown_contacts(message)
+        if not people:
+            return None
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py: the numbered people,
+        # then the one line saying what they have in common, a block at a
+        # time. No opener, no close, no question, no "+N more" line.
+        lines = wording.dm_no_meeting_post([
+            {"who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
+             "block": a.get("block") or "none", "meeting_iso": a.get("meeting_iso") or ""}
+            for a in people],
+            days=config.DM_NO_MEETING_DAYS, gap_days=config.DM_NO_MEETING_BOOKED_GAP_DAYS)
         if not lines:
             return None
-        return {"header": _voice(message, "r7_opener", DM_NO_MEETING_OPENERS).format(
-                    n=total),
-                "lines": lines, "extra": extra,
-                "close": _voice(message, "r7_close", DM_NO_MEETING_CLOSES)}
+        return {"header": "", "lines": lines, "extra": [], "close": ""}
     if kind == nextaction.R_PROSPECTS:
         parts = render_prospects(actions, limit=cap)
         if not parts:
@@ -2180,9 +2163,10 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         lead = "" if points.get("opener_in_block") else who
         body = (lead + points_block(points)
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
-        if message.get("type") == nextaction.R_LI_NO_DM:
+        if message.get("type") in (nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING):
             # R6 IS ITS FOUR BLOCKS AND NOTHING ELSE: no source link under it and
-            # no bracketed note about a search that could not run.
+            # no bracketed note about a search that could not run. R7 is its
+            # two blocks and nothing else, for the same reason.
             return body
         if message.get("type") == nextaction.R_PROSPECTS:
             # R5 IS ITS AGREED SHAPE AND NOTHING ELSE. Its only research is the

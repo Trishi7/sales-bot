@@ -59,7 +59,7 @@
 #                       asking for one is reported, not sent. See the note at
 #                       the bottom of this file.
 #   counts_toward_cap   whether a post takes one of the day's DAILY_MESSAGE_CAP
-#                       (5) counted posts. R8 and R9 are false: a meeting is
+#                       (7) counted posts. R8 and R9 are false: a meeting is
 #                       time-critical and must not be crowded out by a Monday
 #                       chase. The code holds those two outside the cap whatever
 #                       this says (drip.NEVER_COUNTED). R13 is false too, and
@@ -90,10 +90,10 @@ source:
 # the "Voice" row — the same sentence as sales_strategy.md §9, so the sheet,
 # the strategy and the code say one thing (rules.global_rule("voice")).
 global_rules:
-  # Row "Daily cap". DAILY_MESSAGE_CAP=5, the same on every weekday; the old
-  # per-day table (DAILY_MESSAGE_CAP_BY_DAY) is retired.
+  # Row "Daily cap". DAILY_MESSAGE_CAP=7 (5 until 13 Oct 2026), the same on
+  # every weekday; the old per-day table (DAILY_MESSAGE_CAP_BY_DAY) is retired.
   daily_cap: >-
-    Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups,
+    Max 7 posts a day; meeting prep, meeting follow-ups, next-step follow-ups,
     reminders, urgent news and answers to questions don't count.
   # Row "AI news". R1 is new content every day, so the re-ask clock does not
   # apply to it. Since 8 Oct it has no fixed time: it takes its place in the
@@ -572,35 +572,52 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R7
-  # DM sent, no meeting after 7 days. Shows days since the DM and the last note
-  # logged against that contact.
+  # NO MEETING BOOKED YET: THE ESCALATION BEHIND RULE 13 (rebuilt 13 Oct 2026).
+  # Rule 13 does the chasing: from a week after the DM it says "We need to call
+  # these PoCs" every weekday. This rule says, on Mondays, that the chasing is
+  # not working.
   #
-  # S3: at most DM_NO_MEETING_MAX_CONTACTS (5) CONTACTS, not companies. Longest
-  # since the DM first; ties by PROSPECT_ROLE_ORDER (founder first), then sheet
-  # order. One line each: name — company — DM sent N days ago — last note.
-  # Overflow: "+N more next Monday".
+  # (Until 13 Oct it handed every Connected person to Rule 13, and since 12 Oct
+  # that was every DM'd row, so it ran each Monday and named nobody. At its old
+  # 7 days it would also have fired on exactly Rule 13's call condition.)
   #
-  # RULE 13 COMES FIRST (Vaishnavi, 7 Oct: "rule 13 supercedes this"). Back on
-  # Mondays since 8 Oct, but NEVER for a person Rule 13 covers: "Sid - LI
-  # Addition" Connected with an LI Connected Date (nextaction.
-  # covered_by_next_steps, Rule 13's own check). Those people get Rule 13's
-  # call reminders instead. On 7 Oct every row with an LI DM Date was
-  # Connected, so this rule lists somebody only when a DM went to a person who
-  # is not marked Connected, or whose LI Connected Date is missing.
+  # WHO: LI DM Sent says Sent (Replied is Rule 13's meeting line; blank is no
+  # DM). An LI DM Date (no date, no lookup). Meeting Status blank or TBD
+  # (DM_NO_MEETING_STATUS_OPEN). Then either NO Meeting Date and the DM is
+  # DM_NO_MEETING_DAYS (21) or more days old, or A Meeting Date that sits
+  # DM_NO_MEETING_BOOKED_GAP_DAYS (7) or more days after the DM.
+  # OUT: Meeting Status Completed; Deal Status Won or Lost (and every other stop
+  # marker, as for every rule); Deal Status ON HOLD, which stops THIS RULE ONLY
+  # (DEAL_ON_HOLD_MARKERS is not a stop marker for the other twelve).
+  #
+  # THE POST, rendered in code (wording.dm_no_meeting_post), never composed: a
+  # numbered list of name and company, then one line under it saying what they
+  # have in common; the people with a late meeting in a second block with the
+  # same numbering, each showing the meeting date. No day counts, no notes, no
+  # cell names, no question. REPLIES ARE NOT READ.
+  #
+  # DM_NO_MEETING_MAX_CONTACTS (3) PEOPLE A POST, across both blocks. THE ORDER
+  # IS A ROTATION: least recently named first (never named ahead of everybody),
+  # then longest since the DM, then sheet order. NOBODY IS DROPPED on a timer;
+  # a person stays until the sheet moves. Nothing is posted when nobody
+  # qualifies.
+  #
+  # RULE 13 COMES FIRST. It is listed above this rule, so on a Monday anybody
+  # Rule 13 names that day is skipped here and the next person moves up.
   - id: R7
-    name: DM sent, no meeting
-    plain: people we DM'd who haven't booked a meeting
+    name: No meeting booked yet
+    plain: people we DM'd who still have no meeting
     # The Bot Rules tab, rule 7, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      People we DM'd more than 7 days ago who haven't booked a meeting,
-      every Monday, second in the day's order: days since the DM and the
-      last note logged. Rule 13 comes first: anyone it covers (Sid - LI
-      Addition says Connected and the LI Connected Date is filled in) gets
-      Rule 13's reminders and is never listed here. At most 5 people a
-      post.
+      Every Monday, second in the day's order: people we DM'd more than
+      three weeks ago who still have no meeting, plus anyone whose meeting
+      is booked more than a week after the DM. Three people a post, name
+      and company only. Nobody is dropped: a person keeps coming round
+      until the meeting is Completed or the deal is Won, Lost or On Hold.
+      Rule 13 comes first: anyone it names that day is not listed here.
     weekdays: [mon]
     trigger: dm_no_meeting
-    max_items_per_post: 5
+    max_items_per_post: 3
     destination: channel
     counts_toward_cap: true
     enabled: true

@@ -120,7 +120,7 @@ PLAIN_BY_TRIGGER = {
     "deliverables": "P1 deliverables due this week — title and due date only",
     "prospects": "people we haven't made first contact with",
     "li_no_dm": "people connected on LinkedIn with no DM yet",
-    "dm_no_meeting": "people we DM'd who haven't booked a meeting",
+    "dm_no_meeting": "people we DM'd who still have no meeting",
     "meeting_prep": "meetings coming up that need prep",
     "meeting_followup": "meetings that happened with no next steps recorded",
     "closure_support": "deals close enough to push over the line",

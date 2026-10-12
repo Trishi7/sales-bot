@@ -61,6 +61,8 @@ def pins() -> dict:
     return {
         "NEXT_STEP_TIME": _example("NEXT_STEP_TIME"),
         "NEXT_STEP_CONNECTED_MARKERS": _list("NEXT_STEP_CONNECTED_MARKERS"),
+        # R7's clock, so its boot check (against R13's call clock) reads the contract and not this machine's .env.
+        "DM_NO_MEETING_DAYS": int(_example("DM_NO_MEETING_DAYS")),
         "NEXT_STEP_FIRST_DAYS": int(_example("NEXT_STEP_FIRST_DAYS")),
         "NEXT_STEP_AFTER_PREVIOUS_DAYS": int(_example("NEXT_STEP_AFTER_PREVIOUS_DAYS")),
         "NEXT_STEP_AFTER_EMAIL_DAYS": int(_example("NEXT_STEP_AFTER_EMAIL_DAYS")),
@@ -74,7 +76,6 @@ def pins() -> dict:
         "PROSPECT_LAB_INDUSTRIES": _list("PROSPECT_LAB_INDUSTRIES"),
         "PROSPECT_KEYWORDS": _list("PROSPECT_KEYWORDS"),
         "PROSPECT_UK_MARKERS": _list("PROSPECT_UK_MARKERS"),
-        "DM_NO_MEETING_DAYS": 7,
     }
 
 
@@ -261,10 +262,12 @@ def who_is_in(check):
           (text.split("\n")[0], len(res["reports"]["R13"]["no_date"])), (GROUP_LINES["blank"], 4))
     dmd = rows_of([person("No Date", "Co", "Reach by LI DM", li=None, dm_sent="Sent",
                           dm_date=DAY - timedelta(days=30))])[0]
-    r7 = nextaction.run(today=DAY, rows=[dmd], prospect_rows=[dmd], day_rules=[rules_mod.by_id("R7")],
-                        next_step_state={})
-    check("a Connected row with no date is Rule 13's, so Rule 7 does not list it as well",
-          (nextaction.covered_by_next_steps(dmd), len(r7["actions"])), (True, 0))
+    both = nextaction.run(today=DAY, rows=[dmd], prospect_rows=[dmd], next_step_state={}, dm_no_meeting_state={},
+                          day_rules=[rules_mod.by_id("R13"), rules_mod.by_id("R7")])
+    # CHANGED 13 Oct 2026: Rule 7 no longer hands every Connected row to Rule 13 up front (that was every DM'd
+    # row, so it named nobody). What keeps them apart now is the day's dedup: Rule 13 is listed first.
+    check("a Connected row with no date that both rules pick is named once, by Rule 13",
+          (nextaction.covered_by_next_steps(dmd), [a["rule_id"] for a in both["actions"]]), (True, ["R13"]))
     not_connected = fx.values_row(900, company="Co", name="Stranger", step="Send email 1", connected="Requested",
                                   li_date=OLD)
     check("a row that is not Connected is not in", asks(engine([not_connected])), [])

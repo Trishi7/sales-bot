@@ -13,7 +13,7 @@ Saley does not read these tabs to decide what to do; they are the team's record.
 
 | Day | 2 PM | 4 PM | 6 PM | 8 PM |
 |---|---|---|---|---|
-| Monday | Deliverables checklist (rule 4) | DM sent, no meeting (rule 7) | AI news (rule 1) | Closure support (rule 10) |
+| Monday | Deliverables checklist (rule 4) | No meeting booked yet (rule 7) | AI news (rule 1) | Closure support (rule 10) |
 | Tuesday | Prospects to contact (rule 5) | LinkedIn connected, no DM (rule 6) | News-company screen (rule 2) | AI news (rule 1) |
 | Wednesday | New companies in the pipeline (rule 11) | AI news (rule 1) | AI events and summits (rule 3) | — |
 | Thursday | Prospects to contact (rule 5) | AI news (rule 1) | Sales packages (rule 12) | — |
@@ -23,7 +23,7 @@ Under the table:
 
 - Posts are 2 hours apart, starting at 2 PM. The gap is never shortened.
 - A rule with nothing to post takes no slot, and the next one moves up. Example: a Monday with no P1 deliverable
-  due is DM sent, no meeting at 2 PM, AI news at 4 PM, Closure support at 6 PM.
+  due is No meeting booked yet at 2 PM, AI news at 4 PM, Closure support at 6 PM.
 - Nothing in this order is posted after 8 PM. What is left waits for that rule's next day.
 - Outside this order, at their own times (they never move a post in the table, and no post in the table waits for
   them):
@@ -38,7 +38,7 @@ Under the table:
 | Sunday, 2 PM | Deliverables checklist, only when a P1 item is due on the Monday. Nothing else |
 | Saturday | Nothing |
 
-- At most 5 posts a day count (the longest day above has 4). Meeting posts, next-step follow-ups, reminders,
+- At most 7 posts a day count (5 until 13 Oct 2026; the longest day above has 4). Meeting posts, next-step follow-ups, reminders,
   urgent news and answers to questions don't count.
 - A post goes out at the first check at or after its time (Saley checks every 15 minutes), never before it.
 
@@ -80,11 +80,14 @@ Under the table:
 > Checked again every hour, weekends included, and posted straight away only when something is major. No AI news post
 > on Saturday or Sunday. Nobody on the departures list is looked up.
 
-### Rule 7 (DM sent, no meeting)
+### Rule 7 (No meeting booked yet)
 
-> People we DM'd more than 7 days ago who haven't booked a meeting, every Monday, second in the day's order: days
-> since the DM and the last note logged. Rule 13 comes first: anyone it covers (Sid - LI Addition says Connected and
-> the LI Connected Date is filled in) gets Rule 13's reminders and is never listed here. At most 5 people a post.
+Rewritten on 13 Oct 2026 (it was "DM sent, no meeting": 7 days, days since the DM and the last note, 5 a post).
+
+> Every Monday, second in the day's order: people we DM'd more than three weeks ago who still have no meeting, plus
+> anyone whose meeting is booked more than a week after the DM. Three people a post, name and company only. Nobody
+> is dropped: a person keeps coming round until the meeting is Completed or the deal is Won, Lost or On Hold. Rule
+> 13 comes first: anyone it names that day is not listed here.
 
 ### Rule 8 (Meeting preparation)
 

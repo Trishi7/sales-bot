@@ -2331,14 +2331,36 @@ LI_NO_DM_DM_REPLIED_MARKERS: list[str] = _str_list(
 # reports every domain as fine.
 LI_NO_DM_VERIFY_MX = _bool("LI_NO_DM_VERIFY_MX", default=True)
 
-# R7 — DM sent, no meeting after this many days. R7 IS SWITCHED OFF in
-# bot_rules.yaml since 7 Oct 2026 (R13's call reminders replaced it); the
-# evaluator is kept, so these two are still read if somebody re-enables it.
-DM_NO_MEETING_DAYS = _int("DM_NO_MEETING_DAYS", 7)
-# ...and the most CONTACTS one R7 post lists (contacts, not companies): the
-# ones waiting longest, founders first on a tie. The rest are counted in one
-# closing line, "+N more next Monday".
-DM_NO_MEETING_MAX_CONTACTS = _int("DM_NO_MEETING_MAX_CONTACTS", 5)
+# -- R7 — NO MEETING BOOKED YET: THE ESCALATION BEHIND R13 (rebuilt 13 Oct 2026) --
+# R13 does the chasing: from NEXT_STEP_CALL_AFTER_DM_DAYS after the DM it says
+# "We need to call these PoCs" every weekday. R7 says, once a week on Monday,
+# that the chasing is not working.
+#
+# DAYS FROM THE LI DM DATE before R7 names somebody with NO meeting booked.
+# THREE WEEKS, NOT ONE (it was 7): at one week this fires on exactly R13's
+# call-tier condition, R13 names those people every weekday, and the
+# one-mention-a-day dedup means R7 never speaks.
+DM_NO_MEETING_DAYS = _int("DM_NO_MEETING_DAYS", 21)
+# ...and when a Meeting Date IS set and the Meeting Status is still open: how
+# far after the LI DM Date the meeting has to sit before R7 flags it as
+# drifting. A separate number because it answers a different question (how
+# long until the meeting, not how long with none).
+DM_NO_MEETING_BOOKED_GAP_DAYS = _int("DM_NO_MEETING_BOOKED_GAP_DAYS", 7)
+# PEOPLE NAMED IN ONE POST, shared across both blocks (it was 5). Nobody is
+# dropped: the rest come round with the rotation (least recently named first).
+DM_NO_MEETING_MAX_CONTACTS = _int("DM_NO_MEETING_MAX_CONTACTS", 3)
+# WHAT "LI DM Sent" SAYS when the DM has gone out, and when they answered.
+# REPLIED IS CHECKED FIRST: a reply is R13's meeting line, never this rule's.
+# R7's own lists, not R13's, so the two rules can be tuned apart.
+DM_NO_MEETING_DM_SENT_MARKERS: list[str] = _str_list("DM_NO_MEETING_DM_SENT_MARKERS", "sent")
+DM_NO_MEETING_DM_REPLIED_MARKERS: list[str] = _str_list(
+    "DM_NO_MEETING_DM_REPLIED_MARKERS", "replied")
+# MEETING STATUS VALUES THAT COUNT AS "NO MEETING YET". The default is blank
+# and TBD: the EMPTY entry before the comma IS the blank cell, which is why
+# this is not read through `_str_list` (that drops empty entries). Completed
+# is never open, whatever this says (`nextaction.dm_no_meeting_state`).
+DM_NO_MEETING_STATUS_OPEN: list[str] = [
+    x.strip().lower() for x in (os.getenv("DM_NO_MEETING_STATUS_OPEN", ",tbd") or "").split(",")]
 
 # -- R13 — NEXT STEPS FOR CONNECTED CONTACTS ----------------------------------
 # One post each weekday naming up to five connected contacts and the one thing
@@ -2819,7 +2841,7 @@ LEAVE_FALLBACK_ORDER: list[str] = _str_list("LEAVE_FALLBACK_ORDER", "Vaishnavi,S
 # THE ONE DAILY DIGEST IS RETIRED. Its format — one long message at
 # SALES_DIGEST_TIME, grouped into HOT / DEADLINES / OVERDUE / ESCALATIONS /
 # HYGIENE / five cadence sections, with carry-forward "(3rd day)" markers — is
-# gone. What replaces it is a DRIP: at most DAILY_MESSAGE_CAP (5) counted short
+# gone. What replaces it is a DRIP: at most DAILY_MESSAGE_CAP (7) counted short
 # messages a weekday, time-spaced, one per (action type x owner).
 #
 # WHY. The digest was one message a day because six kinds of scattered message
@@ -2965,9 +2987,12 @@ def drip_end_ist() -> tuple[int, int]:
 # about whether the day is full. Each sent row carries its own
 # `counts_toward_cap` (drip_sends), written when it is sent.
 #
-# AI NEWS (R1) COUNTS AS ONE OF THE FIVE and is decided in its place in the
+# AI NEWS (R1) COUNTS AS ONE OF THEM and is decided in its place in the
 # day's order, like every other rule.
-DAILY_MESSAGE_CAP = _int("DAILY_MESSAGE_CAP", 5)
+#
+# 7 SINCE 13 Oct 2026 (it was 5): R7 came back as a Monday post that names
+# people, and Monday already carried four.
+DAILY_MESSAGE_CAP = _int("DAILY_MESSAGE_CAP", 7)
 
 # HOW MANY POSTS THE SUNDAY EXCEPTION MAY SEND. One, at SALES_DRIP_START, and
 # only for SUNDAY_RULE_IDS. Not a setting: "one weekend message" is the whole
@@ -3592,6 +3617,33 @@ def validate() -> list[str]:
                 "no found address can be added. Set EMAIL_WRITE_ALLOWED=true in .env to "
                 "let an approver's yes write one."
             )
+        log.info(
+            "[config] R7 no meeting booked yet (Mondays, the escalation behind R13; "
+            "replies are not read): in %dd after the LI DM Date with no Meeting Date, or "
+            "with a Meeting Date more than %dd after the DM; LI DM Sent sent=%s "
+            "replied=%s (checked first); Meeting Status open=%s; out on Deal Status "
+            "on hold=%s (R7 only); %d name(s) a post, least recently named first, "
+            "nobody is dropped",
+            DM_NO_MEETING_DAYS, DM_NO_MEETING_BOOKED_GAP_DAYS,
+            ",".join(DM_NO_MEETING_DM_SENT_MARKERS) or "(none)",
+            ",".join(DM_NO_MEETING_DM_REPLIED_MARKERS) or "(none)",
+            ",".join(x or "(blank)" for x in DM_NO_MEETING_STATUS_OPEN) or "(none)",
+            ",".join(DEAL_ON_HOLD_MARKERS) or "(none)", DM_NO_MEETING_MAX_CONTACTS,
+        )
+        if DM_NO_MEETING_DAYS <= NEXT_STEP_CALL_AFTER_DM_DAYS:
+            log.warning(
+                "DM_NO_MEETING_DAYS=%d is at or below NEXT_STEP_CALL_AFTER_DM_DAYS=%d. R7 "
+                "would pick people on exactly the day R13 starts asking for a call; R13 "
+                "names them first every weekday and the one-mention-a-day rule then "
+                "silences R7. The agreed number is 21.",
+                DM_NO_MEETING_DAYS, NEXT_STEP_CALL_AFTER_DM_DAYS,
+            )
+        if not DM_NO_MEETING_DM_SENT_MARKERS:
+            log.warning(
+                "DM_NO_MEETING_DM_SENT_MARKERS is empty. R7 only names people whose LI DM "
+                "Sent cell says the DM went out, so nobody would ever qualify and the "
+                "Monday post would never appear. The default is: sent"
+            )
         if not LI_NO_DM_DM_SENT_MARKERS and not LI_NO_DM_DM_REPLIED_MARKERS:
             log.warning(
                 "LI_NO_DM_DM_SENT_MARKERS and LI_NO_DM_DM_REPLIED_MARKERS are both empty. "
@@ -4030,11 +4082,11 @@ def validate() -> list[str]:
                 "it plainly and logs one line a day to prove it.",
                 DAILY_MESSAGE_CAP,
             )
-        elif DAILY_MESSAGE_CAP > 6:
+        elif DAILY_MESSAGE_CAP > 7:
             log.warning(
-                "DAILY_MESSAGE_CAP=%s is above 6. The whole point of the volume contract "
+                "DAILY_MESSAGE_CAP=%s is above 7. The whole point of the volume contract "
                 "is that a busy channel absorbs a few short messages and starts skimming "
-                "past more. The agreed number is 5.",
+                "past more. The agreed number is 7.",
                 DAILY_MESSAGE_CAP,
             )
         if max(MESSAGE_GAP_MINUTES, MESSAGE_GAP_MIN_MINUTES) < 15:

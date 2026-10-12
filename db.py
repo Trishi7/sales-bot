@@ -802,6 +802,23 @@ CREATE TABLE IF NOT EXISTS next_step_followups (
     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- R7: WHO WAS LAST NAMED UNDER "No meeting booked yet", and when (13 Oct 2026).
+--
+-- One row per contact (the same key the cross-rule dedup uses). `last_date` is
+-- the rotation: the people named least recently go first, so the three names
+-- change from one Monday to the next. Nobody is dropped and nothing here ends
+-- a person; they leave when the sheet moves.
+--
+-- WRITTEN ONLY BY THE SENDER, after a real send, like next_step_followups. The
+-- evaluator is handed a copy and writes nothing, so a preview cannot move it.
+CREATE TABLE IF NOT EXISTS dm_no_meeting_mentions (
+    row_key    TEXT PRIMARY KEY,
+    last_date  TEXT NOT NULL DEFAULT '',
+    mentions   INTEGER NOT NULL DEFAULT 0,
+    last_block TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- R13: WHAT EACH POST SAID, by Discord message id.
 --
 -- RETIRED 12 Oct 2026. It existed so a reply to the post ("done") could be
@@ -2818,6 +2835,56 @@ class DB:
                 "last_call_date = excluded.last_call_date, last_ask = excluded.last_ask, "
                 "updated_at = CURRENT_TIMESTAMP",
                 (key, sig, day, mentions, calls, last_call, what),
+            )
+
+    def dm_no_meeting_state(self) -> Optional[dict]:
+        """{row_key: {last_date, mentions, last_block}} for R7, or None when it
+        cannot be read.
+
+        FAILS CLOSED, like `next_step_state`: an empty dict would mean "nobody
+        has ever been named" and the rotation would start again from the top.
+        None means "unknown", and the evaluator posts nothing on it.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT row_key, last_date, mentions, last_block "
+                    "FROM dm_no_meeting_mentions"
+                ).fetchall()
+            return {
+                r["row_key"]: {
+                    "last_date": str(r["last_date"] or ""),
+                    "mentions": int(r["mentions"] or 0),
+                    "last_block": str(r["last_block"] or ""),
+                }
+                for r in rows
+            }
+        except Exception:
+            log.exception(
+                "[db] R7's rotation state could not be read. R7 posts nothing until "
+                "it can: guessing would start the rotation again from the top."
+            )
+            return None
+
+    def record_dm_no_meeting_mention(self, row_key: str, *, on_date: str,
+                                     block: str = "") -> None:
+        """R7 named this contact in a post that really went out.
+
+        CALLED BY THE SENDER, NEVER BY THE ENGINE, for the same reason as
+        `record_next_step_mention`: a preview that recorded a mention would
+        change the rotation it was previewing.
+        """
+        key = str(row_key or "").strip()
+        if not key:
+            return
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO dm_no_meeting_mentions (row_key, last_date, mentions, "
+                "last_block) VALUES (?, ?, 1, ?) "
+                "ON CONFLICT(row_key) DO UPDATE SET "
+                "last_date = excluded.last_date, mentions = mentions + 1, "
+                "last_block = excluded.last_block, updated_at = CURRENT_TIMESTAMP",
+                (key, str(on_date or ""), str(block or "")),
             )
 
     def open_proposal(self, *, proposal_key: str, kind: str, tab: str,

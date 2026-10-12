@@ -1260,7 +1260,7 @@ def the_wording() -> None:
     print("\n   Global Rules tab — row \"Daily cap\":")
     print("     " + cap_row)
     check("the Global Rules row is the agreed sentence (rule 13 added next-step follow-ups on 7 Oct 2026)", cap_row,
-          "Max 5 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent "
+          "Max 7 posts a day; meeting prep, meeting follow-ups, next-step follow-ups, reminders, urgent "
           "news and answers to questions don't count.")
     for key, label in (("ai_news", "AI news"), ("weekends", "Weekends"),
                        ("reminders", "Reminders")):
