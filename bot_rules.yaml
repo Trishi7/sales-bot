@@ -292,43 +292,68 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R3
-  # EVERY WEDNESDAY (S3; EVENTS_ANCHOR_DATE and the every-other-week cadence are
-  # retired), and the ONE events path — the separate "one reminder at T-20"
-  # lane is retired too. Per row (Event, Date, Last day for registration,
-  # Registered, Link), with a window of EVENTS_WINDOW_DAYS (14), so an event
-  # next Tuesday is in THIS Wednesday's post:
-  #   date passed                      never mentioned
-  #   registered                       "You're registered for X on <date>"
-  #   not registered, deadline ahead   "Register for X by <deadline> (event on <date>)"
+  # EVERY WEDNESDAY, and the ONE events path (EVENTS_ANCHOR_DATE, the
+  # every-other-week cadence and the separate "one reminder at T-20" lane are
+  # all retired).
+  #
+  # REBUILT 14 Oct 2026: THREE LINES IN THE WHOLE POST, in up to three labelled
+  # blocks, numbered straight through, rendered in code (wording.events_post):
+  #   A  We have registered for these events and they are coming up soon:
+  #   B  Registration closes soon for these events:
+  #   C  Events not in the sheet, but worth looking at:
+  # A block with nobody in it does not appear, heading included.
+  #
+  # PER ROW of the AI Events & Summits tab (Event, Location, Date, Last day for
+  # registration, Registered, Link; Attended is not read), with a window of
+  # EVENTS_WINDOW_DAYS (14):
+  #   the END date has passed          never mentioned
+  #   started, not finished            kept; the line says "started Tuesday"
+  #   registered, starts within 14d    block A
+  #   registered, further out          not mentioned
+  #   not registered, deadline ahead   block B when the deadline OR the start is
+  #                                    within 14d, with the close date
   #   not registered, deadline passed  skipped, logged "registration closed"
-  #   not registered, no deadline      "X on <date> — no registration deadline on the sheet"
-  #   date unreadable                  listed ONCE, "date unclear"
-  # It closes with "Want me to remind you again on Monday?" — "tomorrow" when an
-  # event falls before Monday. A yes schedules one reminder for
-  # EVENTS_REMIND_AGAIN_WEEKDAY at 14:00 in the channel, listing those events;
-  # it is a reminder, so it does not count toward the cap. Discovery (events the
-  # tab lacks) and the deadline backfill still run, and still ask first.
+  #   not registered, NO USABLE        SKIPPED and logged (blank, "not
+  #   deadline                         available", "TBD", anything unreadable)
+  #   date unreadable                  skipped and logged; no line at all
+  #   date with no year                the next occurrence, and the line says so
+  #
+  # THE "no registration deadline on the sheet" LINE AND THE "date unclear" LINE
+  # ARE GONE. Most rows have no usable deadline, so blocks A and B are usually
+  # empty and the post is suggestions. That is the rule working. What brings
+  # block B back is the deadline backfill below, and people filling the cell in.
+  #
+  # THE SHEET GETS FIRST CALL on the three lines (max_items_per_post), closing
+  # registrations first (by close date), then registered events (by start),
+  # ties in sheet order. SUGGESTIONS FILL WHATEVER IS LEFT: events the tab
+  # lacks, ONLY in EVENTS_SUGGEST_LOCATIONS (Bangalore, Karnataka, London),
+  # each line a link. No "+N more" line and no rotation.
+  #
+  # It closes with "Shall I remind you again on Monday?" ("tomorrow" when
+  # something listed falls before Monday), with "Want me to add any of these to
+  # the GTM Playbook? And ..." in front when block C has something. A yes to
+  # the reminder schedules one for EVENTS_REMIND_AGAIN_WEEKDAY at 14:00 in the
+  # channel, listing those events, outside the cap. A yes to adding appends the
+  # suggested rows; nothing is added without one, and a no is final. The
+  # deadline backfill still runs, and still asks before writing a cell.
   - id: R3
     name: AI events and summits
     plain: AI events and summits coming up
     # The Bot Rules tab, rule 3, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      AI events and summits coming up. Every Wednesday, checks the AI
-      Events & Summits tab and lists what falls in the next 14 days:
-      "You're registered for X on <date>" when Registered is Yes;
-      "Register for X by <deadline> (event on <date>)" when it isn't and
-      the last day for registration is still ahead; "X on <date> — no
-      registration deadline on the sheet" when that cell is blank. An
-      event that has passed, or whose registration has closed, is not
-      mentioned; one whose date can't be read is listed once as "date
-      unclear". Ends with "Want me to remind you again on Monday?" (or
-      "tomorrow" if an event is before Monday): a yes posts the list
-      once more that day at 2 PM, and that doesn't count toward the 5
-      posts a day. Still looks for events the tab lacks and for missing
-      deadlines, and asks before adding anything.
+      AI events and summits. Every Wednesday, three lines in total: the
+      events we're registered for that start in the next 14 days; the
+      ones we haven't registered for whose registration is closing; and
+      events not on the sheet that are worth adding, filling whatever
+      room is left, from Bangalore, Karnataka or London. Rows with no
+      registration deadline are not listed, and neither is an event
+      that has ended or whose registration has closed. Ends by offering
+      to remind you again on Monday (or tomorrow if something is before
+      Monday), and to add the new events: nothing is added without a
+      yes. A reminder doesn't count toward the 7 posts a day.
     weekdays: [wed]
     trigger: events
-    max_items_per_post: 5
+    max_items_per_post: 3
     destination: channel
     counts_toward_cap: true
     enabled: true

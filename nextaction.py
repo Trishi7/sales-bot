@@ -19,7 +19,8 @@ THE THIRTEEN, with the trigger name the file uses:
 
      R1  ai_news                weekdays            the news sweep
      R2  news_company_screen    Tue, Fri            news companies vs the pipeline
-     R3  events                 alt. Wed            register / attend, until it passes
+     R3  events                 Wed                 3 lines: registered soon, registration
+                                                    closing, then suggestions
      R4  deliverables           Mon                 P1 only, due this week or passed
      R5  prospects              Tue, Thu            first contact FALSE or blank
      R6  li_no_dm               Tue, Fri            connected > 3d, no DM: the email check
@@ -554,20 +555,17 @@ def _r_news_company_screen(rule, ctx) -> list:
 # is there every Wednesday so the research layer (new events, missing
 # deadlines) has somewhere to put what it finds, even in a week with no event
 # close enough to mention.
-EVENT_REGISTERED = "registered"
-EVENT_REGISTER = "register"
-EVENT_NO_DEADLINE = "no_deadline"
-EVENT_UNCLEAR = "unclear"
+EVENT_REGISTERED = "registered"       # block A
+EVENT_REGISTER = "register"           # block B
 EVENT_CARRIER = "carrier"
-
-
-def unclear_event_key(name: str) -> str:
-    """The once-only key for an event whose date the sheet cannot read."""
-    return "unclear|" + gtm_sheet.normalise_header(name)
+EVENT_BLOCK_A, EVENT_BLOCK_B = "A", "B"
+# (EVENT_NO_DEADLINE and EVENT_UNCLEAR are gone, 14 Oct 2026, with the lines
+# they stood for. A row with no usable registration deadline, and a row whose
+# date cannot be read, are now skipped and logged.)
 
 
 def remind_again_on(today: date, soonest: Optional[date]) -> tuple:
-    """(date, word) for R3's "want me to remind you again?" offer.
+    """(date, word) for R3's "shall I remind you again?" offer.
 
     The next EVENTS_REMIND_AGAIN_WEEKDAY after today — "Monday" — unless one of
     the events listed FALLS BEFORE that day, in which case a Monday reminder
@@ -583,116 +581,197 @@ def remind_again_on(today: date, soonest: Optional[date]) -> tuple:
     return when, "on " + when.strftime("%A")
 
 
+def event_deadline_unknown(value) -> bool:
+    """Does the "Last day for registration" cell say nothing usable? Blank,
+    "not available", "TBD", or anything that does not read as a date: all the
+    same thing. THE TWO EXISTING DEFINITIONS, AND NO THIRD
+    (`gtm_sheet.is_unknown_value`, `events_discovery.deadline_is_unknown`),
+    plus the date parser's own verdict for everything else."""
+    import events_discovery
+
+    if gtm_sheet.is_unknown_value(value) or events_discovery.deadline_is_unknown(value):
+        return True
+    return not gtm_sheet.parse_event_date(value)["known"]
+
+
+def event_urgency(event: dict) -> tuple:
+    """R3's RANKING when more than the post's three lines qualify, across both
+    sheet blocks together:
+
+      1. REGISTRATION CLOSING SOONEST (block B, by its close date);
+      2. then THE EVENT STARTING SOONEST (block A, by its start date);
+      3. ties in sheet order.
+
+    A registration closing on Friday beats an event three weeks out: one is a
+    door closing, the other is a date in a calendar. THE RANKING DECIDES WHO IS
+    IN, NOT WHERE THEY SIT: the blocks still print A, B, C.
+
+    NOTHING ROTATES. Next Wednesday the same ranking runs against a tab that
+    has moved on, and an event leaves by happening or by its deadline passing.
+    A rotation would hide the most urgent thing because it was urgent last
+    week too.
+    """
+    if event["block"] == EVENT_BLOCK_B:
+        return (0, dl.iso(event["deadline"]), int(event.get("sheet_row") or 0))
+    return (1, dl.iso(event["start"]), int(event.get("sheet_row") or 0))
+
+
 def _r_events(rule, ctx) -> list:
-    """R3 — the events worth a line THIS week. Every Wednesday.
+    """R3 — the events worth a line THIS week. Every Wednesday. THREE LINES IN
+    THE WHOLE POST, in up to three labelled blocks (rebuilt 14 Oct 2026):
 
-    ONE PATH. This used to run every other Wednesday beside a second lane
-    (`events.due_events`, one reminder per event at T-20, for ever) that read
-    the same tab and knew nothing of this one. Both are gone; this is all of
-    it. The research layer still looks for events the tab lacks and for
-    missing registration deadlines, and what it finds rides on the carrier
-    item below.
+      A  we are registered, and it starts within EVENTS_WINDOW_DAYS (14)
+      B  we are not registered and the registration deadline is still ahead
+      C  events not on the sheet at all, worth a look
 
-    PER ROW (Event, Date, Last day for registration, Registered, Link), with
-    W = EVENTS_WINDOW_DAYS (14) — wide enough that an event next Tuesday is in
-    THIS Wednesday's post:
+    THIS FUNCTION DOES A AND B, from the AI Events & Summits tab (Event,
+    Location, Date, Last day for registration, Registered, Link; "Attended?"
+    is not read). C is the research layer's: what it finds rides on the
+    carrier item below, and fills only the room the sheet left.
 
-      date passed                       never mentioned
-      registered                        "You're registered for X on <date>"
-                                        when the date is within W
-      not registered, deadline ahead    "Register for X by <deadline> (event on
-                                        <date>)" when the deadline or the date
-                                        is within W
+    PER ROW, with W = EVENTS_WINDOW_DAYS:
+
+      the END date has passed           never mentioned
+      started, not finished             kept; the line says "started Tuesday"
+      registered, starts within W       block A
+      registered, further out           not mentioned: W days is enough notice
+      not registered, deadline ahead    block B when the deadline OR the start
+                                        is within W (a deadline next week for
+                                        an event in December still matters)
       not registered, deadline passed   skipped, logged "registration closed"
-      not registered, no deadline       "X on <date> — no registration deadline
-                                        on the sheet" when the date is within W
-      date unreadable                   listed ONCE, "date unclear"
-                                        (`ctx["events_unclear_seen"]` is what
-                                        makes it once; the caller records it
-                                        after the post)
+      not registered, NO USABLE         SKIPPED, logged, nothing posted. Blank,
+      deadline                          "not available", "TBD" and anything
+                                        unreadable are one thing
+                                        (`event_deadline_unknown`)
+      date unreadable                   skipped and logged. No line at all
+      date with no year                 the next occurrence, and the line says
+                                        the year was assumed (`year_assumed`)
 
-    THE OFFER. Every line item carries `remind_on` / `remind_word`, worked out
-    from the whole post: "Want me to remind you again on Monday?" — or
-    "tomorrow" when something listed falls before Monday.
+    THE NO-DEADLINE LINE IS GONE AND IT IS MOST OF THE TAB. Until 14 Oct such a
+    row got "X on <date> — no registration deadline on the sheet". On the day
+    this shipped six of the seven rows were like that, so blocks A and B are
+    usually EMPTY and the post is suggestions. THAT IS THE RULE WORKING, NOT A
+    FAULT; do not reinstate the line. What revives block B is the DEADLINE
+    BACKFILL (`events_discovery.rows_needing_deadline`, run by the caller,
+    unchanged): every deadline it finds and an approver accepts turns a
+    skipped row into a block B line.
+
+    THE CAP IS THE RULE'S `max_items_per_post` (3), FOR THE WHOLE POST. The
+    sheet gets first call: A and B take as many of the places as qualify, in
+    `event_urgency`, and the carrier says how much room is left (`event_room`)
+    for suggestions. There is no "+N more" line and no rotation.
+
+    AN EMPTY OR UNREADABLE TAB POSTS NOTHING, not even the carrier, and says so
+    at ERROR: "no rows" is not the same as "nothing coming up".
+
+    PURE: rows in, items out. The search, the proposals and the reminder are
+    the caller's.
     """
     today = ctx["today"]
     window = max(1, int(config.EVENTS_WINDOW_DAYS))
     horizon = today + timedelta(days=window)
-    seen_unclear = {str(k) for k in (ctx.get("events_unclear_seen") or ())}
-    lines: list = []
-    for row in ctx.get("events") or ():
+    cap = max(1, int(getattr(rule, "max_items_per_post", 3) or 3))
+    rows = list(ctx.get("events") or ())
+    report = {"rows": len(rows), "block_a": 0, "block_b": 0, "skipped": [], "left_out": []}
+    ctx.setdefault("reports", {})[getattr(rule, "id", "") or "R3"] = report
+    if not rows:
+        log.error("[R3] the AI Events & Summits tab came back with NO ROWS (empty or "
+                  "unreadable), so nothing is posted. That is not the same as nothing "
+                  "coming up.")
+        return []
+
+    def skip(row, name, why):
+        report["skipped"].append({"sheet_row": row.get("_row"), "event": name, "why": why})
+        log.info("[R3] skipped %r (row %s): %s", name, row.get("_row") or "?", why)
+
+    found: list = []
+    for row in rows:
         name = _text(row, "event")
         if not name:
             continue
         when = gtm_sheet.parse_event_date(row.get("event_date"))
-        closes = gtm_sheet.parse_event_date(row.get("registration_deadline"))
-        registered = gtm_sheet.parse_flag(row.get("registered")) is True
-        start = when["start"] if when["known"] else None
-        deadline = closes["start"] if closes["known"] else None
-        soonest = None
-        key = ""
-
-        if start is None:
-            key = unclear_event_key(name)
-            if key in seen_unclear:
-                log.info("[R3] skipped %r (row %s): date unclear, already listed once",
-                         name, row.get("_row") or "?")
-                continue
+        if not when["known"]:
             raw = _text(row, "event_date")
-            kind = EVENT_UNCLEAR
-            line = f"{name} — date unclear" + (
-                f" (the sheet says \"{raw}\")" if raw else " (no date on the sheet)")
-            due = today
-        else:
-            end = when["end"] or start
-            if end < today:
-                log.info("[R3] skipped %r (row %s): it was on %s — passed",
-                         name, row.get("_row") or "?", dl.iso(start))
+            skip(row, name, f"the date cannot be read ({raw!r})" if raw else "no date on the sheet")
+            continue
+        start = when["start"]
+        end = when["end"] or start
+        if end < today:
+            skip(row, name, f"it ended on {dl.iso(end)}")
+            continue
+        registered = gtm_sheet.parse_flag(row.get("registered")) is True
+        within = start <= horizon
+        event = {"row": row, "name": name, "location": _text(row, "location"),
+                 "start": start, "end": end, "deadline": None, "sheet_row": row.get("_row"),
+                 "started": start < today,
+                 "year_assumed": start.year if when.get("year_assumed") else 0,
+                 "date_text": _text(row, "event_date")}
+        if registered:
+            if not within:
+                skip(row, name, f"registered, but it starts on {dl.iso(start)}, more than "
+                                f"{window} days out")
                 continue
-            on = _short_date(start) + ("" if end == start else f" to {_short_date(end)}")
-            within = start <= horizon
-            if registered:
-                if not within:
-                    continue
-                kind, due, soonest = EVENT_REGISTERED, start, start
-                line = f"You're registered for {name} on {on}"
-            elif deadline is not None:
-                if deadline < today:
-                    log.info("[R3] skipped %r (row %s): registration closed on %s",
-                             name, row.get("_row") or "?", dl.iso(deadline))
-                    continue
-                if not (within or deadline <= horizon):
-                    continue
-                kind, due, soonest = EVENT_REGISTER, deadline, start
-                line = f"Register for {name} by {_short_date(deadline)} (event on {on})"
-            else:
-                if not within:
-                    continue
-                kind, due, soonest = EVENT_NO_DEADLINE, start, start
-                line = f"{name} on {on} — no registration deadline on the sheet"
-        lines.append(_item(
-            rule=rule, trigger=R_EVENTS, today=today, due=due,
-            why=f"R3 (Wednesdays): {kind}, inside the {window}-day window",
-            text=line, company=name, sheet_row=row.get("_row"),
-            extra={"event_kind": kind, "event_line": line,
-                   "event_date": dl.iso(start) if start else "",
-                   "event_deadline": dl.iso(deadline) if deadline else "",
-                   "event_link": _text(row, "link"), "event_soonest": soonest,
-                   "event_unclear_key": key},
-        ))
+            event["block"] = EVENT_BLOCK_A
+        else:
+            cell = row.get("registration_deadline")
+            if event_deadline_unknown(cell):
+                skip(row, name, "not registered and no usable registration deadline "
+                                f"({_text(row, 'registration_deadline')!r})")
+                continue
+            deadline = gtm_sheet.parse_event_date(cell)["start"]
+            if deadline < today:
+                skip(row, name, f"registration closed on {dl.iso(deadline)}")
+                continue
+            if not (within or deadline <= horizon):
+                skip(row, name, f"registration closes on {dl.iso(deadline)} and it starts on "
+                                f"{dl.iso(start)}, both more than {window} days out")
+                continue
+            event["block"], event["deadline"] = EVENT_BLOCK_B, deadline
+        found.append(event)
 
-    dated = [i["event_soonest"] for i in lines if i.get("event_soonest")]
-    remind_on, remind_word = remind_again_on(today, min(dated) if dated else None)
-    for item in lines:
-        item.pop("event_soonest", None)
-        item["remind_on"] = dl.iso(remind_on)
-        item["remind_word"] = remind_word
-    # THE CARRIER: nothing to read, somewhere for the research to land.
+    ranked = sorted(found, key=event_urgency)
+    picked, left = ranked[:cap], ranked[cap:]
+    for event in left:
+        report["left_out"].append({"sheet_row": event["sheet_row"], "event": event["name"]})
+        log.info("[R3] %r (row %s) qualifies but the post's %d line(s) went to more urgent "
+                 "events", event["name"], event["sheet_row"] or "?", cap)
+    report["block_a"] = sum(1 for e in picked if e["block"] == EVENT_BLOCK_A)
+    report["block_b"] = sum(1 for e in picked if e["block"] == EVENT_BLOCK_B)
+    room = cap - len(picked)
+    log.info("[R3] %d row(s) read: %d registered and starting within %dd, %d with "
+             "registration closing; %d skipped, %d left out by the cap of %d; room for %d "
+             "suggestion(s)", len(rows), report["block_a"], window, report["block_b"],
+             len(report["skipped"]), len(left), cap, room)
+
+    lines: list = []
+    for order, event in enumerate(picked):
+        row = event["row"]
+        fields = {"name": event["name"], "location": event["location"],
+                  "start": dl.iso(event["start"]), "end": dl.iso(event["end"]),
+                  "deadline": dl.iso(event["deadline"]) if event["deadline"] else "",
+                  "started": event["start"].strftime("%A") if event["started"] else "",
+                  "year_assumed": event["year_assumed"], "date_text": event["date_text"]}
+        line = wording.event_sheet_line(fields)
+        kind = EVENT_REGISTERED if event["block"] == EVENT_BLOCK_A else EVENT_REGISTER
+        lines.append(_item(
+            rule=rule, trigger=R_EVENTS, today=today,
+            due=event["deadline"] or max(event["start"], today),
+            why=(f"R3 (Wednesdays): block {event['block']} ({kind}), inside the "
+                 f"{window}-day window; {order + 1} of {len(picked)} by urgency"),
+            text=line, company=event["name"], sheet_row=row.get("_row"),
+            extra={"event_kind": kind, "event_block": event["block"], "event_line": line,
+                   "event_fields": fields, "pick_order": order,
+                   "event_date": fields["start"], "event_deadline": fields["deadline"],
+                   "event_link": _text(row, "link")},
+        ))
+    # THE CARRIER: nothing to read, somewhere for the research to land. It
+    # says how many of the post's lines the sheet left for suggestions.
     carrier = _item(
         rule=rule, trigger=R_EVENTS, today=today, due=today,
         why="R3 (Wednesdays): looks for events the tab lacks and missing deadlines",
         text="", web_pending=True,
-        extra={"event_kind": EVENT_CARRIER, "event_line": ""},
+        extra={"event_kind": EVENT_CARRIER, "event_line": "", "event_room": room,
+               "event_today": dl.iso(today), "event_window": window},
     )
     carrier["text"] = ""
     carrier["key"] = "R3:carrier"
@@ -2524,7 +2603,7 @@ def run(
     meeting_followups: Optional[dict] = None,
     focus: Optional[dict] = None,
     inactive: int = 0, day_rules: Optional[list] = None,
-    prospect_rows: Optional[list] = None, events_unclear_seen=None,
+    prospect_rows: Optional[list] = None,
     next_step_state: Optional[dict] = None,
     poc_company_index: Optional[dict] = None,
     dm_no_meeting_state: Optional[dict] = None,
@@ -2574,8 +2653,6 @@ def run(
         "meeting_followups": meeting_followups or {},
         # R5 READS EVERY ROW, not only the active ones (None = use `rows`).
         "prospect_rows": list(prospect_rows) if prospect_rows is not None else None,
-        # Events whose unreadable date has already been listed once.
-        "events_unclear_seen": set(events_unclear_seen or ()),
         # R13's ROTATION STATE. None (unreadable) is kept as None on purpose.
         "next_step_state": (dict(next_step_state)
                             if next_step_state is not None else None),
@@ -3430,54 +3507,51 @@ def _self_test() -> int:
         ev(9, "Registered Far", d(30), registered="Yes"),
         ev(10, "Mystery Day", "sometime in spring"),
     ]
+    # REBUILT 14 Oct 2026: three lines in the whole post, the sheet first, by
+    # urgency; no "no registration deadline" line and no "date unclear" line.
     r3 = rules_mod.by_id("R3")
     got = run(today=WED, events=tab, day_rules=[r3])["actions"]
     lines = {a["company"]: a for a in got if a.get("event_kind") != EVENT_CARRIER}
-    check("the right rows have a line", sorted(lines),
-          ["Far But Closing", "Mystery Day", "Next Tuesday Forum", "No Deadline Meetup",
-           "Registered Summit"])
-    check("registered, within the window",
-          lines["Registered Summit"]["event_line"].startswith(
-              "You're registered for Registered Summit on "), True)
-    check("not registered, deadline ahead",
-          (lines["Next Tuesday Forum"]["event_kind"],
-           lines["Next Tuesday Forum"]["event_line"].startswith(
-               "Register for Next Tuesday Forum by "),
-           "(event on " in lines["Next Tuesday Forum"]["event_line"]),
-          (EVENT_REGISTER, True, True))
-    check("a far event whose DEADLINE is inside the window is in",
-          lines["Far But Closing"]["event_kind"], EVENT_REGISTER)
-    check("no deadline on the sheet",
-          lines["No Deadline Meetup"]["event_line"].endswith(
-              "— no registration deadline on the sheet"), True)
-    check("an unreadable date is listed, as unclear",
-          "date unclear" in lines["Mystery Day"]["event_line"], True)
-    got2 = run(today=WED, events=tab, day_rules=[r3],
-               events_unclear_seen={unclear_event_key("Mystery Day")})["actions"]
-    check("...and only once", "Mystery Day" in [a["company"] for a in got2], False)
-    check("the carrier is always there, and is the only item that wants research",
+    carrier = next(a for a in got if a.get("event_kind") == EVENT_CARRIER)
+    check("three lines at most: the two closing registrations, then the registered event",
+          [(a["company"], a["event_block"]) for a in sorted(lines.values(), key=lambda a: a["pick_order"])],
+          [("Next Tuesday Forum", "B"), ("Far But Closing", "B"), ("Registered Summit", "A")])
+    check("...the sheet used all three places, so there is no room for a suggestion",
+          carrier["event_room"], 0)
+    check("registered, within the window: the name, then the date",
+          lines["Registered Summit"]["event_line"].startswith("Registered Summit \u2014 "), True)
+    check("not registered, deadline ahead: the line shows both dates",
+          ", closes " in lines["Next Tuesday Forum"]["event_line"], True)
+    check("no deadline on the sheet, and an unreadable date: neither has a line any more",
+          [n for n in ("No Deadline Meetup", "Mystery Day") if n in lines], [])
+    check("...and nothing says 'date unclear' or 'no registration deadline'",
+          [a["event_line"] for a in lines.values()
+           if "unclear" in a["event_line"] or "no registration deadline" in a["event_line"]], [])
+    check("'not available' and 'TBD' are the same as blank",
+          [event_deadline_unknown(v) for v in ("", "not available", "TBD", "soon", "20-10-2026")],
+          [True, True, True, True, False])
+    check("the carrier is always there with rows, and is the only item that wants research",
           [(a["event_kind"], a["web_pending"]) for a in got if a["web_pending"]],
           [(EVENT_CARRIER, True)])
-    check("an empty tab still has its carrier",
-          [a["event_kind"] for a in run(today=WED, events=[], day_rules=[r3])["actions"]],
-          [EVENT_CARRIER])
+    check("an empty tab posts nothing at all, not even the carrier",
+          run(today=WED, events=[], day_rules=[r3])["actions"], [])
+    one_row = run(today=WED, events=[ev(2, "Registered Summit", d(10), registered="Yes")],
+                  day_rules=[r3])["actions"]
+    check("one line from the sheet leaves room for two suggestions",
+          [a["event_room"] for a in one_row if a["event_kind"] == EVENT_CARRIER], [2])
     check("it runs on the Wednesday after too (no alternate weeks)",
           bool(run(today=WED + timedelta(days=7), events=tab, day_rules=None)
                ["by_rule"].get("R3")), True)
-    check("nothing listed falls before Monday -> the offer is Monday, even with "
-          "a deadline this week",
-          {a["remind_word"] for a in lines.values()}, {"on Monday"})
-    soon = run(today=WED, events=tab + [ev(11, "Friday Meetup", d(2))],
-               day_rules=[r3])["actions"]
-    check("an event before Monday -> the offer is tomorrow",
-          {a["remind_word"] for a in soon if a["event_kind"] != EVENT_CARRIER},
-          {"tomorrow"})
-    later = run(today=WED, events=[ev(2, "Registered Summit", d(10), registered="Yes")],
-                day_rules=[r3])["actions"]
-    check("nothing before Monday -> the offer is Monday",
-          [(a["remind_word"], a["remind_on"]) for a in later
-           if a["event_kind"] != EVENT_CARRIER],
-          [("on Monday", dl.iso(WED + timedelta(days=5)))])
+    under_way = run(today=WED, day_rules=[r3], events=[
+        ev(2, "Running Now", f"{(WED - timedelta(days=1)).day}-{(WED + timedelta(days=1)).day} "
+                             f"{WED.strftime('%B %Y')}", registered="Yes"),
+        ev(3, "Ended", d(-1), registered="Yes")])["actions"]
+    check("started and not finished is kept and says when it started; ended is gone",
+          [a["event_line"].endswith(", started Tuesday") for a in under_way
+           if a["event_kind"] != EVENT_CARRIER], [True])
+    check("the reminder is the next Monday, or tomorrow when something falls before it",
+          (remind_again_on(WED, WED + timedelta(days=10)), remind_again_on(WED, WED + timedelta(days=2))),
+          ((WED + timedelta(days=5), "on Monday"), (WED + timedelta(days=1), "tomorrow")))
 
     print("\nR11 new company — one working day after it appeared")
     nc = [{"company": "Nova", "first_seen": "2026-09-18"}]     # a Friday

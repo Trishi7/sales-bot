@@ -331,12 +331,17 @@ async def scenario_events(bot, today):
     r3 = items[0]
     body = r3.get("research", "")
 
-    check("discovery proposed the new event", "Voice AI Forum" in body)
-    check("...with its place and date", "Bengaluru" in body)
-    check("...and its link", "<https://voiceaiforum.in>" in body)
-    check("an event already on the tab is NOT proposed",
-          "NeurIPS" in body, False)
-    check("it asks before adding a row", "without one" in body)
+    # CHANGED 14 Oct 2026: the discoveries are no longer a paragraph of the research text. They ride on the item
+    # as `event_proposals` and the post shows them as its third block (verify_events.py covers the post).
+    found = r3.get("event_proposals") or []
+    check("discovery suggested the new event", [e["name"] for e in found], ["Voice AI Forum"])
+    check("...with its place and date",
+          [(e["location"], dl.iso(e["date"])) for e in found], [("Bengaluru, India", "2026-10-14")])
+    check("...and its link", [e["link"] for e in found], ["https://voiceaiforum.in"])
+    check("an event already on the tab is NOT suggested",
+          "NeurIPS" in body or "NeurIPS" in str(found), False)
+    check("the discovery wording is no longer in the research text (it is the post's third block)",
+          "aren't on the Events tab" in body or "isn't on the Events tab" in body, False)
 
     check("the backfill proposed the missing deadline",
           "Evals Day London" in body)
@@ -363,7 +368,7 @@ async def scenario_events(bot, today):
     items2 = [item(nextaction.R_EVENTS, "R3")]
     await bot._events_run(items2, today=today)
     check("a second run does not re-propose it",
-          "Voice AI Forum" in items2[0].get("research", ""), False)
+          [e["name"] for e in items2[0].get("event_proposals") or []], [])
 
     print("\n   the cells that an approved append would write")
     cells = events_discovery.append_values({

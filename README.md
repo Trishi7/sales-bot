@@ -2204,7 +2204,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 |---|---|---|---|---|---|
 | **R1** | AI news | weekdays | `ai_news` | 5 | yes |
 | **R2** | News-company screen | Tue, Fri | `news_company_screen` | 5 | yes |
-| **R3** | AI events & summits | alternate Wed | `events` | 5 | yes |
+| **R3** | AI events & summits — three lines: registered soon, registration closing, suggestions | Wed | `events` | 3 | yes |
 | **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
 | **R6** | Connected, no DM yet, and the email check (LI DM Sent blank; 5 names + up to 5 with email news) | Tue, Fri | `li_no_dm` | 5 | yes |
@@ -2378,6 +2378,105 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 3: AI events and summits
+
+**Rebuilt 14 Oct 2026.** One post every Wednesday, **three lines in the whole
+post**, in up to three labelled blocks numbered straight through. `python
+verify_events.py --show` prints the messages.
+
+```
+**AI events & summits**
+@Vaishnavi @Sid
+
+We have registered for these events and they are coming up soon:
+1. Symphony — India's Voice AI Ecosystem (Bengaluru) — Fri 20 Nov
+
+Registration closes soon for these events:
+2. Future of AI Summit (London) — Wed 4 to Thu 5 Nov, closes Sat 24 Oct
+
+Events not in the sheet, but worth looking at:
+3. [Cypher 2026](<https://…>) — Thu 5 Nov, Bengaluru
+
+Want me to add any of these to the GTM Playbook? And shall I remind you again on Monday?
+```
+
+**Per row** of the AI Events & Summits tab (`nextaction._r_events`), with a
+window of `EVENTS_WINDOW_DAYS` (14). The Attended column is not read.
+
+| The row | What happens |
+|---|---|
+| the END date has passed | never mentioned |
+| started, not finished | kept; the line ends `started Tuesday` |
+| Registered = Yes, starts within 14 days | **block A** |
+| Registered = Yes, further out | not mentioned: fourteen days is enough notice |
+| not registered, deadline ahead | **block B**, when the deadline *or* the start is within 14 days, with `closes <date>` |
+| not registered, deadline passed | skipped; the log says "registration closed" |
+| not registered, **no usable deadline** | **skipped and logged** (blank, "not available", "TBD", anything unreadable: `nextaction.event_deadline_unknown`, which is the two existing definitions and the date parser, not a third list) |
+| date unreadable | skipped and logged; no line at all |
+| date with no year | the next occurrence, and the line says `(no year on the sheet — assuming 2027)` |
+
+**The "no registration deadline on the sheet" line and the "date unclear" line
+are gone**, with the once-only plumbing behind the second. On the day this
+shipped six of the seven rows had no usable deadline and the two registered
+events were more than 14 days out, so **blocks A and B are usually empty and
+the post is suggestions**. That is the rule working. What brings block B back
+is a registration deadline in the sheet: typed in, or found by the deadline
+backfill and accepted.
+
+**The cap is three lines for the whole post** (`max_items_per_post`), and the
+sheet gets first call. When more than three qualify the ranking is
+`nextaction.event_urgency`: registrations closing soonest (block B, by close
+date), then events starting soonest (block A), ties in sheet order. The
+ranking decides who is in; the blocks always print A, B, C. There is no
+"+N more" line and no rotation: an event leaves by happening or by its deadline
+passing.
+
+**Suggestions fill whatever is left** (`bot._events_run`,
+`drip.event_suggestions`). Two lines from the sheet means one suggestion; three
+means none, and the discovery search is not even run. They come from
+`events_discovery.py`, which is unchanged in what matters: nothing is written
+without a yes, a no is final, every fact carries its link, and a date the
+search did not state is never written. Two things are new:
+
+- **Three places and nothing else:** `EVENTS_SUGGEST_LOCATIONS` (Bangalore,
+  Bengaluru, Karnataka, London). `events_discovery.location_allowed` filters on
+  the location each result states, as whole words, in code; the prompt and the
+  two searches name the places too, but a prompt instruction is not a filter.
+- **Twelve a month** (`EVENTS_DISCOVERY_MAX_PER_MONTH`, it was 8): four
+  Wednesdays at three. A run suggests at most the room the post has left, and
+  never more than `EVENTS_DISCOVERY_MAX_PER_RUN` (3). When the month's ceiling
+  is reached block C goes quiet and the log says so at WARNING.
+
+**The lines.** A sheet event is `Name (Location) — date` and is **not** a link
+(its link is in the sheet). A range reads `Tue 20 to Wed 21 Oct`. A suggestion
+is its name as a masked link (`links.link`, embed suppressed, at most six
+words), then the date and the city; one whose link has no http(s) scheme is
+not shown.
+
+**The closing line** is `Shall I remind you again on Monday?`, with `Want me to
+add any of these to the GTM Playbook? And …` in front when block C has
+something. "Monday" is `EVENTS_REMIND_AGAIN_WEEKDAY`; it reads "tomorrow" when
+something listed, from the sheet or suggested, falls before that day. Two
+proposals are opened against the post and both wait:
+
+- `events_remind`: a yes schedules one reminder that day at 14:00 listing the
+  same events, outside the daily cap. A bare "yes" answers this one.
+- `event_append`: "yes, add them" appends every suggestion; **"add 2 and 3"**
+  appends only those numbers (each suggestion carries its number in the post).
+  A number that belongs to an event already on the sheet adds nothing.
+
+**With nothing from the sheet** block C stands alone under `No events on the tab
+for the next 14 days. A few worth a look that we could still register for:`.
+**With nothing anywhere** the whole post is `No events on the tab for the next
+14 days, and nothing new worth suggesting.` That sentence is only posted when
+the search actually ran; if it could not, and the sheet has nothing, nothing
+is posted. **An empty or unreadable tab posts nothing** and is logged at ERROR.
+
+**The deadline backfill is unchanged** (`rows_needing_deadline`,
+`deadline_prompt`, `EVENTS_DEADLINE_RECHECK_DAYS`). When it finds deadlines its
+proposal still rides under the blocks, above the closing line, and "yes to the
+deadlines" writes just those cells.
 
 ### Rule 10: closure support
 
@@ -4151,6 +4250,10 @@ values and no deal qualifies, it stays silent and logs why.
   2026 the offer is R6's only**: R5's lookup still runs (the cache is shared)
   but its message prints no email and opens no `email_write` proposal.
 
+> **Replaced on 14 Oct 2026**: the table and the closing line below are the S3
+> shape. The post is now three lines in three blocks; see
+> [Rule 3](#rule-3-ai-events-and-summits).
+
 **R3 — events, every Wednesday, one path.** `EVENTS_ANCHOR_DATE` (alternate
 weeks) is retired, and so is the second lane that ran beside R3 on the same
 tab (`_event_actions` / `events.due_events` / `EVENT_LEAD_DAYS`: one reminder
@@ -5036,6 +5139,13 @@ where search genuinely did not happen — and in every one of those cases the it
 also carries a `research_note` saying which, because a status is not a reason.
 
 ### R3 fills the sheet from the web, and backfills the deadlines
+
+> **Since 14 Oct 2026** the discoveries are the third block of the Wednesday
+> post, limited to the room the sheet left and to `EVENTS_SUGGEST_LOCATIONS`,
+> at most 3 a run and 12 a month; see [Rule 3](#rule-3-ai-events-and-summits).
+> The matching, the approval and the deadline backfill described below are
+> unchanged; the stand-alone "aren't on the Events tab" wording is no longer
+> posted.
 
 R3 used to read the AI Events & Summits tab and nothing else, which made it half
 a rule: **an event nobody had typed in did not exist**, and a row whose "Last day
@@ -6051,6 +6161,7 @@ python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
 python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the six tiers, the rotation (nobody is dropped), replies not read (--show prints the messages)
+python verify_events.py                   # R3: blocks A, B and C, three lines in all by urgency, no-deadline rows skipped, the live date strings, the assumed year, suggestions in the room left and only from the three places, "add 2", the closing line (--show prints the messages)
 python verify_closure_support.py          # R10: a closure stage above 50% (whole words), the empty-columns line, person first, no cap, highest first, no rotation, the news line read from the store since the last post, the marker (--show prints the messages)
 python verify_dm_no_meeting.py            # R7, the escalation behind R13: who is in (four columns), On Hold out for R7 only, the rotation, the two blocks, the sentence that follows the setting, nothing recorded by a preview or a test day (--show prints the messages)
 python verify_sheet_locks.py              # the write lock by ROLE: three header orders, a missing header refuses every write, ranges only add, the Email cell and the signed new row (--show prints the startup lock log)

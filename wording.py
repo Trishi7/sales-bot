@@ -368,6 +368,15 @@ def confirm_proposal(label: str) -> str:
             "ahead.")
 
 
+def events_add_which(numbers) -> str:
+    """A reply named numbers and none of them is a suggested event (they are
+    events already on the sheet). Says which numbers can be added."""
+    names = [str(int(n)) for n in (numbers or ())]
+    which = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return (f"Only {which} {'is a new event' if len(names) == 1 else 'are new events'} I can "
+            "add; the others are already on the sheet. Nothing was added.")
+
+
 def events_remind_set(when: str) -> str:
     """`when` is "Mon 12 Oct at 2 PM". Names what will be posted, and when."""
     return f"I'll post the AI events list again on {when}."
@@ -833,6 +842,173 @@ def closure_lines_for_check() -> list:
         closure_empty_notice(["Closure Prob%"])]
 
 
+# -- AI events & summits (rule 3) ----------------------------------------------
+#
+# THE POST, AGREED 14 Oct 2026. THREE LINES IN ALL, in up to three labelled
+# blocks, numbered STRAIGHT THROUGH so a reply can say "2 and 3":
+#
+#     **AI events & summits**
+#     @Vaishnavi @Sid
+#
+#     We have registered for these events and they are coming up soon:
+#     1. Symphony — India's Voice AI Ecosystem (Bengaluru) — Fri 20 Nov
+#
+#     Registration closes soon for these events:
+#     2. Future of AI Summit (London) — Wed 4 to Thu 5 Nov, closes Fri 24 Oct
+#
+#     Events not in the sheet, but worth looking at:
+#     3. [Cypher 2026](url) — Thu 6 Nov, Bengaluru
+#
+#     Want me to add any of these to the GTM Playbook? And shall I remind you again on Monday?
+#
+# A block with nobody in it does not appear, heading included. Sheet events
+# are NOT linked (their link is in the sheet); a suggestion's NAME is its link.
+EVENTS_BLOCK_A = "We have registered for these events and they are coming up soon:"
+EVENTS_BLOCK_B = "Registration closes soon for these events:"
+EVENTS_BLOCK_C = "Events not in the sheet, but worth looking at:"
+# Block C's lead when the sheet gave nothing: it stands alone.
+EVENTS_BLOCK_C_ALONE = ("No events on the tab for the next {days} days. A few worth a look that "
+                        "we could still register for:")
+# The whole post when there is nothing anywhere.
+EVENTS_NOTHING = "No events on the tab for the next {days} days, and nothing new worth suggesting."
+# THE CLOSING LINE. {when} is "on Monday" or "tomorrow". The add half is there
+# only when block C has something; the remind half always.
+EVENTS_REMIND = "Shall I remind you again {when}?"
+EVENTS_ADD_AND_REMIND = ("Want me to add any of these to the GTM Playbook? And shall I remind "
+                         "you again {when}?")
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _ymd(iso):
+    """(year, month, day) from "2026-11-20", or None. NO datetime HERE: this
+    module imports nothing, so the calendar it needs is four lines of
+    arithmetic."""
+    try:
+        year, month, day = (int(x) for x in str(iso or "").strip().split("-"))
+    except (ValueError, TypeError):
+        return None
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    if year < 1 or not 1 <= month <= 12 or not 1 <= day <= days[month - 1]:
+        return None
+    return year, month, day
+
+
+def _weekday(ymd) -> int:
+    """0 = Monday. Sakamoto's method."""
+    year, month, day = ymd
+    offsets = (0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4)
+    if month < 3:
+        year -= 1
+    return (year + year // 4 - year // 100 + year // 400 + offsets[month - 1] + day + 6) % 7
+
+
+def day_date(iso) -> str:
+    """"Fri 20 Nov" from "2026-11-20"; "" for anything that is not a date."""
+    d = _ymd(iso)
+    return f"{_WEEKDAY_ABBR[_weekday(d)]} {d[2]} {_MONTH_ABBR[d[1] - 1]}" if d else ""
+
+
+def event_when(start_iso, end_iso="") -> str:
+    """"Fri 20 Nov"; a range reads "Tue 20 to Wed 21 Oct", and across two
+    months "Fri 30 Oct to Sun 1 Nov"."""
+    start, end = _ymd(start_iso), _ymd(end_iso)
+    if start is None:
+        return ""
+    if end is None or end == start:
+        return day_date(start_iso)
+    if start[:2] == end[:2]:
+        return f"{_WEEKDAY_ABBR[_weekday(start)]} {start[2]} to {day_date(end_iso)}"
+    return f"{day_date(start_iso)} to {day_date(end_iso)}"
+
+
+def event_sheet_line(event) -> str:
+    """One event from the sheet, without its number.
+
+        Symphony — India's Voice AI Ecosystem (Bengaluru) — Fri 20 Nov
+        Future of AI Summit (London) — Wed 4 to Thu 5 Nov, closes Fri 24 Oct
+        Yourstory Techsparks (Bengaluru) — Tue 13 to Thu 15 Oct, started Tuesday
+        Some Forum (Pune) — 23 September (no year on the sheet — assuming 2027)
+
+    `event` has name, location, start, end (ISO), and when they apply:
+    deadline (ISO, block B), started (the weekday it began), year_assumed (the
+    year the parser chose) with date_text (the cell as written). NOT A LINK:
+    the row's link is already in the sheet.
+    """
+    name = " ".join(str(event.get("name") or "").split()) or "(unnamed event)"
+    location = " ".join(str(event.get("location") or "").split())
+    head = f"{name} ({location})" if location else name
+    year = int(event.get("year_assumed") or 0)
+    if year:
+        raw = " ".join(str(event.get("date_text") or "").split())
+        when = (f"{raw or event_when(event.get('start'), event.get('end'))} "
+                f"(no year on the sheet \u2014 assuming {year})")
+    else:
+        when = event_when(event.get("start"), event.get("end"))
+    line = f"{head} \u2014 {when}"
+    closes = day_date(event.get("deadline"))
+    if closes:
+        line += f", closes {closes}"
+    started = str(event.get("started") or "").strip()
+    if started:
+        line += f", started {started}"
+    return line
+
+
+def event_suggestion_line(link, start_iso, location="") -> str:
+    """"[Cypher 2026](<url>) — Thu 6 Nov, Bengaluru". `link` is the event's
+    name ALREADY as a masked link; the place is the city the search gave."""
+    city = " ".join(str(location or "").split(",")[0].split())
+    line = f"{str(link or '').strip()} \u2014 {day_date(start_iso)}"
+    return line + (f", {city}" if city else "")
+
+
+def events_post(registered, closing, suggested, *, days, when="on Monday") -> dict:
+    """R3's post under its heading and tags: {"lines": [...], "close": "..."}.
+
+    `registered` and `closing` are the sheet lines for blocks A and B (from
+    `event_sheet_line`), `suggested` the block C lines (from
+    `event_suggestion_line`), each WITHOUT its number. THE BLOCKS PRINT IN THE
+    ORDER A, B, C and the numbering runs straight through them from 1. A block
+    with nobody in it does not appear, heading included. With nothing from the
+    sheet, block C stands alone under its own lead; with nothing anywhere the
+    whole post is the one line and there is no closing line.
+
+    `days` is EVENTS_WINDOW_DAYS and `when` is "on Monday" or "tomorrow".
+    """
+    blocks = [(EVENTS_BLOCK_A, [x for x in (registered or ()) if str(x).strip()]),
+              (EVENTS_BLOCK_B, [x for x in (closing or ()) if str(x).strip()])]
+    extra = [x for x in (suggested or ()) if str(x).strip()]
+    from_sheet = sum(len(rows) for _h, rows in blocks)
+    if not from_sheet and not extra:
+        return {"lines": [EVENTS_NOTHING.format(days=int(days))], "close": ""}
+    blocks.append((EVENTS_BLOCK_C if from_sheet else EVENTS_BLOCK_C_ALONE.format(days=int(days)),
+                   extra))
+    lines: list = []
+    n = 0
+    for heading, rows in blocks:
+        if not rows:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(heading)
+        for row in rows:
+            n += 1
+            lines.append(f"{n}. {row}")
+    close = (EVENTS_ADD_AND_REMIND if extra else EVENTS_REMIND).format(when=str(when or "on Monday"))
+    return {"lines": lines, "close": close}
+
+
+def events_lines_for_check() -> list:
+    """Every fixed line R3's post can carry, with stand-in values."""
+    sheet = event_sheet_line({"name": "Voice AI Forum", "location": "Bengaluru",
+                              "start": "2026-11-20", "end": "2026-11-21"})
+    post = events_post([sheet], [sheet], ["Cypher 2026 \u2014 Thu 6 Nov, Bengaluru"], days=14)
+    alone = events_post([], [], ["Cypher 2026 \u2014 Thu 6 Nov, Bengaluru"], days=14, when="tomorrow")
+    return ([l for l in post["lines"] + alone["lines"] if l] + [post["close"], alone["close"],
+            EVENTS_REMIND.format(when="on Monday")] + events_post([], [], [], days=14)["lines"])
+
+
 # -- every line, rendered, for the register check ----------------------------
 
 
@@ -857,6 +1033,7 @@ def all_lines() -> list:
         *next_step_lines_for_check(),
         *[l for l in dm_no_meeting_lines_for_check() if l],
         *closure_lines_for_check(),
+        *events_lines_for_check(),
     ]
 
 

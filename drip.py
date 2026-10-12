@@ -1698,45 +1698,129 @@ def render_prospects(actions: list, *, limit: int = 5) -> Optional[dict]:
         foot=info.get("foot") or ())
 
 
-# -- R3: AI events — what is close enough to mention --------------------------
+# -- R3: AI events — three lines, three blocks, fixed wording ------------------
+# (Until 14 Oct 2026 this was up to five undifferentiated bullets under one of
+# three openers, each linked, with "(+N more — ask and I'll list them)". The
+# post is now `wording.events_post`: three labelled blocks, numbered straight
+# through, three lines in all.)
 
-EVENT_OPENERS = (
-    "Coming up in the next two weeks:",
-    "On the events calendar for the next two weeks:",
-    "Events in the next two weeks:",
-)
-EVENTS_OFFER = "Want me to remind you again {when}?"
+# The remind half of the closing line, under the old name. The offer matcher
+# below is built from this and from the two-part line.
+EVENTS_OFFER = wording.EVENTS_REMIND
 
 
 def event_lines(message: dict) -> list:
-    """R3's line items — everything but the research carrier — soonest first."""
+    """R3's SHEET items — everything but the research carrier — in the order
+    the rule ranked them (`pick_order`, which is `nextaction.event_urgency`)."""
     rows = [a for a in (message.get("actions") or [])
             if a.get("event_line") and a.get("event_kind") != nextaction.EVENT_CARRIER]
-    return sorted(rows, key=lambda a: (str(a.get("event_deadline") or a.get("event_date")
-                                           or "9999"), str(a.get("company") or "").lower()))
+    return sorted(rows, key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        str(a.get("event_deadline") or a.get("event_date") or "9999")))
 
 
-def render_events(message: dict, *, limit: int = 5) -> tuple:
-    """(lines, extra, offer) for R3.
+def event_carrier(message: dict) -> dict:
+    """R3's research carrier, or {}: where the suggestions and the room for
+    them travel."""
+    return next((a for a in (message.get("actions") or [])
+                 if a.get("event_kind") == nextaction.EVENT_CARRIER), {})
 
-        • You're registered for Voice AI Forum on Sat 10 Oct [voiceaiforum.com](<…>)
-        • Register for Data Summit by Fri 2 Oct (event on Tue 6 Oct)
-        Want me to remind you again on Monday?
 
-    The wording of each line is the rule's (`nextaction._r_events`); this adds
-    the row's link and the offer. `offer` is "" when there is nothing to remind
-    anybody about.
-    """
-    cap = max(1, int(limit))
+def event_suggestions(message: dict) -> list:
+    """The events NOT on the sheet that this post shows (block C): what the
+    research put on the carrier, cut to THE ROOM THE SHEET LEFT. The sheet gets
+    first call on the post's three lines; suggestions are what the post does
+    with the room it did not need."""
+    carrier = event_carrier(message)
+    found = [e for e in (carrier.get("event_proposals") or []) if e.get("name")]
+    room = carrier.get("event_room")
+    cap = int(message.get("max_items_per_post") or 0) or 3
+    room = max(0, cap - len(event_lines(message))) if room is None else max(0, int(room))
+    return found[:room]
+
+
+def event_suggestion_line(event: dict) -> str:
+    """One block C line: the event's NAME as a masked link (`links.link`, so
+    the embed is suppressed), its date and its city. A suggestion whose link
+    carries no http(s) scheme would go out as dead text, so it is not a line
+    at all: "" (and it is not shown)."""
+    url = str(event.get("link") or "").strip().strip("<>")
+    name = " ".join(str(event.get("name") or "").split()).replace("@", "@\u200b")
+    if not name or not re.match(r"^https?://\S+$", url):
+        return ""
+    when = event.get("date")
+    iso = dl.iso(when) if isinstance(when, date) else str(when or "")
+    return wording.event_suggestion_line(link(name, url), iso, event.get("location") or "")
+
+
+def event_blocks(message: dict) -> dict:
+    """{"A": [...], "B": [...], "C": [...]}: every line the post shows, each as
+    {"line", "n", ...}, numbered straight through in the order A, B, C. For a
+    block C entry `event` is the suggestion itself."""
     rows = event_lines(message)
-    lines: list = []
-    for a in rows[:cap]:
-        url = str(a.get("event_link") or "").strip().strip("<>")
-        tail = f" {link('', url)}" if url.lower().startswith(("http://", "https://")) else ""
-        lines.append(f"• {a['event_line']}{tail}")
-    extra = [f"(+{len(rows) - cap} more — ask and I'll list them)"] if len(rows) > cap else []
-    word = next((str(a.get("remind_word") or "") for a in rows), "")
-    return lines, extra, (EVENTS_OFFER.format(when=word) if rows and word else "")
+    out = {"A": [], "B": [], "C": []}
+    for a in rows:
+        block = "A" if a.get("event_block") == nextaction.EVENT_BLOCK_A else "B"
+        out[block].append({"line": str(a.get("event_line") or ""), "action": a})
+    for e in event_suggestions(message):
+        line = event_suggestion_line(e)
+        if line:
+            out["C"].append({"line": line, "event": e})
+    n = 0
+    for block in ("A", "B", "C"):
+        for entry in out[block]:
+            n += 1
+            entry["n"] = n
+    return out
+
+
+def events_searched(message: dict) -> bool:
+    """Did the search for new events RUN for this post? Only then may the post
+    say there is "nothing new worth suggesting"."""
+    return str(event_carrier(message).get("event_search") or "") == "ok"
+
+
+def events_remind(message: dict) -> tuple:
+    """(date or None, word) for the closing line: the next
+    EVENTS_REMIND_AGAIN_WEEKDAY, or "tomorrow" when SOMETHING LISTED, from the
+    sheet or suggested, falls before it (`nextaction.remind_again_on`)."""
+    carrier = event_carrier(message)
+    today = dl.parse_date(carrier.get("event_today"))
+    if today is None:
+        return None, "on Monday"
+    starts = [dl.parse_date(a.get("event_date")) for a in event_lines(message)]
+    for e in event_suggestions(message):
+        when = e.get("date")
+        starts.append(when if isinstance(when, date) else dl.parse_date(when))
+    starts = [d for d in starts if d is not None]
+    return nextaction.remind_again_on(today, min(starts) if starts else None)
+
+
+def render_events(message: dict, *, limit: int = 3) -> tuple:
+    """(lines, extra, close) for R3: `wording.events_post`.
+
+        We have registered for these events and they are coming up soon:
+        1. Voice AI Forum (Bengaluru) — Sat 10 Oct
+
+        Events not in the sheet, but worth looking at:
+        2. [Cypher 2026](<…>) — Thu 6 Nov, Bengaluru
+
+    `extra` is always [] (there is no "+N more" line any more). With nothing
+    from the sheet and nothing suggested: the one "nothing anywhere" line when
+    the search ran, and NO LINES AT ALL when it did not, because "nothing new
+    worth suggesting" is a claim only a search can make. `limit` is unused:
+    the rule and the room it reports already hold the post to three lines.
+    """
+    blocks = event_blocks(message)
+    if not any(blocks.values()) and not events_searched(message):
+        return [], [], ""
+    carrier = event_carrier(message)
+    _when, word = events_remind(message)
+    post = wording.events_post(
+        [e["line"] for e in blocks["A"]], [e["line"] for e in blocks["B"]],
+        [e["line"] for e in blocks["C"]],
+        days=int(carrier.get("event_window") or config.EVENTS_WINDOW_DAYS), when=word)
+    return post["lines"], [], post["close"]
 
 
 def prospect_order(actions: list) -> list:
@@ -1862,7 +1946,10 @@ def nothing_to_say(message: dict) -> bool:
         return not research_of(message)
     if message.get("type") != nextaction.R_EVENTS:
         return False
-    return not event_lines(message) and not research_of(message)
+    # R3 HAS SOMETHING TO SAY when it has a line, when the search ran and found
+    # nothing (the one-line "nothing anywhere" post), or when the research
+    # found a deadline to propose. With no line and no search, nothing.
+    return not render_events(message)[0] and not research_of(message)
 
 
 def closure_order(actions: list) -> list:
@@ -1975,11 +2062,12 @@ def points_of(message: dict) -> Optional[dict]:
                 "extra": ([""] + parts["tail"]) if parts["tail"] else [],
                 "close": "", "opener_in_block": True}
     if kind == nextaction.R_EVENTS:
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py: the block headings, the
+        # numbered lines and the closing line. No opener variant.
         lines, extra, offer = render_events(message, limit=cap)
         if not lines:
             return None
-        return {"header": _voice(message, "r3_opener", EVENT_OPENERS),
-                "lines": lines, "extra": extra, "close": offer}
+        return {"header": "", "lines": lines, "extra": extra, "close": offer}
     if kind == nextaction.R_LI_NO_DM:
         people = shown_contacts(message)
         if not people:
@@ -2103,7 +2191,8 @@ def _offer_pattern(template: str):
 # THE TWO POSTS THAT END ON AN OFFER a "yes" answers: R3's "remind you again?"
 # and R5's "add the email I found?". Matched by their FIXED words, built from
 # the templates themselves so a reworded offer cannot drift from its matcher.
-_OFFER_LINES = (_offer_pattern(EVENTS_OFFER), _offer_pattern(EMAIL_OFFER),
+_OFFER_LINES = (_offer_pattern(EVENTS_OFFER), _offer_pattern(wording.EVENTS_ADD_AND_REMIND),
+                _offer_pattern(EMAIL_OFFER),
                 _offer_pattern(wording.LI_NO_DM_ADD_QUESTION))
 
 
@@ -2176,6 +2265,8 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         # R3 ENDS ON ITS OFFER. Whatever the research found (events the tab
         # lacks, missing deadlines) goes between the list and the question, so
         # the last thing the reader sees is the thing a "yes" answers.
+        # A BLANK LINE BETWEEN THE PARTS: the agreed shape has one above the
+        # closing line.
         parts = [points_block(points)]
         if research:
             parts.append(research)
@@ -2184,7 +2275,7 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
             parts.append(f"({note})")
         if points.get("close"):
             parts.append(points["close"])
-        return "\n".join(parts).strip()
+        return "\n\n".join(parts).strip()
     if message.get("type") == nextaction.R_EVENTS and research:
         return research                    # nothing listed; only what was found
     if points:

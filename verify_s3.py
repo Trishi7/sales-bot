@@ -430,7 +430,7 @@ def new_bot(path: str):
     async def nothing(*_a, **_k):
         return None
 
-    async def no_new_events(rows, *, today, marker):
+    async def no_new_events(rows, *, today, marker, **_k):
         return []
 
     async def no_missing_deadlines(rows, *, today, marker):
@@ -967,22 +967,25 @@ async def the_wednesday() -> None:
     for line in [x for x in live["logs"] if x.startswith("[R3]")]:
         print("   log: " + line)
     body = "\n".join(live["posts"].get("R3") or [])
-    bullets = [l for l in body.splitlines() if l.startswith("• ")]
-    check("only the right two show, the nearer date first",
-          bullets,
-          ["• Register for Data Summit by Fri 25 Sep (event on Tue 29 Sep) "
-           "[datasummit.example](<https://datasummit.example/register>)",
-           "• You're registered for Voice AI Forum on Sat 3 Oct "
-           "[voiceaiforum.example](<https://voiceaiforum.example>)"])
+    # REBUILT 14 Oct 2026: two labelled blocks, numbered straight through, the sheet's events not linked. (It was
+    # two bullets, each with its link, "Register for X by ..." and "You're registered for X on ...".)
+    check("only the right two show: the registered one, then the one whose registration is closing",
+          [l for l in body.splitlines() if l and not l.startswith("**") and not l.startswith("<@")][:4],
+          ["We have registered for these events and they are coming up soon:",
+           "1. Voice AI Forum (Bengaluru) \u2014 Sat 3 Oct",
+           "Registration closes soon for these events:",
+           "2. Data Summit (Online) \u2014 Tue 29 Sep, closes Fri 25 Sep"])
+    check("no bullets, no links on sheet events, and no search note in the post",
+          [w for w in ("\u2022", "https://", "web research unavailable") if w in body], [])
     check("the past event, the closed one and the far one are not mentioned",
           [n for n in ("Old Expo", "Closed Conf", "Far Away Con") if n in body], [])
     check("...and the log says why two of them were skipped",
-          (any("Old Expo" in x and "passed" in x for x in live["logs"]),
+          (any("Old Expo" in x and "ended on" in x for x in live["logs"]),
            any("Closed Conf" in x and "registration closed" in x for x in live["logs"])),
           (True, True))
     check("an event next Tuesday is in THIS Wednesday's post", "Data Summit" in body, True)
     check("the post ends on the offer — Monday, since nothing falls before it",
-          body.splitlines()[-1], "Want me to remind you again on Monday?")
+          body.splitlines()[-1], "Shall I remind you again on Monday?")
     check("posted as rendered, never composed", "echo " in body, False)
     same("R3", live, test, sim)
 
@@ -1043,11 +1046,12 @@ async def the_wednesday() -> None:
     for line in [x for x in quiet["logs"] if "nothing to say" in x]:
         print("   log: " + line)
     rows = quiet["bot"].db.drip_sent_today(dl.iso(WED))
-    check("a Wednesday with nothing inside the window posts nothing",
-          quiet["posts"].get("R3"), [])
-    check("...and its slot is recorded, uncounted, so the sweep does not come back "
-          "to it", [(r["action_type"], r["counts_toward_cap"]) for r in rows],
-          [("events", 0)])
+    # CHANGED 14 Oct 2026: with nothing on the tab AND nothing found by the search that ran, R3 now says so in one
+    # line (it used to post nothing and spend the slot silently).
+    check("a Wednesday with nothing inside the window and nothing found says so in one line",
+          [b.splitlines()[-1] for b in quiet["posts"].get("R3") or []],
+          ["No events on the tab for the next 14 days, and nothing new worth suggesting."])
+    check("...as one post", [r["action_type"] for r in rows], ["events"])
 
     # ---- the next Wednesday: weekly, not fortnightly ----
     wednesday_sheet()
@@ -1058,7 +1062,7 @@ async def the_wednesday() -> None:
     check("R3 runs the next Wednesday too — Data Summit has passed, the Forum is "
           "still listed, and the offer is \"tomorrow\" because it is on Saturday",
           ("Voice AI Forum" in body, "Data Summit" in body, body.splitlines()[-1]),
-          (True, False, "Want me to remind you again tomorrow?"))
+          (True, False, "Shall I remind you again tomorrow?"))
 
 
 # -- (w) the wording -----------------------------------------------------------

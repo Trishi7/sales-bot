@@ -8043,6 +8043,23 @@ class SalesBot(discord.Client):
                               wording.nothing_left(self._proposal_label(proposal)),
                               reason="approved append had no events")
             return
+        # "ADD 2 AND 3". The post numbers its lines straight through, and each
+        # suggestion carries its number. A reply that names numbers adds THOSE
+        # suggestions only; a reply with no number adds all of them, as before.
+        # A number that belongs to an event already on the sheet adds nothing.
+        said = [int(x) for x in re.findall(r"(?<![\w.])(\d{1,2})(?![\w.])",
+                                           str(getattr(message, "content", "") or ""))]
+        numbered = {int(e["n"]): e for e in events if e.get("n")}
+        if said and numbered:
+            chosen = [numbered[n] for n in dict.fromkeys(said) if n in numbered]
+            if not chosen:
+                await self._reply(
+                    message, wording.events_add_which(sorted(numbered)),
+                    reason="events append: the numbers named are not suggestions")
+                return
+            log.info("[approvals] R3: %s chose %s of the suggested events %s", decided_by,
+                     [e["n"] for e in chosen], sorted(numbered))
+            events = chosen
 
         tab = await asyncio.to_thread(gtm_sheet.SHEETS.tab, gtm_sheet.EVENTS)
         if tab is None:
@@ -9407,19 +9424,25 @@ class SalesBot(discord.Client):
         `open_proposal_for_message` exactly as it does for a cell update — there
         is one approval mechanism in this bot and R3 does not get its own.
         """
-        found: list = []
+        # ONLY THE SUGGESTIONS THE POST SHOWED (its third block), each with the
+        # number it carries there, so a reply can say "add 2 and 3".
+        found = [{**entry["event"], "n": entry["n"]}
+                 for entry in drip.event_blocks(message)["C"]]
         deadlines: list = []
         for action in (message.get("actions") or []):
-            found.extend(action.get("event_proposals") or [])
-            deadlines.extend(action.get("deadline_proposals") or [])
+            for d in action.get("deadline_proposals") or []:
+                if d not in deadlines:
+                    deadlines.append(d)
         if not found and not deadlines:
             return
 
         for kind, items, payload in (
             ("event_append", found,
-             {"events": [{**e, "date": dl.iso(e["date"]),
+             {"events": [{**e, "date": (dl.iso(e["date"]) if isinstance(e.get("date"), date)
+                                        else str(e.get("date") or "")),
                           "deadline": (dl.iso(e["deadline"])
-                                       if e.get("deadline") else "")}
+                                       if isinstance(e.get("deadline"), date)
+                                       else str(e.get("deadline") or ""))}
                          for e in found]}),
             ("event_deadline", deadlines,
              {"deadlines": [{"name": d["name"], "sheet_row": d.get("sheet_row"),
@@ -10358,10 +10381,11 @@ class SalesBot(discord.Client):
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
-            # R2's, R13's, R6's and R7's agreed shapes have a blank line between
-            # the tags and the list.
+            # R2's, R13's, R6's, R7's and R3's agreed shapes have a blank line
+            # between the tags and the list.
             gap=message.get("type") in (nextaction.R_NEWS_SCREEN, nextaction.R_NEXT_STEPS,
-                                        nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING),
+                                        nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING,
+                                        nextaction.R_EVENTS),
         )
         opener_text = body
         # THE HEADING GOES ON LAST, ABOVE THE TAGS LINE: one bold line per
@@ -11037,16 +11061,17 @@ class SalesBot(discord.Client):
         """
         if message.get("type") != nextaction.R_EVENTS:
             return
-        lines, _extra, offer = drip.render_events(
-            message, limit=int(message.get("max_items_per_post") or 0) or 20)
-        rows = drip.event_lines(message)
-        if not offer or not rows:
+        _lines, _extra, offer = drip.render_events(message)
+        blocks = drip.event_blocks(message)
+        # THE SAME LIST, sheet events and suggestions alike, as plain lines.
+        shown = [e["line"] for b in ("A", "B", "C") for e in blocks[b]]
+        if not offer or not shown:
             return
+        on, word = drip.events_remind(message)
         key = f"events_remind:{marker}:{getattr(sent, 'id', 0)}"
         channel_id = int(getattr(getattr(sent, "channel", None), "id", 0) or 0)
-        payload = {"on": str(rows[0].get("remind_on") or ""),
-                   "word": str(rows[0].get("remind_word") or ""), "time": "14:00",
-                   "lines": [str(a.get("event_line") or "") for a in rows][:len(lines)]}
+        payload = {"on": dl.iso(on) if on else "", "word": word, "time": "14:00",
+                   "lines": shown}
         await asyncio.to_thread(
             lambda: self.db.open_proposal(
                 proposal_key=key, kind="events_remind", tab=gtm_sheet.EVENTS,
@@ -11163,18 +11188,6 @@ class SalesBot(discord.Client):
                          "next is %s; %d paused", shown[0].get("company") or "?", len(shown),
                          int(info.get("left_total") or 0), info.get("next_company") or "nobody",
                          len(state_.get("paused") or []))
-        elif kind == nextaction.R_EVENTS:
-            for action in drip.event_lines(message):
-                key = str(action.get("event_unclear_key") or "")
-                if not key:
-                    continue
-                await asyncio.to_thread(
-                    lambda a=action, k=key: self.db.record_event_reminder(
-                        event_key=k, event=a.get("company", ""), event_date="",
-                        location="", sent_on=marker))
-                log.info("[rules] R3: %r listed once as \"date unclear\"; it is not "
-                         "listed again until the sheet's date can be read",
-                         action.get("company"))
         elif kind == nextaction.R_NEWS_SCREEN:
             # R2: THE MARKER AND THE LEDGER, FOR A LIVE POST ONLY. A test day or
             # a simulation gets the same message and leaves both untouched, so
@@ -11794,9 +11807,6 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[rules] R9's ladder could not be read")
             meeting_followups = {}
-        # R3 lists an event whose date it cannot read ONCE; this is what it
-        # has already listed.
-        unclear_seen = await asyncio.to_thread(self.db.event_keys_recorded, "unclear|")
         # NEXT STEPS FILLED, OR THE MEETING MOVED: that chase is over.
         try:
             meeting_followups = await self._reset_answered_ladders(
@@ -11829,7 +11839,6 @@ class SalesBot(discord.Client):
                 # ones: a never-contacted row is exactly what the activation
                 # gate has not let through yet.
                 prospect_rows=list(tab.rows),
-                events_unclear_seen=unclear_seen,
                 next_step_state=next_step_state,
                 dm_no_meeting_state=dm_no_meeting_state,
                 # R11's CROSS-CHECK: a SUMMARY of every row on the tab (a count
@@ -13022,10 +13031,17 @@ class SalesBot(discord.Client):
     async def _events_run(self, items: list, *, today) -> list:
         """R3's web half: find events we lack, and fill in missing deadlines.
 
-        ONLY WHEN THERE IS SOMETHING TO ASK. Discovery runs when the per-run
-        and per-month ceilings leave room; the backfill runs when at least one
-        row has an unknown deadline that has not been looked for recently. A
-        fortnight where neither is true costs nothing.
+        THE SUGGESTIONS FILL THE ROOM THE SHEET LEFT (14 Oct 2026). The post is
+        three lines; the rule says how many the sheet used (`event_room` on its
+        carrier). Three from the sheet means NO discovery search at all that
+        week; one means at most two suggestions. They ride on the carrier as
+        `event_proposals` and the post shows them as its third block
+        (`drip.event_blocks`).
+
+        THE DEADLINE BACKFILL RUNS AS IT ALWAYS HAS, and it is what brings the
+        "Registration closes soon" block back: a row with no usable deadline is
+        skipped by the rule, and every deadline found here and accepted turns
+        one into a line.
 
         NEITHER WRITES. Discovery proposes rows and the backfill proposes cells;
         both wait for an approver. `gtm_sheet.append_row` and the cell write are
@@ -13035,27 +13051,32 @@ class SalesBot(discord.Client):
         event_items = [i for i in items if i.get("rule") == nextaction.R_EVENTS]
         if not event_items:
             return []
+        # THE CARRIER IS WHERE THE SUGGESTIONS LAND. The rule always supplies one;
+        # a caller that hands over a bare R3 item (no carrier, so no statement
+        # of how much room the sheet left) gets the per-run ceiling instead.
+        carrier = next((i for i in event_items
+                        if i.get("event_kind") == nextaction.EVENT_CARRIER), event_items[0])
 
         ok, why = await self._search_available()
         if not ok:
             for item in event_items:
                 self._mark_unresearched(item, why)
+                item["event_search"] = "unavailable"
             return event_items
 
         marker = dl.iso(today)
         rows = await self._rule_tab_rows(gtm_sheet.EVENTS, "R3")
 
-        found = await self._discover_events(rows, today=today, marker=marker)
+        room = carrier.get("event_room")
+        room = None if room is None else int(room)
+        found = await self._discover_events(rows, today=today, marker=marker, room=room)
         deadlines_found, deadline_note = await self._backfill_deadlines(
             rows, today=today, marker=marker,
         )
 
-        # THE EXTRAS RIDE THE RULE'S OWN ITEMS rather than becoming new ones.
-        # R3 already has a place in the day's plan and a cap; a discovery that
-        # arrived as a separate item would quietly double the rule's volume.
+        # THE DEADLINE PROPOSAL RIDES UNDER THE BLOCKS, as it did. The
+        # discoveries no longer do: they are block C, rendered with the list.
         extra: list = []
-        if found:
-            extra.append(events_discovery.render_proposal(found))
         if deadlines_found:
             extra.append(events_discovery.render_deadline_proposal(deadlines_found))
         if deadline_note:
@@ -13063,37 +13084,59 @@ class SalesBot(discord.Client):
 
         for item in event_items:
             item["web_pending"] = False
+            item["event_search"] = "ok"
             item["text"] = str(item.get("text") or "").replace(
                 f" [{rules.WEB_PENDING}]", ""
             )
+            item["research_note"] = ""
+            is_carrier = item is carrier
+            if is_carrier:
+                item["event_proposals"] = found
+                item["deadline_proposals"] = deadlines_found
             if extra:
                 item["research"] = "\n\n".join(extra)
-                item["research_note"] = ""
+            if is_carrier and (found or deadlines_found):
                 item["sources"] = (
                     [{"url": e["link"], "title": e["name"]} for e in found]
                     + [{"url": d["source"], "title": d["name"]}
                        for d in deadlines_found]
                 )
-                item["event_proposals"] = found
-                item["deadline_proposals"] = deadlines_found
-            else:
-                # NOTHING NEW IS NOT A LINE IN THE POST. It used to be said in
-                # brackets under the list; the post now ends on its offer, and
-                # in a week with nothing listed either there is no post at all.
-                item["research_note"] = ""
-                log.info("[events] %s: nothing new to add — every event found is "
-                         "already on the tab, and no deadline was missing", marker)
+        if not found and not extra:
+            log.info("[events] %s: nothing new to add — no event worth suggesting in the "
+                     "room left (%s), and no deadline was found", marker,
+                     "the per-run limit" if room is None else room)
         return event_items
 
-    async def _discover_events(self, rows: list, *, today, marker: str) -> list:
-        """Look for events we do not have. Returns what is worth proposing.
+    async def _discover_events(self, rows: list, *, today, marker: str,
+                               room: Optional[int] = None) -> list:
+        """Look for events we do not have. Returns what is worth suggesting.
 
-        TWO SEARCHES AND THE CALENDAR PAGES. "AI conference <month> <year>
-        India OR global" for this month and next, plus `fetch_page` on each url
-        in EVENTS_CALENDAR_URLS (read around the two month names, where a
+        AT MOST `room` OF THEM: the places the sheet left in the post, and
+        never more than EVENTS_DISCOVERY_MAX_PER_RUN. With no room the search
+        is not run at all.
+
+        ONLY IN EVENTS_SUGGEST_LOCATIONS. The searches and the prompt both name
+        those places, and `events_discovery.choose` filters on the location
+        each result states, because a prompt instruction is not a filter.
+
+        TWO SEARCHES AND THE CALENDAR PAGES: "AI conference <month> <year>
+        <places>" for this month and next, plus `fetch_page` on each url in
+        EVENTS_CALENDAR_URLS (read around the two month names, where a
         calendar lists its events). MODEL_LIGHT returns EVENT lines from those
-        snippets; `events_discovery.parse_events` and `choose` are unchanged.
+        snippets.
         """
+        per_run = max(0, int(config.EVENTS_DISCOVERY_MAX_PER_RUN))
+        if room is not None:
+            per_run = min(per_run, max(0, int(room)))
+        if per_run <= 0:
+            log.info("[events] the sheet filled every line of the post — no suggestions "
+                     "this run, and no discovery search")
+            return []
+        places = [str(p).strip() for p in (config.EVENTS_SUGGEST_LOCATIONS or []) if str(p).strip()]
+        if not places:
+            log.warning("[events] EVENTS_SUGGEST_LOCATIONS is empty, so no event can be "
+                        "suggested — no discovery this run")
+            return []
         month = today.strftime("%Y-%m")
         try:
             used = await asyncio.to_thread(
@@ -13103,20 +13146,20 @@ class SalesBot(discord.Client):
             return []
         per_month = max(0, int(config.EVENTS_DISCOVERY_MAX_PER_MONTH))
         if used >= per_month:
-            log.info("[events] %d event(s) already proposed in %s, which is the "
-                     "limit of %d — no discovery this run", used, month, per_month)
+            log.warning("[events] %d event(s) already suggested in %s, which is the "
+                        "monthly limit of %d (EVENTS_DISCOVERY_MAX_PER_MONTH) — the "
+                        "suggestions block is quiet until next month", used, month, per_month)
             return []
 
         nxt = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
         months = [today.strftime("%B"), nxt.strftime("%B")]
+        where = " OR ".join(places)
         result = await self._one_search(
             events_discovery.discovery_prompt(rows, today=today),
             rule_id="R3", lean=True, max_uses=2,
             queries=[
-                {"q": f"AI conference {today.strftime('%B %Y')} India OR global",
-                 "n": 10},
-                {"q": f"AI conference {nxt.strftime('%B %Y')} India OR global",
-                 "n": 10},
+                {"q": f"AI conference {today.strftime('%B %Y')} {where}", "n": 10},
+                {"q": f"AI conference {nxt.strftime('%B %Y')} {where}", "n": 10},
             ],
             pages=list(config.EVENTS_CALENDAR_URLS or []),
             focus=tuple(months),
@@ -13131,13 +13174,13 @@ class SalesBot(discord.Client):
         candidates = events_discovery.parse_events(text)
         keep, skipped = await asyncio.to_thread(
             lambda: events_discovery.choose(
-                candidates, existing=rows, today=today, db=self.db,
+                candidates, existing=rows, today=today, db=self.db, per_run=per_run,
             )
         )
         for line in skipped:
-            log.info("[events] not proposing: %s", line)
-        log.info("[events] discovery: %d candidate(s), %d proposed, %d skipped",
-                 len(candidates), len(keep), len(skipped))
+            log.info("[events] not suggesting: %s", line)
+        log.info("[events] discovery: %d candidate(s), %d suggested (room for %d), %d "
+                 "skipped", len(candidates), len(keep), per_run, len(skipped))
 
         if keep:
             await asyncio.to_thread(

@@ -20,8 +20,15 @@ itself. Discovery proposes a row and waits; backfill proposes a cell and waits.
 design rather than an accident — a bot that adds rows to a shared sheet on the
 strength of a search result is a bot somebody turns off.
 
-THE LIMITS ARE THERE BECAUSE PROPOSALS COST ATTENTION. Three per run and eight a
-month, counted in SQLite. A discovery feature with no ceiling produces a weekly
+SINCE 14 Oct 2026 THE DISCOVERIES ARE BLOCK C OF R3's WEDNESDAY POST ("Events not
+in the sheet, but worth looking at"), filling whatever of the post's three lines
+the sheet did not need, and ONLY FROM THE PLACES THE TEAM CAN GET TO
+(EVENTS_SUGGEST_LOCATIONS; `location_allowed`, a filter in code and not only a
+line in the prompt). `render_proposal` is the older stand-alone wording, kept for
+its checks.
+
+THE LIMITS ARE THERE BECAUSE PROPOSALS COST ATTENTION. Three per run and twelve a
+month (four Wednesdays at three), counted in SQLite. A discovery feature with no ceiling produces a weekly
 listings page, and a listings page is not read — at which point the one event
 that mattered is missed by exactly the same margin as if the feature did not
 exist.
@@ -83,6 +90,24 @@ def event_key(name: str, when: Optional[date]) -> str:
 
 def deadline_is_unknown(value) -> bool:
     return _norm(value).strip() in UNKNOWN_DEADLINE
+
+
+def location_allowed(location, places=None) -> bool:
+    """Is this event somewhere the team would go? EVENTS_SUGGEST_LOCATIONS.
+
+    A FILTER IN CODE. The search prompt names the same places, and a prompt
+    instruction is not a filter: a model asked for Bangalore and London still
+    returns a summit in Mumbai when it is a good one. Matched NORMALISED AND AS
+    WHOLE WORDS against the location the search returned ("Bengaluru, India",
+    "London, UK"), so "Londonderry" is not London. A candidate with no
+    location, or with an empty list of places, is NOT suggested: nothing says
+    where it is.
+    """
+    places = config.EVENTS_SUGGEST_LOCATIONS if places is None else places
+    have = f" {_norm(location)} "
+    if not have.strip():
+        return False
+    return any(_norm(p) and f" {_norm(p)} " in have for p in (places or ()))
 
 
 # -- matching against what the tab already has --------------------------------
@@ -189,6 +214,13 @@ def discovery_prompt(existing: list, *, today: date,
         f"ONLY events whose date falls in those two months, and only ones that have "
         f"NOT already happened (today is {dl.iso(today)}).",
     ]
+    places = [str(p).strip() for p in (config.EVENTS_SUGGEST_LOCATIONS or []) if str(p).strip()]
+    if places:
+        lines += [
+            "",
+            "ONLY events held IN PERSON in one of these places: " + ", ".join(places)
+            + ". An event anywhere else is not wanted, however good.",
+        ]
     if seeds:
         lines += [
             "",
@@ -275,6 +307,7 @@ def choose(candidates: list, *, existing: list, today: date, db,
 
     THE GATES, IN ORDER AND FOR DIFFERENT REASONS:
       1. it has a date we can read and a link                 (parse_events)
+      1a. it is in one of EVENTS_SUGGEST_LOCATIONS            (location_allowed)
       2. the date is in this month or next, and ahead of us
       3. it is not already on the tab, spelling tolerated
       4. it has not been proposed before — a no is an answer
@@ -300,6 +333,10 @@ def choose(candidates: list, *, existing: list, today: date, db,
     skipped: list = []
 
     for cand in candidates:
+        if not location_allowed(cand.get("location")):
+            skipped.append(f"{cand['name']} — {cand.get('location') or 'no location given'} "
+                           "is not one of EVENTS_SUGGEST_LOCATIONS")
+            continue
         if len(keep) >= int(per_run):
             skipped.append(f"{cand['name']} — over the {per_run}-per-run limit, "
                            "it will come up again")
@@ -367,14 +404,22 @@ def append_values(event: dict) -> dict:
     of them. An empty cell is a question somebody can answer; an invented one is
     a wrong answer nobody knows to check.
     """
+    def day(value) -> str:
+        # AN APPROVED PROPOSAL COMES BACK FROM SQLITE AS JSON, so its dates are
+        # ISO strings by then, not `date` objects. Both are written the same.
+        if isinstance(value, date):
+            return dl.iso(value)
+        when = _read_date(str(value or ""))
+        return dl.iso(when) if when else ""
+
     values = {
         "event": str(event.get("name") or "").strip(),
         "location": str(event.get("location") or "").strip(),
-        "event_date": dl.iso(event["date"]) if event.get("date") else "",
+        "event_date": day(event.get("date")),
         "link": str(event.get("link") or "").strip(),
     }
     if event.get("deadline"):
-        values["registration_deadline"] = dl.iso(event["deadline"])
+        values["registration_deadline"] = day(event["deadline"])
     return {k: v for k, v in values.items() if v}
 
 

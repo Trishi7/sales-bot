@@ -595,7 +595,7 @@ class World:
         async def nothing(*_a, **_k):
             return None
 
-        async def no_new_events(rows, *, today, marker):
+        async def no_new_events(rows, *, today, marker, **_k):
             return []
 
         async def no_missing_deadlines(rows, *, today, marker):

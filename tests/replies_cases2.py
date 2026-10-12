@@ -54,7 +54,11 @@ async def _open_on(w, kind, sent):
         await w.bot._open_poc_lookup_proposal({"type": nextaction.R_NEW_COMPANY, "companies": ["Acme AI"]},
                                               sent=sent, marker=marker)
     elif kind in ("event_append", "event_deadline"):
-        act = ({"event_proposals": [{"name": "Data Summit", "date": date(2026, 10, 13), "deadline": date(2026, 10, 9),
+        # (14 Oct 2026: the suggestions ride on R3's carrier and are shown as the post's third block; one with no
+        # link is not shown, so it has one here.)
+        act = ({"event_kind": nextaction.EVENT_CARRIER, "event_room": 3, "event_today": "2026-10-07",
+                "event_proposals": [{"name": "Data Summit", "date": date(2026, 10, 13), "deadline": date(2026, 10, 9),
+                                     "location": "London, UK", "link": "https://datasummit.example",
                                      "event_key": "ds"}]} if kind == "event_append"
                else {"deadline_proposals": [{"name": "Data Summit", "sheet_row": 3, "deadline": date(2026, 10, 9),
                                              "source": "https://datasummit.example"}]})
@@ -62,10 +66,13 @@ async def _open_on(w, kind, sent):
     elif kind == "email_write":
         return await _open_email(w, sent)
     elif kind == "events_remind":
-        act = {"event_line": "You're registered for Voice AI Forum on Sat 17 Oct", "remind_on": "2026-10-12",
-               "remind_word": "Monday", "event_link": ""}
-        await w.bot._open_events_remind_proposal({"type": nextaction.R_EVENTS, "max_items_per_post": 5,
-                                                  "actions": [act]}, sent=sent, marker=marker)
+        # (14 Oct 2026: the reminder's day is worked out from the post's own day and what it lists.)
+        act = {"event_kind": nextaction.EVENT_REGISTERED, "event_block": nextaction.EVENT_BLOCK_A, "pick_order": 0,
+               "event_line": "Voice AI Forum (Bengaluru) \u2014 Sat 17 Oct", "event_date": "2026-10-17"}
+        carrier = {"event_kind": nextaction.EVENT_CARRIER, "event_room": 2, "event_today": "2026-10-07",
+                   "event_search": "ok"}
+        await w.bot._open_events_remind_proposal({"type": nextaction.R_EVENTS, "max_items_per_post": 3,
+                                                  "actions": [act, carrier]}, sent=sent, marker=marker)
     keys = [k for k in w.proposals() if k.startswith(kind + ":")]
     assert keys, f"the real opener for {kind} opened nothing"
     return keys[-1]
@@ -163,5 +170,5 @@ async def e3b_an_already_sent_post_comes_back_from_the_stored_body(check, test_m
               rc.today_group(after, wording.TODAY_ALSO), line)
         check("E3b: the post's own text is not pasted, and there is no closing offer line",
               ([l for l in stored.splitlines()[1:] if l.strip() and l in after],
-               "Want me to remind you" in after), ([], False))
+               "remind you again" in after), ([], False))
         return {"text": after}

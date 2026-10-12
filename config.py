@@ -2214,8 +2214,24 @@ NEWS_REPEAT_DAYS = _int("NEWS_REPEAT_DAYS", 30)
 # because they stop different things: the per-run limit stops one message
 # becoming a listings page, and the per-month limit stops a slow drip of
 # proposals nobody has time to read.
+#
+# 12 A MONTH SINCE 14 Oct 2026 (it was 8). Eight was set when suggestions were an
+# occasional extra; they are now what fills R3's post when the sheet has
+# nothing close, and that will be most weeks. Four Wednesdays at three is
+# twelve; at eight the suggestions went quiet two posts before the month ended
+# with nothing saying why. The per-run three is the limit that protects the
+# reader. (A run proposes at most the room the post has left: three lines in
+# all, the sheet first.)
 EVENTS_DISCOVERY_MAX_PER_RUN = _int("EVENTS_DISCOVERY_MAX_PER_RUN", 3)
-EVENTS_DISCOVERY_MAX_PER_MONTH = _int("EVENTS_DISCOVERY_MAX_PER_MONTH", 8)
+EVENTS_DISCOVERY_MAX_PER_MONTH = _int("EVENTS_DISCOVERY_MAX_PER_MONTH", 12)
+
+# WHERE A SUGGESTED EVENT MAY BE. An event whose location matches none of these
+# is never suggested, however good. Matched normalised, as whole words, against
+# the location the search returned (`events_discovery.location_allowed`): a
+# filter in code, not only a line in the prompt. It does not touch the events
+# already on the sheet.
+EVENTS_SUGGEST_LOCATIONS: list[str] = _str_list(
+    "EVENTS_SUGGEST_LOCATIONS", "Bangalore,Bengaluru,Karnataka,London")
 
 # How long before the bot asks again about a registration deadline it could not
 # find. Saying "I couldn't find it" once is useful; saying it every other
@@ -3702,6 +3718,32 @@ def validate() -> list[str]:
                 "is meant to be public — starting on a DM means the first anyone else "
                 "hears of a stalled meeting is the escalation.",
                 MEETING_FOLLOWUP_LADDER[0],
+            )
+        log.info(
+            "[config] R3 events (Wednesdays): THREE lines in the whole post, the sheet "
+            "first: registered and starting within %dd; not registered with a registration "
+            "deadline still ahead (the deadline or the start within %dd), closing soonest "
+            "first; a row with no usable deadline is skipped; then suggestions fill the room "
+            "left, only from %s, at most %d a run and %d a month; nothing is added without "
+            "a yes; the offer reminds again on weekday %d",
+            EVENTS_WINDOW_DAYS, EVENTS_WINDOW_DAYS,
+            "/".join(EVENTS_SUGGEST_LOCATIONS) or "(nowhere)",
+            EVENTS_DISCOVERY_MAX_PER_RUN, EVENTS_DISCOVERY_MAX_PER_MONTH,
+            EVENTS_REMIND_AGAIN_WEEKDAY,
+        )
+        if not EVENTS_SUGGEST_LOCATIONS:
+            log.warning(
+                "EVENTS_SUGGEST_LOCATIONS is empty. R3 only suggests an event held in one "
+                "of those places, so no event could ever be suggested and the third block "
+                "of the Wednesday post would never appear. The default is: "
+                "Bangalore,Bengaluru,Karnataka,London"
+            )
+        if EVENTS_DISCOVERY_MAX_PER_MONTH < EVENTS_DISCOVERY_MAX_PER_RUN * 4:
+            log.warning(
+                "EVENTS_DISCOVERY_MAX_PER_MONTH=%d is below 4 x EVENTS_DISCOVERY_MAX_PER_RUN "
+                "(%d). R3's suggestions will go quiet before the month ends, with nothing "
+                "in the post saying why. The agreed numbers are 3 a run and 12 a month.",
+                EVENTS_DISCOVERY_MAX_PER_MONTH, EVENTS_DISCOVERY_MAX_PER_RUN,
             )
         log.info(
             "[config] R10 closure support (Mondays): a closure stage (%s, whole words) AND "

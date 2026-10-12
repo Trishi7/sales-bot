@@ -379,12 +379,13 @@ async def d11b_a_refused_send_opens_no_proposal(check, test_mode):
 async def d12_yes_to_the_last_part_of_a_two_part_r3_post(check, test_mode):
     """F3: only the FIRST part of a split post was recorded, and R3's offer is in the LAST."""
     import wording
-    with World(test_mode, pretend=(WED, 14, 5), pins={"QUERY_REPLY_CHUNK": 230}) as w:
+    # (200, it was 230: the R3 post was reworded on 14 Oct 2026, and at 230 the [TEST] tag moved the split by a line.)
+    with World(test_mode, pretend=(WED, 14, 5), pins={"QUERY_REPLY_CHUNK": 200}) as w:
         n = w.n_posted
         post, _ = await w.send_r3_post(WED)
         parts = w.posted[n:]
         check("D12 setup: the post went out in two or more parts, the offer in the last",
-              (len(parts) >= 2, "Want me to remind you" in parts[-1].content), (True, True))
+              (len(parts) >= 2, "remind you again" in parts[-1].content), (True, True))
         key = next(iter(w.proposals()))
         m = Mark(w)
         await w.say("yes", reply_to=parts[-1])
@@ -718,7 +719,11 @@ async def _kind_opener(w, kind):
         await w.bot._open_poc_lookup_proposal({"type": nextaction.R_NEW_COMPANY, "companies": ["Acme AI"]},
                                               sent=sent, marker=marker)
     elif kind in ("event_append", "event_deadline"):
-        act = ({"event_proposals": [{"name": "Data Summit", "date": date(2026, 10, 13), "deadline": date(2026, 10, 9),
+        # (14 Oct 2026: the suggestions ride on R3's carrier and are shown as the post's third block; one with no
+        # link is not shown, so it has one here.)
+        act = ({"event_kind": nextaction.EVENT_CARRIER, "event_room": 3, "event_today": "2026-10-07",
+                "event_proposals": [{"name": "Data Summit", "date": date(2026, 10, 13), "deadline": date(2026, 10, 9),
+                                     "location": "London, UK", "link": "https://datasummit.example",
                                      "event_key": "ds"}]} if kind == "event_append"
                else {"deadline_proposals": [{"name": "Data Summit", "sheet_row": 3, "deadline": date(2026, 10, 9),
                                              "source": "https://datasummit.example"}]})
@@ -726,10 +731,13 @@ async def _kind_opener(w, kind):
     elif kind == "email_write":
         return sent, await _open_email(w, sent)
     elif kind == "events_remind":
-        act = {"event_line": "You're registered for Voice AI Forum on Sat 17 Oct", "remind_on": "2026-10-12",
-               "remind_word": "Monday", "event_link": ""}
-        await w.bot._open_events_remind_proposal({"type": nextaction.R_EVENTS, "max_items_per_post": 5,
-                                                  "actions": [act]}, sent=sent, marker=marker)
+        # (14 Oct 2026: the reminder's day is worked out from the post's own day and what it lists.)
+        act = {"event_kind": nextaction.EVENT_REGISTERED, "event_block": nextaction.EVENT_BLOCK_A, "pick_order": 0,
+               "event_line": "Voice AI Forum (Bengaluru) \u2014 Sat 17 Oct", "event_date": "2026-10-17"}
+        carrier = {"event_kind": nextaction.EVENT_CARRIER, "event_room": 2, "event_today": "2026-10-07",
+                   "event_search": "ok"}
+        await w.bot._open_events_remind_proposal({"type": nextaction.R_EVENTS, "max_items_per_post": 3,
+                                                  "actions": [act, carrier]}, sent=sent, marker=marker)
     elif kind == "row_add":
         key = w.open_proposal(kind="row_add", message_id="", payload={"people": [{"name": "Janajit Bagchi",
                                                                                 "company": "ARTPARK India"}]})
@@ -866,7 +874,7 @@ def blocks_match(answer, posts, order):
 
 def _without_offer_line(post):
     lines = post.rstrip().splitlines()
-    return "\n".join(lines[:-1]) if lines and lines[-1].startswith("Want me to") else post
+    return "\n".join(lines[:-1]) if lines and lines[-1].startswith(("Want me to", "Shall I remind")) else post
 
 
 @case
@@ -889,7 +897,7 @@ async def o_objectives_text_is_what_the_posts_contain(check, test_mode):
                if l.strip() and l in text], [])
         check("O: what is due soon is there instead: the registration that closes inside the look-ahead",
               today_group(text, wording.TODAY_DUE), ["- Fri 2 Oct: registration for Data Summit closes"])
-        check("O: the closing offer is not in the answer (Q3)", ("Want me to remind you" in text) == Q3_OFFER_LINES_IN_OBJECTIVES, True)
+        check("O: the closing offer is not in the answer (Q3)", ("remind you again" in text) == Q3_OFFER_LINES_IN_OBJECTIVES, True)
         check("O: none of the forbidden words (times, rules, rule numbers, schedule words)", forbidden_in(text), [])
         check("O: no AI-news block (Q1)", ("AI news" in text) == Q1_AI_NEWS_IN_OBJECTIVES, True)
         check("O: no @-mention in the answer (asking pings nobody)", "<@" in text, False)

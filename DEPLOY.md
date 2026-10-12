@@ -1502,3 +1502,60 @@ posted M deal(s); the last-posted marker is now ...` (the numbers are illustrati
 `bot_rules.yaml`); paste it into the sheet.
 
 `python verify_closure_support.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R3 rebuild (14 Oct): AI events and summits
+
+What changes for the team: the Wednesday post becomes **three lines in total**, in up to three labelled blocks:
+the events we are registered for that start in the next 14 days; the ones we have not registered for whose
+registration is closing; and events that are not on the sheet but look worth adding, from Bangalore, Karnataka or
+London. The lines are numbered straight through, so a reply can say "add 2 and 3". It still ends by offering to
+remind you again on Monday.
+
+**The first post will be suggestions only.** A row we are not registered for is now listed only when its "Last day
+for registration" cell holds a real date that has not passed. Rows where that cell is blank or says "not available"
+are no longer listed (the old "no registration deadline on the sheet" line is gone), and that is most of the tab
+today. **Filling in the registration deadlines is what brings the "Registration closes soon" block to life.** The
+"date unclear" line is gone too: a date Saley cannot read is skipped and logged.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** One default changed. A default only applies
+when the line is absent, so **if the line is already there, change it**:
+
+```
+EVENTS_DISCOVERY_MAX_PER_MONTH=12
+```
+
+One new variable; the default is what was specified, so the line is optional:
+
+```
+EVENTS_SUGGEST_LOCATIONS=Bangalore,Bengaluru,Karnataka,London
+```
+
+The other changed default is not in `.env`: rule 3's `max_items_per_post` in `bot_rules.yaml` went from 5 to 3, and
+ships with the code. Nothing is retired. Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** Nothing to migrate. The table that remembered a "date unclear" line is no longer written by rule 3.
+
+**What to look for in the boot log:**
+
+```
+[config] R3 events (Wednesdays): THREE lines in the whole post, the sheet first: registered and starting within 14d; not registered with a registration deadline still ahead (the deadline or the start within 14d), closing soonest first; a row with no usable deadline is skipped; then suggestions fill the room left, only from Bangalore/Bengaluru/Karnataka/London, at most 3 a run and 12 a month; nothing is added without a yes; the offer reminds again on weekday 0
+```
+
+A warning follows if `EVENTS_SUGGEST_LOCATIONS` is empty, or if `EVENTS_DISCOVERY_MAX_PER_MONTH` is below four
+times `EVENTS_DISCOVERY_MAX_PER_RUN`. On a Wednesday, when the queue is computed, one line a skipped row and a
+summary:
+
+```
+[R3] skipped 'Some Event' (row 4): not registered and no usable registration deadline ('not available')
+[R3] 7 row(s) read: 0 registered and starting within 14d, 0 with registration closing; 7 skipped, 0 left out by the cap of 3; room for 3 suggestion(s)
+[events] discovery: 5 candidate(s), 3 suggested (room for 3), 2 skipped
+```
+
+(the numbers are illustrative). An event outside the three places shows as `[events] not suggesting: <name> —
+<place> is not one of EVENTS_SUGGEST_LOCATIONS`. When the month's twelve are used up: `[events] 12 event(s)
+already suggested in 2026-10, which is the monthly limit of 12`.
+
+**The Bot Rules tab, by hand.** Rule 3's "What the Bot Shares / Checks" wording is new end to end
+(`sheet_wording` in `bot_rules.yaml`); paste it into the sheet.
+
+`python verify_events.py --show` checks all of it offline and prints the messages.
