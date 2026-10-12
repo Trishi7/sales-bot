@@ -223,10 +223,19 @@ out_yes = nextaction.run(today=date(2026, 9, 22), rows=prospects, day_rules=[R5]
 
 print(f"  without focus  {[a['company'] for a in out_no['actions']]}")
 print(f"  WITH focus     {[a['company'] for a in out_yes['actions']]}")
-check("unfocused takes the first two companies in sheet order",
-      sorted({a["company"] for a in out_no["actions"]}), ["Acme", "PolyAI"])
-check("focused takes the two that match",
-      sorted({a["company"] for a in out_yes["actions"]}), ["PolyAI", "Wispr Flow"])
+# CHANGED 11 Oct 2026: R5 opens ONE company, chosen by score (it was the first
+# two in sheet order). PolyAI and Wispr Flow are both voice with one person
+# left, so sheet order decides between them. A focus puts the companies it
+# matches first; it no longer picks two.
+check("unfocused opens the one best-scoring company (voice; sheet order on the tie)",
+      sorted({a["company"] for a in out_no["actions"]}), ["PolyAI"])
+check("focused on a voice industry still opens a company that matches it",
+      sorted({a["company"] for a in out_yes["actions"]}), ["PolyAI"])
+out_robot = nextaction.run(today=date(2026, 9, 22), rows=prospects, day_rules=[R5],
+                           focus={"value": "Robotics"})
+print(f"  focus Robotics {[a['company'] for a in out_robot['actions']]}")
+check("a focus reaches the choice itself: Robotics opens Borealis ahead of the voice companies",
+      sorted({a["company"] for a in out_robot["actions"]}), ["Borealis"])
 note = out_yes["actions"][0].get("focus_note", "")
 print(f"  R5 says        {note}")
 check("the note names the focus", "AI Voice Agents" in note, True)

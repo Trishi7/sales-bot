@@ -23,7 +23,7 @@ from replies_world import (APPROVER, APPROVER2, MEMBER, OBJ_DAY, WED, World, Scr
 
 # -- the open decisions, as constants (plan section 0) ---------------------------------------------------------
 Q1_AI_NEWS_IN_OBJECTIVES = False        # Q1: the AI-news post is not in the on-demand objectives
-Q3_OFFER_LINES_IN_OBJECTIVES = False    # Q3: R3's / R5's closing offer line is not in the on-demand answer
+Q3_OFFER_LINES_IN_OBJECTIVES = False    # Q3: R3's / R6's closing offer line is not in the on-demand answer
 Q5_ACK = "👍"                           # Q5: the acknowledgement reaction
 Q6_NON_REPLY_ACK_REACTS = True          # Q6: "@Saley thanks" with nothing open: one reaction, no text
 
@@ -191,9 +191,9 @@ async def d4_yes_to_r3_post_schedules_its_reminder(check, test_mode):
 
 @case
 async def d5_sure_to_a_post_that_made_a_proposal(check, test_mode):
-    """'sure' to R5's post with a found email applies THAT proposal, and only that one."""
+    """'sure' to R6's post with a found email applies THAT proposal, and only that one."""
     with World(test_mode, pretend=(date(2026, 10, 6), 14, 5)) as w:
-        post = w.bot_says("**PoCs to contact**\n1. Ada Lovelace (CTO) — Acme AI — email found: ada@acme.ai\n"
+        post = w.bot_says("**LinkedIn connected, no DM yet**\n1. Ada Lovelace (CTO) — Acme AI — email found: ada@acme.ai\n"
                           "Want me to add the email I found to the sheet? Say yes.")
         mine = await _open_email(w, post)
         other_post = w.bot_says("Another post with its own offer.")
@@ -211,7 +211,7 @@ async def d5_sure_to_a_post_that_made_a_proposal(check, test_mode):
 
 async def _open_email(w, sent, *, marker="2026-10-06"):
     import nextaction
-    msg = {"type": nextaction.R_PROSPECTS, "rule_id": "R5", "max_items_per_post": 5,
+    msg = {"type": nextaction.R_LI_NO_DM, "rule_id": "R6", "max_items_per_post": 5,
            "actions": [{"sheet_row": 5, "row_key": "acme|ada", "company": "Acme AI", "poc": "Ada Lovelace",
                         "email_found": "ada@acme.ai", "email_source": "https://acme.example/team",
                         "contact_key": ("Acme AI", "Ada Lovelace")}]}
@@ -241,7 +241,7 @@ async def _two_open(w, *, age=1):
     """R3's remind offer (on its real post) and an email offer (on another post), both open in the channel."""
     r3, _ = await w.send_r3_post(WED)
     remind = next(iter(w.proposals()))
-    other = w.bot_says("**PoCs to contact**\nWant me to add the email I found to the sheet? Say yes.")
+    other = w.bot_says("**LinkedIn connected, no DM yet**\nWant me to add the email I found to the sheet? Say yes.")
     email = await _open_email(w, other)
     return r3, remind, other, email
 

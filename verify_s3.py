@@ -1,4 +1,4 @@
-"""S3 — DELIVERABLES, R7, R10, R5 EMAILS, R3 EVENTS. Real output.
+"""S3 — DELIVERABLES, R7, R10, R5, R6's EMAILS, R3 EVENTS. Real output.
 
     python verify_s3.py              every check
     python verify_s3.py --only iv,v  some of them (i ii iii iv v w)
@@ -12,11 +12,13 @@ Each day is lived three ways — the live sweep (a dry run), "make it <date>" an
         founder first on a tie, "+2 more next Monday"
   (iii) Monday: R10 with Prospect Status and Closure Prob% empty -> the message;
         with values and nothing qualifying -> silence, and a log line saying why
-  (iv)  Tuesday: R5 names never-contacted rows that are NOT "active"; one email
-        found with its source, one "no public email found" (the model's guessed
-        address is thrown out); "yes" writes only that one cell; a second yes
-        does nothing because the cell is filled; undo empties it again; the
-        two-companies-a-week and "skip them?" counters move
+  (iv)  Tuesday: R5 names the ONE open company's never-contacted rows, which
+        are NOT "active", in the agreed shape with no email on it (11 Oct); its
+        lookup still runs and the model's guessed address is thrown out. R6's
+        post carries the one email found with its source and the offer; "yes"
+        writes only that one cell; a second yes does nothing because the cell
+        is filled; undo empties it again. Over the fortnight R5 stays with the
+        same company and the same person, and never asks to skip anybody
   (v)   Wednesday: R3 with a registered event in 10 days, an unregistered event
         next Tuesday, a past event and one whose deadline has passed -> only the
         right two show, the offer appears, "yes" creates Monday's reminder, and
@@ -90,8 +92,15 @@ SETTINGS = {
     # the settings under test
     "DELIVERABLE_NEAR_DAYS": 3, "DELIVERABLE_DEFAULT_OWNER": "Vaishnavi",
     "DM_NO_MEETING_DAYS": 7, "DM_NO_MEETING_MAX_CONTACTS": 5,
-    "CLOSURE_SUPPORT_MIN": 50, "PROSPECT_COMPANIES_PER_WEEK": 2,
-    "PROSPECT_REPEAT_ASK_AT": 3, "EMAIL_LOOKUP_MAX_PER_POST": 5,
+    "CLOSURE_SUPPORT_MIN": 50, "PROSPECT_COMPANIES_PER_WEEK": 1,
+    "PROSPECT_VOICE_INDUSTRIES": ["AI Voice Agents", "AI Voice/Productivity Tools"],
+    "PROSPECT_LAB_INDUSTRIES": ["AI Labs"],
+    "PROSPECT_KEYWORDS": ["alignment", "safety", "trust", "evaluations", "robotics",
+                          "red-teaming", "STT", "TTS", "speech", "duplex"],
+    "PROSPECT_UK_MARKERS": ["UK", "United Kingdom", "London", "Cambridge", "Oxford",
+                            "Edinburgh", "Manchester", "Bristol", "Glasgow"],
+    "PROSPECT_DESIGNATION_MAX_CHARS": 60, "LI_NO_DM_DAYS": 3,
+    "EMAIL_LOOKUP_MAX_PER_POST": 5,
     "EMAIL_WRITE_ALLOWED": True, "SHEET_WRITES_ENABLED": True,
     "EVENTS_WINDOW_DAYS": 14, "EVENTS_REMIND_AGAIN_WEEKDAY": 0,
     "RESEARCH_CACHE_DAYS": 7,
@@ -186,6 +195,7 @@ GRIDS = {"Outreach PoCs": [POC_HEADERS], "Deliverables Checklist": [DELIV_HEADER
          "AI Events & Summits": [EVENT_HEADERS]}
 UPDATES: list = []        # every cell the stand-in worksheet was asked to update
 ACTIVE = [True]           # does the activation gate let the PoC rows through?
+                          # True: all; False: none; a set of names: only those people
 
 
 def poc(n, company, name, designation="", **cells) -> list:
@@ -201,6 +211,15 @@ def poc(n, company, name, designation="", **cells) -> list:
 
 def cell(d: date) -> str:
     return d.strftime("%d-%m-%Y")
+
+
+def _split_rows(rows) -> tuple:
+    """(active, inactive) as the activation stand-in has it (see ACTIVE)."""
+    gate = ACTIVE[0]
+    if isinstance(gate, (set, frozenset)):
+        return ([r for r in rows if r.get("name") in gate],
+                [r for r in rows if r.get("name") not in gate])
+    return (list(rows), []) if gate else ([], list(rows))
 
 
 def bare(d: date) -> str:
@@ -427,7 +446,7 @@ def new_bot(path: str):
     leave.who_is_away = nobody_away
     # THE ACTIVATION GATE: every row through, or (for R5) none of them.
     bot._split_active = lambda rows, why: (
-        (list(rows), []) if ACTIVE[0] else ([], list(rows)))
+        _split_rows(rows))
     bot._run_next_actions = the_rules_under_test
     bot._send_drip_message = recording_send
     bot._convert_if_already_done = nothing
@@ -697,7 +716,10 @@ async def the_monday() -> None:
 def tuesday_sheet() -> None:
     set_sheet(pocs=[
         poc(1, "Acme AI", "Cy Diaz", "Research Scientist", **{"Email id": "cy@acme.ai"}),
-        poc(2, "Acme AI", "Ada Lovelace", "CTO"),
+        # Ada is LinkedIn-connected with no DM: R6's person. Acme AI is not R5's
+        # open company, so R5 does not also name her.
+        poc(2, "Acme AI", "Ada Lovelace", "CTO",
+            **{"LI Connected Date": cell(TUE - timedelta(days=5))}),
         poc(3, "Borealis", "Bo Chen", "Founder"),
         poc(4, "Cinder", "Dee Evans", "Co-Founder"),              # a third company
         poc(5, "Acme AI", "Al Dead", "CEO", Deal_Status="Dead"),  # a stop rule
@@ -705,42 +727,69 @@ def tuesday_sheet() -> None:
     ])
 
 
+R5_TUESDAY = """**PoCs to contact — Borealis**
+
+1. Bo Chen (Founder)
+
+We've already reached 1 from Borealis.
+
+Cinder is next on our list, let me know if you'd like to move on to Cinder"""
+
+
 async def the_tuesday() -> None:
-    say(f"(iv) A TUESDAY — {TUE:%A %d %b %Y}: R5, the emails, and the yes")
+    say(f"(iv) A TUESDAY — {TUE:%A %d %b %Y}: R5, R6's email, and the yes")
     RULES.clear()
-    RULES.add("R5")
-    ACTIVE[0] = False                        # NOT ONE ROW IS "ACTIVE"
-    print("   the activation gate lets NO row through today — R5 used to see only "
-          "the rows it did")
+    RULES.update({"R5", "R6"})
+    # ONLY R6's PERSON IS "ACTIVE". R5's rows are not, which is the point: R5
+    # reads every never-contacted row, not only the ones the gate lets through.
+    ACTIVE[0] = {"Ada Lovelace"}
+    print("   the activation gate lets through ONLY Ada Lovelace (R6's person) today — "
+          "R5 used to see only the rows it did")
     live, test, sim = await three_ways(TUE, tuesday_sheet)
     print("\n   R5 — PoCs TO CONTACT, as posted by the live sweep:")
     show(live, "R5")
     for line in [x for x in live["logs"] if x.startswith("[email]")]:
         print("   log: " + line[:230])
     body = "\n".join(live["posts"].get("R5") or [])
-    numbered = [l for l in body.splitlines() if re.match(r"^\d+\. ", l)]
-    check("three contacts, none of them on an active row",
-          [l.split(" — ")[0].split(". ", 1)[1] for l in numbered],
-          ["Ada Lovelace (CTO)", "Cy Diaz (Research Scientist)", "Bo Chen (Founder)"])
-    check("two companies a week: Cinder waits; the stopped and the contacted rows "
-          "are not there",
-          [n for n in ("Dee Evans", "Al Dead", "Done Already") if n in body], [])
-    check("one email found, with the page it was found on",
-          numbered[0], "1. Ada Lovelace (CTO) — Acme AI — email found: ada@acme.ai "
-                       "([voicesummit.example](<https://voicesummit.example/speakers/"
-                       "ada-lovelace>))")
-    check("one \"no public email found\" — the model's bo.chen@borealis.com was in "
-          "no snippet, so it was thrown out",
-          (numbered[2], "bo.chen@borealis.com" in body),
-          ("3. Bo Chen (Founder) — Borealis — no public email found", False))
-    check("a contact whose email is on file is not looked up and gets no email note",
-          numbered[1], "2. Cy Diaz (Research Scientist) — Acme AI")
-    check("exactly two searches, in the spec's words",
-          live["searches"], ['"Ada Lovelace" "Acme AI" email',
-                             '"Bo Chen" "Borealis" email'])
-    check("the post ends on the offer",
-          body.splitlines()[-1], "Want me to add the email I found to the sheet? Say yes.")
+    # CHANGED 11 Oct: R5 is ONE company at a time. None of the three companies
+    # here matches a priority rule, so the tie goes to fewer people left
+    # (Borealis and Cinder have one each, Acme AI two) and then to sheet order:
+    # Borealis is open and Cinder is named as next. It used to be the first two
+    # companies in sheet order, three people, each with an email note.
+    check("the open company's person, on a row that is not active, in the agreed shape",
+          body, R5_TUESDAY)
+    check("one company at a time: Cinder and Acme AI wait; the stopped and the "
+          "contacted rows are not there",
+          [n for n in ("Dee Evans", "Ada Lovelace", "Cy Diaz", "Al Dead", "Done Already")
+           if n in body], [])
+    check("R5 prints no email, no email note and no offer",
+          [w for w in ("@", "email", "Say yes") if w in body], [])
+    check("...but its lookup still ran, and the model's bo.chen@borealis.com, which "
+          "was in no snippet, was thrown out",
+          [x for x in live["logs"] if x.startswith("[email] R5")][:1],
+          ["[email] R5: dropped 1 address(es) no snippet contains: bo.chen@borealis.com"])
     same("R5", live, test, sim)
+
+    print("\n   R6 — the email check, as posted by the live sweep:")
+    show(live, "R6")
+    body6 = "\n".join(live["posts"].get("R6") or [])
+    # R6 IS COMPOSED BY THE MODEL (an echo here), so its wording is not pinned.
+    # What is pinned: the page the address was found on is on the post, and the
+    # offer is a proposal keyed to it (checked under "THE YES" below). The exact
+    # "email found: ... / Want me to add the email" lines were R5's renderer,
+    # which no longer prints an email at all.
+    check("R6's post carries the page the email was found on",
+          "[voicesummit.example](<https://voicesummit.example/speakers/ada-lovelace>)"
+          in body6, True)
+    check("...and R6's lookup found the address in a snippet",
+          [x for x in live["logs"] if x.startswith("[email] R6") and "ada@acme.ai" in x] != [],
+          True)
+    check("a contact whose email is on file is not looked up",
+          [q for q in live["searches"] if "Cy Diaz" in q], [])
+    check("exactly two searches, in the spec's words: R5's person and R6's",
+          live["searches"], ['"Bo Chen" "Borealis" email',
+                             '"Ada Lovelace" "Acme AI" email'])
+    same("R6", live, test, sim)
     check("nothing has been written to the sheet by any of the three", UPDATES, [])
 
     # ---- the yes, on the test day's own post ----
@@ -748,7 +797,12 @@ async def the_tuesday() -> None:
     SEARCHES.clear()
     run = await test_path(TUE, label=f"THE YES — \"make it {dl.iso(TUE)}\", then a reply")
     bot = run["bot"]
-    post_id = run["raw"][0]["first_id"]
+    # THE OFFER IS R6's (11 Oct): R5's message shows no email, so it makes no
+    # offer and no proposal is keyed to it.
+    r5_id = next(x["first_id"] for x in run["raw"] if x["rule"] == "R5")
+    check("no proposal is keyed to R5's post",
+          bot.db.open_proposals_for_message(str(r5_id)), [])
+    post_id = next(x["first_id"] for x in run["raw"] if x["rule"] == "R6")
     proposals = bot.db.open_proposals_for_message(str(post_id))
     print(f"   open proposals keyed to the post: "
           f"{[(p['kind'], p['proposed_text']) for p in proposals]}")
@@ -826,32 +880,41 @@ async def the_tuesday() -> None:
           (UPDATES[-1], email_cells()["Ada Lovelace"]),
           (("Outreach PoCs", "F3", ""), ""))
 
-    # ---- the counters, across the fortnight ----
-    print("\n   THE COUNTERS — the same sheet on Thursday, and the next Tuesday and "
+    # ---- the open company, across the fortnight ----
+    # CHANGED 11 Oct. This used to check "two companies a week" and the count
+    # that ended in "Skip them?". Both are gone by design: one company is open
+    # until everybody there is contacted or a person says to move on, and the
+    # same people are named every time.
+    print("\n   THE OPEN COMPANY — the same sheet on Thursday, and the next Tuesday and "
           "Thursday")
-    key_bo = "borealis|bo chen"
-    week = "%d-W%02d" % TUE.isocalendar()[:2]
-    print(f"   after Tuesday: week {week} companies = "
-          f"{bot.db.prospect_week_companies(week)}; times named = "
-          f"{bot.db.prospect_repeats()}")
-    check("Tuesday's post opened this week's two companies",
-          bot.db.prospect_week_companies(week), ["Acme AI", "Borealis"])
-    check("...and counted each contact it named once",
-          sorted(bot.db.prospect_repeats().values()), [1, 1, 1])
+    st = bot.db.prospect_state()
+    print(f"   after Tuesday: open = {st['open']!r}, paused = {st['paused']}, "
+          f"next = {st['next']!r}")
+    check("Tuesday's post made Borealis the open company and remembered Cinder as next",
+          (st["open"], st["paused"], st["next"]), ("borealis", [], "cinder"))
     searched = len(SEARCHES)
     listed: list = []
     for day in (THU, TUE + timedelta(days=7), THU + timedelta(days=7)):
         run = await test_path(day, bot=bot, label=f"test day {day:%a %d %b}")
         body = "\n".join(run["posts"].get("R5") or [])
-        listed.append((day.strftime("%a %d %b"), bot.db.prospect_repeats().get(key_bo),
-                       "Skip them?" in body, "Dee Evans" in body))
-        print(f"     Bo Chen named {bot.db.prospect_repeats().get(key_bo)} time(s); "
+        listed.append((body, "Skip them" in body or "listed them" in body,
+                       bot.db.prospect_state()["open"]))
+        print(f"     {day:%a %d %b}: open = {bot.db.prospect_state()['open']!r}; "
               + next((l for l in body.splitlines() if "Bo Chen" in l), "(not listed)"))
-    check("Thursday stays with the week's two companies — Cinder still waits",
-          listed[0][3], False)
-    check("the count climbs one a post: 2, 3, 4", [n for _d, n, _s, _c in listed], [2, 3, 4])
-    check("at 3 listings with nothing changed the next post asks \"Skip them?\"",
-          [s for _d, _n, s, _c in listed], [False, False, True])
+    check("Thursday, nothing changed on the sheet: the same message as Tuesday",
+          listed[0][0], R5_TUESDAY)
+    # Tue 29 Sep is September's last Tuesday-or-Thursday, and nobody at Borealis
+    # gained a First Contact Date in September ("Done Already" is ticked with no
+    # date), so that post carries the two month-end lines at its foot.
+    check("Tue 29 Sep, the month's last slot with nothing moved: the same message "
+          "with the two lines at its foot",
+          listed[1][0], R5_TUESDAY + "\n\nBorealis hasn't moved this month — 1 person "
+          "still to contact there.\nIt's blocking other PoCs to contact.")
+    check("Thu 1 Oct: the plain message again", listed[2][0], R5_TUESDAY)
+    check("...nothing ever asks to skip anybody", [s_ for _b, s_, _o in listed],
+          [False, False, False])
+    check("...and Borealis is still the open company: nothing but a first contact or "
+          "\"move on\" moves it", [o for _b, _s, o in listed], ["borealis"] * 3)
     check("the email lookups were cached: no search after Tuesday's two",
           len(SEARCHES), searched)
 

@@ -88,6 +88,7 @@ import notes
 import persona
 import poc_crosscheck
 import prep
+import prospects
 import query
 import replies
 import replyguard
@@ -283,6 +284,46 @@ _MORE_POCS_RE = re.compile(
     r"\b(different|another|others?|more|additional|else)\b[^.?!\n]{0,40}\b(person|people|pocs?|"
     r"contacts?|names?|ones?|options?|candidates?)\b|\b(some|any)(one|body)\s+else\b|"
     r"\bfind\s+(more|others|another)\b|\b(any|some)\s+others?\b|\btry\s+again\b",
+    re.IGNORECASE)
+
+
+# R5's REPLIES AND QUESTIONS (`_maybe_prospect_reply`, `_answer_prospects`).
+# "move on", "let's move on to Cartesia"; "list the rest", "show me the others".
+_MOVE_ON_RE = re.compile(r"\bmov(?:e|ing)\s+on\b(?:\s+(?:to|with)\s+(?P<to>[^?!\n]+))?",
+                         re.IGNORECASE)
+# "don't move on yet", "no need to move on": not an instruction to move.
+_MOVE_ON_NOT_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|not|no\s+need|never|shouldn'?t|wait)\b[^.?!\n]{0,25}\bmov(?:e|ing)\s+on\b",
+    re.IGNORECASE)
+# OUTSIDE A REPLY "move on" must be the WHOLE message ("@Saley move on to
+# Cartesia"): "we should move on from this topic" is about something else.
+_MOVE_ON_ONLY_RE = re.compile(
+    r"^\s*(?:(?:ok(?:ay)?|yes|sure|please|let'?s|lets|can\s+(?:we|you)|we\s+can)[\s,]+)*"
+    r"mov(?:e|ing)\s+on(?:\s+(?:to|with)\s+[^?!\n]+)?[\s.!]*$", re.IGNORECASE)
+_LIST_REST_RE = re.compile(
+    r"\b(list|show|see|give|send|share|name)\b[^.?!\n]{0,30}\b(rest|others?|remaining|"
+    r"everyone|everybody|all)\b", re.IGNORECASE)
+# "who should I reach out to at Cartesia?", "who's left at ElevenLabs?". NOT
+# "who is our contact at Sierra?", which asks about somebody already known.
+_PROSPECT_AT_RE = re.compile(
+    r"\bwho(?:m)?\s+(?:should|do|can|could|shall|would)\s+(?:i|we)\s+"
+    r"(?P<verb>reach\s+out\s+to|contact|approach|get\s+in\s+touch\s+with)"
+    r"(?:\s+(?:next|first))?\s+(?:at|in|from)\s+(?P<co>[^?\n]+)|"
+    r"\bwho\s+to\s+(?P<verb2>reach\s+out\s+to|contact|approach)(?:\s+(?:next|first))?\s+"
+    r"(?:at|in|from)\s+(?P<co2>[^?\n]+)|"
+    r"\bwho(?:'s|\u2019s|\s+is|\s+are|\s+else\s+is)?\s+(?:still\s+)?(?P<verb3>left|remaining)"
+    r"(?:\s+to\s+(?:contact|reach))?\s+(?:at|in|from)\s+(?P<co3>[^?\n]+)",
+    re.IGNORECASE)
+# "who's left to contact?", "what is left to contact", "how many PoCs are left"
+_PROSPECT_LEFT_RE = re.compile(
+    r"\b(?:what|who|which|how many)\b[^?\n]{0,40}\b(?:left|remaining)\b[^?\n]{0,12}"
+    r"\b(?:to (?:contact|reach)|pocs?\b|prospects?\b)|"
+    r"\bhow many\b[^?\n]{0,30}\b(?:pocs?|prospects?)\b[^?\n]{0,20}"
+    r"\b(?:left|remaining)\b", re.IGNORECASE)
+# "find me PoCs in voice AI" (an industry; "find PoCs AT a company" is a search)
+_PROSPECT_IN_RE = re.compile(
+    r"\b(?:find|get|give|show|list)\s+(?:me\s+|us\s+)?(?:some\s+|the\s+)?"
+    r"(?:pocs?|prospects?)\s+(?:to (?:contact|reach)\s+)?in\s+(?P<ind>[^?.\n]+)",
     re.IGNORECASE)
 
 
@@ -586,6 +627,9 @@ class SalesBot(discord.Client):
         # now be a page of zeroes; these four numbers are what actually decides
         # whether the bot can see anything today.
         await self._log_sheet_world()
+        # R5's QUEUE, ONCE AT BOOT: how many companies still have people to
+        # contact and how many of them match none of the six priority rules.
+        await self._prospect_view(where="startup")
 
         self._write_state_summary(trigger="startup")
         state.audit(
@@ -1608,6 +1652,11 @@ class SalesBot(discord.Client):
             # other people, never the general people-search answer.
             if await self._maybe_more_pocs(message, text, ctx):
                 return True
+            # A YES OR "MOVE ON" UNDER THE PoCs-TO-CONTACT POST answers that
+            # post: the rest of the list, or the next company. Before the
+            # acknowledgement, which would give "yes" one reaction and stop.
+            if await self._maybe_prospect_reply(message, text, ctx):
+                return True
             if await self._maybe_acknowledge(message, text, ctx):
                 return True
             async with self._typing(message.channel):
@@ -1710,6 +1759,13 @@ class SalesBot(discord.Client):
                      "without the model)", message.id)
             self._mark_route(message, "today")
             return await self._answer_today(message, text)
+
+        # "WHO'S LEFT AT ELEVENLABS?" IS ANSWERED BY CODE, in the order the
+        # Tuesday post uses (`prospects.order_people`), so the question and
+        # the post can never disagree. Anything it cannot place on the sheet
+        # falls through to the engine.
+        if await self._answer_prospects(message, text):
+            return True
 
         # A PLAIN "ANY AI NEWS?" IS ANSWERED BY CODE, before the extractor and
         # the router: no company, person or subject is named, so there is
@@ -8178,6 +8234,257 @@ class SalesBot(discord.Client):
             return
         await self._r11_answer(message, chosen, suggested={}, attempt=0)
 
+    # -- R5: the open company, its replies and the questions about it -------
+
+    async def _prospect_view(self, *, where: str = ""):
+        """(queue, view, state) for R5, read off the sheet NOW, or None when
+        the tab cannot be read. `where` logs the unmatched count (startup).
+        Never raises."""
+        try:
+            tab, _source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
+            if tab is None:
+                return None
+            snoozes = await asyncio.to_thread(self.db.snoozes)
+            state_ = await asyncio.to_thread(self.db.prospect_state)
+            queue = await asyncio.to_thread(
+                lambda: prospects.build_queue(list(tab.rows), today=dl.today_ist(),
+                                              snoozes=snoozes))
+        except Exception:
+            log.info("[prospects] the Outreach PoCs tab could not be read%s",
+                     f" ({where})" if where else "", exc_info=True)
+            return None
+        if where:
+            prospects.log_unmatched(queue, where=where)
+        return queue, prospects.resolve(queue, state_), state_
+
+    async def _save_prospect_state(self, state_: dict) -> None:
+        """Remember R5's open company, the paused ones and the company the
+        last message named as next (`db.prospect_open`)."""
+        await asyncio.to_thread(
+            lambda: self.db.save_prospect_state(
+                open_key=str(state_.get("open") or ""),
+                paused=list(state_.get("paused") or []),
+                next_key=str(state_.get("next") or ""),
+                names=dict(state_.get("names") or {}), on_date=dl.iso(dl.today_ist())))
+
+    @staticmethod
+    def _prospect_cap() -> int:
+        rule = rules.by_id("R5")
+        return max(1, int(getattr(rule, "max_items_per_post", 0) or 5))
+
+    @staticmethod
+    def _view_state(view: dict) -> dict:
+        """`prospects.resolve`'s state plus what the database also keeps: the
+        next company and each company's spelling."""
+        nxt = view.get("next")
+        entries = [e for e in [view.get("open"), nxt] + list(view.get("paused") or []) if e]
+        return {**view["state"], "next": nxt["key"] if nxt else "",
+                "names": {e["key"]: e["company"] for e in entries}}
+
+    def _is_prospect_post(self, ctx: dict) -> bool:
+        """Is this a direct reply to a PoCs-to-contact message (the scheduled
+        post, or the one posted after a "move on")?"""
+        if not ctx.get("direct_is_bot"):
+            return False
+        return ((ctx.get("drip") or {}).get("action_type") == nextaction.R_PROSPECTS
+                or (ctx.get("said") or {}).get("kind") == "prospects"
+                or bool(prospects.read_post(ctx.get("parent_text") or "")["company"]))
+
+    async def _maybe_prospect_reply(self, message, text: str, ctx: dict) -> bool:
+        """A reply to R5's message: "yes" lists the rest, "move on" moves on.
+
+        ANYONE ON THE TEAM MAY SAY EITHER. Neither writes to the sheet, so
+        neither is a proposal and neither needs an approver: a yes prints
+        names the sheet already holds, and "move on" changes which company the
+        bot talks about next.
+
+        "MOVE ON" IS ALSO READ WHEN IT IS NOT A REPLY, but only when it is the
+        whole message ("@Saley move on to Cartesia"): under some other post
+        the same words are about that post. Returns False for anything else.
+        """
+        is_post = self._is_prospect_post(ctx)
+        body = replies.after_ack(text, self._bot_names()) or text or ""
+        move = None if _MOVE_ON_NOT_RE.search(text or "") else _MOVE_ON_RE.search(text or "")
+        if move and (is_post or (not ctx.get("is_reply")
+                                 and _MOVE_ON_ONLY_RE.match(text or ""))):
+            return await self._prospect_move_on(message, move.group("to") or "", ctx)
+        if not is_post:
+            return False
+        if replies.is_bare_vote(text, self._bot_names()) == approvals.VOTE_YES \
+                or _LIST_REST_RE.search(body):
+            return await self._prospect_list_rest(message, ctx)
+        return False
+
+    async def _prospect_list_rest(self, message, ctx: dict) -> bool:
+        """"Yes" to "Would you like me to list the rest?": everybody else at
+        that company, numbered on from the post. The company stays open and
+        NO NEW QUESTION is asked. Read off the sheet now, so anybody contacted
+        since the post is not in it."""
+        self._mark_route(message, "prospects")
+        post = prospects.read_post(ctx.get("parent_text") or "")
+        got = await self._prospect_view()
+        if got is None:
+            await self._reply(message, prospects.CANNOT_READ,
+                              reason="R5: the tab could not be read for the rest of the list")
+            return True
+        queue, view, _state = got
+        company = post["company"] or str((ctx.get("said") or {}).get("company") or "") \
+            or (view["open"]["company"] if view["open"] else "")
+        entry = next((e for e in queue if e["key"] == prospects.company_key(company)), None)
+        if entry is None:
+            await self._reply(message, prospects.NOBODY_LEFT.format(company=company or "there"),
+                              reason="R5: nobody is left at the company asked about")
+            return True
+        shown = set(post["names"])
+        label = lambda r: prospects.person_line(  # noqa: E731
+            0, gtm_sheet.clean_cell(r.get("name")), gtm_sheet.clean_cell(r.get("designation")))[3:]
+        if shown:
+            named = [r for r in entry["left"] if label(r) in shown]
+            rest = [r for r in entry["left"] if label(r) not in shown]
+        else:
+            cap = self._prospect_cap()
+            named, rest = entry["left"][:cap], entry["left"][cap:]
+        if not rest:
+            await self._reply(message, prospects.THAT_IS_EVERYONE.format(company=entry["company"]),
+                              reason="R5: the post already named everyone left")
+            return True
+        text_ = prospects.rest_text(entry["company"], prospects.pairs(rest), start=len(named) + 1)
+        sent = await self._reply(message, self._without_pings(text_),
+                                 reason="R5: the rest of the open company's people")
+        self._remember_said(sent, kind="prospects_rest", company=entry["company"])
+        log.info("[prospects] msg=%s listed the other %d at %s (from %d); the company "
+                 "stays open", getattr(message, "id", "?"), len(rest), entry["company"],
+                 len(named) + 1)
+        return True
+
+    async def _prospect_move_on(self, message, to: str, ctx: dict) -> bool:
+        """"Move on" / "move on to Cartesia": that company becomes the open one
+        and its message is posted. A BARE "move on" takes the company the last
+        message named as next.
+
+        THE COMPANY MOVED ON FROM IS PAUSED, NOT DROPPED. It keeps its score
+        (read off the sheet each time) and comes back when the new one is
+        finished (`prospects.resolve`). This is the only way, other than
+        everybody being contacted, that a company leaves the open slot.
+        """
+        self._mark_route(message, "prospects")
+        got = await self._prospect_view()
+        if got is None:
+            await self._reply(message, prospects.CANNOT_READ,
+                              reason="R5: the tab could not be read to move on")
+            return True
+        queue, view, state_ = got
+        current = view["open"]
+        if current is None:
+            await self._reply(message, prospects.NOBODY_WAITING,
+                              reason="R5: asked to move on with nobody waiting")
+            return True
+        said = re.sub(r"\b(please|then|now|instead|thanks?|thank you)\b", " ", to or "",
+                      flags=re.IGNORECASE).strip(" ,.!")
+        target = None
+        if said:
+            hits = prospects.find_company(queue, said)
+            if not hits:
+                await self._reply(message, prospects.NOT_IN_QUEUE.format(company=said),
+                                  reason="R5: asked to move on to a company with nobody left")
+                return True
+            if len(hits) > 1:
+                await self._reply(
+                    message, prospects.WHICH_COMPANY.format(
+                        names=prospects._names([e["company"] for e in hits[:6]])),
+                    reason="R5: 'move on to' named more than one company")
+                return True
+            target = hits[0]
+        else:
+            named = prospects.read_post(ctx.get("parent_text") or "")["next"] \
+                if self._is_prospect_post(ctx) else ""
+            key = prospects.company_key(named) or str(state_.get("next") or "")
+            target = next((e for e in queue if e["key"] == key), None) or view["next"]
+        if target is None:
+            await self._reply(message, prospects.NO_OTHER_COMPANY.format(
+                                  company=current["company"]),
+                              reason="R5: asked to move on with no other company")
+            return True
+        if target["key"] == current["key"]:
+            await self._reply(message, prospects.ALREADY_OPEN.format(company=current["company"]),
+                              reason="R5: asked to move on to the open company")
+            return True
+        new = prospects.move_on(queue, state_, target["key"])
+        await self._save_prospect_state(self._view_state(new))
+        log.info("[prospects] msg=%s moved on from %s to %s; %s is paused, not dropped "
+                 "(%d paused in all)", getattr(message, "id", "?"), current["company"],
+                 target["company"], current["company"], len(new["paused"]))
+        state.audit("prospects_moved_on", reason="a person said to move on",
+                    from_company=current["company"], to_company=target["company"],
+                    by=_display(message.author))
+        opened, nxt = new["open"], new["next"]
+        body = prospects.post_text(
+            opened["company"], prospects.pairs(opened["left"][:self._prospect_cap()]),
+            reached=opened["reached"], left_total=len(opened["left"]),
+            next_company=nxt["company"] if nxt else "")
+        sent = await self._reply(message, self._without_pings(body),
+                                 reason="R5: the new open company, after 'move on'")
+        self._remember_said(sent, kind="prospects", company=opened["company"],
+                            next=nxt["company"] if nxt else "")
+        return True
+
+    async def _answer_prospects(self, message, text: str) -> bool:
+        """An ad-hoc question about who to contact, answered by code in THE
+        SAME ORDER AS THE POST (`prospects.build_queue`, `order_people`).
+
+            "who's left at ElevenLabs?"            everybody left there
+            "who should I reach out to at X?"      the top five, as the post
+            "find me PoCs in voice AI"             the best company in it
+            "what's left to contact?"              the queue, with the count
+                                                   of companies matching no rule
+
+        Returns False, and the engine answers, when the words name no company
+        or industry with somebody left to contact: this never guesses.
+        NOTHING IS OPENED OR MOVED by a question.
+        """
+        at, ind = _PROSPECT_AT_RE.search(text or ""), _PROSPECT_IN_RE.search(text or "")
+        left = _PROSPECT_LEFT_RE.search(text or "")
+        if not (at or ind or left):
+            return False
+        got = await self._prospect_view()
+        if got is None:
+            return False
+        queue, view, _state = got
+        body = ""
+        if at:
+            named = at.group("co") or at.group("co2") or at.group("co3") or ""
+            hits = prospects.find_company(queue, named)
+            if len(hits) == 1:
+                e = hits[0]
+                everyone = bool(at.group("verb3")) \
+                    or re.search(r"\b(all|everyone|everybody)\b", text, re.IGNORECASE)
+                people = e["left"] if everyone else e["left"][:self._prospect_cap()]
+                body = prospects.post_text(e["company"], prospects.pairs(people),
+                                           reached=e["reached"], left_total=len(e["left"]),
+                                           ask=False)
+        if not body and ind:
+            hits = prospects.in_industry(queue, ind.group("ind"))
+            if hits:
+                e = hits[0]
+                body = prospects.post_text(
+                    e["company"], prospects.pairs(e["left"][:self._prospect_cap()]),
+                    reached=e["reached"], left_total=len(e["left"]), ask=False)
+                if len(hits) > 1:
+                    body += "\n\nAlso, in order: " + ", ".join(
+                        f"{h['company']} ({len(h['left'])} left)" for h in hits[1:9])
+        if not body and left and not at:
+            body = prospects.queue_summary(queue, view)
+        if not body:
+            return False
+        log.info("[query] msg=%s → who to contact, answered from the sheet in the post's "
+                 "order (no model call)", getattr(message, "id", "?"))
+        self._mark_route(message, "prospects")
+        sent = await self._reply(message, self._without_pings(body),
+                                 reason="who is left to contact, in R5's order")
+        self._remember_said(sent, kind="prospects_answer", question=text)
+        self.memory.record(message.channel.id, text, body)
+        return True
+
     async def _maybe_more_pocs(self, message, text: str, ctx: dict) -> bool:
         """"Find a different person" replied to R11's list of suggested PoCs.
 
@@ -10359,8 +10666,7 @@ class SalesBot(discord.Client):
         for action in shown:
             if asked >= room:
                 break
-            if not action.get("email_lookup") or action.get("email_checked") \
-                    or action.get("ask_to_skip"):
+            if not action.get("email_lookup") or action.get("email_checked"):
                 continue
             action["web_pending"] = True
             asked += 1
@@ -10457,7 +10763,10 @@ class SalesBot(discord.Client):
         EMAIL_WRITE_ALLOWED is false: the post then makes no offer, and a
         proposal nobody was asked about is a yes nobody can give.
         """
-        if message.get("type") not in (nextaction.R_PROSPECTS, nextaction.R_LI_NO_DM):
+        # R6 ONLY (11 Oct). R5's message no longer prints the email it found,
+        # and an offer to write something the reader was never shown is a yes
+        # nobody can give. R5's lookup still runs: R6 reads the same cache.
+        if message.get("type") != nextaction.R_LI_NO_DM:
             return
         if not config.EMAIL_WRITE_ALLOWED:
             return
@@ -10680,10 +10989,10 @@ class SalesBot(discord.Client):
     async def _after_send(self, message: dict, *, sent, marker: str) -> None:
         """The bookkeeping that follows a post that actually landed.
 
-        R5 — `start_prospect_company` and `record_prospect_mention`, for the
-        contacts the post NAMED. Both existed with no caller, so "two companies
-        a week" restarted from the top of the sheet every run and no contact
-        ever reached the count at which the bot asks "skip them?".
+        R5 — the company the post was about becomes (or stays) THE OPEN
+        COMPANY, and the company it named as next is remembered for a bare
+        "move on" (`db.prospect_open`). Nothing counts how often a person was
+        named: the same five are named until one is contacted.
 
         R3 — an event listed as "date unclear" is recorded, which is what
         makes that line appear once.
@@ -10697,24 +11006,18 @@ class SalesBot(discord.Client):
         """
         kind = message.get("type")
         if kind == nextaction.R_PROSPECTS:
-            try:
-                week = "%d-W%02d" % date.fromisoformat(marker).isocalendar()[:2]
-            except ValueError:
-                week = "%d-W%02d" % dl.today_ist().isocalendar()[:2]
-            for action in drip.shown_contacts(message):
-                company = str(action.get("company") or "").strip()
-                key = str(action.get("row_key") or "").strip()
-                if company:
-                    await asyncio.to_thread(
-                        lambda c=company: self.db.start_prospect_company(
-                            c, iso_week=week, on_date=marker))
-                if key:
-                    count = await asyncio.to_thread(
-                        lambda k=key, a=action: self.db.record_prospect_mention(
-                            k, signature=str(a.get("signature") or ""), on_date=marker))
-                    log.info("[rules] R5: %s named %d time(s) unchanged (asks to skip "
-                             "at %d); %s is one of week %s's companies", key, count,
-                             int(config.PROSPECT_REPEAT_ASK_AT), company or "?", week)
+            shown = drip.shown_contacts(message)
+            info = next((a.get("prospect") for a in shown if a.get("prospect")), None) or {}
+            state_ = dict(info.get("state") or {})
+            if state_.get("open"):
+                await self._save_prospect_state(state_)
+                self._remember_said(sent, kind="prospects",
+                                    company=str(shown[0].get("company") or ""),
+                                    next=str(info.get("next_company") or ""))
+                log.info("[rules] R5: %s is the open company (%d named, %d left in all); "
+                         "next is %s; %d paused", shown[0].get("company") or "?", len(shown),
+                         int(info.get("left_total") or 0), info.get("next_company") or "nobody",
+                         len(state_.get("paused") or []))
         elif kind == nextaction.R_EVENTS:
             for action in drip.event_lines(message):
                 key = str(action.get("event_unclear_key") or "")
@@ -11192,16 +11495,8 @@ class SalesBot(discord.Client):
             log.exception("[rules] the pipeline snapshot failed; R11 produces nothing today")
             new_companies = []
 
-        # R5's cross-day state, and R9's ladder. Both are read-only here.
-        iso_week = "%d-W%02d" % today.isocalendar()[:2]
-        try:
-            week_companies = await asyncio.to_thread(
-                self.db.prospect_week_companies, iso_week
-            )
-            prospect_repeats = await asyncio.to_thread(self.db.prospect_repeats)
-        except Exception:
-            log.exception("[rules] R5's weekly state could not be read")
-            week_companies, prospect_repeats = [], {}
+        # R5's OPEN COMPANY, and R9's ladder. Both are read-only here.
+        prospect_state = await asyncio.to_thread(self.db.prospect_state)
         try:
             meeting_followups = await asyncio.to_thread(self.db.meeting_followups)
         except Exception:
@@ -11230,7 +11525,7 @@ class SalesBot(discord.Client):
                 today=today, rows=active, snoozes=snoozes,
                 deliverables=deliverables, packages=packages, events=events,
                 pipeline_companies=pipeline_companies, new_companies=new_companies,
-                prospect_repeats=prospect_repeats, week_companies=week_companies,
+                prospect_state=prospect_state,
                 meeting_followups=meeting_followups, inactive=len(inactive),
                 # R5 READS EVERY ROW the stop rules allow, not only the active
                 # ones: a never-contacted row is exactly what the activation

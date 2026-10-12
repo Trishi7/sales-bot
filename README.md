@@ -1677,7 +1677,11 @@ not select every row whose industry says *"Robotics"*. A focus that silently
 selects the wrong rows is worse than one that selects none, because the second
 says so.
 
-**A focus narrows; it does not silence.** When nothing matches, R5 keeps going in
+**A focus narrows; it does not silence.** (Since 11 Oct 2026 a focus puts the
+companies it matches first in R5's queue; it does not take the slot from a
+company that is already open. `_run_next_actions` has never passed a focus to
+the engine, so in production this path is not reached.) When nothing matches,
+R5 keeps going in
 sheet order **and says so**:
 
 ```
@@ -2433,20 +2437,135 @@ line starting with a bullet or a number, and the template goes instead, logged
 with three or more companies renders them as numbered points in its template
 too — so the fallback obeys the rule the check enforces.
 
-**R5 has four constraints and they interact.** Eligible rows are those where
-First Contact is FALSE or blank *and* no first-contact date is recorded. It
-takes **two companies a week in sheet order** and **stays with a company until
-every contact on it has a first contact recorded** — the companies in flight are
-remembered in SQLite against the ISO week, because otherwise Thursday would
-start two fresh companies and Tuesday's would be abandoned half-contacted.
-Within a company it goes in **role order** (`PROSPECT_ROLE_ORDER`: founders >
-CXO > chief scientist > research); a title the list does not recognise sorts
-**last**, since an unrecognised title is not evidence of seniority in either
-direction. And after `PROSPECT_REPEAT_ASK_AT` (3) posts carrying the same
-contact **with nothing changed**, it asks whether to skip them instead of naming
-them a fourth time. *A changed row resets the count* — somebody who updated it
-has acted, and a counter that kept climbing through their update would ask to
-skip a contact who is moving.
+**R5 works through ONE company at a time (rebuilt 11 Oct 2026).** It used to
+take two companies a week in sheet order; now one company is open, chosen by
+score, and held. Everything that ranks a company or a person is in
+`prospects.py` (pure), and the Tuesday post, the replies to it and the ad-hoc
+answers all call it, so the same question cannot get two orders.
+`python verify_prospects_priority.py --show` prints the messages.
+
+*Which company.* Every company that still has somebody with no first contact
+is scored by **six rules that stack**, most important first:
+
+| # | Rule | True when |
+|---|---|---|
+| 1 | warm | 2 or more people there already have First Contact recorded |
+| 2 | voice | Industry is AI Voice Agents or AI Voice/Productivity Tools (`PROSPECT_VOICE_INDUSTRIES`) |
+| 3 | lab | Industry is AI Labs (`PROSPECT_LAB_INDUSTRIES`) |
+| 4 | uk | an uncontacted person is UK-based (`PROSPECT_UK_MARKERS`, read off the free-text Based cell) |
+| 5 | keyword | an uncontacted person's title carries a keyword (`PROSPECT_KEYWORDS`) |
+| 6 | paper | an uncontacted person has a research paper link |
+
+Each rule's weight (32, 16, 8, 4, 2, 1) is larger than all the lower ones added
+together, so an earlier rule outweighs any combination of later ones, and the
+later rules still separate companies that share their earliest. It is **not**
+first-match-wins: warm + voice beats warm alone. Industry is matched loosely
+(normalised, then substring), so "AI labs " and "AI Labs (frontier)" are AI
+Labs; the UK and keyword lists match whole words, so "UK" is not "Ukraine".
+**Two tie-breaks:** the company with **fewer people left** goes first (it can
+be finished sooner), then **sheet order** (where the company first appears on
+Outreach PoCs). A company matching no rule is **queued last, never left out**;
+how many there are is logged at startup and on every R5 run, and is in the
+answer to "what's left to contact?". It is not in the Tuesday post.
+
+*Who, within the company.* Seniority first (`nextaction._role_rank` against
+`PROSPECT_ROLE_ORDER`); between people at the same rank, whoever carries more
+of the three person signals (UK-based, a keyword in the title, a paper link);
+then sheet order. A title the list does not recognise ranks last, in sheet
+order. The top five are named.
+
+*The role order is the design.* The list is walked top to bottom and the first
+phrase a title carries wins, so "chief scientist" sits above "chief" and
+"senior lecturer" above "lecturer": founder, co-founder, cofounder, founding
+team, founding, chief executive, chief technology, chief scientist, chief
+science, chief product, chief operating, ceo, cto, coo, cpo, cso, chief,
+president, vice president, vp, head of, head -, director, strategic sourcing,
+sourcing, human data, data operations, business development, partnerships,
+principal, staff, tech lead, team lead, lead, professor, reader, senior
+lecturer, lecturer, phd, senior, sr, research engineer, research scientist,
+research lead, principal researcher, researcher, research, member of technical
+staff, member of the founding team, computational, scientist, machine learning
+engineer, ml engineer, ai engineer, agent engineer, speech ai engineer,
+software engineer, engineer, product manager, product, program manager,
+engineering manager, manager. **A phrase matches as whole words**, not as a
+bare substring: with a substring, "Director" carried "cto" and ranked as a CTO,
+"Coordinator" carried "coo", and "Leadership" carried "lead".
+
+*The same five, every time.* Nothing rotates and nothing counts repeats.
+Thursday posts the same message as Tuesday; somebody who gets a first contact
+in between is simply no longer selected, and the numbering closes up. The
+"listed N times, skip them?" line, `PROSPECT_REPEAT_ASK_AT` and the
+`prospect_mentions` counter are retired. **There is no way to drop a person
+who will never be contacted**: no command, no column and no marker exists for
+it, and none was invented. That is an open gap.
+
+*Five after the dedup.* One contact is named once a day and R13, listed before
+R5, keeps anybody both rules select. So the rule emits **everybody** left at
+the open company, in order, and the post takes the first five that survive the
+dedup (`drip.prospect_order`): the sixth person moves up. The person R13 kept
+is still counted as left to contact.
+
+*The message* is fixed text (`prospects.post_parts`; R5 is in
+`drip.VERBATIM_TYPES`, so no model writes it):
+
+```
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Sahaj Garg (Co-Founder/CTO)
+3. Ray (Ruizhe) Huang (Member of Technical Staff)
+4. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+5. Nathan Klapoetke (Computational Neuroscientist)
+
+We've already reached 2 from Wisprlow.ai, there are 7 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+```
+
+"Reached" is the people there with a first contact; "left" is the uncontacted
+people beyond the five shown; the last line names the second-ranked company.
+One question only. With five or fewer left the question is dropped. A
+Designation longer than `PROSPECT_DESIGNATION_MAX_CHARS` (60), or one with a
+line break in it, prints **no bracket at all**: it is never cut short. A "yes"
+(from anybody on the team; it writes nothing) lists the rest, numbered on from
+6, with no new question, and the company stays open.
+
+*A company is never dropped.* It leaves the open slot in exactly two ways:
+everybody there has a first contact recorded, or a person says **"move on"**
+(`prospects.resolve`, `prospects.move_on`). "Move on to Cartesia" opens that
+company and posts its message; a bare "move on" takes the company the last
+message named. The company moved on from is **paused, not dropped**: it keeps
+its score, which is read off the sheet every time, and comes back when the
+company that replaced it is finished. The open company, the paused ones and
+the last-named next company are in the `prospect_open` table.
+
+*The month's last post.* On the last Tuesday or Thursday of the month,
+whichever falls later, if no row at the open company gained a First Contact
+Date in that calendar month, two lines go at the foot of the normal message:
+
+```
+Wisprlow.ai hasn't moved this month — 12 people still to contact there.
+It's blocking other PoCs to contact.
+```
+
+Paused companies that have not moved either are named with it and share one
+number ("Wisprlow.ai and Cartesia.ai haven't moved — 27 people still to contact
+between them. / They're blocking other PoCs to contact."). This is read off
+the First Contact Date column, because Deal Status is empty; no state is kept
+for it, and it closes nothing.
+
+*The email lookup still runs* for the people named whose Email cell is blank,
+because R6 reads the same cache, but R5's message neither prints the result
+nor offers to write it. R6 still does both.
+
+*Ad-hoc questions use the same order* and are answered by code, with no model
+call (`bot._answer_prospects`): "who's left at ElevenLabs?" (everybody left
+there), "who should I reach out to at Cartesia?" (the top five), "find me PoCs
+in voice AI" (the best company in that industry) and "what's left to contact?"
+(the queue). A question opens and moves nothing. A phrasing those patterns do
+not catch still goes to the model and its tracker tools, which have their own
+order.
 
 **R7 shows days since the DM and the last note logged.** Those two are what a
 person needs to decide whether to chase again or leave it: *"no reply after 9
@@ -2634,7 +2753,7 @@ pass when that layer arrives.
 
 `nextaction.run()` reads no sheet, writes no database row and sends nothing.
 Everything it needs is passed in: the snoozes, the four
-context tabs' rows, the R5 repeat counts and week state, the R9 ladder, and
+context tabs' rows, R5's open company (`prospect_state`), the R9 ladder, and
 R11's new companies.
 
 **R11's snapshot is the reason that matters.** Detecting a new company needs
@@ -2689,8 +2808,9 @@ the same thing and neither should get an empty list.
 | Snoozes | `snoozes` | keyed company + PoC |
 | One-off reminders | `scheduled_reminders` | the only dates exempt from the weekend shift |
 | Explicit activations | `row_activations` | see [Row activation](#row-activation--which-rows-the-bot-may-raise-unprompted) |
-| **R5 repeat counts** | `prospect_mentions` | a changed row signature resets the count |
-| **R5 week companies** | `prospect_week` | keyed on the ISO week, so the two-a-week promise spans days |
+| **R5 open company** | `prospect_open` | the one open company, the paused ones in order, and the company the last message named as next; written after a post lands and on "move on" |
+| ~~R5 repeat counts~~ | `prospect_mentions` | RETIRED 11 Oct 2026: left in the schema, nothing reads or writes it |
+| ~~R5 week companies~~ | `prospect_week` | RETIRED 11 Oct 2026, with "two companies a week": left in the schema, nothing reads or writes it |
 | **R9 ladder** | `meeting_followups` | advanced by the sender; cleared when Notes/Remarks is filled |
 | **R13 rotation** | `next_step_followups` | written by the sender after a real send; a changed step signature starts the person again; `closed` is never reset |
 | **R13 posts** | `next_step_posts` | who each post named and what each was asked, by message id |
@@ -2801,8 +2921,8 @@ two.
 
 `nextaction.py` runs ~60 assertions: that every known trigger has an evaluator
 and every rule in the file resolves to one; that all four stop values stop a row
-and a blank closure does not; that R5's role order, two-company limit, week
-carry-over and repeat-ask all hold; that R6 and R7 fire at their thresholds and
+and a blank closure does not; that R5 opens one company, keeps the one held
+open, orders it by role and matches titles as whole words; that R6 and R7 fire at their thresholds and
 not before; that R8 produces T-5, T-3 and day-of and *never* a late T-5; that
 R9 walks its ladder and stops at the end; that R10 takes 51% and rejects exactly
 50%; that R11 waits a working day and respects its window; that R12 treats blank
@@ -3664,10 +3784,9 @@ qualifies, it stays silent and logs why.
   rule blocks — not only "active" rows. The activation gate lets a row through
   once somebody has started on it, which a never-contacted row has not; fed
   only active rows, R5 could see almost none of the people it exists to name.
-- `db.start_prospect_company` and `db.record_prospect_mention` existed with no
-  caller, so "two companies a week" restarted from the top of the sheet every
-  run and nobody ever reached the "skip them?" count. They are now called
-  after each post that lands (`_after_send`), for the contacts it named.
+- (S3 wired up "two companies a week" and the "skip them?" count. **Both were
+  retired on 11 Oct 2026**: R5 is one company at a time and names the same five
+  until one is contacted. See "R5 works through ONE company at a time".)
 - **A missing email is looked up.** One search (`"<name>" "<company>" email`,
   eight results, through `search_backend`), one `MODEL_LIGHT` extraction, and
   the address is kept **only if it appears word for word in a snippet the
@@ -3683,8 +3802,9 @@ qualifies, it stays silent and logs why.
   logged in `sheet_writes`, undoable. `write_cells` still refuses the Email
   column and every other column in the band; `write_email` takes no role
   argument, so there is nothing else it can be pointed at. Off by default.
-  R6's email lookup is the same path and makes the same offer. The R5 post is
-  posted as rendered (never composed), because a "yes" answers its last line.
+  R6's email lookup is the same path and makes the same offer. **Since 11 Oct
+  2026 the offer is R6's only**: R5's lookup still runs (the cache is shared)
+  but its message prints no email and opens no `email_write` proposal.
 
 **R3 — events, every Wednesday, one path.** `EVENTS_ANCHOR_DATE` (alternate
 weeks) is retired, and so is the second lane that ran beside R3 on the same
@@ -5468,7 +5588,8 @@ python verify_day_order.py                # NFT2-1069: every weekday's order and
 python verify_s1.py                       # cap 5 + R8/R9, the order of the day THREE WAYS (live sweep ticked every 15 min, test day, simulation), R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window
 python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
-python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5 emails + the one A:I write, R3 weekly + the reminder offer
+python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one A:I write, R3 weekly + the reminder offer
+python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_rule13.py                   # the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test
 python verify_voice_profile.py --offline  # the parts that need neither Discord nor the model
@@ -5908,6 +6029,7 @@ guardrails forbid.
 | `events.py` | **events & summits and the weekly funnel line**: the T-minus window, the permanent dedup key, and the counts-only Friday message. Pure — rows in, action dicts out |
 | `research.py` | **research briefs**: link extraction, the domain allow-list, the bounded fetch, the LinkedIn status, and the brief prompt. Copy material only — never sent, never written |
 | `approvals.py` | **permission before every write**: reading a yes/no from a message, the Sid-wins tie-break computed from *all* the votes, the proposal text, and the one wording of the add offer (`ROW_ADD_OFFER`, `row_add_offer`, `row_add_question`). Pure |
+| `prospects.py` | **who to contact next (R5)**: the six stacking rules and the company queue, the open / paused / next company, the person order, the month-end lines, and the fixed wording of the post and its replies. Pure — rows in, lists and text out |
 | `focus.py` | **focus commands**: parsing the command and its duration, matching a row against the focus, and the ordering R5 applies. Pure |
 | `simulation.py` | **simulation and test mode**: the `simulate …` parser, the throwaway database copy, the injected clock, the leave override, the [TEST]/DM rendering, and the silent channel gate — plus the **plain-language test commands** (`test help`, `make it Monday`, `next day`, `back to today`, `start over`), matched as text before any model call. Nearly pure — the only I/O is copying a file |
 | `tests/` | **the regression suite** — one class per bug that shipped and was caught by running something real, plus `test_env_example.py`, which pins the `.env.example` contract by reading every module's AST for the variables it uses. `pytest`, all offline |

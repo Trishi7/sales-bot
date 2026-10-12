@@ -522,6 +522,11 @@ CREATE TABLE IF NOT EXISTS pipeline_companies (
 -- row looked like when it was last posted, and a differing signature RESETS the
 -- count. Somebody who updated the row deserves a fresh start, not a bot still
 -- counting from before they acted.
+--
+-- RETIRED 11 Oct 2026. R5 names the same five people every time until one of
+-- them is contacted, by design, so nothing counts repeats and nothing asks to
+-- skip anybody. The table is left so an existing database opens unchanged;
+-- NOTHING READS OR WRITES IT.
 CREATE TABLE IF NOT EXISTS prospect_mentions (
     row_key     TEXT PRIMARY KEY,
     count       INTEGER NOT NULL DEFAULT 0,
@@ -537,11 +542,40 @@ CREATE TABLE IF NOT EXISTS prospect_mentions (
 -- flight are remembered against the ISO week rather than recomputed each run —
 -- otherwise Thursday would start two fresh companies and Tuesday's would be
 -- abandoned half-contacted.
+--
+-- RETIRED 11 Oct 2026, with "two companies a week" (see `prospect_open`).
+-- Left so an existing database opens unchanged; nothing reads or writes it.
 CREATE TABLE IF NOT EXISTS prospect_week (
     iso_week    TEXT NOT NULL,
     company     TEXT NOT NULL,
     started_on  TEXT NOT NULL,
     PRIMARY KEY (iso_week, company)
+);
+
+-- R5: THE ONE COMPANY THAT IS OPEN, AND THE ONES A PERSON MOVED ON FROM.
+--
+-- One company is open at a time and it is HELD: the score decides which
+-- company opens, and after that only two things move it, everybody there being
+-- contacted or a person saying "move on". That promise spans days and
+-- restarts, so it is a row here and not something recomputed from the scores
+-- each run (a company that picked up one more signal would otherwise take the
+-- slot from a half-contacted one).
+--
+--   status 'open'    the open company. At most one row.
+--   status 'paused'  moved on from by a person. `seq` is the order they were
+--                    paused in. PAUSED IS NOT DROPPED: it comes back when the
+--                    company that replaced it is finished.
+--   status 'next'    the company the last R5 message named as next, which is
+--                    what a bare "move on" means. At most one row.
+--
+-- `company_key` is the normalised company name (`prospects.company_key`).
+CREATE TABLE IF NOT EXISTS prospect_open (
+    status       TEXT NOT NULL,
+    company_key  TEXT NOT NULL,
+    company      TEXT NOT NULL DEFAULT '',
+    seq          INTEGER NOT NULL DEFAULT 0,
+    since        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (status, company_key)
 );
 
 -- R9: WHICH RUNG OF THE FOLLOW-UP LADDER EACH MEETING IS ON.
@@ -2525,80 +2559,57 @@ class DB:
             log.exception("[db] the pipeline snapshot could not be read")
             return set()
 
-    # -- R5: repeat counts and the week's companies ------------------------
+    # -- R5: the open company ------------------------------------------------
 
-    def prospect_repeats(self) -> dict:
-        """{row_key: count} — how many posts have carried each contact unchanged.
+    def prospect_state(self) -> dict:
+        """{"open": key, "paused": [keys, oldest first], "next": key, "names":
+        {key: the sheet's spelling}} for R5 (`prospects.resolve`).
 
-        FAILS OPEN, at 0. An unreadable table means the bot asks "shall I skip
-        them?" later than it should, which is a mild annoyance; failing closed
-        would mean it asked on the first mention, which reads as a bot giving up
-        before it started.
+        FAILS TO "NOTHING OPEN". An unreadable table returns the empty state,
+        and the rule then opens the best-scoring company: the worst case is
+        that a company a person moved on from is named again, which a second
+        "move on" fixes. Failing the other way would post nothing at all.
         """
+        out = {"open": "", "paused": [], "next": "", "names": {}}
         try:
             with self.conn() as c:
                 rows = c.execute(
-                    "SELECT row_key, count FROM prospect_mentions"
-                ).fetchall()
-            return {r["row_key"]: int(r["count"] or 0) for r in rows}
+                    "SELECT status, company_key, company FROM prospect_open "
+                    "ORDER BY seq, company_key").fetchall()
         except Exception:
-            log.exception("[db] prospect repeat counts could not be read; treating as 0")
-            return {}
+            log.exception("[db] R5's open company could not be read; treating as none open")
+            return out
+        for r in rows:
+            key = str(r["company_key"] or "")
+            if not key:
+                continue
+            out["names"][key] = str(r["company"] or "")
+            if r["status"] == "open":
+                out["open"] = key
+            elif r["status"] == "next":
+                out["next"] = key
+            elif r["status"] == "paused":
+                out["paused"].append(key)
+        return out
 
-    def record_prospect_mention(self, row_key: str, *, signature: str, on_date: str) -> int:
-        """Count one post that carried this contact. Returns the new count.
-
-        A CHANGED SIGNATURE RESETS THE COUNT TO 1. The rule is "three times with
-        nothing changed", not "three times" — somebody who updated the row has
-        acted, and a counter that kept climbing through their update would ask
-        to skip a contact who is actually moving.
-        """
-        key = str(row_key or "").strip()
-        if not key:
-            return 0
+    def save_prospect_state(self, *, open_key: str, paused: list, next_key: str = "",
+                            names: Optional[dict] = None, on_date: str = "") -> None:
+        """Replace R5's state in one transaction: the open company, the paused
+        ones in order, and the company the last message named as next."""
+        names = names or {}
+        rows = []
+        if open_key:
+            rows.append(("open", open_key, 0))
+        rows += [("paused", k, i) for i, k in enumerate(paused or [], 1) if k and k != open_key]
+        if next_key:
+            rows.append(("next", next_key, 0))
         with self.conn() as c:
-            row = c.execute(
-                "SELECT count, signature FROM prospect_mentions WHERE row_key = ?",
-                (key,),
-            ).fetchone()
-            if row and str(row["signature"] or "") == str(signature or ""):
-                count = int(row["count"] or 0) + 1
-            else:
-                count = 1
-            c.execute(
-                "INSERT INTO prospect_mentions (row_key, count, signature, last_date) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(row_key) DO UPDATE SET "
-                "count = excluded.count, signature = excluded.signature, "
-                "last_date = excluded.last_date, updated_at = CURRENT_TIMESTAMP",
-                (key, count, str(signature or ""), str(on_date or "")),
-            )
-        return count
-
-    def prospect_week_companies(self, iso_week: str) -> list:
-        """The companies this week's prospecting is already working through."""
-        try:
-            with self.conn() as c:
-                rows = c.execute(
-                    "SELECT company FROM prospect_week WHERE iso_week = ? "
-                    "ORDER BY started_on, company",
-                    (str(iso_week),),
-                ).fetchall()
-            return [r["company"] for r in rows]
-        except Exception:
-            log.exception("[db] the week's prospect companies could not be read")
-            return []
-
-    def start_prospect_company(self, company: str, *, iso_week: str, on_date: str) -> None:
-        """Remember that this week's prospecting has opened this company."""
-        label = str(company or "").strip()
-        if not label:
-            return
-        with self.conn() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO prospect_week (iso_week, company, started_on) "
-                "VALUES (?, ?, ?)",
-                (str(iso_week), label, str(on_date or "")),
-            )
+            c.execute("DELETE FROM prospect_open")
+            for status, key, seq in rows:
+                c.execute(
+                    "INSERT OR REPLACE INTO prospect_open (status, company_key, company, "
+                    "seq, since) VALUES (?, ?, ?, ?, ?)",
+                    (status, str(key), str(names.get(key) or ""), int(seq), str(on_date or "")))
 
     # -- R9: the meeting follow-up ladder ----------------------------------
 

@@ -831,145 +831,138 @@ def _short_date(d) -> str:
 def _role_rank(designation: str) -> int:
     """Where this designation sits in PROSPECT_ROLE_ORDER. Lower is better.
 
-    Founders before CXOs before chief scientists before researchers. Anything
-    the list does not recognise sorts LAST, in sheet order — an unrecognised
-    title is not evidence of seniority in either direction, so it waits rather
-    than jumping the queue or being dropped.
+    THE LIST IS WALKED TOP TO BOTTOM AND THE FIRST PHRASE THE TITLE CARRIES
+    WINS, so the order of the list is the design: "chief scientist" sits above
+    "chief", "senior lecturer" above "lecturer".
+
+    A PHRASE MATCHES AS WHOLE WORDS (11 Oct; it was a bare substring). With a
+    substring, "Director" carried "cto" (dire-CTO-r) and ranked as a CTO,
+    "Coordinator" carried "coo", "Leadership" carried "lead" and anything with
+    "sr" in it was senior. Short entries such as cto, coo, vp, sr and lead are
+    only safe as words. Punctuation is ignored ("Co-Founder/CTO" reads as the
+    words co, founder, cto) and a plural "s" on the last word still matches
+    ("Founders").
+
+    Anything the list does not recognise sorts LAST, in sheet order — an
+    unrecognised title is not evidence of seniority in either direction, so it
+    waits rather than jumping the queue or being dropped.
     """
-    want = gtm_sheet.normalise_header(designation or "")
+    want = gtm_sheet.normalise_header(designation or "").replace("?", " ")
+    want = " ".join(want.split())
     if not want:
         return 10_000
+    hay = f" {want} "
     for i, phrase in enumerate(config.PROSPECT_ROLE_ORDER or ()):
-        key = gtm_sheet.normalise_header(str(phrase))
-        if key and (key in want or want == key):
+        key = " ".join(gtm_sheet.normalise_header(str(phrase)).replace("?", " ").split())
+        if key and (f" {key} " in hay or f" {key}s " in hay):
             return i
     return 10_000
 
 
 def _r_prospects(rule, ctx) -> list:
-    """R5 — contacts with no first contact recorded. Tue and Thu.
+    """R5 — people with no first contact recorded, ONE COMPANY AT A TIME.
 
-    FOUR CONSTRAINTS, and they interact:
+    Everything that ranks a company or a person is in `prospects.py`, because
+    the post, the replies to it and the ad-hoc answers must give one order.
+    What this does:
 
-      1. Eligible rows are those where First Contact is FALSE or blank AND no
-         first-contact date is recorded (`first_contact_done`) — EVERY such
-         row the stop rules allow, read from `ctx["prospect_rows"]`, not only
-         the "active" ones. The activation gate lets a row through once
+      1. Reads EVERY row the stop rules allow (`ctx["prospect_rows"]`), not
+         only the "active" ones. The activation gate lets a row through once
          somebody has started on it, which is exactly what a never-contacted
-         row has not had: fed only active rows, this rule could see almost
-         none of the people it exists to name.
-      2. TWO COMPANIES A WEEK, in SHEET ORDER. The bot stays with a company
-         until every contact on it has a first contact recorded, then moves on.
-         Jumping around is how a company ends up half-contacted forever.
-      3. Within a company, ROLE ORDER: founders > CXO > chief scientist >
-         research > everything else.
-      4. Five per post — enforced by the rule's `max_items_per_post` when the
-         drip builds the message, not here, so the preview shows everything
-         that qualified and the post shows what fits.
+         row has not had.
+      2. Builds the company queue (`prospects.build_queue`: six stacking
+         rules, then fewer-people-left, then sheet order) and asks which
+         company is open (`prospects.resolve`, from `ctx["prospect_state"]`).
+      3. Emits EVERYBODY left at the open company, in `prospects.order_people`
+         order, each carrying `pick_order`. NOT just five: one contact is
+         named once a day and an earlier rule keeps them (R13 sits before R5),
+         so the post takes the first `max_items_per_post` that SURVIVE the
+         dedup. That is how the post still carries five after R13 has claimed
+         one of them.
 
-    `ctx["week_companies"]` is the companies already started this week, passed
-    in by the caller. It is what makes constraint 2 hold across days: Thursday
-    continues Tuesday's companies rather than starting two more.
+    A COMPANY IS NEVER DROPPED. It leaves the open slot only when nobody there
+    is left to contact or a person said to move on (`prospects.resolve`). This
+    function has no branch that retires one.
 
-    THE REPEAT ASK. `ctx["prospect_repeats"]` counts how many posts have carried
-    a contact with nothing changed. At PROSPECT_REPEAT_ASK_AT the item asks
-    whether to skip them instead of naming them again — three times is where
-    repeating turns into nagging.
+    THE SAME FIVE EVERY TIME. Nothing counts how often somebody was named and
+    nothing rotates: the five are the top five until one of them has a first
+    contact recorded, at which point they are simply no longer a row this
+    selects. (There is no way to drop a person who will never be contacted;
+    that is an open gap, not something to invent here.)
+
+    THE MONTH'S LAST POST carries two more lines when no First Contact Date
+    was recorded at the open company this calendar month
+    (`prospects.stalled_lines`). They close nothing.
     """
+    import prospects
+
     today = ctx["today"]
-    repeats = ctx.get("prospect_repeats") or {}
-    started = [c for c in (ctx.get("week_companies") or []) if c]
-    per_week = max(1, int(config.PROSPECT_COMPANIES_PER_WEEK))
-    ask_at = max(2, int(config.PROSPECT_REPEAT_ASK_AT))
-
-    # Group eligible rows by company, preserving SHEET ORDER for both the
-    # companies and the contacts inside them.
-    by_company: dict = {}
     source = ctx.get("prospect_rows")
-    for row in (source if source is not None else ctx.get("rows")) or ():
-        ok, _reason, _until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
-        if not ok:
-            continue
-        if first_contact_done(row):
-            continue
-        company = _text(row, "company")
-        if not company:
-            continue
-        by_company.setdefault(company, []).append(row)
+    rows = list((source if source is not None else ctx.get("rows")) or ())
+    queue = prospects.build_queue(rows, today=today, snoozes=ctx.get("snoozes") or {})
+    prospects.log_unmatched(queue, where=f"R5 on {today.isoformat()}")
+    if not queue:
+        return []
 
-    # THE FOCUS GOES FIRST, BEFORE THE TWO-A-WEEK LIMIT PICKS COMPANIES.
-    # Ordering the companies after the limit had already chosen two would mean a
-    # focus could only reorder what it had not been allowed to influence — the
-    # filter has to reach the choice itself or it does nothing useful.
-    #
-    # `focus_note` is carried onto every item so R5's message can say what the
-    # filter did. It is never empty while a focus is live, including when the
-    # focus matched NOTHING — a filter that silently matched nothing reads
-    # exactly like a quiet week.
+    # A FOCUS, WHEN ONE IS LIVE, PUTS THE COMPANIES IT MATCHES FIRST. It does
+    # not take the slot from a company that is already open: only a person
+    # saying "move on" does that.
     focus_note = ""
     active_focus = ctx.get("focus")
     if active_focus:
-        flat = [r for rows_ in by_company.values() for r in rows_]
-        ordered_rows, focus_note = focus_mod.apply_to(flat, active_focus)
-        regrouped: dict = {}
-        for row in ordered_rows:
-            regrouped.setdefault(_text(row, "company"), []).append(row)
-        by_company = regrouped
+        flat = [r for e in queue for r in e["left"]]
+        _ordered, focus_note = focus_mod.apply_to(flat, active_focus)
+        value = str(active_focus.get("value") or "")
+        hit = {e["key"] for e in queue if any(focus_mod.matches(r, value) for r in e["left"])}
+        queue = [e for e in queue if e["key"] in hit] + [e for e in queue if e["key"] not in hit]
 
-    # Finish the companies already started this week before opening new ones.
-    ordered = [c for c in started if c in by_company]
-    for company in by_company:
-        if company not in ordered and len(ordered) < per_week:
-            ordered.append(company)
+    view = prospects.resolve(queue, ctx.get("prospect_state"))
+    current, nxt = view["open"], view["next"]
+    if current is None:
+        return []
+    foot = (prospects.stalled_lines(view)
+            if prospects.is_last_slot_of_month(today, rule.weekdays) else [])
+    log.info("[rules] R5: %s is open (score %d: %s; %d left, %d reached); next is %s; "
+             "%d paused", current["company"], current["score"],
+             "+".join(current["flags"]) or "no rule", len(current["left"]),
+             current["reached"], nxt["company"] if nxt else "nobody", len(view["paused"]))
 
+    names = {e["key"]: e["company"] for e in [current] + ([nxt] if nxt else []) + view["paused"]}
+    shared = {
+        "reached": current["reached"], "left_total": len(current["left"]),
+        "next_company": nxt["company"] if nxt else "",
+        "foot": list(foot),
+        # WHAT TO REMEMBER ONCE THE POST HAS LANDED (`bot._after_send`).
+        "state": {**view["state"], "next": nxt["key"] if nxt else "", "names": names},
+    }
     out = []
-    for company in ordered:
-        members = sorted(
-            by_company.get(company) or [],
-            key=lambda r: (_role_rank(_text(r, "designation")), r.get("_row") or 0),
-        )
-        for row in members:
-            key = _contact_key(row)
-            seen = int(repeats.get(key) or 0)
-            designation = _text(row, "designation")
-            if seen >= ask_at:
-                text = (f"{_describe(row)} — I have listed them {seen} times with nothing "
-                        "changed. Shall I skip them?")
-                why = (f"R5: named {seen} times unchanged, which is "
-                       f"PROSPECT_REPEAT_ASK_AT ({ask_at}) or more")
-            else:
-                text = f"{_describe(row)} — no first contact recorded"
-                why = (f"R5 (Tue/Thu): First Contact is "
-                       f"{_text(row, 'first_contact') or 'blank'}"
-                       + (f", role rank {_role_rank(designation)}" if designation else ""))
-            out.append(_item(
-                rule=rule, trigger=R_PROSPECTS, today=today, due=today,
-                why=why + (f"; {focus_note}" if focus_note else ""),
-                text=text, company=company, poc=_text(row, "name"),
-                designation=designation, sheet_row=row.get("_row"),
-                row_key=key, contact_key=key,
-                extra={"repeat_count": seen, "ask_to_skip": seen >= ask_at,
-                       "role_rank": _role_rank(designation),
-                       # THE EMAIL: on file, or to be looked up at send time
-                       # for the contacts that make the post (`email_lookup`
-                       # is a request, not a promise — see bot._research_message).
-                       "email_on_file": _text(row, "email"),
-                       "email_lookup": not _text(row, "email"),
-                       # WHAT "NOTHING CHANGED" MEANS for the repeat count: the
-                       # cells somebody would touch if they had acted.
-                       "signature": prospect_signature(row),
-                       "focus_note": focus_note,
-                       "focus": (active_focus or {}).get("value", "")},
-            ))
+    for order, row in enumerate(current["left"]):
+        key = _contact_key(row)
+        designation = _text(row, "designation")
+        rank = _role_rank(designation)
+        out.append(_item(
+            rule=rule, trigger=R_PROSPECTS, today=today, due=today,
+            why=(f"R5: {current['company']} is the open company "
+                 f"({'+'.join(current['flags']) or 'no priority rule'}); person "
+                 f"{order + 1} of {len(current['left'])}"
+                 + (f", role rank {rank}" if rank < 10_000 else ", title not in the role order")
+                 + (f"; {focus_note}" if focus_note else "")),
+            text=f"{_describe(row)} — no first contact recorded",
+            company=current["company"], poc=_text(row, "name"),
+            designation=designation, sheet_row=row.get("_row"),
+            row_key=key, contact_key=key,
+            extra={"pick_order": order, "role_rank": rank,
+                   "signals": prospects.signals(row),
+                   # THE EMAIL: on file, or to be looked up at send time for
+                   # the contacts that make the post. The lookup still runs
+                   # (R6 shares its cache); R5's message does not print it.
+                   "email_on_file": _text(row, "email"),
+                   "email_lookup": not _text(row, "email"),
+                   "prospect": shared,
+                   "focus_note": focus_note,
+                   "focus": (active_focus or {}).get("value", "")},
+        ))
     return out
-
-
-def prospect_signature(row: dict) -> str:
-    """The state of a never-contacted row, as one string. When it changes,
-    R5's repeat count starts again (`db.record_prospect_mention`)."""
-    return "|".join(_text(row, role) for role in (
-        "first_contact", "first_contact_type", "first_contact_date", "sid_li_added",
-        "li_connected_date", "li_dm_date", "email", "next_steps"))
 
 
 def _r_li_no_dm(rule, ctx) -> list:
@@ -1976,8 +1969,8 @@ def run(
     snoozes: Optional[dict] = None, scheduled: Optional[dict] = None,
     deliverables: Optional[list] = None, packages: Optional[list] = None,
     events: Optional[list] = None, pipeline_companies: Optional[list] = None,
-    new_companies: Optional[list] = None, prospect_repeats: Optional[dict] = None,
-    week_companies: Optional[list] = None, meeting_followups: Optional[dict] = None,
+    new_companies: Optional[list] = None, prospect_state: Optional[dict] = None,
+    meeting_followups: Optional[dict] = None,
     focus: Optional[dict] = None,
     inactive: int = 0, day_rules: Optional[list] = None,
     prospect_rows: Optional[list] = None, events_unclear_seen=None,
@@ -2021,8 +2014,8 @@ def run(
         # None: "not supplied" and "the tab is empty" are different.
         "poc_company_index": (dict(poc_company_index)
                               if poc_company_index is not None else None),
-        "prospect_repeats": prospect_repeats or {},
-        "week_companies": list(week_companies or []),
+        # R5: which company is open and which are paused, read by the caller.
+        "prospect_state": dict(prospect_state or {}),
         "meeting_followups": meeting_followups or {},
         # R5 READS EVERY ROW, not only the active ones (None = use `rows`).
         "prospect_rows": list(prospect_rows) if prospect_rows is not None else None,
@@ -2370,7 +2363,7 @@ def _self_test() -> int:
     check("a blank closure does NOT stop the row",
           row_gate(row(), today=MON, snoozes={})[0], True)
 
-    print("\nR5 prospects — eligibility, role order, repeats")
+    print("\nR5 prospects — eligibility, one company, role order")
     rows5 = [
         row(_row=2, company="Acme", name="Zed", designation="Researcher"),
         row(_row=3, company="Acme", name="Ann", designation="Co-Founder"),
@@ -2382,21 +2375,28 @@ def _self_test() -> int:
     out = run(today=TUE, rows=rows5, day_rules=[rules_mod.by_id("R5")])
     names = [a["poc"] for a in out["actions"]]
     check("first contact TRUE is excluded", "Skip" not in names, True)
-    check("role order founders > CXO > research",
-          [n for n in names if n in ("Ann", "Cy", "Zed")], ["Ann", "Cy", "Zed"])
-    check("two companies a week only",
-          sorted({a["company"] for a in out["actions"]}), ["Acme", "Borealis"])
-    out = run(today=TUE, rows=rows5, week_companies=["Cinder"],
+    check("ONE company is open (nothing scores, so fewer-left then sheet order)",
+          sorted({a["company"] for a in out["actions"]}), ["Borealis"])
+    out = run(today=TUE, rows=rows5, prospect_state={"open": "acme"},
               day_rules=[rules_mod.by_id("R5")])
-    check("a company started this week is finished first",
-          "Cinder" in {a["company"] for a in out["actions"]}, True)
-    key = activation.row_key(rows5[1])
-    out = run(today=TUE, rows=[rows5[1]], prospect_repeats={key: 3},
-              day_rules=[rules_mod.by_id("R5")])
-    check("three unchanged listings asks to skip",
-          out["actions"][0]["ask_to_skip"], True)
-    check("...and says so in the text",
-          "skip them" in out["actions"][0]["text"], True)
+    check("the company held open stays open, in role order",
+          [a["poc"] for a in sorted(out["actions"], key=lambda a: a["pick_order"])],
+          ["Ann", "Cy", "Zed"])
+    check("...and nothing asks to skip anybody",
+          [k for a in out["actions"] for k in ("ask_to_skip", "repeat_count") if k in a], [])
+    # THE ROLE ORDER IS PINNED HERE: a machine's .env may still carry an older list.
+    kept_order = config.PROSPECT_ROLE_ORDER
+    config.PROSPECT_ROLE_ORDER = ["founder", "chief scientist", "cto", "chief", "head of",
+                                  "director", "lead"]
+    try:
+        check("a Director is not a CTO (whole words)",
+              (_role_rank("Director of Research"), _role_rank("Co-Founder/CTO"),
+               _role_rank("Leadership Coach")), (5, 0, 10_000))
+        check("Chief Scientist is not the generic chief",
+              (_role_rank("Chief Scientist"), _role_rank("Chief of Staff")), (1, 3))
+    finally:
+        config.PROSPECT_ROLE_ORDER = kept_order
+
 
     print("\nR6 / R7 — the day thresholds")
     r6 = row(li_connected_date="15-09-2026")
@@ -2703,9 +2703,6 @@ def _self_test() -> int:
               )["actions"]
     check("a stop rule still blocks; an email on file needs no lookup",
           [(a["poc"], a["email_lookup"]) for a in got], [("Em", False)])
-    check("the signature changes when the row does",
-          prospect_signature(never) == prospect_signature(dict(never, email="z@zeta.ai")),
-          False)
 
     print("\nR3 events — every Wednesday, a 14-day window")
     def ev(n, name, when, deadline="", registered="", link=""):

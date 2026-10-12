@@ -550,7 +550,7 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         #
         # THE NOTES ROLE (Z, "Notes/Remarks"). The name is historical: until
         # 7 Oct the column was 'Next Steps/Notes'. The dropdown is
-        # `outreach_step`. R9, `last_note` and `prospect_signature` read this.
+        # `outreach_step`. R9 and `last_note` read this.
         "next_steps": ("notes remarks", "notes/remarks", "next steps notes",
                        "next steps/notes", "notes", "remarks", "comments"),
         # WHICH PACKAGE went out. Cross-referenced against the Sales Packages

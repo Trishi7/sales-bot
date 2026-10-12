@@ -94,7 +94,7 @@ SETTINGS = {
     "SIMULATION_PREFIX": "[TEST]",           # the laptop's is [TEST-live]; the contract default is [TEST]
     "REMINDER_DEFAULT_TIME": "14:00", "SHEET_WRITE_UNDO_HOURS": 24,
     "EMAIL_LOOKUP_MAX_PER_POST": 5, "EMAIL_WRITE_ALLOWED": False, "SHEET_WRITES_ENABLED": True,
-    "PROSPECT_COMPANIES_PER_WEEK": 2, "PROSPECT_REPEAT_ASK_AT": 3,
+    "PROSPECT_COMPANIES_PER_WEEK": 1,
     "WEB_SEARCH_ENABLED": True, "SEARCH_BACKEND": "searxng", "SEARXNG_URL": "http://127.0.0.1:9",
     "SEARCH_FALLBACKS": [],
     # Rule 13's own contract defaults (.env.example)

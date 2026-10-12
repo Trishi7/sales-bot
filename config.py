@@ -2098,25 +2098,57 @@ DELIVERABLE_DONE_MARKERS: list[str] = _str_list(
     "done,completed,complete,closed,shipped,live,finished,delivered",
 )
 
-# R5 — PROSPECTS. Two companies or universities a week, in sheet order, and the
-# bot stays with one until every contact on it has a first contact recorded.
-# Moving on early is how a company ends up half-contacted forever.
-PROSPECT_COMPANIES_PER_WEEK = _int("PROSPECT_COMPANIES_PER_WEEK", 2)
+# R5 — PROSPECTS. ONE company is open at a time (11 Oct; it was two a week, in
+# sheet order). The open company is chosen by score and held until nobody there
+# is left to contact or a person says to move on (`prospects.resolve`). The
+# message names one company in its heading, so any value other than 1 is
+# treated as 1 and logged.
+PROSPECT_COMPANIES_PER_WEEK = _int("PROSPECT_COMPANIES_PER_WEEK", 1)
 
-# R5 — after this many posts carrying the SAME contact with nothing changed, the
-# bot asks whether to skip them rather than listing them a fourth time. Three is
-# where repeating turns into nagging.
-PROSPECT_REPEAT_ASK_AT = _int("PROSPECT_REPEAT_ASK_AT", 3)
-
-# R5 — the role order within a company, best first. A contact whose designation
-# matches an earlier phrase is offered before one matching a later phrase;
-# anything matching none goes last, in sheet order.
+# R5 — the role order within a company, best first. THE ORDER IS THE DESIGN: a
+# title is ranked by the FIRST phrase it carries, top to bottom, so "chief
+# scientist" must sit above "chief" and "senior lecturer" above "lecturer".
+# A phrase matches as WHOLE WORDS (`nextaction._role_rank`). Anything matching
+# none goes last, in sheet order.
 PROSPECT_ROLE_ORDER: list[str] = _str_list(
     "PROSPECT_ROLE_ORDER",
-    "founder,co-founder,cofounder,ceo,cto,coo,cpo,chief executive,chief technology,"
-    "chief scientist,chief,vp,head of research,research lead,principal researcher,"
-    "research scientist,researcher,professor,phd,product",
+    "founder,co-founder,cofounder,founding team,founding,chief executive,"
+    "chief technology,chief scientist,chief science,chief product,chief operating,"
+    "ceo,cto,coo,cpo,cso,chief,president,vice president,vp,head of,head -,director,"
+    "strategic sourcing,sourcing,human data,data operations,business development,"
+    "partnerships,principal,staff,tech lead,team lead,lead,professor,reader,"
+    "senior lecturer,lecturer,phd,senior,sr,research engineer,research scientist,"
+    "research lead,principal researcher,researcher,research,"
+    "member of technical staff,member of the founding team,computational,scientist,"
+    "machine learning engineer,ml engineer,ai engineer,agent engineer,"
+    "speech ai engineer,software engineer,engineer,product manager,product,"
+    "program manager,engineering manager,manager",
 )
+
+# R5 — the company score. Industry cells are matched LOOSELY (normalised, then
+# substring), so "AI labs " and "AI Labs (frontier)" are both AI Labs.
+PROSPECT_VOICE_INDUSTRIES: list[str] = _str_list(
+    "PROSPECT_VOICE_INDUSTRIES", "AI Voice Agents,AI Voice/Productivity Tools",
+)
+PROSPECT_LAB_INDUSTRIES: list[str] = _str_list("PROSPECT_LAB_INDUSTRIES", "AI Labs")
+
+# R5 — a title carrying one of these (whole words) is a person signal. Bare
+# "AI" was dropped on 11 Oct: nearly every title on the tab carries it.
+PROSPECT_KEYWORDS: list[str] = _str_list(
+    "PROSPECT_KEYWORDS",
+    "alignment,safety,trust,evaluations,robotics,red-teaming,STT,TTS,speech,duplex",
+)
+
+# R5 — "UK-based" is read off the free-text Based cell (whole words). THIS LIST
+# STILL NEEDS AGREEING WITH THE TEAM: "Cambridge" is also Cambridge, MA.
+PROSPECT_UK_MARKERS: list[str] = _str_list(
+    "PROSPECT_UK_MARKERS",
+    "UK,United Kingdom,London,Cambridge,Oxford,Edinburgh,Manchester,Bristol,Glasgow",
+)
+
+# R5 — a Designation longer than this prints no bracket at all. It is never cut
+# short: the cell is a person's own words.
+PROSPECT_DESIGNATION_MAX_CHARS = _int("PROSPECT_DESIGNATION_MAX_CHARS", 60)
 
 # R6 — LinkedIn connected, no DM after this many days.
 LI_NO_DM_DAYS = _int("LI_NO_DM_DAYS", 3)
@@ -3333,12 +3365,12 @@ def validate() -> list[str]:
     if NEXT_ACTION_ENABLED:
         log.info(
             "[config] the thirteen rules are ON (computation only — the engine has no "
-            "send path). rules_file=%s deliverables<=%dd prospects=%d co/week "
-            "ask_at=%d li_no_dm=%dd dm_no_meeting=%dd prep=%s+day-of@%s "
+            "send path). rules_file=%s deliverables<=%dd prospects=%d open company "
+            "li_no_dm=%dd dm_no_meeting=%dd prep=%s+day-of@%s "
             "followup=%dd/every %dd ladder=%s closure>%d%% new_company=+%dwd "
             "window=%dd weekend_shift=%s",
             BOT_RULES_FILE, DELIVERABLE_NEAR_DAYS, PROSPECT_COMPANIES_PER_WEEK,
-            PROSPECT_REPEAT_ASK_AT, LI_NO_DM_DAYS, DM_NO_MEETING_DAYS,
+            LI_NO_DM_DAYS, DM_NO_MEETING_DAYS,
             ",".join(MEETING_PREP_DAYS_BEFORE) or "(none)", MEETING_DAYOF_TIME,
             MEETING_FOLLOWUP_AFTER_DAYS, MEETING_FOLLOWUP_EVERY_DAYS,
             ">".join(MEETING_FOLLOWUP_LADDER) or "(empty)",
@@ -3393,12 +3425,16 @@ def validate() -> list[str]:
                 "CLOSURE_SUPPORT_STAGES is empty — R10 matches no prospect status and "
                 "closure support never fires, however high a closure probability gets."
             )
-        if PROSPECT_REPEAT_ASK_AT < 2:
+        if PROSPECT_COMPANIES_PER_WEEK != 1:
             log.warning(
-                "PROSPECT_REPEAT_ASK_AT=%d — R5 would ask whether to skip a contact "
-                "the first or second time it names them, which reads as a bot giving "
-                "up immediately. The plan's number is 3.",
-                PROSPECT_REPEAT_ASK_AT,
+                "PROSPECT_COMPANIES_PER_WEEK=%d — R5 keeps ONE company open at a time "
+                "(its message names one company in the heading), so this is treated "
+                "as 1.", PROSPECT_COMPANIES_PER_WEEK,
+            )
+        if not PROSPECT_ROLE_ORDER:
+            log.warning(
+                "PROSPECT_ROLE_ORDER is empty, so R5 cannot rank anybody by seniority "
+                "and names people in sheet order."
             )
         if not DELIVERABLE_P1_MARKERS:
             log.warning(

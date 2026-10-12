@@ -1201,7 +1201,10 @@ HEADINGS = {
     "R2": "Companies in the news",
     "R3": "AI events & summits",
     "R4": "This week's deliverables",
-    "R5": "PoCs to contact",
+    # R5 HAS NO HEADING HERE: its bold first line carries the company
+    # ("**PoCs to contact — Wisprlow.ai**") and a blank line under it, so it is
+    # part of the rendered block (`prospects.post_parts`), like R11's opener.
+    "R5": "",
     "R6": "LinkedIn connected, no DM yet",
     "R7": "DM sent, no meeting yet",
     "R8": "Meeting prep for {company}",
@@ -1695,50 +1698,34 @@ def render_dm_no_meeting(actions: list, *, limit: Optional[int] = None) -> tuple
     return lines, extra, len(rows)
 
 
-# -- R5: PoCs to contact — one line a contact, with the email -----------------
+# -- R5: PoCs to contact — one company, the same five, fixed wording ----------
 
-PROSPECT_OPENERS = (
-    "No first contact yet with these {n}:",
-    "{n} to reach out to — no first contact recorded:",
-    "Next up for a first contact — {n}:",
-)
 EMAIL_OFFER = "Want me to add the email{s} I found to the sheet? Say yes."
 
 
-def render_prospects(actions: list, *, limit: int = 5) -> tuple:
-    """(lines, extra, found) for R5 — `found` is the emails the lookup verified.
+def render_prospects(actions: list, *, limit: int = 5) -> Optional[dict]:
+    """R5's message as `prospects.post_parts` gives it, or None with nobody to
+    name. The people are the first `limit` in `prospect_order`; the counts, the
+    next company and the month-end lines travel on the items
+    (`nextaction._r_prospects`).
 
-        1. Ada Lovelace (CTO) — Acme AI — email found: ada@acme.ai ([acme.ai](<…>))
-        2. Bo Chen (Founder) — Borealis — no public email found
-        3. Cy Diaz — Cinder — I've listed them 3 times with nothing changed. Skip them?
-
-    THE EMAIL HALF IS SAID ONLY WHEN IT WAS LOOKED UP. A contact with an email
-    on file, or one past EMAIL_LOOKUP_MAX_PER_POST, has nothing after the
-    company. An address is here only because it appeared, character for
-    character, in a snippet the search returned (`websearch.verified_emails`).
+    NO EMAIL IS PRINTED AND NO EMAIL OFFER IS MADE (11 Oct). The lookup still
+    runs for the people named, because R6 reads the same cache; the agreed
+    message has no place for its result.
     """
-    cap = max(1, int(limit))
-    rows = prospect_order(actions)
-    lines: list = []
-    found: list = []
-    for i, a in enumerate(rows[:cap], 1):
-        who = str(a.get("poc") or "").strip() or "(no name on the row)"
-        role = str(a.get("poc_designation") or "").strip()
-        line = f"{i}. {who}" + (f" ({role})" if role else "") \
-            + f" — {str(a.get('company') or '').strip()}"
-        if a.get("ask_to_skip"):
-            line += (f" — I've listed them {int(a.get('repeat_count') or 0)} times "
-                     "with nothing changed. Skip them?")
-        elif a.get("email_found"):
-            src = str(a.get("email_source") or "").strip()
-            line += f" — email found: {a['email_found']}" + (
-                f" ({link('', src)})" if src else "")
-            found.append(a)
-        elif a.get("email_checked"):
-            line += " — no public email found"
-        lines.append(line)
-    extra = [f"(+{len(rows) - cap} more next time)"] if len(rows) > cap else []
-    return lines, extra, found
+    import prospects
+
+    rows = prospect_order(actions)[:max(1, int(limit))]
+    if not rows:
+        return None
+    info = next((a.get("prospect") for a in rows if a.get("prospect")), None) or {}
+    return prospects.post_parts(
+        str(rows[0].get("company") or ""),
+        [(a.get("poc"), a.get("poc_designation")) for a in rows],
+        reached=int(info.get("reached") or 0),
+        left_total=int(info.get("left_total") or len(rows)),
+        next_company=str(info.get("next_company") or ""),
+        foot=info.get("foot") or ())
 
 
 # -- R3: AI events — what is close enough to mention --------------------------
@@ -1783,9 +1770,12 @@ def render_events(message: dict, *, limit: int = 5) -> tuple:
 
 
 def prospect_order(actions: list) -> list:
-    """R5's contacts in the order they are listed: company by company, and
-    within a company the more senior role first (PROSPECT_ROLE_ORDER — founder
-    first), then sheet order. One contact once."""
+    """R5's people in the order the rule picked them (`pick_order`, which is
+    `prospects.order_people`): seniority, then the person signals, then sheet
+    order. One contact once. `group` sorts members by due date, which is not
+    it. The first five of THIS list are the post, so a person another rule
+    kept for the day (the dedup) is simply not in it and the next one moves up.
+    """
     seen: set = set()
     rows: list = []
     for a in actions or []:
@@ -1794,15 +1784,9 @@ def prospect_order(actions: list) -> list:
             continue
         seen.add(key)
         rows.append(a)
-    first_row: dict = {}
-    for a in rows:
-        company = str(a.get("company") or "").lower()
-        first_row[company] = min(first_row.get(company, 10 ** 9),
-                                 int(a.get("sheet_row") or 0))
-    return sorted(rows, key=lambda a: (first_row[str(a.get("company") or "").lower()],
-                                       str(a.get("company") or "").lower(),
-                                       _rank_of(a),
-                                       int(a.get("sheet_row") or 0)))
+    return sorted(rows, key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        _rank_of(a), int(a.get("sheet_row") or 0)))
 
 
 def shown_contacts(message: dict) -> list:
@@ -1914,15 +1898,16 @@ def points_of(message: dict) -> Optional[dict]:
                 "lines": lines, "extra": extra,
                 "close": _voice(message, "r7_close", DM_NO_MEETING_CLOSES)}
     if kind == nextaction.R_PROSPECTS:
-        lines, extra, found = render_prospects(actions, limit=cap)
-        if not lines:
+        parts = render_prospects(actions, limit=cap)
+        if not parts:
             return None
-        offer = (EMAIL_OFFER.format(s="" if len(found) == 1 else "s")
-                 if found and config.EMAIL_WRITE_ALLOWED else "")
-        return {"header": _voice(message, "r5_opener", PROSPECT_OPENERS).format(
-                    n=len(lines)),
-                "lines": lines, "extra": extra,
-                "close": offer or _voice(message, "list_close", GENERIC_CLOSES)}
+        # THE WHOLE POST IS THE AGREED SHAPE, posted as written (R5 is in
+        # VERBATIM_TYPES): the bold heading with the company, a blank line,
+        # the numbered people, then the counts, the one question and the
+        # next-company line. No opener variant and no separate close.
+        return {"header": parts["header"] + "\n", "lines": parts["lines"],
+                "extra": ([""] + parts["tail"]) if parts["tail"] else [],
+                "close": "", "opener_in_block": True}
     if kind == nextaction.R_EVENTS:
         lines, extra, offer = render_events(message, limit=cap)
         if not lines:
@@ -2122,6 +2107,11 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         lead = "" if points.get("opener_in_block") else who
         body = (lead + points_block(points)
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
+        if message.get("type") == nextaction.R_PROSPECTS:
+            # R5 IS ITS AGREED SHAPE AND NOTHING ELSE. Its only research is the
+            # email lookup, whose result the message does not print, so a note
+            # about that lookup ("the search is down") has no business under it.
+            return body
         if research:
             body += "\n\n" + research
         note = note_of(message)

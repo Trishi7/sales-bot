@@ -299,7 +299,10 @@ def _stage_today(w, *, empty=False):
         pocs=[fx.person(1, name="Priya Rao", company="Acme Labs", li_date=THU - timedelta(days=10),
                         step="Send email 1"),
               fx.person(2, name="Dev Shah", company="Borealis", li_date=THU - timedelta(days=12),
-                        step="Send email 1", meeting_date=date(2026, 10, 16))],            # a meeting tomorrow
+                        step="Send email 1", meeting_date=date(2026, 10, 16)),             # a meeting tomorrow
+              # A PLAIN PROSPECT (11 Oct): R5 works one company at a time, and the next-steps post keeps anybody
+              # both rules select, so R5 needs somebody of its own to have a post that day.
+              fx.values_row(3, company="Acme Labs", name="Noor Ali", designation="Founder")],
     )
     w.bot.db.add_scheduled_reminder(due_date=mon.isoformat(), due_time="15:00", what="the pulse overview doc",
                                     requested_by="Kushal", channel_id=str(rw.CHANNEL), asker_id=str(rw.MEMBER))

@@ -436,42 +436,50 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R5
-  # Outreach PoCs rows where First Contact is FALSE or blank. Five contacts a
-  # post, in the role order founders > CXO > chief scientist > research. Two
-  # companies or universities a week, in sheet order — stay with a company
-  # until all its contacts have a first contact recorded. If the same contact
-  # comes up three times with no update, ask whether to skip it.
+  # Outreach PoCs rows where First Contact is FALSE or blank, ONE COMPANY AT A
+  # TIME (rebuilt 11 Oct 2026; it was two companies a week in sheet order).
   #
-  # S3: EVERY such row the stop rules allow — not only the "active" ones, which
-  # is what a never-contacted row is not. The two-a-week and the "skip them?"
-  # counters are now actually written, after each post that lands.
+  # WHICH COMPANY. Every company with somebody left to contact is scored by six
+  # rules that STACK, most important first: warm (2+ people there already have a
+  # first contact), voice industry, AI lab, somebody UK-based, a keyword in a
+  # title, a research paper link. An earlier rule outweighs all the later ones
+  # together. A tie goes to the company with FEWER people left, then to sheet
+  # order. A company matching nothing is queued last, never left out.
   #
-  # THE EMAIL. For each contact in the post whose Email cell is blank: ONE
-  # search ('"<name>" "<company>" email'), a light-model extraction, and the
-  # address is kept ONLY if it appears word for word in a snippet the search
-  # returned. The line says "email found: x@y.com (<source>)" or "no public
-  # email found". Never a guessed pattern. At most EMAIL_LOOKUP_MAX_PER_POST;
-  # cached RESEARCH_CACHE_DAYS. With EMAIL_WRITE_ALLOWED=true the post offers
-  # to add what it found: a yes re-reads the row and writes ONLY the Email
-  # cell, ONLY if it is still blank — logged in sheet_writes, undoable. That
-  # is the single exception to "columns A:I are never written". R6 uses the
-  # same lookup and the same offer.
+  # IT IS HELD. The open company stays open until everybody there has a first
+  # contact recorded, or a person says "move on" (which PAUSES it; it returns
+  # when the next one is finished). Nothing else moves it.
+  #
+  # WHO. Seniority (PROSPECT_ROLE_ORDER), then how many of UK-based / keyword /
+  # paper link a person carries, then sheet order. The top five, and THE SAME
+  # FIVE every post until one of them is contacted. Nothing counts repeats and
+  # nothing asks to skip anybody.
+  #
+  # EVERY such row the stop rules allow is read, not only the "active" ones,
+  # which is what a never-contacted row is not.
+  #
+  # THE EMAIL. For each person named whose Email cell is blank the lookup still
+  # runs (ONE search, kept only if the address is word for word in a snippet;
+  # at most EMAIL_LOOKUP_MAX_PER_POST; cached RESEARCH_CACHE_DAYS), because R6
+  # reads the same cache. R5's MESSAGE NO LONGER PRINTS IT and makes no offer to
+  # write it: the agreed message has no place for it. R6 still does both.
   - id: R5
     name: Prospects to contact
     plain: people we haven't made first contact with
     # The Bot Rules tab, rule 5, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      People we haven't made first contact with. Tuesday and Thursday:
-      every Outreach PoCs row where First Contact is FALSE or blank,
-      unless the row is dead, won or lost — two companies a week in
-      sheet order, staying with a company until all its contacts are
-      done; up to 5 contacts a post, founders first. For a contact with
-      no email on the sheet, searches once for a published address and
-      shows "email found: x@y.com (source)" or "no public email found" —
-      never a guessed address. If one was found, asks whether to add it
-      to the sheet; on a yes writes only that Email cell, and only if it
-      is still blank (it can be undone). After the same contact has been
-      listed 3 times with nothing changed, asks whether to skip them.
+      People we haven't made first contact with, one company at a time.
+      Tuesday and Thursday: the open company's top 5 people with no First
+      Contact (unless the row is dead, won or lost), most senior first,
+      and the same 5 each time until one is contacted. The company is
+      chosen by priority: 2 or more people there already contacted, then
+      voice AI, then AI labs, then anyone UK-based, a keyword in a title,
+      a research paper link; on a tie the company with fewer people left,
+      then sheet order. Says how many we have reached there and how many
+      are left, offers to list the rest, and names the next company; reply
+      "move on" to switch to it (the current one is paused, not dropped).
+      On the month's last Tuesday or Thursday, if nobody there was
+      contacted that month, it adds a line saying so.
     weekdays: [tue, thu]
     trigger: prospects
     max_items_per_post: 5

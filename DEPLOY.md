@@ -1095,3 +1095,57 @@ files; that is a team decision, not part of this change.
 
 Then, on the laptop, `python tools/redact_env.py`. No database migration. `python verify_poc_crosscheck.py --show`
 checks it offline and prints the messages.
+
+## Upgrading to the R5 rebuild (11 Oct): one company at a time
+
+What changes for the team: the Tuesday and Thursday "PoCs to contact" post is about ONE company, chosen by priority
+(two or more people already contacted there, then voice AI, AI labs, UK-based, a keyword in a title, a paper link),
+and it names the same five people every time until one is contacted. It says how many have been reached and how
+many are left, offers to list the rest (reply "yes"), and names the next company (reply "move on" to switch; the
+current one is paused, not dropped). On the month's last Tuesday or Thursday it adds two lines if nobody at that
+company was contacted that month. It no longer prints emails, and never asks whether to skip anybody.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`). THIS RELEASE NEEDS AN EDIT, NOT JUST A RESTART.**
+The laptop's `.env` sets the two old values below, and a value in `.env` beats the new default, so until they are
+changed the bot keeps the OLD role order. Check the server's file for the same lines. Set:
+
+```
+PROSPECT_COMPANIES_PER_WEEK=1
+PROSPECT_ROLE_ORDER=founder,co-founder,cofounder,founding team,founding,chief executive,chief technology,chief scientist,chief science,chief product,chief operating,ceo,cto,coo,cpo,cso,chief,president,vice president,vp,head of,head -,director,strategic sourcing,sourcing,human data,data operations,business development,partnerships,principal,staff,tech lead,team lead,lead,professor,reader,senior lecturer,lecturer,phd,senior,sr,research engineer,research scientist,research lead,principal researcher,researcher,research,member of technical staff,member of the founding team,computational,scientist,machine learning engineer,ml engineer,ai engineer,agent engineer,speech ai engineer,software engineer,engineer,product manager,product,program manager,engineering manager,manager
+```
+
+(or delete both lines to take the defaults), and delete this line, which now does nothing:
+
+```
+PROSPECT_REPEAT_ASK_AT=3
+```
+
+Five new variables; the defaults are what was specified, so the lines are optional:
+
+```
+PROSPECT_VOICE_INDUSTRIES=AI Voice Agents,AI Voice/Productivity Tools
+PROSPECT_LAB_INDUSTRIES=AI Labs
+PROSPECT_KEYWORDS=alignment,safety,trust,evaluations,robotics,red-teaming,STT,TTS,speech,duplex
+PROSPECT_UK_MARKERS=UK,United Kingdom,London,Cambridge,Oxford,Edinburgh,Manchester,Bristol,Glasgow
+PROSPECT_DESIGNATION_MAX_CHARS=60
+```
+
+Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** One new table, `prospect_open`, created on start. `prospect_mentions` and `prospect_week` are left in
+place and no longer read or written. Nothing to run by hand.
+
+**What to look for in the log** after the restart:
+
+```
+[prospects] startup: 91 company(ies) with people left to contact; 82 of them (116 people) match none of the six priority rules and are queued last
+[rules] R5: Sierra AI is open (score 52: warm+voice+uk; 5 left, 3 reached); next is ElevenLabs; 0 paused
+```
+
+(the numbers are illustrative). If the boot log warns `PROSPECT_COMPANIES_PER_WEEK=2 ... treated as 1`, the old
+line is still in `.env`.
+
+**The Bot Rules tab.** Rule 5's "What the Bot Shares / Checks" wording changed (`sheet_wording` in
+`bot_rules.yaml`); paste it into the sheet by hand.
+
+`python verify_prospects_priority.py --show` checks all of it offline and prints the messages.
