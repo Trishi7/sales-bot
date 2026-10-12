@@ -172,13 +172,43 @@ def poc_targets(now: Optional[datetime] = None) -> list:
             if len(" ".join(str(t.get("name") or "").split())) >= POC_NAME_MIN_CHARS]
 
 
+_BAD_FEEDS_LOGGED: set = set()
+
+
+def feed_url(raw) -> str:
+    """One NEWS_RSS_FEEDS entry as a url `requests` can fetch, or "".
+
+    A PROTOCOL-RELATIVE ENTRY GETS ITS SCHEME. One feed was configured as
+    "//news.google.com/rss/search?..." (the "https:" lost in a paste), and
+    every poll raised InvalidSchema on it. "//host/path" can only mean
+    https here, so it is read as that. Anything else with no http(s) scheme
+    is NOT guessed at: it is left out and logged once, naming the entry.
+    """
+    url = str(raw or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        fixed = "https:" + url
+        if url not in _BAD_FEEDS_LOGGED:
+            _BAD_FEEDS_LOGGED.add(url)
+            log.warning("[feeds] NEWS_RSS_FEEDS entry %r has no scheme; reading it as %r. "
+                        "Put https: in front of it in .env.", url[:80], fixed[:80])
+        return fixed
+    if not url.lower().startswith(("http://", "https://")):
+        if url not in _BAD_FEEDS_LOGGED:
+            _BAD_FEEDS_LOGGED.add(url)
+            log.error("[feeds] NEWS_RSS_FEEDS entry %r is not an http(s) url; skipped", url[:80])
+        return ""
+    return url
+
+
 def sources() -> list:
     """[(url, topic_hint)] — the outlets' feeds first, then one Google News
     query per topic."""
     out: list = []
     seen: set = set()
     for url in config.NEWS_RSS_FEEDS or []:
-        url = str(url or "").strip()
+        url = feed_url(url)
         if url and url not in seen:
             seen.add(url)
             out.append((url, ""))
@@ -451,6 +481,10 @@ def _self_test() -> int:
 
     print("\nthe sources")
     saved = (config.NEWS_RSS_FEEDS, config.NEWS_TOPICS)
+    check("a protocol-relative feed gets https, and a schemeless one is left out",
+          (feed_url("//news.google.com/rss/search?q=x"), feed_url("news.google.com/rss"),
+           feed_url(" https://a.com/feed ")),
+          ("https://news.google.com/rss/search?q=x", "", "https://a.com/feed"))
     config.NEWS_RSS_FEEDS, config.NEWS_TOPICS = ["https://a.com/feed"], ["evals",
                                                                          "voice agent"]
     src = sources()

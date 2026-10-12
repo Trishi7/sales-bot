@@ -70,7 +70,9 @@ SPACED = {
     THU: [("R5", "14:00"), ("R1", "16:00"), ("R12", "18:00")],
     FRI: [("R2", "14:00"), ("R6", "16:00"), ("R1", "18:00")],
 }
-FIXED = [("R8", "10:00"), ("R9", "10:00"), ("R13", "15:00")]
+# R8 IS TWO POSTS since 12 Oct 2026: "Meeting today" at 10:00 and "Meeting preparation" at 14:00. The made-up
+# sheet has a meeting on the day and one three days out, so every day carries both.
+FIXED = [("R8", "10:00"), ("R8", "14:00"), ("R9", "10:00"), ("R13", "15:00")]
 
 
 @contextlib.contextmanager
@@ -197,16 +199,18 @@ def day_table(day: date) -> list:
 # -- the checks -----------------------------------------------------------------------------------------------------
 
 def every_weekday(check) -> None:
-    """Each weekday with every rule due: the exact times; R13 at 15:00, R8 and R9 at 10:00, moving nothing."""
+    """Each weekday with every rule due: the exact times; R13 at 15:00, R9 and "Meeting today" at 10:00,
+    "Meeting preparation" at 14:00, moving nothing."""
     with pinned():
         for day in WEEK:
             name = day.strftime("%A")
             planned = plan(day)
             check(f"{name}, every rule due: the spaced posts, in the team's order, two hours apart",
                   posts(planned, pinned_only=False), SPACED[day])
-            check(f"{name}: meeting prep and the meeting follow-up at 10:00, next steps at 15:00",
+            check(f"{name}: meeting today and the meeting follow-up at 10:00, meeting preparation at 14:00, "
+                  "next steps at 15:00",
                   sorted(posts(planned, pinned_only=True)), sorted(FIXED))
-            check(f"{name}: sent in time order — 10:00, 10:00, 14:00, 15:00, then the rest",
+            check(f"{name}: sent in time order — 10:00, 10:00, 14:00, 14:00, 15:00, then the rest",
                   [t for _r, t in posts(planned)],
                   sorted(t for _r, t in SPACED[day] + FIXED))
             check(f"{name}: every gap between spaced posts is exactly 120 minutes",
@@ -594,7 +598,9 @@ def startup(check) -> None:
 
 
 def weekend(check) -> None:
-    """Sunday is unchanged: SUNDAY_RULE_IDS=R4, one post at 14:00, only for a P1 due on the Monday. Saturday: none."""
+    """Sunday's one counted post is unchanged: SUNDAY_RULE_IDS=R4, at 14:00, only for a P1 due on the Monday.
+    Saturday has none. SINCE 12 Oct 2026 THE TWO R8 POSTS GO ON THEIR OWN DAYS, weekends included: a touch belongs
+    to its meeting's date, not to the working week."""
     with pinned():
         def sunday(due: date) -> dict:
             deliverables = [{"_row": 2, "_extra": {}, "action_item": "MSA template", "priority": "P1",
@@ -605,15 +611,20 @@ def weekend(check) -> None:
             return drip.plan(nextaction.run(**base)["actions"], day=SUN)
 
         due_monday = sunday(SUN + timedelta(days=1))
-        check("a Sunday with a P1 due on the Monday: one post, the checklist, at 14:00",
-              posts(due_monday), [("R4", "14:00")])
-        check("...no AI news, no next steps; the meeting posts wait for Monday",
-              sorted({g["rule_id"] for g in due_monday["held"]}), ["R8", "R9"])
-        check("a Sunday with nothing due on the Monday: silent",
-              posts(sunday(SUN + timedelta(days=4))), [])
+        check("a Sunday with a P1 due on the Monday: the checklist at 14:00, and the two meeting posts at their "
+              "own times",
+              posts(due_monday), [("R8", "10:00"), ("R4", "14:00"), ("R8", "14:00")])
+        check("...only the checklist counts toward Sunday's one post",
+              [m["rule_id"] for m in due_monday["messages"] if m["counts_toward_cap"]], ["R4"])
+        check("...no AI news, no next steps; the meeting follow-up waits for Monday",
+              sorted({g["rule_id"] for g in due_monday["held"]}), ["R9"])
+        check("a Sunday with nothing due on the Monday: the meeting posts alone",
+              posts(sunday(SUN + timedelta(days=4))), [("R8", "10:00"), ("R8", "14:00")])
         check("Sunday has no order of its own", (rules_mod.order_for(SUN), rules_mod.order_for(SAT)), ([], []))
         sat = drip.plan(nextaction.run(**world(SAT))["actions"], day=SAT)
-        check("Saturday: nothing", (posts(sat), drip.is_sending_day(SAT)), ([], False))
+        check("Saturday: nothing but the meeting posts, and it is still not a sending day",
+              (posts(sat), drip.is_sending_day(SAT), sorted({g["rule_id"] for g in sat["held"]})),
+              ([("R8", "10:00"), ("R8", "14:00")], False, ["R9"]))
         check("Sunday is a sending day only because of SUNDAY_RULE_IDS",
               (drip.is_sending_day(SUN), sorted(drip.sunday_rule_ids())), (True, ["R4"]))
 
@@ -677,7 +688,7 @@ def wording(check) -> None:
     check("Global Rules has the order of the day, weekday by weekday",
           all(d in order for d in ("Monday:", "Tuesday:", "Wednesday:", "Thursday:", "Friday:")), True)
     for rule, must in (("R1", "in its place in the day's order"), ("R7", "Rule 13 comes first"),
-                       ("R8", "Every touch posts at 10 AM"), ("R9", "Posts at 10 AM"),
+                       ("R8", "Today's meetings post on their own at 10 AM"), ("R9", "Posts at 10 AM"),
                        ("R11", "every Wednesday")):
         text = rules_mod.sheet_wording_for(rule)
         check(f"Bot Rules, rule {rule[1:]}: the wording for the sheet says \"{must}\"", must in text, True)

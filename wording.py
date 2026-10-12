@@ -1079,6 +1079,234 @@ def packages_lines_for_check() -> list:
         packages_gone("DPO Pack")]
 
 
+# -- meeting preparation (rule 8) ------------------------------------------------
+#
+# THE TWO POSTS, AGREED 12 Oct 2026. Today's meetings are ALWAYS their own post:
+#
+#     **Meeting today**
+#     @Vaishnavi @Sid
+#     we have a meeting today with:
+#     1. Ada Lovelace (Acme AI)
+#     2. Sujith P (ARTPARK)
+#        They've been in the news recently — worth a skim before you go in:
+#        [headline](url)
+#
+#     Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+#
+# and the afternoon one, the closest block first, numbered straight through:
+#
+#     **Meeting preparation**
+#     @Vaishnavi @Sid
+#     we have a meeting in 3 days with:
+#     1. Dr. David Gamez (Middlesex University London) — Wed 15 Oct
+#        They've been in the news recently — worth a skim before the call:
+#        [headline](url)
+#
+#     and a meeting in 5 days with:
+#     2. Sujith P (ARTPARK) — Fri 17 Oct
+#
+#     Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+#
+# LOWER-CASE "we", as written. PERSON FIRST, COMPANY IN BRACKETS. Today's lines
+# carry no date (it is today); the others carry the weekday and the date. The
+# news sentence ends on a colon and the headline is on the next line, both
+# indented under the name; no story, no sentence, and nothing ever says "no
+# news". THE 5-DAY CLOSE SAYS START, THE OTHERS SAY CHECK: deliberate, and a
+# post carrying a nearer block takes the check one. One meeting is still a list
+# of one. The heading and the tags line are the sender's, not part of the block.
+MEETING_TODAY_OPENER = "we have {meetings} today with:"
+MEETING_PREP_OPENER = "we have {meetings} {when} with:"
+MEETING_PREP_OPENER_NEXT = "and {meetings} {when} with:"
+MEETING_NEWS_TODAY = ("   They've been in the news recently — worth a skim before you go in:")
+MEETING_NEWS_PREP = ("   They've been in the news recently — worth a skim before the call:")
+MEETING_NEWS_LINK = "   {link}"
+MEETING_TODAY_CLOSE = ("Are we all set on the deck, the package and the demo? Let me know if you "
+                       "need anything from me, or if you'd like another nudge before it starts.")
+MEETING_PREP_CLOSE = ("Are we all set on the deck, the package and the demo? Let me know if you "
+                      "need anything from me, or if you'd like me to remind you again nearer the "
+                      "day.")
+MEETING_PREP_CLOSE_START = ("Good time to start on the deck, the package and the demo. Let me know "
+                            "if you need anything from me, or if you'd like me to remind you again "
+                            "nearer the day.")
+# A MEETING DATE NOBODY COULD READ is still named, in the afternoon post, on a
+# line of its own after the blocks: without a date there is no touch for it to
+# be on. Asked once a week.
+MEETING_UNREADABLE = ("{n}. {who} — I couldn't read the Meeting Date on the sheet. Could you "
+                      "put the day in?")
+# THE REMINDER THE CLOSE OFFERS. Set from a reply under the post; sent by the
+# one reminder loop like every other reminder.
+MEETING_REMIND_SET = "I'll remind you about the meeting with {who} on {when}."
+MEETING_REMIND_WHICH = "Which meeting is that for? Give me its number or the name."
+MEETING_REMIND_WHEN = ("When would you like the reminder? Give me a day or a time, like "
+                       "\"Thursday\" or \"3 PM\".")
+MEETING_REMIND_AFTER = ("That's after the meeting with {who} on {day}. Could you give me a time "
+                        "before it?")
+MEETING_REMIND_NO_DATE = ("I don't have a date for the meeting with {who} yet, so there's nothing "
+                          "to time a reminder against.")
+MEETING_REMIND_WHAT = "the meeting with {who} on {day}"
+# The meeting moved after a reminder was set: said once, when it is re-anchored.
+MEETING_REMIND_MOVED = ("The meeting with {who} has moved to {day}, so I've moved your reminder "
+                        "to {when}.")
+_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+                8: "eight", 9: "nine", 10: "ten"}
+
+
+def meetings_count(n) -> str:
+    """"a meeting", "two meetings", "12 meetings": the noun through `plural`,
+    the number as a word up to ten because that is how the sentence was agreed
+    ("we have two meetings today with:")."""
+    n = max(1, int(n or 1))
+    if n == 1:
+        return "a meeting"
+    counted = plural(n, "meeting")
+    return counted.replace(str(n), _COUNT_WORDS[n], 1) if n in _COUNT_WORDS else counted
+
+
+def meeting_days(days) -> str:
+    """"in 3 days", or "tomorrow" for one (only a catch-up touch is that
+    close)."""
+    days = int(days or 0)
+    return "tomorrow" if days == 1 else "in " + plural(days, "day")
+
+
+def _meeting_lines(people, *, start, shown, sentence, dated) -> list:
+    """One block's numbered lines, with a news line after each company's
+    people. `shown` is the companies whose story this POST has already
+    carried: a company's story appears once a post, after the last of its
+    names in the first block it stands in."""
+    people = list(people or ())
+    lines: list = []
+    n = start
+    for i, person in enumerate(people):
+        n += 1
+        line = f"{n}. {str(person.get('who') or '').strip() or '(unnamed row)'}"
+        when = day_date(person.get("meeting_iso")) if dated else ""
+        if when:
+            line += " — " + when
+        lines.append(line)
+        company = str(person.get("company_key") or "")
+        nxt = str(people[i + 1].get("company_key") or "") if i + 1 < len(people) else None
+        if company and nxt == company:
+            continue                       # more of this company's people follow
+        link = next((str(p.get("news_link") or "").strip() for p in people
+                     if str(p.get("company_key") or "") == company
+                     and str(p.get("news_link") or "").strip()), "") if company else \
+            str(person.get("news_link") or "").strip()
+        key = company or f"#{n}"
+        if link and key not in shown:
+            shown.add(key)
+            lines += [sentence, MEETING_NEWS_LINK.format(link=link)]
+    return lines
+
+
+def meeting_today_post(people) -> list:
+    """The lines of "Meeting today" under its heading and tags, WITHOUT the
+    close (the caller adds `MEETING_TODAY_CLOSE` after a blank line).
+
+    `people` are dicts with `who`, `company_key` and, when a story was found,
+    `news_link` (the headline already as a masked link). Listed IN THE ORDER
+    GIVEN, every one of them: no cap. [] with nobody, and then nothing is
+    posted.
+    """
+    people = list(people or ())
+    if not people:
+        return []
+    return [MEETING_TODAY_OPENER.format(meetings=meetings_count(len(people)))] + _meeting_lines(
+        people, start=0, shown=set(), sentence=MEETING_NEWS_TODAY, dated=False)
+
+
+def meeting_prep_post(blocks, *, unreadable=()) -> list:
+    """The lines of "Meeting preparation" under its heading and tags, WITHOUT
+    the close (`meeting_prep_close`).
+
+    `blocks` are [{"days": 3, "people": [...]}, ...] IN THE ORDER GIVEN (the
+    caller puts the closest first); each person as in `meeting_today_post`
+    plus `meeting_iso`. The first block opens "we have…", each later one "and…"
+    after a blank line, and the numbering runs straight through.
+    `unreadable` are the `who` of the people whose Meeting Date could not be
+    read: one line each, after the blocks. [] with nobody at all.
+    """
+    lines: list = []
+    shown: set = set()
+    n = 0
+    for block in blocks or ():
+        people = list(block.get("people") or ())
+        if not people:
+            continue
+        opener = MEETING_PREP_OPENER if not lines else MEETING_PREP_OPENER_NEXT
+        if lines:
+            lines.append("")
+        lines.append(opener.format(meetings=meetings_count(len(people)),
+                                   when=meeting_days(block.get("days"))))
+        lines += _meeting_lines(people, start=n, shown=shown, sentence=MEETING_NEWS_PREP,
+                                dated=True)
+        n += len(people)
+    asks = [str(w or "").strip() for w in (unreadable or ()) if str(w or "").strip()]
+    if asks and lines:
+        lines.append("")
+    for who in asks:
+        n += 1
+        lines.append(MEETING_UNREADABLE.format(n=n, who=who))
+    return lines
+
+
+def meeting_prep_close(days, *, start_days=None) -> str:
+    """The afternoon post's close. `days` are the blocks' day counts.
+
+    "Good time to start…" ONLY when every block is the earliest touch
+    (`start_days`, 5): with a nearer block in the post the close is the check
+    one. "" when the post has no block at all (only dates nobody could read):
+    there is no meeting day to be set for.
+    """
+    days = [int(d) for d in (days or ())]
+    if not days:
+        return ""
+    if start_days is not None and all(d == int(start_days) for d in days):
+        return MEETING_PREP_CLOSE_START
+    return MEETING_PREP_CLOSE
+
+
+def meeting_remind_set(who, when) -> str:
+    return MEETING_REMIND_SET.format(who=str(who or "").strip(), when=str(when or "").strip())
+
+
+def meeting_remind_after(who, day) -> str:
+    return MEETING_REMIND_AFTER.format(who=str(who or "").strip(), day=str(day or "").strip())
+
+
+def meeting_remind_no_date(who) -> str:
+    return MEETING_REMIND_NO_DATE.format(who=str(who or "").strip())
+
+
+def meeting_remind_what(who, day) -> str:
+    return MEETING_REMIND_WHAT.format(who=str(who or "").strip(), day=str(day or "").strip())
+
+
+def meeting_remind_moved(who, day, when) -> str:
+    return MEETING_REMIND_MOVED.format(who=str(who or "").strip(), day=str(day or "").strip(),
+                                       when=str(when or "").strip())
+
+
+def meeting_lines_for_check() -> list:
+    """Every fixed line R8 can post, with stand-in values."""
+    who = next_step_who("Priya Rao", "Acme Labs")
+    link = "[Acme Labs raises a round](<https://example.com/a>)"
+    one = {"who": who, "company_key": "acme labs", "news_link": link,
+           "meeting_iso": "2026-10-15"}
+    two = [one, {**one, "who": next_step_who("Bo Chen", "Borealis"), "company_key": "borealis",
+                 "news_link": ""}]
+    lines = (meeting_today_post([one]) + meeting_today_post(two)
+             + meeting_prep_post([{"days": 3, "people": [one]}, {"days": 5, "people": two}],
+                                 unreadable=[who])
+             + meeting_prep_post([{"days": 1, "people": [one]}]))
+    return [l for l in lines if l] + [
+        MEETING_TODAY_CLOSE, MEETING_PREP_CLOSE, MEETING_PREP_CLOSE_START,
+        meeting_remind_set(who, "Wed 14 Oct at 2 PM"), MEETING_REMIND_WHICH, MEETING_REMIND_WHEN,
+        meeting_remind_after(who, "Wed 15 Oct"), meeting_remind_no_date(who),
+        meeting_remind_what(who, "Wed 15 Oct"),
+        meeting_remind_moved(who, "Fri 17 Oct", "Thu 16 Oct at 2 PM")]
+
+
 # -- every line, rendered, for the register check ----------------------------
 
 
@@ -1105,6 +1333,7 @@ def all_lines() -> list:
         *closure_lines_for_check(),
         *events_lines_for_check(),
         *packages_lines_for_check(),
+        *meeting_lines_for_check(),
     ]
 
 

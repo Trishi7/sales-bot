@@ -30,13 +30,14 @@ Under the table:
 
 | When | Post |
 |---|---|
-| Any day, 10 AM | Meeting preparation (rule 8): 5 days before, 3 days before and on the day |
+| Any day, weekends too, 10 AM | Meeting today (rule 8): the meetings happening that day |
+| Any day, weekends too, 2 PM | Meeting preparation (rule 8): the meetings 3 days away, then those 5 days away |
 | Any day, 10 AM | Meeting done, no next steps (rule 9) |
 | Monday to Friday, 3 PM | Next steps for connected contacts (rule 13) |
 | The minute it was asked for | A reminder somebody asked for |
 | Hourly, 11 AM to 11 PM, weekends too | Urgent AI news, only when something is major |
 | Sunday, 2 PM | Deliverables checklist, only when a P1 item is due on the Monday. Nothing else |
-| Saturday | Nothing |
+| Saturday | Nothing but the two meeting posts above |
 
 - At most 7 posts a day count (5 until 13 Oct 2026; the longest day above has 4). Meeting posts, next-step follow-ups, reminders,
   urgent news and answers to questions don't count.
@@ -91,9 +92,14 @@ Rewritten on 13 Oct 2026 (it was "DM sent, no meeting": 7 days, days since the D
 
 ### Rule 8 (Meeting preparation)
 
-> Meetings coming up that need prep. Three touches for each meeting on Outreach PoCs: 5 days before, 3 days before and
-> on the day. Every touch posts at 10 AM, outside the day's order, and doesn't count toward the 5 posts a day. Asks
-> whether the deck, package and demo are ready, with any recent news on the company.
+Rewritten on 12 Oct 2026 (it was one post at 10 AM for every touch, three meetings at most, and it left out a
+meeting marked Completed).
+
+> Meetings coming up that need prep. Reads the Meeting Date on Outreach PoCs and nothing else. Three touches for each
+> meeting: 5 days before, 3 days before and on the day. Today's meetings post on their own at 10 AM; the 3-day and
+> 5-day ones post together after 2 PM. Both are outside the day's order, don't count toward the day's posts, and go
+> out at weekends too. Every meeting is named, with the date and one recent news story on the company when there is
+> one. Asks whether the deck, package and demo are ready, and offers a reminder.
 
 ### Rule 9 (Meeting done, no next steps)
 

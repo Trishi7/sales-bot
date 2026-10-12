@@ -35,8 +35,9 @@ THE VOLUME CONTRACT (plan section 8):
     MESSAGE_JITTER_MINUTES (0) can only ADD time to a gap;
   - AI news (R1) is never held, and takes its place in the order like any
     other rule;
-  - meeting prep and meeting follow-ups (R8, R9, at MEETING_DAYOF_TIME) and the
-    next-step follow-ups (R13, at NEXT_STEP_TIME) go at FIXED TIMES, outside
+  - meeting follow-ups (R9) and "Meeting today" (R8) at MEETING_DAYOF_TIME,
+    "Meeting preparation" (R8) at MEETING_PREP_TIME and the next-step
+    follow-ups (R13, at NEXT_STEP_TIME) go at FIXED TIMES, outside
     the order and the gap: they move no spaced post, no spaced post waits for
     them, and they do not count;
   - what does not fit is NOT SENT LATE: it waits for the next day its rule
@@ -78,7 +79,7 @@ log = logging.getLogger(__name__)
 
 # THE ONE LINK HELPER: `[short name](<url>)`. Lives in links.py so guardrails
 # can use it too; this is the name every renderer calls.
-from links import link, doc_label  # noqa: E402,F401
+from links import link, doc_label, headline_link  # noqa: E402,F401
 
 # Stages a message can be at for its group. See `db.drip_group_history`.
 STAGE_NUDGE = "nudge"
@@ -132,7 +133,17 @@ def group_key(action: dict) -> str:
     people's work in one message; keying on owner alone would mix a quote chase
     with a DM check, and a message asking two different kinds of thing gets half
     an answer. THE EXCEPTION is RULE_ONLY_TYPES, grouped by rule alone.
+
+    R8 IS TWO POSTS (12 Oct 2026): today's meetings, and the afternoon one.
+    The key says which. A SECOND post of one kind on the same day (a Meeting
+    Date typed in after the first had gone) carries how many touches of that
+    kind have already gone today, so it is a different key from the first and
+    the "said today, not said twice" guard lets it through exactly once.
     """
+    if action.get("type") == nextaction.R_MEETING_PREP:
+        wave = int(action.get("wave") or 0)
+        return (f"{action.get('type')}|{action.get('post') or 'prep'}"
+                + (f"|late{wave}" if wave else ""))
     if action.get("type") in RULE_ONLY_TYPES:
         return f"{action.get('type')}|*"
     return f"{action.get('type')}|{owner_key(action)}"
@@ -419,6 +430,23 @@ def sunday_due_monday(group: dict, *, day: date) -> bool:
     return False
 
 
+# WHAT POSTS ON ITS OWN DAY WHATEVER THE DAY IS. R8's touches are computed for
+# exact dates: a Saturday meeting gets its "Meeting today" on the Saturday,
+# and a Monday meeting's 3-day touch is a Friday or a Sunday's wherever it
+# falls. The weekend silence is about chases, and this is not one.
+EVERY_DAY_TYPES = frozenset({nextaction.R_MEETING_PREP})
+
+
+def plans_on(day: date) -> bool:
+    """Is there anything to plan on `day` at all? A sending day, or any day
+    while a rule in EVERY_DAY_TYPES is enabled. THE LIVE SWEEP'S FIRST GATE: it
+    used to ask `is_sending_day`, which returned before a Saturday meeting
+    could be planned."""
+    if is_sending_day(day):
+        return True
+    return any(r.enabled and r.trigger in EVERY_DAY_TYPES for r in rules.safe_load())
+
+
 def is_sending_day(day: date) -> bool:
     """Weekdays, plus the Sunday exception. Saturday never.
 
@@ -541,9 +569,10 @@ def cap_reached(already, day: date) -> bool:
 def pinned_time(group: dict, day: date) -> Optional[datetime]:
     """The fixed send time of a group that has one, else None.
 
-    Three rules have one: meeting prep (R8, every touch) and the meeting
-    follow-ups (R9), both at MEETING_DAYOF_TIME, and the next-step follow-ups
-    (R13) at NEXT_STEP_TIME. Each is tied to a known time — a meeting, a time
+    Three rules have one: meeting prep (R8: today's meetings at
+    MEETING_DAYOF_TIME, the earlier touches at MEETING_PREP_TIME), the meeting
+    follow-ups (R9) at MEETING_DAYOF_TIME, and the next-step follow-ups (R13)
+    at NEXT_STEP_TIME. Each is tied to a known time — a meeting, a time
     the team was told — so they sit OUTSIDE the day's order: they take no
     slot, they move no spaced post, no spaced post waits for them, and the
     window cannot roll them. AI news (R1) had one until 8 Oct; it now takes
@@ -574,7 +603,8 @@ def earliest_send_ist() -> tuple:
     any given minute; this only says when to start asking.
     """
     best = tuple(config.drip_start_ist())
-    for raw in (config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME):
+    for raw in (config.MEETING_DAYOF_TIME, config.MEETING_PREP_TIME,
+                config.NEXT_STEP_TIME):
         try:
             hh, mm = (int(x) for x in str(raw or "").strip().split(":")[:2])
         except (TypeError, ValueError):
@@ -763,14 +793,39 @@ def plan(
     sent_group_keys = {str(r.get("group_key")) for r in already}
     used_slots = {int(r.get("slot") or 0) for r in already}
     next_slot = (max(used_slots) + 1) if used_slots else 1
+    first_slot = next_slot
+
+    def every_day_posts() -> None:
+        """R8 ON A DAY THE DRIP DOES NOT SEND. A touch belongs to its own
+        date: a Saturday meeting still gets its Saturday-morning post, and a
+        Monday meeting its Wednesday and Friday ones wherever they fall. Each
+        goes at its own fixed time, outside the cap, and the day's slots are
+        renumbered in send order so Sunday's one post keeps its place."""
+        why = "anchored to the meeting date: it posts on its own day, weekends included"
+        for g in groups:
+            if g["type"] not in EVERY_DAY_TYPES or g["group_key"] in sent_group_keys:
+                continue
+            at = pinned_time(g, day) or slot_times(day, count=1)[0]
+            result["messages"].append({
+                **g, "slot": 0, "stage": STAGE_NUDGE, "stage_why": why, "why": why,
+                "counts_toward_cap": counts(g), "pinned": True,
+                "send_at": at, "send_at_hhmm": at.strftime("%H:%M"),
+            })
+        result["messages"].sort(key=lambda m: m["send_at"])
+        for i, m in enumerate(result["messages"]):
+            m["slot"] = first_slot + i
 
     # SATURDAY IS SILENT, FULL STOP — and so is a Sunday with no SUNDAY_RULE_IDS.
+    # (Except for R8, which is about a meeting and not about the day.)
     if not result["is_sending_day"]:
         for g in groups:
-            result["held"].append({**g, "why": HELD_WEEKEND})
+            if g["type"] not in EVERY_DAY_TYPES:
+                result["held"].append({**g, "why": HELD_WEEKEND})
+        every_day_posts()
         log.info(
-            "[drip] %s is a %s — no proactive messages. %d group(s) wait for Monday.",
-            dl.iso(day), day.strftime("%A"), len(groups),
+            "[drip] %s is a %s — no proactive messages but %d meeting post(s). %d "
+            "group(s) wait for Monday.",
+            dl.iso(day), day.strftime("%A"), len(result["messages"]), len(result["held"]),
         )
         return result
 
@@ -780,6 +835,7 @@ def plan(
         eligible = [
             g for g in groups
             if sunday_allows(g) and sunday_due_monday(g, day=day)
+            and g["type"] not in EVERY_DAY_TYPES
         ]
         only = (
             HELD_WEEKEND + " (Sunday sends only "
@@ -787,12 +843,16 @@ def plan(
             + ", and only for items due Monday)"
         )
         for g in groups:
-            if g not in eligible:
+            if g not in eligible and g["type"] not in EVERY_DAY_TYPES:
                 result["held"].append({**g, "why": only})
         # WHAT HAS ALREADY GONE COUNTS, which is the restart guard here too: the
         # live sweep re-plans on every tick, and without this a Sunday post
         # would have been planned again fifteen minutes after it was sent.
-        room = max(0, limit - len(already))
+        #
+        # COUNTED POSTS ONLY (`counted_today`): a "Meeting today" post that went
+        # at 10:00 on a Sunday is outside the cap and must not take the room
+        # the one Sunday heads-up has.
+        room = max(0, limit - counted_today(already))
         start = slot_times(day, count=1)[0]
         for g in eligible:
             if g["group_key"] in sent_group_keys:
@@ -813,6 +873,7 @@ def plan(
             next_slot += 1
             room -= 1
             result["counted"] += 1
+        every_day_posts()
         log.info(
             "[drip] %s is a Sunday — %d already sent, %d post(s) planned for %s, %d "
             "group(s) wait for Monday. NOTHING HAS BEEN SENT BY THIS MODULE.",
@@ -1038,14 +1099,9 @@ _ASK = {
         "No meeting yet with {companies}, and the DM went out {ago}. Shall I leave "
         "it with you, or ask again next week?",
     ),
-    nextaction.R_MEETING_PREP: (
-        "{hey}the {companies} meeting is coming up. Are the deck, the package and "
-        "the demo ready? If they are, just say and I won't ask again.",
-        "{name}quick one: the {companies} meeting's nearly here. Anything still "
-        "missing from the deck, the package or the demo? Say all good if not.",
-        "The {companies} meeting is coming up soon. Is everything ready, or is "
-        "something still open? Tell me and I'll stop asking.",
-    ),
+    # (R8, meeting preparation, has no template here since 12 Oct 2026: it is
+    # verbatim now. Both of its posts are rendered in code, one meeting or
+    # thirty, `wording.meeting_today_post` and `wording.meeting_prep_post`.)
     nextaction.R_MEETING_FOLLOWUP: (
         "{hey}the {companies} meeting is marked done but there are no next steps on "
         "the sheet. What was agreed, which package came up, and roughly how big is "
@@ -1199,7 +1255,10 @@ HEADINGS = {
     "R5": "",
     "R6": "Connected, no DM yet",
     "R7": "No meeting booked yet",
-    "R8": "Meeting prep for {company}",
+    # R8 IS TWO POSTS (12 Oct 2026), each about every meeting it lists, so
+    # neither names a company: today's meetings, and the 3-day and 5-day ones.
+    "R8": "Meeting preparation",
+    "R8_today": "Meeting today",
     "R9": "Follow-up on the {company} meeting",
     "R10": "Closure support",
     # R11 HAS NO HEADING: its agreed shape opens on its own plain first line
@@ -1241,6 +1300,8 @@ def heading(key: str, *, day: Optional[date] = None, company: str = "") -> str:
 def heading_for(message: dict, *, day: Optional[date] = None) -> str:
     """The heading for one drip message, by its type (or its rule id)."""
     key = _HEADING_BY_TYPE.get(message.get("type")) or str(message.get("rule_id") or "")
+    if message.get("type") == nextaction.R_MEETING_PREP and meeting_post(message) == "today":
+        key = "R8_today"
     companies = [c for c in (message.get("companies") or []) if str(c).strip()]
     return heading(key, day=day, company=companies[0] if companies else "")
 
@@ -1295,7 +1356,13 @@ VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             # closing question were agreed word for word. A
                             # composer could renumber, reorder or add a per cent
                             # (`wording.packages_post`).
-                            nextaction.R_PACKAGES})
+                            nextaction.R_PACKAGES,
+                            # R8 (12 Oct): the opener, the numbered lines, the news
+                            # line and the close were agreed word for word. A
+                            # composer could reorder the blocks or move a date
+                            # from one person to the next
+                            # (`wording.meeting_today_post`, `meeting_prep_post`).
+                            nextaction.R_MEETING_PREP})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1861,6 +1928,10 @@ def shown_contacts(message: dict) -> list:
         return li_no_dm_shown(actions, plain_cap=cap)
     if kind == nextaction.R_PACKAGES:
         return packages_order(actions)[:cap]
+    if kind == nextaction.R_MEETING_PREP:
+        # NO CAP, ON PURPOSE: the rule must not drop a meeting. Thirty
+        # meetings are thirty lines, split across messages if they have to be.
+        return meeting_order(actions)
     if kind == nextaction.R_CLOSURE_SUPPORT:
         # NO CAP, ON PURPOSE. A closure stage AND above 50% should never be
         # more than a handful; if it is ever twenty, that is a good week and all
@@ -1936,7 +2007,8 @@ def nothing_to_say(message: dict) -> bool:
     every Wednesday for the research layer, and in a week with no event close
     enough to mention and nothing new found, there is nothing to post. The
     sender then spends the slot silently rather than posting a heading."""
-    if message.get("type") in (nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING):
+    if message.get("type") in (nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING,
+                               nextaction.R_MEETING_PREP):
         # Cannot happen (nobody due means no item, so no group); if it ever
         # did, an opener with nobody under it must not be posted.
         return not shown_contacts(message)
@@ -1996,6 +2068,82 @@ def render_packages(message: dict) -> list:
     shown = shown_contacts(message)
     held = max([int(a.get("held_back") or 0) for a in shown] or [0])
     return wording.packages_post([package_name(a) for a in shown], held_back=held)
+
+
+def meeting_order(actions: list) -> list:
+    """R8's people in the order the rule put them (`meeting_prep.ordered`):
+    today's meetings in sheet order; on the afternoon post the closest block
+    first, a company's people together, the unreadable dates last. EVERYBODY,
+    and one person's two meetings are two lines: nothing is deduplicated or
+    capped here (`meeting_prep.pick` already dropped a true duplicate)."""
+    return sorted(actions or [], key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        int(a.get("sheet_row") or 0)))
+
+
+def meeting_post(message: dict) -> str:
+    """Which of R8's two posts this message is: "today" (today's meetings, on
+    their own) or "prep" (the afternoon post)."""
+    posts = {str(a.get("post") or "") for a in (message.get("actions") or [])}
+    return "today" if posts == {"today"} else "prep"
+
+
+def meeting_news_link(story) -> str:
+    """A stored story as R8 shows it: THE WHOLE HEADLINE as a masked link,
+    embed suppressed, trimmed to about 100 characters with the ellipsis inside
+    the link (`links.headline_link`). No date and never a bare url. "" with no
+    headline, or a url that carries no http(s) scheme: then there is no line."""
+    story = story or {}
+    headline = " ".join(str(story.get("headline") or "").split()).replace("@", "@\u200b")
+    return headline_link(headline, story.get("url"))
+
+
+def meeting_people(message: dict) -> list:
+    """The people an R8 post names, numbered as the post numbers them:
+    [{"n", "row_key", "poc", "company", "meeting_date"}]. Stored with the
+    post (`drip_sends.people`) so a reply saying "2" means one meeting."""
+    return [{"n": i, "row_key": str(a.get("row_key") or ""), "poc": str(a.get("poc") or ""),
+             "company": str(a.get("company") or ""),
+             "meeting_date": str(a.get("meeting_date") or "")}
+            for i, a in enumerate(meeting_order(message.get("actions") or []), 1)]
+
+
+def render_meetings(message: dict) -> tuple:
+    """(lines, close) for one R8 post, under its heading. ([], "") with nobody.
+
+    "Meeting today" is one list. "Meeting preparation" is a block for each
+    number of days, CLOSEST FIRST, numbered straight through, then the dates
+    nobody could read. The close is the "start" one only when the post is the
+    earliest touch alone (`wording.meeting_prep_close`).
+    """
+    import meeting_prep
+
+    people = meeting_order(message.get("actions") or [])
+    if not people:
+        return [], ""
+
+    def person(a):
+        return {"who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
+                "company_key": meeting_prep.company_key(a.get("company")),
+                "news_link": meeting_news_link(a.get("news")),
+                "meeting_iso": a.get("meeting_date") or ""}
+
+    if meeting_post(message) == "today":
+        return wording.meeting_today_post([person(a) for a in people]), wording.MEETING_TODAY_CLOSE
+    blocks: list = []
+    unreadable: list = []
+    for a in people:
+        if a.get("touch") == meeting_prep.TOUCH_UNREADABLE:
+            unreadable.append(person(a)["who"])
+            continue
+        days = int(a.get("block") or 0)
+        if not blocks or blocks[-1]["days"] != days:
+            blocks.append({"days": days, "people": []})
+        blocks[-1]["people"].append(person(a))
+    befores = nextaction._int_list(config.MEETING_PREP_DAYS_BEFORE)
+    return (wording.meeting_prep_post(blocks, unreadable=unreadable),
+            wording.meeting_prep_close([b["days"] for b in blocks],
+                                       start_days=max(befores) if len(befores) > 1 else None))
 
 
 def closure_order(actions: list) -> list:
@@ -2166,6 +2314,16 @@ def points_of(message: dict) -> Optional[dict]:
             return None
         return {"header": lines[0], "lines": lines[1:], "extra": [],
                 "close": wording.PACKAGES_CLOSE}
+    if kind == nextaction.R_MEETING_PREP:
+        # BOTH POSTS ARE FIXED TEXT FROM wording.py, FOR ONE MEETING OR THIRTY
+        # (12 Oct 2026). With three or more it used to reach the generic tail
+        # below ("1. Company — Person", the dates thrown away) and with one or
+        # two it was a composed sentence. A list of ONE is still a list.
+        lines, close = render_meetings(message)
+        if not lines:
+            return None
+        return {"header": lines[0], "lines": lines[1:] + ([""] if close else []),
+                "extra": [], "close": close}
     companies = [c for c in (message.get("companies") or []) if str(c).strip()]
     if len(companies) >= 3:
         lines = []
@@ -2339,7 +2497,8 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         body = (lead + points_block(points)
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
         if message.get("type") in (nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING,
-                                   nextaction.R_CLOSURE_SUPPORT, nextaction.R_PACKAGES):
+                                   nextaction.R_CLOSURE_SUPPORT, nextaction.R_PACKAGES,
+                                   nextaction.R_MEETING_PREP):
             # R6 IS ITS FOUR BLOCKS AND NOTHING ELSE: no source link under it and
             # no bracketed note about a search that could not run. R7 is its
             # two blocks and nothing else, for the same reason.
@@ -2591,6 +2750,7 @@ def _self_test() -> int:
     config.MESSAGE_JITTER_MINUTES = 0
     config.DAILY_MESSAGE_CAP = 5
     config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME = "10:00", "15:00"
+    config.MEETING_PREP_TIME, config.MEETING_PREP_DAYS_BEFORE = "14:00", ["5", "3"]
 
     def check(name, got, want):
         nonlocal failures
@@ -2617,12 +2777,14 @@ def _self_test() -> int:
     # THE SEEDED DAY FROM THE PLAN: 7 due items, 2 owners, 3 types. The two
     # meeting-prep items carry their fixed time, as the evaluator sets it.
     seeded = [
-        dict(action("Acme", "Ann", nextaction.R_MEETING_PREP, "Vaishnavi",
+        dict(action("Acme", "Ann", nextaction.R_MEETING_PREP, "",
                     nextaction.P_MEETING, date(2026, 9, 4), 5, "R8"),
-             dayof_time="10:00"),
-        dict(action("Borealis", "Sam", nextaction.R_MEETING_PREP, "Vaishnavi",
+             dayof_time="10:00", post="today", touch="0", block=0, pick_order=0,
+             contact_key="", meeting_date="2026-09-09", who="Ann (Acme)"),
+        dict(action("Borealis", "Sam", nextaction.R_MEETING_PREP, "",
                     nextaction.P_MEETING, date(2026, 9, 8), 1, "R8"),
-             dayof_time="10:00"),
+             dayof_time="10:00", post="today", touch="0", block=0, pick_order=1,
+             contact_key="", meeting_date="2026-09-09", who="Sam (Borealis)"),
         # (These two were closure-support items until 13 Oct 2026, when R10 became
         # one post whatever the owners. Sales packages still groups by owner.)
         action("Cinder", "Dev", nextaction.R_PACKAGES, "Vaishnavi",
@@ -2821,8 +2983,12 @@ def _self_test() -> int:
 
     print("\nweekends")
     sat = plan(seeded, day=date(2026, 9, 12))
-    check("Saturday sends nothing", len(sat["messages"]), 0)
-    check("...and holds every group for Monday", len(sat["held"]), 4)
+    check("Saturday sends nothing but the meeting post, at its own time",
+          [(m["type"], m["send_at_hhmm"], m["counts_toward_cap"]) for m in sat["messages"]],
+          [(nextaction.R_MEETING_PREP, "10:00", False)])
+    check("...and holds every other group for Monday", len(sat["held"]), 3)
+    check("so a Saturday is planned, though it is not a sending day",
+          (plans_on(date(2026, 9, 12)), is_sending_day(date(2026, 9, 12))), (True, False))
     sunday = date(2026, 9, 13)
     check("Saturday is not a sending day; Sunday is, for SUNDAY_RULE_IDS",
           (is_sending_day(date(2026, 9, 12)), is_sending_day(sunday)),
@@ -2833,21 +2999,30 @@ def _self_test() -> int:
                           nextaction.P_CHASE, date(2026, 9, 17), 0, "R4")
     if "R4" in sunday_rule_ids():
         sun = plan(seeded + [due_monday], day=sunday)
-        check("a Sunday with a deliverable due Monday sends one post",
-              [m["type"] for m in sun["messages"]], [nextaction.R_DELIVERABLES])
-        check("...at the start of the window",
-              sun["messages"][0]["send_at_hhmm"],
-              slot_times(sunday, count=1)[0].strftime("%H:%M"))
-        check("...and everything else waits for Monday", len(sun["held"]), 4)
-        check("a Sunday with nothing due Monday is silent",
-              len(plan(seeded + [due_thursday], day=sunday)["messages"]), 0)
-        again_sun = plan(seeded + [due_monday], day=sunday, already_sent=[
-            {"slot": 1, "group_key": sun["messages"][0]["group_key"],
+        check("a Sunday with a deliverable due Monday sends that one post, after the "
+              "meeting post",
+              [m["type"] for m in sun["messages"]],
+              [nextaction.R_MEETING_PREP, nextaction.R_DELIVERABLES])
+        check("...at the start of the window, the meeting post at its own time",
+              [m["send_at_hhmm"] for m in sun["messages"]],
+              ["10:00", slot_times(sunday, count=1)[0].strftime("%H:%M")])
+        check("...and everything else waits for Monday", len(sun["held"]), 3)
+        check("a Sunday with nothing due Monday carries the meeting post alone",
+              [m["type"] for m in plan(seeded + [due_thursday], day=sunday)["messages"]],
+              [nextaction.R_MEETING_PREP])
+        gone = [{"slot": 1, "group_key": sun["messages"][0]["group_key"],
+                 "action_type": nextaction.R_MEETING_PREP, "counts_toward_cap": 0, "pinned": 1}]
+        check("the meeting post having gone does not take Sunday's one counted post",
+              [m["type"] for m in plan(seeded + [due_monday], day=sunday,
+                                       already_sent=gone)["messages"]],
+              [nextaction.R_DELIVERABLES])
+        again_sun = plan(seeded + [due_monday], day=sunday, already_sent=gone + [
+            {"slot": 2, "group_key": sun["messages"][1]["group_key"],
              "action_type": nextaction.R_DELIVERABLES, "counts_toward_cap": 1}])
-        check("once it has gone, the next tick plans nothing more",
+        check("once both have gone, the next tick plans nothing more",
               len(again_sun["messages"]), 0)
         mon = plan([due_monday], day=date(2026, 9, 14), history={
-            sun["messages"][0]["group_key"]: {"last_nudge": "2026-09-13",
+            sun["messages"][1]["group_key"]: {"last_nudge": "2026-09-13",
                                               "last_sent": "2026-09-13"}})
         check("Sunday's heads-up does not hold Monday's checklist back",
               len(mon["messages"]), 1)
@@ -2876,7 +3051,12 @@ def _self_test() -> int:
             "say no", "shall i", "either answer", "is plenty", "or ")
     banned = ("nothing to act on", "quiet cycle", "worth flagging", "as per",
               "kindly", "please note")
-    base = dict(planned["messages"][0])
+    # A COMPOSED RULE, to hear the three variants: the meeting follow-up. (This
+    # was the meeting-prep message until 12 Oct 2026, when R8 became verbatim.)
+    base = dict(planned["messages"][0], type=nextaction.R_MEETING_FOLLOWUP, rule_id="R9",
+                owner="Vaishnavi", owner_key="vaishnavi",
+                actions=[dict(a, type=nextaction.R_MEETING_FOLLOWUP, owner="Vaishnavi")
+                         for a in planned["messages"][0]["actions"]])
     seen = set()
     for i in range(3):
         msg = dict(base, _voice={"ask": i, "reask": i})
@@ -2917,6 +3097,26 @@ def _self_test() -> int:
                            or " is are " in filled or "  " in filled)
                     if bad:
                         check(f"{kind}: fills cleanly ({many}, {name!r})", filled, "")
+    check("R8 has no composed template any more: both its posts are rendered in code",
+          (nextaction.R_MEETING_PREP in _ASK, nextaction.R_MEETING_PREP in VERBATIM_TYPES),
+          (False, True))
+    r8 = planned["messages"][0]
+    check("R8, today's meetings: its own heading, and the fixed text for two",
+          (heading_for(r8, day=today), compose_fallback(r8)),
+          ("**Meeting today**",
+           "we have two meetings today with:\n1. Ann (Acme)\n2. Sam (Borealis)\n\n"
+           + wording.MEETING_TODAY_CLOSE))
+    lone = dict(r8, actions=[dict(r8["actions"][1], post="prep", touch="5", block=5,
+                                  dayof_time="14:00")], companies=["Borealis"])
+    check("R8, a list of ONE is the same shape, and five days out says start",
+          (heading_for(lone, day=today), compose_fallback(lone)),
+          ("**Meeting preparation**",
+           "we have a meeting in 5 days with:\n1. Sam (Borealis) \u2014 Wed 9 Sep\n\n"
+           + wording.MEETING_PREP_CLOSE_START))
+    check("R8's two posts are two groups, and a late one is a third",
+          [group_key(dict(a)) for a in (r8["actions"][0], lone["actions"][0],
+                                        dict(r8["actions"][0], wave=2))],
+          ["meeting_prep|today", "meeting_prep|prep", "meeting_prep|today|late2"])
     check("R12 has no composed template any more: its post is rendered in code",
           (nextaction.R_PACKAGES in _ASK, nextaction.R_PACKAGES in VERBATIM_TYPES), (False, True))
     check("two companies agree", _fill(_ASK[nextaction.R_PROSPECTS][1], name="Vaishnavi",

@@ -1060,6 +1060,43 @@ CREATE TABLE IF NOT EXISTS rule_last_posted (
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- R8: WHICH MEETING-PREP TOUCH WENT OUT FOR WHICH MEETING (12 Oct 2026).
+--
+-- R8 was stateless: it worked out today's touches from the Meeting Date alone.
+-- So a meeting pushed from the 15th to the 17th got a second "5 days" post,
+-- and a date typed in after the day's post had gone was never mentioned.
+--
+-- ONE ROW PER (contact, meeting date, touch). A NEW DATE HAS NO ROWS, so it
+-- gets fresh touches; THE SAME DATE NEVER REPEATS ONE. `touch` is the days
+-- before ('5', '3'), '0' for the day itself, 'catchup' for the one touch a
+-- meeting gets when its date moved so close that both earlier ones were
+-- skipped, and 'unreadable' (with `meeting_date` '') for the line that asks
+-- for a date nobody could read: its `sent_on` is the last day it was asked,
+-- which is what makes that question weekly and not daily.
+--
+-- WRITTEN ONLY BY THE SENDER, after a real send, in the style of
+-- rule_last_posted. The evaluator is handed a copy and writes nothing.
+CREATE TABLE IF NOT EXISTS meeting_touches (
+    row_key      TEXT NOT NULL,
+    meeting_date TEXT NOT NULL DEFAULT '',   -- YYYY-MM-DD; '' for 'unreadable'
+    touch        TEXT NOT NULL,              -- '5' | '3' | '0' | 'catchup' | 'unreadable'
+    sent_on      TEXT NOT NULL,              -- YYYY-MM-DD IST
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (row_key, meeting_date, touch)
+);
+
+-- R8: THE MEETING DATES EACH CONTACT HAS HAD, and the day each was first seen.
+-- This is how a MOVED meeting is told from a newly booked one: a date that
+-- appears where another upcoming date used to be has moved. A meeting booked
+-- two days out says nothing until its day; one MOVED to two days out gets the
+-- one catch-up touch. Noted on the live sweep, never by a preview.
+CREATE TABLE IF NOT EXISTS meeting_dates_seen (
+    row_key      TEXT NOT NULL,
+    meeting_date TEXT NOT NULL,
+    first_seen   TEXT NOT NULL,              -- YYYY-MM-DD IST
+    PRIMARY KEY (row_key, meeting_date)
+);
+
 -- R2: WHAT HAS BEEN PROPOSED, AND WHAT BECAME OF IT. Keyed on the normalised
 -- company name (`news_screen.name_key`).
 --
@@ -1173,6 +1210,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # same post as a reply to the first. Empty on rows from before this.
     ("drip_sends", "body", "TEXT NOT NULL DEFAULT ''"),
     ("drip_sends", "part_ids", "TEXT NOT NULL DEFAULT '[]'"),
+    # R8: THE PEOPLE A MEETING POST NAMED, IN ITS ORDER (a JSON list of
+    # {n, row_key, poc, company, meeting_date}). The post closes on an offer to
+    # remind, and a reply says "2" or a name: this is what turns that into one
+    # meeting, and only a meeting ON THAT POST. Empty on every other post.
+    ("drip_sends", "people", "TEXT NOT NULL DEFAULT '[]'"),
     # THE TOPIC FEED. R1 became an AI industry feed on a topic list (24/29 Sep),
     # and a posted story now carries its topic (for the spread rules), its
     # headline key (for the no-repeats check across outlets), the importance
@@ -2185,6 +2227,14 @@ class DB:
                 parts = []
             out["part_ids"] = [str(p) for p in parts if str(p or "").strip()] \
                 if isinstance(parts, list) else []
+        if "people" in out:
+            # R8's people, a JSON list of dicts; anything else reads as nobody.
+            try:
+                people = _json.loads(out.get("people") or "[]")
+            except (ValueError, TypeError):
+                people = []
+            out["people"] = [p for p in people if isinstance(p, dict)] \
+                if isinstance(people, list) else []
         return out
 
     def record_drip_send(
@@ -2319,7 +2369,7 @@ class DB:
         if not mid:
             return None
         cols = ("on_date, slot, group_key, action_type, owner_label, companies, "
-                "stage, offer, body, message_id, channel_id, part_ids")
+                "stage, offer, body, message_id, channel_id, part_ids, people")
         try:
             with self.conn() as c:
                 row = c.execute(
@@ -3990,6 +4040,96 @@ class DB:
                 "SELECT on_date, action_type, company, owner_label, source, "
                 "evidence, citation FROM nudge_conversions ORDER BY id DESC LIMIT ?",
                 (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- R8: meeting-prep touches ------------------------------------------
+
+    def meeting_prep_state(self) -> Optional[dict]:
+        """R8's memory, or None when it cannot be read:
+
+            {"touches": {(row_key, meeting_date): {touch: sent_on}},
+             "seen":    {row_key: {meeting_date: first_seen}}}
+
+        FAILS CLOSED, like `next_step_state`. An empty dict would say "no touch
+        has ever gone out" and every touch due today would be posted again on
+        the next tick; None says "unknown" and the caller posts nothing.
+        """
+        try:
+            with self.conn() as c:
+                touches = c.execute(
+                    "SELECT row_key, meeting_date, touch, sent_on FROM meeting_touches"
+                ).fetchall()
+                seen = c.execute(
+                    "SELECT row_key, meeting_date, first_seen FROM meeting_dates_seen"
+                ).fetchall()
+        except Exception:
+            log.exception("[db] could not read R8's touches")
+            return None
+        out: dict = {"touches": {}, "seen": {}}
+        for r in touches:
+            out["touches"].setdefault(
+                (str(r["row_key"]), str(r["meeting_date"] or "")), {})[
+                    str(r["touch"])] = str(r["sent_on"] or "")
+        for r in seen:
+            out["seen"].setdefault(str(r["row_key"]), {})[
+                str(r["meeting_date"])] = str(r["first_seen"] or "")
+        return out
+
+    def record_meeting_touch(self, row_key: str, *, meeting_date: str, touch: str,
+                             sent_on: str) -> None:
+        """A meeting-prep touch really went out. CALLED BY THE SENDER, NEVER BY
+        THE ENGINE: a preview that recorded a touch would cancel the real one.
+
+        The 'unreadable' ask overwrites its own row, so `sent_on` is always the
+        LAST day the date was asked for.
+        """
+        key = str(row_key or "").strip()
+        if not key or not str(touch or "").strip():
+            return
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO meeting_touches (row_key, meeting_date, touch, sent_on) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(row_key, meeting_date, touch) DO UPDATE SET "
+                "sent_on = excluded.sent_on, updated_at = CURRENT_TIMESTAMP",
+                (key, str(meeting_date or ""), str(touch), str(sent_on)),
+            )
+
+    def note_meeting_dates(self, pairs, *, on_date: str) -> int:
+        """Remember each (row_key, meeting_date) the sheet shows today. How many
+        were new. The FIRST day a date was seen is kept; seeing it again
+        changes nothing, so this is safe on every tick."""
+        new = 0
+        with self.conn() as c:
+            for key, iso in pairs or ():
+                key, iso = str(key or "").strip(), str(iso or "").strip()
+                if not key or not iso:
+                    continue
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO meeting_dates_seen (row_key, meeting_date, "
+                    "first_seen) VALUES (?, ?, ?)", (key, iso, str(on_date)))
+                new += int(cur.rowcount or 0)
+        return new
+
+    def set_drip_people(self, *, on_date: str, slot: int, people) -> bool:
+        """Attach the people a meeting post named, in its order, to its slot
+        (see the `people` migration)."""
+        import json as _json
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE drip_sends SET people = ? WHERE on_date = ? AND slot = ?",
+                (_json.dumps(list(people or [])), str(on_date), int(slot)),
+            )
+        return bool(cur.rowcount)
+
+    def open_meeting_reminders(self) -> list:
+        """Every OPEN reminder that belongs to a meeting (row key "meeting|…"),
+        oldest first: what the re-anchor check walks when a date moves."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM scheduled_reminders WHERE status = 'open' "
+                "AND row_key LIKE 'meeting|%' ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
 

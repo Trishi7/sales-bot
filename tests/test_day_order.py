@@ -39,7 +39,8 @@ def _run(fn) -> None:
 
 def test_every_weekday_with_every_rule_due_gives_the_exact_times():
     """Mon 14/16/18/20 R4 R7 R1 R10; Tue R5 R6 R2 R1; Wed R11 R1 R3; Thu R5 R1 R12;
-    Fri R2 R6 R1. Rule 13 at 15:00, R8 and R9 at 10:00, none moving a spaced post."""
+    Fri R2 R6 R1. Rule 13 at 15:00, R9 and R8's "Meeting today" at 10:00, R8's
+    "Meeting preparation" at 14:00, none moving a spaced post."""
     _run(doc.every_weekday)
 
 

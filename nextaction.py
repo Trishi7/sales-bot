@@ -27,7 +27,9 @@ THE THIRTEEN, with the trigger name the file uses:
      R7  dm_no_meeting          Mon                 DM > 21d and no meeting, or one
                                                     booked > 7d after the DM; 3 a
                                                     post, rotating, behind R13
-     R8  meeting_prep           anchored, 10:00     T-5, T-3, and on the day
+     R8  meeting_prep           anchored            every Meeting Date: 5 and 3 days
+                                                    before (after 14:00) and the day
+                                                    itself (10:00); no cap, stored news
      R9  meeting_followup       anchored, 10:00     done + 3d, no next steps, laddered
     R10  closure_support        Mon                 a closure stage AND closure > 50;
                                                     highest first, no cap, stored news
@@ -1434,68 +1436,119 @@ def _r_dm_no_meeting(rule, ctx) -> list:
 
 
 def _r_meeting_prep(rule, ctx) -> list:
-    """R8 — prep touches at T-5, T-3 and on the day, each at MEETING_DAYOF_TIME.
+    """R8 — every meeting with a touch due today: 5 and 3 days before
+    (MEETING_PREP_DAYS_BEFORE) and the day itself. Rebuilt 12 Oct 2026.
 
-    EVERY TOUCH HAS THE SAME FIXED TIME (8 Oct). Only the day-of touch used to;
-    the two earlier ones took a spaced slot and so pushed the day's other
-    posts back. A prep note is about a meeting, not about the day's order, so
-    all three go at MEETING_DAYOF_TIME, outside the order and the gap.
+    ONE COLUMN IS READ: Meeting Date, on EVERY row of Outreach PoCs that has
+    one (`ctx["meeting_rows"]`, the whole tab). NO ACTIVATION GATE AND NO
+    MEETING STATUS: a row nobody has contacted yet qualifies, and a meeting
+    marked Completed or cancelled with a date still to come is still chased.
+    Both were accepted on 12 Oct; do not add a status check back in.
 
-    ANCHORED TO THE MEETING, NOT TO A WEEKDAY, which is why its weekday list in
-    bot_rules.yaml is empty.
+    TWO POSTS, AND THE ITEM SAYS WHICH (`post`): today's meetings at
+    MEETING_DAYOF_TIME, always on their own, and everything else after
+    MEETING_PREP_TIME. Each is outside the day's order and the 2-hour gap.
 
-    TOUCHES ALREADY IN THE PAST ARE SKIPPED. A meeting booked with three days'
-    notice gets the 3-day and day-of touches and never a late 5-day one —
-    sending "five days to go" two days before is worse than sending nothing.
+    NO CAP. Every meeting is handed on and every one is named; the rule's
+    `max_items_per_post` is not applied (`drip.shown_contacts`).
 
-    RESCHEDULING RE-ANCHORS EVERYTHING, and costs no code: the meeting date is
-    read fresh from the sheet on every run, so a moved meeting simply produces a
-    different set of touches from the next run onwards.
+    NEVER DROPPED BY THE DEDUP (`never_dropped`). "One contact, one mention a
+    day" used to cost a meeting its prep whenever a rule listed earlier named
+    the same person that day. A meeting is named whatever else is said, and
+    one person's two meetings are two lines. In the other direction nothing
+    changed: R8 still claims its contact, so a rule listed AFTER it, and R6
+    (which gives way to everybody), do not name that person the same day.
 
-    Checks the meeting is ready (deck, package, demo) and carries recent news
-    about the person and the company — the news half is WEB-DEPENDENT.
+    WHO IS PICKED, and the memory that stops a touch repeating, catches up a
+    date that moved close, and asks for an unreadable date weekly, are
+    `meeting_prep.pick`. `ctx["meeting_state"]` is `db.meeting_prep_state()`;
+    the caller passes {"unreadable": True} when that table cannot be read and
+    then NOTHING is posted: without the memory every touch due today would go
+    out again on the next tick.
+
+    NO FETCH. Until 12 Oct each meeting asked the research layer for a web
+    search. The news line now comes from what R1 has already stored
+    (`bot._meeting_news`, which reads; this function is handed nothing and
+    asks for nothing).
     """
+    import meeting_prep
+
     today = ctx["today"]
-    befores = _int_list(config.MEETING_PREP_DAYS_BEFORE)
+    report = ctx["reports"].setdefault("R8", {
+        "today": 0, "prep": 0, "blank_names": [], "duplicates": [], "past": 0,
+        "outside": 0, "quiet": 0, "done": 0, "asked": 0})
+    state = ctx.get("meeting_state")
+    if isinstance(state, dict) and state.get("unreadable"):
+        log.error("[R8] the record of which touches have gone out cannot be read; nothing "
+                  "is posted, so no touch can go out twice")
+        report["state_unreadable"] = True
+        return []
+    rows = ctx.get("meeting_rows")
+    rows = list(rows if rows is not None else (ctx.get("rows") or ()))
+    if rows and not any("meeting_date" in r for r in rows):
+        log.error("[R8] %d row(s) read and no Meeting Date column I can find by its header; "
+                  "nothing is posted", len(rows))
+        report["missing_column"] = True
+        return []
+    got = meeting_prep.pick(rows, today=today,
+                            befores=_int_list(config.MEETING_PREP_DAYS_BEFORE), state=state)
+    for skipped in got["blank_names"]:
+        log.warning("[R8] row %s has a Meeting Date (%r) and no Name; skipped",
+                    skipped.get("sheet_row"), skipped.get("meeting_date"))
+    for dup in got["duplicates"]:
+        log.info("[R8] %s (%s) is on the sheet twice for %s; row %s is not listed again",
+                 dup["name"], dup["company"] or "no company", dup["meeting_date"],
+                 dup.get("sheet_row"))
+    for name in ("blank_names", "duplicates", "past", "outside", "quiet", "done", "asked"):
+        report[name] = got[name]
+    report["dates"] = got["dates"]
+
+    waves = {post: meeting_prep.sent_today(state, today, post)
+             for post in (meeting_prep.POST_TODAY, meeting_prep.POST_PREP)}
     out = []
-    for row in ctx.get("rows") or ():
-        ok, _reason, _until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
-        if not ok:
-            continue
-        meeting = _date(row, "meeting_date")
-        if meeting is None or meeting < today:
-            continue
-        if gtm_sheet.is_meeting_completed(row.get("meeting_status")):
-            continue
-        days_out = (meeting - today).days
-        touch = None
-        if days_out == 0:
-            touch = f"day of, {config.MEETING_DAYOF_TIME} IST"
-        elif days_out in befores:
-            touch = f"T-{days_out}"
-        if touch is None:
-            continue
-        package = _text(row, "package")
+    for item in got["items"]:
+        row, meeting, post = item["row"], item["meeting"], item["post"]
+        who = wording.next_step_who(item["name"], item["company"])
+        iso = dl.iso(meeting) if meeting else ""
+        if item["touch"] == meeting_prep.TOUCH_UNREADABLE:
+            why = f"R8: the Meeting Date {item['raw']!r} cannot be read; asked for once a week"
+            text = f"{who} — the Meeting Date cannot be read"
+        elif item["touch"] == meeting_prep.TOUCH_CATCHUP:
+            why = (f"R8: meeting on {dl.format_date(meeting)} moved to {item['days_out']} "
+                   "day(s) away, past every earlier touch; the one catch-up touch")
+            text = f"{who} — meeting on {dl.format_date(meeting)}"
+        else:
+            why = (f"R8: meeting on {dl.format_date(meeting)}, "
+                   + ("the day itself" if item["days_out"] == 0
+                      else f"{item['days_out']} days before"))
+            text = f"{who} — meeting on {dl.format_date(meeting)}"
+        report[post] += 1
         out.append(_item(
             rule=rule, trigger=R_MEETING_PREP, today=today,
-            # The day-of touch is NOT weekend-shifted: the meeting is when the
-            # meeting is, and a Saturday meeting still needs its morning note.
-            due=meeting - timedelta(days=days_out),
-            why=(f"R8: meeting on {dl.format_date(meeting)}, {touch} touch"
-                 + (f" (skipping the T-{max(befores)} touch, already past)"
-                    if befores and days_out < max(befores) and touch.startswith("T-")
-                    else "")),
-            text=(f"{_describe(row)} — meeting {('today' if days_out == 0 else f'in {days_out} day(s)')}"
-                  f" on {dl.format_date(meeting)}. Deck, package and demo ready?"
-                  + (f" Package: {package}." if package else "")),
-            company=_text(row, "company"), poc=_text(row, "name"),
-            designation=_text(row, "designation"), sheet_row=row.get("_row"),
-            row_key=_contact_key(row), contact_key=_contact_key(row),
-            web_pending=True,
-            extra={"meeting_date": dl.iso(meeting), "touch": touch,
-                   "days_out": days_out,
-                   "dayof_time": config.MEETING_DAYOF_TIME},
+            # NOT weekend-shifted: the touch belongs to its own day, and a
+            # Saturday meeting still gets its morning note on the Saturday.
+            due=today, why=why, text=text,
+            company=item["company"], poc=item["name"], sheet_row=row.get("_row"),
+            row_key=item["row_key"], contact_key=item["row_key"],
+            # NONE OF THIS IS PRINTED except `who` and, on the afternoon post,
+            # the date: the rest is what the sender, the order and the touch
+            # record need.
+            extra={"meeting_date": iso, "meeting_raw": item["raw"], "touch": item["touch"],
+                   "days_out": item["days_out"], "block": item["block"], "post": post,
+                   "wave": waves[post], "who": who, "pick_order": item["pick_order"],
+                   "never_dropped": True,
+                   "key": f"{getattr(rule, 'id', 'R8')}:{item['row_key']}:{iso}:{item['touch']}",
+                   # NO CAP: 0 means "none", so no overflow is ever reported.
+                   "max_items_per_post": 0,
+                   "dayof_time": (config.MEETING_DAYOF_TIME if post == meeting_prep.POST_TODAY
+                                  else config.MEETING_PREP_TIME)},
         ))
+    log.info("[R8] %d row(s) read: %d for today's post, %d for the afternoon one; %d not on "
+             "a touch today, %d touch(es) already out, %d past, %d beyond %d days, %d "
+             "unreadable date(s) asked inside the last week, %d blank name(s), %d duplicate(s)",
+             len(rows), report["today"], report["prep"], got["quiet"], got["done"], got["past"],
+             got["outside"], meeting_prep.WINDOW_DAYS, got["asked"], len(got["blank_names"]),
+             len(got["duplicates"]))
     return out
 
 
@@ -2664,6 +2717,8 @@ def run(
     next_step_state: Optional[dict] = None,
     poc_company_index: Optional[dict] = None,
     dm_no_meeting_state: Optional[dict] = None,
+    meeting_rows: Optional[list] = None,
+    meeting_state: Optional[dict] = None,
 ) -> dict:
     """THE QUEUE. Everything the thirteen rules make due today, deduped and ranked.
 
@@ -2690,6 +2745,13 @@ def run(
 
     `dm_no_meeting_state` is R7's rotation state from
     `db.dm_no_meeting_state()`, with the same rule: None names nobody.
+
+    `meeting_rows` is EVERY row of Outreach PoCs, for R8, which reads one
+    column and applies no activation gate (None = use `rows`).
+    `meeting_state` is R8's memory from `db.meeting_prep_state()`. None here
+    means "no memory" (every touch due by its date; a preview); the SENDER
+    passes {"unreadable": True} when the table cannot be read, and R8 then
+    names nobody.
     """
     today = today or dl.today_ist()
     rows = list(rows or [])
@@ -2716,6 +2778,10 @@ def run(
         # R7's ROTATION STATE. None (unreadable) is kept as None, like R13's.
         "dm_no_meeting_state": (dict(dm_no_meeting_state)
                                 if dm_no_meeting_state is not None else None),
+        # R8 READS EVERY ROW THAT HAS A MEETING DATE (None = use `rows`), and
+        # its memory of which touches have gone out.
+        "meeting_rows": list(meeting_rows) if meeting_rows is not None else None,
+        "meeting_state": meeting_state,
         # THE CONTACTS EARLIER-LISTED RULES HAVE NAMED SO FAR TODAY, filled in
         # as the rules run (below). A rule that picks a fixed few (R7) reads it
         # so it does not spend a place on somebody the dedup will take away.
@@ -2814,6 +2880,12 @@ def run(
         key = item.get("contact_key") or ""
         if key and item.get("yields") and key in firm:
             seen.setdefault(key, firm[key])
+        if key and item.get("never_dropped"):
+            # R8: A MEETING IS NAMED WHATEVER ELSE NAMES THE PERSON TODAY. It
+            # still claims the contact from the rules listed after it.
+            seen.setdefault(key, item)
+            actions.append(item)
+            continue
         if key and key in seen and seen[key] is not item:
             keeper = seen[key]
             deduped.append({
@@ -3213,26 +3285,36 @@ def _self_test() -> int:
           run(today=MON, rows=[], prospect_rows=seven, day_rules=r7_rule)["actions"], [])
     check("an empty tab posts nothing", r7_run([]), [])
 
-    print("\nR8 meeting prep — touches, and the past ones skipped")
-    def preps(meeting_iso, today):
-        r = row(meeting_date=meeting_iso)
-        return run(today=today, rows=[r], day_rules=[rules_mod.by_id("R8")])["actions"]
-    check("T-5 fires", [a["touch"] for a in preps("26-09-2026", date(2026, 9, 21))], ["T-5"])
-    check("T-3 fires", [a["touch"] for a in preps("24-09-2026", date(2026, 9, 21))], ["T-3"])
-    check("T-4 does not", preps("25-09-2026", date(2026, 9, 21)), [])
-    check("day-of fires at the configured time",
-          [a["dayof_time"] for a in preps("21-09-2026", date(2026, 9, 21))],
-          [config.MEETING_DAYOF_TIME])
-    check("the T-5 and T-3 touches have the same fixed time",
-          ([a["dayof_time"] for a in preps("26-09-2026", date(2026, 9, 21))],
-           [a["dayof_time"] for a in preps("24-09-2026", date(2026, 9, 21))]),
-          ([config.MEETING_DAYOF_TIME], [config.MEETING_DAYOF_TIME]))
-    check("a meeting booked in 3 days never gets a late T-5",
-          [a["touch"] for a in preps("24-09-2026", date(2026, 9, 21))], ["T-3"])
+    print("\nR8 meeting prep — one column, three touches, two posts")
+    def preps(meeting_iso, today, **more):
+        r = row(meeting_date=meeting_iso, **more)
+        return run(today=today, rows=[], meeting_rows=[r],
+                   day_rules=[rules_mod.by_id("R8")])["actions"]
+    check("5 days before", [a["touch"] for a in preps("26-09-2026", date(2026, 9, 21))], ["5"])
+    check("3 days before", [a["touch"] for a in preps("24-09-2026", date(2026, 9, 21))], ["3"])
+    check("4 days out says nothing", preps("25-09-2026", date(2026, 9, 21)), [])
+    check("the day itself goes at MEETING_DAYOF_TIME, in its own post",
+          [(a["dayof_time"], a["post"]) for a in preps("21-09-2026", date(2026, 9, 21))],
+          [(config.MEETING_DAYOF_TIME, "today")])
+    check("the earlier touches go at MEETING_PREP_TIME, in the afternoon post",
+          [(a["dayof_time"], a["post"]) for a in preps("26-09-2026", date(2026, 9, 21))
+           + preps("24-09-2026", date(2026, 9, 21))],
+          [(config.MEETING_PREP_TIME, "prep")] * 2)
     check("a past meeting produces nothing", preps("01-09-2026", date(2026, 9, 21)), [])
-    check("a completed meeting produces no prep",
-          len(run(today=MON, rows=[row(meeting_date="24-09-2026", meeting_status="Completed")],
-                  day_rules=[rules_mod.by_id("R8")])["actions"]), 0)
+    check("a Completed meeting with a date to come is still chased (accepted 12 Oct)",
+          len(preps("24-09-2026", MON, meeting_status="Completed")), 1)
+    check("no activation is needed: only the Meeting Date is read",
+          len(run(today=MON, rows=[], meeting_rows=[{"_row": 9, "name": "Zed", "company": "Zeta",
+                                                    "meeting_date": "24-09-2026"}],
+                  day_rules=[rules_mod.by_id("R8")])["actions"]), 1)
+    twice = run(today=MON, rows=[], day_rules=[rules_mod.by_id("R8")],
+                meeting_rows=[row(meeting_date="24-09-2026"), dict(row(meeting_date="26-09-2026"), _row=9)])
+    check("never dropped by the dedup: one person's two meetings are two items",
+          [(a["touch"], a["never_dropped"]) for a in twice["actions"]], [("3", True), ("5", True)])
+    check("a record that cannot be read posts nothing",
+          run(today=MON, rows=[], meeting_rows=[row(meeting_date="24-09-2026")],
+              meeting_state={"unreadable": True},
+              day_rules=[rules_mod.by_id("R8")])["actions"], [])
 
     print("\nR9 meeting follow-up — the ladder, and its end")
     done = row(meeting_date="15-09-2026", meeting_status="Completed")

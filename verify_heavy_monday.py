@@ -40,6 +40,7 @@ config.MESSAGE_GAP_MINUTES = config.MESSAGE_GAP_MIN_MINUTES = 120
 config.MESSAGE_JITTER_MINUTES = 0
 config.DAILY_MESSAGE_CAP = 5
 config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME = "10:00", "15:00"
+config.MEETING_PREP_TIME = "14:00"
 
 MONDAY = date(2026, 9, 21)
 SID, VAISHNAVI, KUSHAL = 1001, 1002, 1003
@@ -92,12 +93,17 @@ def main() -> int:
         item("R4", nextaction.R_DELIVERABLES, "Sid", "MSA"),
         item("R7", nextaction.R_DM_NO_MEETING, "Kushal", "London Met"),
         item("R10", nextaction.R_CLOSURE_SUPPORT, "Vaishnavi", "ElevenLabs"),
-        item("R8", nextaction.R_MEETING_PREP, "Vaishnavi", "Wispr Flow",
-             counts=False, dayof=config.MEETING_DAYOF_TIME),
-        # EVERY MEETING POST HAS THE FIXED TIME since 8 Oct: the earlier prep
-        # touches and the follow-ups too, not only the day-of touch.
-        item("R8", nextaction.R_MEETING_PREP, "Kushal", "PolyAI", counts=False,
-             dayof=config.MEETING_DAYOF_TIME),
+        # R8 IS TWO POSTS since 12 Oct 2026: today's meetings at
+        # MEETING_DAYOF_TIME, the earlier touches at MEETING_PREP_TIME. Both
+        # are fixed times, outside the order.
+        item("R8", nextaction.R_MEETING_PREP, "", "Wispr Flow",
+             counts=False, dayof=config.MEETING_DAYOF_TIME,
+             extra={"post": "today", "touch": "0", "block": 0,
+                    "meeting_date": dl.iso(MONDAY)}),
+        item("R8", nextaction.R_MEETING_PREP, "", "PolyAI", counts=False,
+             dayof=config.MEETING_PREP_TIME,
+             extra={"post": "prep", "touch": "3", "block": 3,
+                    "meeting_date": dl.iso(MONDAY)}),
         item("R9", nextaction.R_MEETING_FOLLOWUP, "Sid", "Acme", counts=False,
              dayof=config.MEETING_DAYOF_TIME,
              extra={"rung": 3, "rung_destination": "escalation",
@@ -172,7 +178,7 @@ def main() -> int:
     dayof = [m for m in messages if m.get("dayof_time")]
     check("all three meeting posts (two R8, one R9) keep the fixed time",
           sorted((m["rule_id"], m["send_at_hhmm"], m["pinned"]) for m in dayof),
-          [("R8", "10:00", True), ("R8", "10:00", True), ("R9", "10:00", True)])
+          [("R8", "10:00", True), ("R8", "14:00", True), ("R9", "10:00", True)])
     windowed = sorted(m["send_at_hhmm"] for m in messages if not m.get("dayof_time"))
     check("the first windowed post is on the start",
           windowed[0], config.SALES_DRIP_START)

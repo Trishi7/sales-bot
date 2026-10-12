@@ -160,8 +160,9 @@ global_rules:
 # (rules._parse_daily_order).
 #
 # R8, R9 AND R13 ARE IN NO LIST. They post at fixed times (MEETING_DAYOF_TIME
-# 10:00 for R8 and R9, NEXT_STEP_TIME 15:00 for R13), outside the order and the
-# gap. Sunday has no order: SUNDAY_RULE_IDS (R4), one post.
+# 10:00 for R9 and R8's "Meeting today", MEETING_PREP_TIME 14:00 for R8's
+# "Meeting preparation", NEXT_STEP_TIME 15:00 for R13), outside the order and
+# the gap. Sunday has no order: SUNDAY_RULE_IDS (R4), one post.
 daily_order:
   mon: [R4, R7, R1, R10]
   tue: [R5, R6, R2, R1]
@@ -648,30 +649,45 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R8
-  # ANCHORED TO THE MEETING, NOT TO A WEEKDAY — hence the empty weekday list.
-  # Touches at 5 days before, 3 days before, and MEETING_DAYOF_TIME (10:00) on
-  # the day. Touches already in the past are skipped, so a meeting booked with
-  # three days' notice gets the 3-day and day-of touches and not a late
-  # 5-day one. A reschedule re-anchors every touch on the new date.
+  # REBUILT 12 Oct 2026. ANCHORED TO THE MEETING, NOT TO A WEEKDAY — hence the
+  # empty weekday list — and it runs on Saturdays and Sundays too.
+  #
+  # ONE COLUMN IS READ: Meeting Date on Outreach PoCs, on every row that has
+  # one. No activation gate, no Meeting Status: a Completed or cancelled
+  # meeting with a date still to come is chased (accepted 12 Oct).
+  #
+  # THREE TOUCHES, TWO POSTS. Today's meetings at MEETING_DAYOF_TIME (10:00),
+  # always on their own ("Meeting today"). The 3-day block and then the 5-day
+  # block after MEETING_PREP_TIME (14:00), in one post ("Meeting
+  # preparation"). 7, 6, 4, 2 or 1 days out: nothing that day.
+  #
+  # RENDERED IN CODE (wording.meeting_today_post / meeting_prep_post), with a
+  # news line from what R1 has already stored. No search and no model call.
+  #
+  # NO CAP: every meeting is named, and a post too long for one Discord
+  # message is split. `max_items_per_post` is required by the loader and is
+  # NOT applied to this rule.
   #
   # counts_toward_cap: false — a meeting is time-critical and must not be
-  # crowded out by a Monday chase. Never held by the re-ask clock either: each
-  # touch belongs to one date, and a held touch is a lost one.
-  # A FIXED TIME (8 Oct): every touch posts at MEETING_DAYOF_TIME (10:00), not
-  # only the meeting-day one. Outside daily_order and the 2-hour gap.
+  # crowded out by a Monday chase. Outside daily_order and the 2-hour gap.
+  # Never held by the re-ask clock: each touch belongs to one date and goes
+  # out once (db.meeting_touches).
   - id: R8
     name: Meeting preparation
     plain: meetings coming up that need prep
     # The Bot Rules tab, rule 8, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      Meetings coming up that need prep. Three touches for each meeting on
-      Outreach PoCs: 5 days before, 3 days before and on the day. Every
-      touch posts at 10 AM, outside the day's order, and doesn't count
-      toward the 5 posts a day. Asks whether the deck, package and demo are
-      ready, with any recent news on the company.
+      Meetings coming up that need prep. Reads the Meeting Date on Outreach
+      PoCs and nothing else. Three touches for each meeting: 5 days before, 3
+      days before and on the day. Today's meetings post on their own at 10
+      AM; the 3-day and 5-day ones post together after 2 PM. Both are outside
+      the day's order, don't count toward the day's posts, and go out at
+      weekends too. Every meeting is named, with the date and one recent
+      news story on the company when there is one. Asks whether the deck,
+      package and demo are ready, and offers a reminder.
     weekdays: []
     trigger: meeting_prep
-    max_items_per_post: 3
+    max_items_per_post: 50
     destination: channel
     counts_toward_cap: false
     enabled: true

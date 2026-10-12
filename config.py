@@ -2496,6 +2496,12 @@ EMAIL_WRITE_ALLOWED = _bool("EMAIL_WRITE_ALLOWED", default=False)
 # reschedule re-anchors every touch on the new date.
 MEETING_PREP_DAYS_BEFORE: list[str] = _str_list("MEETING_PREP_DAYS_BEFORE", "5,3")
 MEETING_DAYOF_TIME = (os.getenv("MEETING_DAYOF_TIME", "10:00") or "").strip() or "10:00"
+# R8's SECOND POST (12 Oct 2026). Today's meetings go on their own at
+# MEETING_DAYOF_TIME; the 3-day and 5-day touches go together in ONE post
+# after this time. Two R8 posts a day at most, both outside the day's order,
+# the 2-hour gap and DAILY_MESSAGE_CAP. A value that is not HH:MM falls back
+# to 14:00 with a warning.
+MEETING_PREP_TIME = _hhmm("MEETING_PREP_TIME", os.getenv("MEETING_PREP_TIME", "14:00"), "14:00")
 
 # R9 — MEETING DONE, NO NEXT STEPS. First ask this many days after the meeting,
 # then every this-many days again.
@@ -3626,12 +3632,13 @@ def validate() -> list[str]:
         log.info(
             "[config] the thirteen rules are ON (computation only — the engine has no "
             "send path). rules_file=%s deliverables<=%dd prospects=%d open company "
-            "li_no_dm=%dd dm_no_meeting=%dd prep=%s+day-of@%s "
+            "li_no_dm=%dd dm_no_meeting=%dd prep=%s@%s+day-of@%s "
             "followup=%dd/every %dd ladder=%s closure>%d%% new_company=+%dwd "
             "window=%dd weekend_shift=%s",
             BOT_RULES_FILE, DELIVERABLE_NEAR_DAYS, PROSPECT_COMPANIES_PER_WEEK,
             LI_NO_DM_DAYS, DM_NO_MEETING_DAYS,
-            ",".join(MEETING_PREP_DAYS_BEFORE) or "(none)", MEETING_DAYOF_TIME,
+            ",".join(MEETING_PREP_DAYS_BEFORE) or "(none)", MEETING_PREP_TIME,
+            MEETING_DAYOF_TIME,
             MEETING_FOLLOWUP_AFTER_DAYS, MEETING_FOLLOWUP_EVERY_DAYS,
             ">".join(MEETING_FOLLOWUP_LADDER) or "(empty)",
             CLOSURE_SUPPORT_MIN, NEW_COMPANY_AFTER_WORKING_DAYS,
@@ -3767,6 +3774,16 @@ def validate() -> list[str]:
                 "in the post saying why. The agreed numbers are 3 a run and 12 a month.",
                 EVENTS_DISCOVERY_MAX_PER_MONTH, EVENTS_DISCOVERY_MAX_PER_RUN,
             )
+        log.info(
+            "[config] R8 meeting preparation (every day, weekends included): reads the "
+            "Meeting Date on every Outreach PoCs row and nothing else; touches %s days "
+            "before and on the day; \"Meeting today\" at %s on its own, \"Meeting "
+            "preparation\" after %s; no cap, outside the 2-hour gap and "
+            "DAILY_MESSAGE_CAP; the news line is read from the stored feed (last 14 "
+            "days), nothing is fetched; a touch goes out once (meeting_touches)",
+            ",".join(MEETING_PREP_DAYS_BEFORE) or "(none)", MEETING_DAYOF_TIME,
+            MEETING_PREP_TIME,
+        )
         log.info(
             "[config] R12 sales packages (Thursdays): every package whose Ready? is not Yes "
             "(blank is not ready), by name only, order=%s with a blank per cent last; the "

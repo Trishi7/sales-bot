@@ -67,6 +67,31 @@ def link(text: str, url: str) -> str:
     return f"[{short_name(text, url)}](<{url}>)"
 
 
+# A headline shown IN FULL as link text is cut here, on a word, with an
+# ellipsis inside the link.
+HEADLINE_MAX_CHARS = 100
+
+
+def headline_link(headline: str, url: str, *, limit: int = HEADLINE_MAX_CHARS) -> str:
+    """`[the whole headline](<url>)`, embed suppressed like `link`. "" unless
+    there is a headline AND a url with an http(s) scheme.
+
+    `link` shortens its text to six words, which is right for a source name
+    and wrong where the headline IS the line (R8's news line). This keeps the
+    headline, trimmed to about `limit` characters on a word boundary with "…"
+    INSIDE the link text. A url with no scheme would go out as dead text, so
+    it gives nothing at all.
+    """
+    text = " ".join(re.sub(r"[\[\]<>`*_|]", " ", str(headline or "")).split())
+    url = str(url or "").strip().strip("<>")
+    if not text or not re.match(r"^https?://\S+$", url):
+        return ""
+    if len(text) > limit:
+        cut = text[:limit].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
+        text = cut.rstrip(" ,;:.-\u2014\u2013") + "\u2026"
+    return f"[{text}](<{url}>)"
+
+
 # Already masked: [name](<url>) — left exactly as it is.
 _MASKED_RE = re.compile(r"\[[^\]\n]{1,200}\]\(<https?://[^\s>]+>\)")
 # Markdown without the angle brackets: [name](url) — gets them, so no embed.

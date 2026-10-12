@@ -117,7 +117,9 @@ _ACTION_STAGE: dict = {
     nextaction.R_LI_NO_DM: STAGE_TOUCHED,
     nextaction.R_PROSPECTS: STAGE_TOUCHED,
     nextaction.R_DM_NO_MEETING: STAGE_REPLIED,
-    nextaction.R_MEETING_PREP: STAGE_MEETING,
+    # (R8, meeting prep, left this map on 12 Oct 2026: its two posts are fixed
+    # text about every meeting they list, and it reads one column. Evidence
+    # that "a meeting was booked" must never turn that post into an offer.)
     nextaction.R_CLOSURE_SUPPORT: STAGE_QUOTED,
 }
 

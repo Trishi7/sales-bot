@@ -4,8 +4,9 @@ THE CHECK THE SCHEDULE CHANGE IS WRITTEN AGAINST: Monday's four rules plus two
 meeting-prep items should produce SIX posts, of which only FOUR count against
 the cap of 5. The four go in the order the team gave on 8 Oct (NFT2-1069) —
 deliverables 14:00, DM sent no meeting 16:00, AI news 18:00, closure support
-20:00 — exactly two hours apart; the two meeting posts go at 10:00, outside
-that order; and every post opens by tagging Vaishnavi and Sid.
+20:00 — exactly two hours apart; the two meeting posts ("Meeting today" at
+10:00, "Meeting preparation" at 14:00, since 12 Oct 2026) go outside that
+order; and every post opens by tagging Vaishnavi and Sid.
 
 It touches no sheet, no database and no network. Nothing is sent — `drip.plan`
 computes and returns, and this file only prints what it returned.
@@ -48,14 +49,18 @@ config.MESSAGE_GAP_MINUTES = config.MESSAGE_GAP_MIN_MINUTES = 120
 config.MESSAGE_JITTER_MINUTES = 0
 config.DAILY_MESSAGE_CAP = 5
 config.MEETING_DAYOF_TIME, config.NEXT_STEP_TIME = "10:00", "15:00"
+config.MEETING_PREP_TIME, config.MEETING_PREP_DAYS_BEFORE = "14:00", ["5", "3"]
 
 MONDAY = date(2026, 9, 21)
 
 
 def item(rule_id, trigger, owner, company, *, counts=True, due=MONDAY, overdue=0,
-         dayof=""):
+         dayof="", post=""):
     band = nextaction.RULE_BANDS.get(trigger, nextaction.P_CHASE)
     return {
+        # R8 SAYS WHICH OF ITS TWO POSTS AN ITEM BELONGS TO (12 Oct 2026).
+        **({"post": post, "touch": "0" if post == "today" else "3",
+            "block": 0 if post == "today" else 3, "meeting_date": dl.iso(due)} if post else {}),
         # A FIXED-TIME ITEM CARRIES ITS TIME, as `nextaction` sets it on every
         # meeting-prep touch.
         **({"dayof_time": dayof} if dayof else {}),
@@ -78,17 +83,17 @@ def main() -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)-7s %(message)s")
 
     # FOUR SCHEDULED RULES that count against the cap, and TWO meeting-prep
-    # items that do not. R8's two items are for different owners, so the
-    # grouping rule (one group per rule x owner) makes them two posts.
+    # items that do not. One is a meeting today and one is three days out, so
+    # they are R8's two posts (it groups by which post, not by owner).
     actions = [
         item("R1", nextaction.R_AI_NEWS, "Vaishnavi", "the AI news"),
         item("R4", nextaction.R_DELIVERABLES, "Sid", "MSA", overdue=2),
         item("R7", nextaction.R_DM_NO_MEETING, "Kushal", "ElevenLabs", overdue=7),
         item("R10", nextaction.R_CLOSURE_SUPPORT, "Vaishnavi", "PolyAI"),
-        item("R8", nextaction.R_MEETING_PREP, "Vaishnavi", "Acme", counts=False,
-             dayof=config.MEETING_DAYOF_TIME),
-        item("R8", nextaction.R_MEETING_PREP, "Kushal", "Borealis", counts=False,
-             dayof=config.MEETING_DAYOF_TIME),
+        item("R8", nextaction.R_MEETING_PREP, "", "Acme", counts=False,
+             dayof=config.MEETING_DAYOF_TIME, post="today"),
+        item("R8", nextaction.R_MEETING_PREP, "", "Borealis", counts=False,
+             dayof=config.MEETING_PREP_TIME, post="prep"),
     ]
 
     planned = drip.plan(actions, day=MONDAY)
@@ -155,9 +160,9 @@ def main() -> int:
         ("the four rules go in Monday's order, two hours apart",
          [(m["rule_id"], m["send_at_hhmm"]) for m in messages if not m["pinned"]],
          [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")]),
-        ("the two meeting-prep posts go at 10:00, outside that order",
+        ("the two meeting posts go at 10:00 and 14:00, outside that order",
          [(m["rule_id"], m["send_at_hhmm"], m["pinned"]) for m in messages
-          if m["pinned"]], [("R8", "10:00", True), ("R8", "10:00", True)]),
+          if m["pinned"]], [("R8", "10:00", True), ("R8", "14:00", True)]),
         ("...and the day is the same with them or without them",
          [(m["rule_id"], m["send_at_hhmm"])
           for m in drip.plan(actions[:4], day=MONDAY)["messages"]],

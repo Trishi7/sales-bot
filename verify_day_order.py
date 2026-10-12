@@ -9,7 +9,8 @@ the order posts after 20:00; AI news (R1) takes its place in the order instead o
 and meeting follow-ups (10:00) and next-step follow-ups (15:00) sit outside the order; R7 is back on Mondays but
 never for a person Rule 13 covers; R11 runs on Wednesdays only.
 
-  EVERY WEEKDAY, EVERY RULE DUE   the exact times; R13 at 15:00, R8 and R9 at 10:00, moving no spaced post
+  EVERY WEEKDAY, EVERY RULE DUE   the exact times; R13 at 15:00, R9 and R8's "Meeting today" at 10:00, R8's
+                                  "Meeting preparation" at 14:00, moving no spaced post
   NOTHING TO POST                 Monday with no deliverables, with nobody for R7, with only AI news; a P1 that
                                   appears after the day was planned takes the next free slot
   THE GAP                         never under 120 minutes; jitter only adds; nothing after 20:00; a late post
@@ -17,7 +18,8 @@ never for a person Rule 13 covers; R11 runs on Wednesdays only.
   RULE 11                         a company that appears on a Thursday is asked about the next Wednesday only
   AI NEWS                         Tuesday's 20:00 post covers from Monday's 18:00 slot, Monday's from Friday's
   THE STARTUP CHECK               weekdays and daily_order disagreeing is refused, naming both
-  THE WEEKEND                     Sunday: one post, R4, only for a P1 due Monday. Saturday: nothing
+  THE WEEKEND                     Sunday: one counted post, R4, only for a P1 due Monday. Saturday: none.
+                                  The two meeting posts (R8) go on their own days, weekends included
   THE SETTINGS, THE WORDING       the defaults in code and .env.example; NEWS_MAIN_TIME retired; the sheet words
 
 The checks are in tests/day_order_checks.py (shared with tests/test_day_order.py): the REAL rule evaluators, the
@@ -71,10 +73,12 @@ def the_days() -> None:
             print(f"\n  {day:%A %d %b %Y}")
             for line in doc.day_table(day):
                 print("    " + line)
-        print(f"\n  {doc.SUN:%A %d %b %Y}  (unchanged: one post, only when a P1 deliverable is due on the Monday)")
+        print(f"\n  {doc.SUN:%A %d %b %Y}  (one counted post, only when a P1 deliverable is due on the Monday)")
         print("    14:00  R4   Deliverables checklist             the Sunday exception (SUNDAY_RULE_IDS=R4)")
+        print("    10:00 / 14:00  R8   Meeting today / Meeting preparation, when a touch falls on the day")
         print(f"\n  {doc.SAT:%A %d %b %Y}")
-        print("    (nothing)")
+        print("    10:00 / 14:00  R8   Meeting today / Meeting preparation, when a touch falls on the day")
+        print("    (nothing else)")
 
 
 def main() -> int:

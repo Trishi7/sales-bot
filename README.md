@@ -2209,7 +2209,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
 | **R6** | Connected, no DM yet, and the email check (LI DM Sent blank; 5 names + up to 5 with email news) | Tue, Fri | `li_no_dm` | 5 | yes |
 | **R7** | No meeting booked yet — the escalation behind R13, rotating | Mon | `dm_no_meeting` | 3 | yes |
-| **R8** | Meeting preparation | **anchored**, 10:00 | `meeting_prep` | 3 | **no** |
+| **R8** | Meeting preparation — "Meeting today" at 10:00, "Meeting preparation" after 14:00; every Meeting Date, weekends too | **anchored** | `meeting_prep` | no cap | **no** |
 | **R9** | Meeting done, no next steps | **anchored**, 10:00 | `meeting_followup` | 3 | **no** |
 | **R10** | Closure support — every deal, highest first, with stored news | Mon | `closure_support` | no cap | yes |
 | **R11** | New company in Master Pipeline | Wed | `new_pipeline_company` | 10 | yes |
@@ -2378,6 +2378,118 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 8: meeting preparation
+
+**Rebuilt 12 Oct 2026.** Two posts, both rendered in code. `python
+verify_meeting_prep.py --show` prints them.
+
+```
+**Meeting today**                                   (10:00, MEETING_DAYOF_TIME)
+@Vaishnavi @Sid
+we have two meetings today with:
+1. Ada Lovelace (Acme AI)
+2. Sujith P (ARTPARK)
+   They've been in the news recently — worth a skim before you go in:
+   [the headline](<link>)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+```
+
+```
+**Meeting preparation**                             (after 14:00, MEETING_PREP_TIME)
+@Vaishnavi @Sid
+we have a meeting in 3 days with:
+1. Dr. David Gamez (Middlesex University London) — Thu 15 Oct
+   They've been in the news recently — worth a skim before the call:
+   [the headline](<link>)
+
+and a meeting in 5 days with:
+2. Sujith P (ARTPARK) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+```
+
+**One column is read** (`meeting_prep.pick`, called by
+`nextaction._r_meeting_prep`): Meeting Date, on **every** row of Outreach PoCs
+that has one, found by its header. No activation gate, no Meeting Status, no
+stage. So a row nobody has contacted yet qualifies, and **a meeting marked
+Completed or cancelled with a date still to come is still chased**. Both were
+accepted on 12 Oct; do not add a status check back. A row with a date and no
+Name is skipped and logged.
+
+**Three touches, and only on their days.** `MEETING_PREP_DAYS_BEFORE` (5 and 3)
+and the day itself. The next 7 days are only the read filter: a meeting 7, 6,
+4, 2 or 1 days out says nothing that day, and a past date is never posted.
+
+**Two posts a day at most, each at its own time.** Today's meetings are always
+their own post. The 3-day block and then the 5-day block share the afternoon
+one, numbered straight through. Either can be absent; nothing qualifying means
+no post and no "no meetings today" line. Both are outside the day's order, the
+2-hour gap and `DAILY_MESSAGE_CAP`, and **both go out on Saturdays and
+Sundays** (`drip.EVERY_DAY_TYPES`, `drip.plans_on`): a touch belongs to its
+meeting's date. Nothing else posts at the weekend because of this.
+
+**No cap.** Every meeting is named. The rule's `max_items_per_post` is not
+applied (`drip.shown_contacts`), and a post over Discord's 2,000 characters is
+split between lines into consecutive messages.
+
+**The text is fixed** (`wording.meeting_today_post`, `meeting_prep_post`; R8 is
+in `drip.VERBATIM_TYPES`). A list of one is still a list. "a meeting" for one,
+"two meetings" for more. Today's lines carry no date; the others carry the
+weekday and date. **The 5-day close says start, the others say check**, and a
+post with a nearer block in it takes the check one.
+
+**The news line fetches nothing** (`bot._meeting_news`). It reads what R1 has
+already stored, the last 14 days of `news_feed_items`, through
+`nextaction.closure_news_pick`: the company's full normalised name (never a
+substring), the most important story by R1's ranking, then the newest. The
+whole headline is the link text, trimmed to about 100 characters with the
+ellipsis inside the link (`links.headline_link`); no date, no bare url. No
+story, or a link with no `http(s)` scheme (logged): no line. Two people at one
+company are numbered together with one line after both; a company in both
+blocks gets its line once. The same story at the 3-day touch as at the 5-day
+one is shown again. A lookup that fails or times out never holds the post.
+
+**A touch goes out once** (`db.meeting_touches`, one row a contact, date and
+touch, written after a real send):
+
+| What happens | What R8 does |
+|---|---|
+| the bot is down at 10:00 | today's post goes out once when it is back |
+| the bot is down all day | that day's 3-day or 5-day touch is gone; it belonged to one date |
+| a date is typed in after the day's post has gone | posted late, once, at the next run (its own post) |
+| the meeting is rescheduled | the new date gets fresh touches; the old date's are not repeated |
+| the date moves so close that both earlier touches were skipped | **one** catch-up touch, saying the real number of days |
+| a meeting is newly booked that close (it never moved) | nothing until its day |
+| the date cannot be read | named in the afternoon post on its own line, **once a week** |
+| the same person is on the sheet twice for one date | one line, logged |
+| the same person has two dates | two lines |
+
+A moved date is told from a new one by `db.meeting_dates_seen`: the dates each
+contact has had, noted on the live sweep. If the touch record cannot be read,
+nothing is posted.
+
+**The dedup.** R8 is never dropped by "one contact, one mention a day": a rule
+listed earlier naming the same person no longer costs the meeting its post. It
+still claims its contact from the rules listed after it, and from R6.
+
+**The reminder the close offers** (`bot._maybe_meeting_reminder`). A reply
+under the post that asks for one ("remind me about 2 the day before", "nudge
+me on David at 9am Wednesday") books a row in `scheduled_reminders`;
+`bot._fire_due_reminders` is still the only sender. The person is matched by
+their number on that post or by name, **among the people on that post only**
+(`drip_sends.people`). "The day before" and "2 days before" count from the
+meeting. A bare "yes" books nothing: the same close asks "are we all set?".
+
+- No meeting named under a post of several, or no day or time that can be read:
+  one question, nothing booked.
+- A time after the meeting, or a meeting that has already been: said so, and
+  another time asked for.
+- **The meeting moves after a reminder is set:** the reminder moves to the same
+  distance before the new date and that is said once
+  (`bot._meeting_reminder_moved`, checked on the live sweep and again at the
+  reminder's minute). A meeting with no date left closes its reminder quietly.
 
 ### Rule 12: sales packages
 
@@ -3106,12 +3218,10 @@ order.
 the days since the DM and the last note). See
 [Rule 7](#rule-7-no-meeting-booked-yet-the-escalation-behind-rule-13).
 
-**R8 skips touches already in the past.** A meeting booked with three days'
-notice gets the T-3 and day-of touches and **never a late T-5** — sending "five
-days to go" two days before is worse than sending nothing. **A reschedule
-re-anchors every touch**, and costs no code: the meeting date is read fresh on
-every run, so a moved meeting simply produces a different set of touches from
-the next run onward.
+**R8 reads one column and remembers what it has sent** (rebuilt 12 Oct 2026).
+A touch that has gone out for a meeting's date never goes out again; a
+rescheduled meeting gets fresh touches on its new date; a late 5-day touch is
+never sent. See [Rule 8](#rule-8-meeting-preparation).
 
 **R9's ladder ends.** One channel post, then two DMs, then one escalation to
 Sid, then **stop, permanently** (`MEETING_FOLLOWUP_LADDER`). The end is the
@@ -3799,8 +3909,9 @@ answerable — *"yes, done"* means something. A document is not.
   — seeded on `(date, slot)` — so a restart recomputes the identical schedule.
   `MESSAGE_GAP_MIN_MINUTES` (120) is a floor under the gap: the larger of the
   two is used (`drip.gap_minutes`).
-- **Fixed-time posts are outside the order and the gap:** meeting prep (R8,
-  every touch) and meeting follow-ups (R9) at `MEETING_DAYOF_TIME` (10:00), the
+- **Fixed-time posts are outside the order and the gap:** "Meeting today" (R8)
+  and meeting follow-ups (R9) at `MEETING_DAYOF_TIME` (10:00), "Meeting
+  preparation" (R8) at `MEETING_PREP_TIME` (14:00), the
   next-step follow-ups (R13) at `NEXT_STEP_TIME` (15:00), reminders at their
   minute, urgent news at `NEWS_CHECK_TIMES`. None moves a spaced post and no
   spaced post waits for one. Every fixed-time post that is due goes on the same
@@ -4754,7 +4865,7 @@ nothing at all there is no model call: the result is `NOTHING FOUND`.
 | **R3 discovery** | `fetch_page` on each url in `EVENTS_CALENDAR_URLS` (default empty) plus `search("AI conference <month> <year> India OR global", n=10)` for this month and next; MODEL_LIGHT returns EVENT lines |
 | **R3 deadlines** | `fetch_page(row link)` first, read around the registration words; `search('"<event>" registration deadline', n=5)` second, only for what the page did not answer |
 | **R6 email** | `search('"<name>" "<company>" email contact', n=8)` → MODEL_LIGHT extracts an address **with its url**, else "no public email found". **Never guessed, and checked:** an address that is not in a snippet character for character is dropped (`websearch.verified_emails`) |
-| **R8** (R10 fetches nothing since 13 Oct 2026: it reads the stored news) | `news(company, days=7, n=8)` — Google News RSS, falling back to `search(company, news=True, days=7)` only when the feed is empty → snippets → the existing brief format via MODEL_LIGHT; Sonnet composes the message as before |
+| **R8, until 12 Oct 2026** (it fetches nothing now, like R10 since 13 Oct: both read the stored news) | `news(company, days=7, n=8)` — Google News RSS, falling back to `search(company, news=True, days=7)` only when the feed is empty → snippets → the existing brief format via MODEL_LIGHT; Sonnet composes the message as before |
 | **R11 yes, `find_people`** | `search('site:linkedin.com/in "<company>" <department>', n=10)` — the result title already reads "Name - Title - Company" — plus `fetch_page` on the company's own team/about page when a second search finds one. MODEL_LIGHT extracts name, title, url, source; `parse_people` still drops anyone the results do not name. LinkedIn itself is never fetched |
 | **Channel questions** | The server-side tool is replaced by two **client** tools: `web_search(query)` → up to 8 snippets, at most `WEB_QUESTION_MAX_SEARCHES` (4) per question, and `fetch_page(url)`. **Cheap first, one extension:** a question that reaches the limit and asks for a search it has not run yet gets `WEB_QUESTION_EXTENDED_SEARCHES` (6) in all and `QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS` (9) tool rounds — once per question, logged as `[engine] msg=… LIMIT EXTENDED ONCE`, never more; a repeated query never extends (`query_engine.QuestionLimits`). Both are offered on **every** question except "what do we need to do today?", whatever the question's route, and a `profile` route covers "LinkedIn / profile / link / url / scholar / X" questions. At the limit the tool returns what was searched and what was not, and the answer says per person what was found, what was not found and what is "not checked yet". The engine (Sonnet) reasons over the snippets |
 
@@ -4879,7 +4990,7 @@ header.
 | **R2** | Companies in the news that are on **neither** sheet, each with one of two verdicts judged against "What we sell" in `sales_strategy.md`. **Reads the feed store since its own last post** and matches names against both sheets in code — see "R2 screens the feed, in code" |
 | **R3** | Events not already on the tab, in the current and next month — plus the **registration-deadline backfill** for rows that lack one |
 | **R6** | A published public email — **only when column F is empty** (see below) |
-| **R8** | Recent news about the person and company, for meeting prep |
+| **R8** | Nothing searched since 12 Oct 2026: one stored story a company, read from `news_feed_items` |
 | **R10** | Nothing searched since 13 Oct 2026: one stored story a deal, read from `news_feed_items` |
 | **R11** | Funding, location, industry, and PoCs worth contacting |
 
@@ -6254,6 +6365,7 @@ python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
 python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the six tiers, the rotation (nobody is dropped), replies not read (--show prints the messages)
+python verify_meeting_prep.py             # R8: only the Meeting Date is read (no activation, no status), 5/3/0 days out and nothing between, the exact text of all four shapes, 30 meetings split with no name dropped, the news line from the store, a touch once, a reschedule, the one catch-up, the weekly ask for an unreadable date, weekends, the reminder set / re-anchored / refused after the meeting (--show prints the messages)
 python verify_packages.py                 # R12: blank Ready? listed, Yes excluded, the exact post for 1, 5 and 7 packages, the order and PACKAGES_ORDER, no per cent anywhere, a date recorded from a reply and replaced, the reminder fired / closed quietly / skipped on a Thursday (--show prints the messages)
 python verify_events.py                   # R3: blocks A, B and C, three lines in all by urgency, no-deadline rows skipped, the live date strings, the assumed year, suggestions in the room left and only from the three places, "add 2", the closing line (--show prints the messages)
 python verify_closure_support.py          # R10: a closure stage above 50% (whole words), the empty-columns line, person first, no cap, highest first, no rotation, the news line read from the store since the last post, the marker (--show prints the messages)
@@ -6732,6 +6844,7 @@ guardrails forbid.
 | `clock.py` | **what time the bot thinks it is**, and the only place that decides. Real IST, or the persistent pretend clock a tester set with "make it Monday" (stored in SQLite, so it survives a restart). No dependencies but `config` |
 | `news_screen.py` | **R2, new companies in the news**: the full-name matcher against both sheets (known / PoCs only / new, and the partial-match question), the news window, the names and verdict prompts and their parsers, the repeat-and-drop merge, the fixed message, and the reply reader. Pure |
 | `news.py` | **R1 and R2**: the one sweep prompt (main and check), STORY parsing, the url and headline keys, `choose` (no-repeats, per-topic, per-week, cap, breaking bar), rendering, the check-slot clock, and R2's screen prompt. No I/O — the search is `llm.web_research(lean=True)`, made by bot.py |
+| `meeting_prep.py` | **R8, meeting preparation** (pure): which meetings have a touch today and which post each goes in (`pick`), the catch-up for a date that moved (`moved_in`), who and when a reply asking for a reminder means (`people_named`, `reminder_when`) and what becomes of a reminder when its meeting moves (`reanchor`). `python -m meeting_prep` is its self-test. (`meetings.py` is the older meeting-notes citation module, unrelated.) |
 | `packages.py` | **R12, sales packages** (pure): which packages are not ready and in what order (`not_ready`), which package a reply names (`match_names`), and which day it promises (`dates_in`, `promises`). `python -m packages` is its self-test |
 | `events_discovery.py` | **R3's web half**: event discovery in the current and next month, tolerant matching against what the tab already has, the per-run and per-month limits, and the registration-deadline backfill. Proposes; never writes. No I/O |
 | `gtm_sheet.write_cells_on` | a **tab-aware** single-cell write for the Events tab: allow-listed tabs, mapped columns, one cell at a time, and it **never overwrites a non-empty cell** |

@@ -80,6 +80,7 @@ import gtm_sheet
 import guardrails
 import mapping_sheet
 import meetings
+import meeting_prep
 import leave
 import news
 import news_screen
@@ -1718,6 +1719,10 @@ class SalesBot(discord.Client):
             # written down, and Saley comes back on that day. Before the
             # acknowledgement, which would give it a thumbs-up and forget it.
             if await self._maybe_package_dates(message, text, ctx):
+                return True
+            # A REMINDER ASKED FOR UNDER A MEETING POST ("remind me about 2 the
+            # day before"): the post's close offers one, so this books it.
+            if await self._maybe_meeting_reminder(message, text, ctx):
                 return True
             if await self._maybe_acknowledge(message, text, ctx):
                 return True
@@ -4164,7 +4169,7 @@ class SalesBot(discord.Client):
         posts = [{"type": str(r.get("action_type") or "")} for r in already or []
                  if (r.get("message_id") or str(r.get("body") or "").strip())
                  and str(r.get("action_type") or "") not in OBJECTIVES_EXCLUDED_TYPES]
-        if drip.is_sending_day(today):
+        if drip.plans_on(today):
             planned = await self._plan_drip(today=today, already=already)
             for m in (planned or {}).get("messages") or []:
                 if str(m.get("destination") or "") in ("dm", "escalation"):
@@ -7020,6 +7025,18 @@ class SalesBot(discord.Client):
                 except Exception:
                     log.exception("[packages] reminder #%s failed; it stays as it is", r["id"])
                 continue
+            if str(r.get("row_key") or "").startswith(meeting_prep.REMINDER_PREFIX):
+                # A MEETING'S REMINDER (R8). If the meeting has moved since it
+                # was set, it is re-anchored to the new date and that is said
+                # once, instead of firing on the old one. If the date stands
+                # it falls through and fires like any other.
+                try:
+                    if await self._meeting_reminder_moved(r, now=now, target=target):
+                        continue
+                except Exception:
+                    log.exception("[R8] reminder #%s could not be checked against the "
+                                  "sheet; it stays as it is", r["id"])
+                    continue
             claimed = await asyncio.to_thread(
                 lambda i=r["id"]: self.db.close_scheduled_reminder(i, status="done"))
             if not claimed:
@@ -7769,6 +7786,289 @@ class SalesBot(discord.Client):
         if not await self._answer_with_engine(message, text, history=history, ask=act):
             await self._engine_no_progress_reply(message, text=act, history=history)
         return True
+
+    # -- R8: the reminder the meeting posts offer ---------------------------
+
+    def _r8_may_record(self) -> bool:
+        """WHERE R8's MEMORY IS WRITTEN, BY PATH: R13's rule exactly
+        (`_record_next_steps`, NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB). Live and
+        SALES_TEST_MODE write DB_PATH; a simulation writes its sandbox copy,
+        which is discarded; a test day ("make it Saturday") writes only when
+        DB_PATH is a *_test.db, so a rehearsal cannot spend a touch the real
+        day still owes."""
+        return not (clock.pretending() and not simulation.in_simulation()
+                    and not NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB
+                    and not str(config.DB_PATH or "").endswith("_test.db"))
+
+    async def _meeting_rows(self):
+        """Every row of Outreach PoCs, or None when the tab cannot be read."""
+        try:
+            tab, _source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
+        except Exception:
+            log.info("[R8] the Outreach PoCs tab cannot be read", exc_info=True)
+            return None
+        return list(tab.rows) if tab is not None else None
+
+    async def _maybe_meeting_reminder(self, message, text: str, ctx: dict) -> bool:
+        """A reply under a meeting post that takes up its offer of a reminder:
+        book it. True when the reply was handled here.
+
+        BOTH POSTS CLOSE ON THE OFFER ("another nudge before it starts",
+        "remind you again nearer the day"), so a reply has to be able to set
+        one. It is one row in `scheduled_reminders` a meeting, and
+        `_fire_due_reminders` is still the ONLY thing that sends it.
+
+        ONLY A REPLY THAT ASKS FOR ONE (`meeting_prep.wants_reminder`). A bare
+        "yes" answers "are we all set?", and "moved to Thursday" is news about
+        the meeting; neither books anything and both go to the ordinary reply
+        handling.
+
+        WHICH MEETING: the NUMBER in front of the name on that post, or the
+        name, AMONG THE PEOPLE ON THE POST BEING ANSWERED and no others
+        (`drip_sends.people`). A post that named one person needs neither.
+        WHEN: `meeting_prep.reminder_when`.
+
+        NOTHING IS GUESSED AND NOTHING USELESS IS BOOKED. No meeting named
+        under a post of several: one question. No day or time that can be
+        read, or one already gone: one question. A time AFTER the meeting, or
+        a meeting that has already been: said so, and another time asked for.
+
+        ONE REMINDER A MEETING: a newer one replaces the older.
+        """
+        if not ctx.get("direct_is_bot"):
+            return False
+        drip_row = ctx.get("drip") or {}
+        if drip_row.get("action_type") != nextaction.R_MEETING_PREP:
+            return False
+        body = " ".join(str(text or "").split())
+        people = [p for p in (drip_row.get("people") or []) if isinstance(p, dict)]
+        if not body or not people or not meeting_prep.wants_reminder(body):
+            return False
+        targets = meeting_prep.people_named(body, people)
+        if not targets:
+            log.info("[R8] a reminder was asked for under a post of %d and no meeting on it "
+                     "was named; asking which, nothing booked", len(people))
+            await self._reply(message, wording.MEETING_REMIND_WHICH,
+                              reason="a reminder with no meeting it belongs to")
+            return True
+        now = dl.now_ist()
+        default = sheetwrite.parse_reminder_time(config.REMINDER_DEFAULT_TIME) or "14:00"
+        asker = _display(message.author)
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        lines: list = []
+        for person in targets:
+            who = wording.next_step_who(person.get("poc"), person.get("company"))
+            meeting = dl.parse_date(str(person.get("meeting_date") or "")) \
+                if str(person.get("meeting_date") or "").strip() else None
+            if meeting is None:
+                lines.append(wording.meeting_remind_no_date(who))
+                continue
+            day = wording.day_date(dl.iso(meeting))
+            got = meeting_prep.reminder_when(body, meeting=meeting, now=now,
+                                             default_time=default)
+            if got["why"] == "after":
+                log.info("[R8] %s asked for a reminder after the meeting with %s (%s); not "
+                         "booked", asker, who, dl.iso(meeting))
+                lines.append(wording.meeting_remind_after(who, day))
+                continue
+            if got["why"]:
+                log.info("[R8] %s asked for a reminder about %s with no usable time (%s) in "
+                         "%r; asking when, nothing booked", asker, who, got["why"], body[:120])
+                lines.append(wording.MEETING_REMIND_WHEN)
+                continue
+            key = meeting_prep.reminder_key(str(person.get("row_key") or ""), dl.iso(meeting))
+            existing = await asyncio.to_thread(self.db.scheduled_reminders_by_row)
+            replaced = 0
+            for old in existing.get(key) or []:
+                closed = await asyncio.to_thread(
+                    lambda i=old["id"]: self.db.close_scheduled_reminder(i, status="cancelled"))
+                replaced += 1 if closed else 0
+            rid = await asyncio.to_thread(
+                lambda p=person, k=key, g=got, w=who, d=day: self.db.add_scheduled_reminder(
+                    row_key=k, company=str(p.get("company") or ""), poc=str(p.get("poc") or ""),
+                    due_date=dl.iso(g["date"]), due_time=g["time"],
+                    what=wording.meeting_remind_what(w, d), requested_by=asker,
+                    on_date=dl.iso(now.date()), channel_id=channel_id,
+                    asker_id=str(getattr(message.author, "id", "") or "")))
+            when = f"{wording.day_date(dl.iso(got['date']))} at {wording.clock_12h(got['time'])}"
+            state.audit("meeting_reminder_set", reason="a reply under a meeting post",
+                        who=who, meeting=dl.iso(meeting), due=f"{dl.iso(got['date'])} {got['time']}",
+                        requested_by=asker, reminder_id=rid, replaced=replaced)
+            log.info("[R8] %s asked to be reminded about %s (meeting %s) on %s at %s: reminder "
+                     "#%s%s", asker, who, dl.iso(meeting), dl.iso(got["date"]), got["time"], rid,
+                     f" (replacing {replaced} earlier one)" if replaced else "")
+            lines.append(wording.meeting_remind_set(who, when))
+        await self._reply(message, "\n".join(dict.fromkeys(lines)),
+                          reason="a reminder asked for under a meeting post")
+        return True
+
+    async def _meeting_reminder_moved(self, r: dict, *, now, target=None) -> bool:
+        """Has the meeting this reminder was set for MOVED? True when the
+        reminder was dealt with here (re-anchored, closed, or left open because
+        the tab could not be read); False when the date stands and the reminder
+        fires as it is.
+
+        A REMINDER FOLLOWS ITS MEETING. Set for the day before the 15th, with
+        the meeting now on the 17th, it would fire two days early about a date
+        that is no longer true. It is moved to the same distance before the
+        new date (`meeting_prep.reanchor`) and that is said ONCE, in the
+        channel it was asked in. A meeting with no date still to come (the
+        cell was cleared, or the date has gone) closes its reminder quietly.
+
+        NOT A SECOND SENDER: it moves a row and says so. The reminder itself
+        still goes out only from `_fire_due_reminders`.
+        """
+        rid = r["id"]
+        contact, iso = meeting_prep.parse_reminder_key(r.get("row_key"))
+        rows = await self._meeting_rows()
+        if rows is None:
+            log.warning("[R8] reminder #%s: the Outreach PoCs tab cannot be read, so I "
+                        "cannot tell whether the meeting moved; leaving it open", rid)
+            return True
+        current = [gtm_sheet.sheet_date(meeting_prep.cell(row)) for row in rows
+                   if meeting_prep.cell(row) and activation.row_key(row) == contact]
+        verdict = meeting_prep.reanchor(meeting_iso=iso, due_iso=str(r.get("due_date") or ""),
+                                        current=current, today=now.date())
+        if verdict["action"] == "keep":
+            return False
+        closed = await asyncio.to_thread(
+            lambda: self.db.close_scheduled_reminder(rid, status="cancelled"))
+        if not closed:
+            return True                          # another tick got there first
+        who = wording.next_step_who(r.get("poc"), r.get("company"))
+        if verdict["action"] == "close":
+            log.info("[R8] reminder #%s for %s: no Meeting Date still to come on the sheet "
+                     "(it was %s); closed quietly", rid, who, iso)
+            return True
+        new_iso, due_iso = dl.iso(verdict["meeting"]), dl.iso(verdict["due"])
+        hhmm = (sheetwrite.parse_reminder_time(r.get("due_time") or "")
+                or sheetwrite.parse_reminder_time(config.REMINDER_DEFAULT_TIME) or "14:00")
+        day = wording.day_date(new_iso)
+        new_id = await asyncio.to_thread(
+            lambda: self.db.add_scheduled_reminder(
+                row_key=meeting_prep.reminder_key(contact, new_iso),
+                company=str(r.get("company") or ""), poc=str(r.get("poc") or ""),
+                due_date=due_iso, due_time=hhmm, what=wording.meeting_remind_what(who, day),
+                requested_by=str(r.get("requested_by") or ""), on_date=dl.iso(now.date()),
+                channel_id=str(r.get("channel_id") or ""), asker_id=str(r.get("asker_id") or "")))
+        log.info("[R8] reminder #%s for %s: the meeting moved from %s to %s, so it is now "
+                 "#%s on %s at %s", rid, who, iso, new_iso, new_id, due_iso, hhmm)
+        state.audit("meeting_reminder_moved", reason="the Meeting Date changed", who=who,
+                    was=iso, now=new_iso, due=f"{due_iso} {hhmm}", reminder_id=new_id)
+        if target is None:
+            cid = (config.test_channel_id() if config.SALES_TEST_MODE
+                   else int(r.get("channel_id") or 0) or config.digest_channel_id())
+            target = self.get_channel(cid) if cid else None
+        if target is None:
+            log.warning("[R8] reminder #%s moved, but its channel is not reachable to say so",
+                        new_id)
+            return True
+        asker = guardrails.mention_for(r.get("asker_id") or 0, r.get("requested_by") or "")
+        line = wording.meeting_remind_moved(
+            who, day, f"{wording.day_date(due_iso)} at {wording.clock_12h(hhmm)}")
+        body = self._tag_test(drip.with_heading(f"{asker} {line}".strip(),
+                                                drip.heading("reminder")))
+        await guardrails.send(target, body, reason=f"meeting reminder #{rid} re-anchored",
+                              kind="reminder", item_key=f"reminder:{new_id}:moved")
+        return True
+
+    async def _reanchor_meeting_reminders(self, *, now, channel=None) -> int:
+        """Move every open meeting reminder whose meeting has moved. How many
+        were dealt with. Run from the live sweep, so a meeting brought FORWARD
+        is noticed before its old reminder day rather than on it. `channel` is
+        where to say so when a test run passes its own; otherwise the channel
+        each reminder was asked in."""
+        waiting = await asyncio.to_thread(self.db.open_meeting_reminders)
+        handled = 0
+        for r in waiting:
+            try:
+                handled += 1 if await self._meeting_reminder_moved(
+                    r, now=now, target=channel) else 0
+            except Exception:
+                log.exception("[R8] reminder #%s could not be checked against the sheet",
+                              r.get("id"))
+        return handled
+
+    async def _meeting_news(self, message: dict, *, today) -> int:
+        """Put ONE stored news story on each person an R8 post names, by their
+        company. How many people got one.
+
+        IT FETCHES NOTHING, exactly like `_closure_news`: R1 already polls the
+        feeds and searches for every company on our sheets, and this only
+        READS that store. One query for the last `meeting_prep.NEWS_DAYS` (14)
+        days, then `nextaction.closure_news_pick` for each company: the FULL
+        normalised name (never a substring), the most important story by R1's
+        ranking, then the newest. No search, no model call, no write.
+
+        NO STORY, NO LINE. Two people at one company carry the same story and
+        the renderer shows it once, after both. THE SAME STORY AT THE 3-DAY
+        TOUCH AS AT THE 5-DAY ONE IS SHOWN AGAIN: nothing here remembers what a
+        post has carried. A story whose link has no http(s) scheme is not
+        shown, and that is logged.
+        """
+        people = drip.shown_contacts(message)
+        if not people:
+            return 0
+        until = (dl.real_now_ist() if today >= dl.real_today_ist()
+                 else datetime.combine(today, time(23, 59, 59), dl.IST))
+        since = until - timedelta(days=meeting_prep.NEWS_DAYS)
+        stories = await asyncio.wait_for(asyncio.to_thread(
+            lambda: self._ledger().news_feed_seen_after(feeds.utc_iso(since),
+                                                        feeds.utc_iso(until))), timeout=20)
+        found = 0
+        picked: dict = {}
+        for action in people:
+            action.pop("news", None)
+            company = str(action.get("company") or "")
+            key = news_screen.name_key(company)
+            if not key:
+                continue
+            if key not in picked:
+                picked[key] = nextaction.closure_news_pick(company, stories)
+                if picked[key] is None:
+                    dead = [s for s in stories
+                            if news_screen.name_key(
+                                nextaction.closure_news_company(s.get("sheet_ref"))) == key
+                            and str(s.get("title") or "").strip()
+                            and not re.match(r"^https?://\S+$", str(s.get("url") or "").strip())]
+                    if dead:
+                        log.warning("[news] R8: %d stored story/stories about %s have a link "
+                                    "with no http(s) scheme (%r); not shown", len(dead), company,
+                                    str(dead[0].get("url") or "")[:80])
+            story = picked[key]
+            if story:
+                action["news"] = {"headline": story["headline"], "url": story["url"]}
+                found += 1
+        log.info("[news] R8: %d stored story/stories first seen in the last %d days; %d of %d "
+                 "meeting line(s) have a story; nothing was fetched", len(stories),
+                 meeting_prep.NEWS_DAYS, found, len(people))
+        return found
+
+    async def _record_meeting_touches(self, message: dict, *, marker: str) -> int:
+        """Record which touch an R8 post carried for which meeting. How many.
+
+        ONLY AFTER A REAL SEND, for every line the post showed: (contact,
+        meeting date, touch) and the day. This is what stops a touch going out
+        twice, lets a date typed in late still get its post, and makes the
+        question about an unreadable date weekly. Where it writes, by path:
+        `_r8_may_record`.
+        """
+        if not self._r8_may_record():
+            log.info("[rules] R8: test day on a live database; the touches are not recorded")
+            return 0
+        done = 0
+        for action in drip.shown_contacts(message):
+            key = str(action.get("row_key") or "").strip()
+            touch = str(action.get("touch") or "").strip()
+            if not key or not touch:
+                continue
+            await asyncio.to_thread(
+                lambda k=key, t=touch, d=str(action.get("meeting_date") or ""):
+                self.db.record_meeting_touch(k, meeting_date=d, touch=t, sent_on=marker))
+            done += 1
+        log.info("[rules] R8: recorded %d touch(es) sent on %s (%s)", done, marker,
+                 drip.meeting_post(message))
+        return done
 
     async def _packages_on_post(self, drip_row: dict) -> list:
         """The package names ONE Sales-packages post carried, as the tab spells
@@ -10034,7 +10334,9 @@ class SalesBot(discord.Client):
         today = now.date()
         marker = dl.iso(today)
 
-        if not drip.is_sending_day(today):
+        # R8 POSTS ON ITS OWN DAY, WEEKENDS INCLUDED, so a Saturday is planned
+        # too while that rule is on; `drip.plan` lets nothing else through.
+        if not drip.plans_on(today):
             return
 
         # FROM THE EARLIEST TIME ANYTHING CAN BE DUE — the window's start, or a
@@ -10107,6 +10409,13 @@ class SalesBot(discord.Client):
                 log.info("[digest] suppressed — SALES_DIGEST_ENABLED=false")
             return
 
+        # A MEETING THAT MOVED TAKES ITS REMINDER WITH IT, checked here so a
+        # date brought forward is noticed before the old reminder day.
+        try:
+            await self._reanchor_meeting_reminders(now=now)
+        except Exception:
+            log.exception("[R8] the reminder re-anchor check failed; continuing")
+
         planned = await self._plan_drip(today=today, already=already)
         if planned is None:
             return
@@ -10151,7 +10460,13 @@ class SalesBot(discord.Client):
         # "THE FIRST" IS THE FIRST POST OF THE DAY, WHICHEVER IT IS — nothing
         # recorded yet — rather than "slot 1", so it is the same moment on a
         # real day and on a test day. Never counted against the cap.
-        if not already and self._swept_proposals_on != marker:
+        # NOT ON THE BACK OF A WEEKEND MEETING POST: "once a working day"
+        # means a day the drip sends, and R8 alone posting on a Saturday is
+        # not the team reading the channel.
+        if not already and self._swept_proposals_on != marker and (
+                drip.is_sending_day(today)
+                and any(m.get("type") not in drip.EVERY_DAY_TYPES or today.weekday() < 5
+                        for m in due)):
             self._swept_proposals_on = marker
             try:
                 await self._sweep_proposals(today=today, channel=channel)
@@ -10221,6 +10536,22 @@ class SalesBot(discord.Client):
                               "with no news lines")
                 for a in actions:
                     a.pop("news", None)
+            message["web_pending"] = False
+            return message
+        if message.get("type") == nextaction.R_MEETING_PREP:
+            # R8 FETCHES NOTHING (12 Oct 2026). Each company's news line is read
+            # from what R1 has already stored (`_meeting_news`). A lookup that
+            # fails or times out never holds the post back: it goes out
+            # without the line.
+            try:
+                await self._meeting_news(message, today=today)
+            except Exception:
+                log.exception("[news] R8's news lookup failed or timed out; the meeting "
+                              "post goes out with no news lines")
+                for a in actions:
+                    a.pop("news", None)
+            for a in actions:
+                a["web_pending"] = False
             message["web_pending"] = False
             return message
         # WHICH CONTACTS GET AN EMAIL LOOKUP is decided now, for the ones this
@@ -10717,6 +11048,17 @@ class SalesBot(discord.Client):
                 body=stored_body, part_ids=part_ids,
             )
         )
+        if message.get("type") == nextaction.R_MEETING_PREP:
+            # WHO THIS POST NAMED, IN ITS ORDER, so a reply asking for a
+            # reminder about "2" means one meeting on THIS post.
+            try:
+                await asyncio.to_thread(
+                    lambda: self.db.set_drip_people(
+                        on_date=marker, slot=int(message["slot"]),
+                        people=drip.meeting_people(message)))
+            except Exception:
+                log.exception("[R8] could not store who the post named; a reply asking "
+                              "for a reminder will not find them")
 
         # R3's PROPOSALS ARE OPENED AGAINST THE MESSAGE THAT CARRIED THEM, so a
         # reply of "yes" finds them the same way it finds any other proposal
@@ -11440,6 +11782,8 @@ class SalesBot(discord.Client):
             await self._record_next_steps(message, sent=sent, marker=marker)
         elif kind == nextaction.R_DM_NO_MEETING:
             await self._record_dm_no_meeting(message, marker=marker)
+        elif kind == nextaction.R_MEETING_PREP:
+            await self._record_meeting_touches(message, marker=marker)
         elif kind == nextaction.R_CLOSURE_SUPPORT:
             # R10's NEWS WINDOW STARTS AT ITS LAST DEALS POST. The marker is its
             # own row in R2's table (`rule_last_posted`, 'R10'), written under
@@ -12047,6 +12391,16 @@ class SalesBot(discord.Client):
             log.exception("[rules] R7's rotation state could not be read")
             dm_no_meeting_state = None
 
+        # R8's MEMORY: which touch has gone out for which meeting. Unreadable
+        # is passed on as unreadable, and the evaluator then names nobody.
+        try:
+            meeting_state = await asyncio.to_thread(self.db.meeting_prep_state)
+        except Exception:
+            log.exception("[rules] R8's touches could not be read")
+            meeting_state = None
+        if meeting_state is None:
+            meeting_state = {"unreadable": True}
+
         result = await asyncio.to_thread(
             lambda: nextaction.run(
                 today=today, rows=active, snoozes=snoozes,
@@ -12065,8 +12419,22 @@ class SalesBot(discord.Client):
                 # so the engine is handed no row and stays pure.
                 poc_company_index=poc_crosscheck.build_index(
                     tab.find_company, pipeline_companies),
+                # R8 READS ONE COLUMN ON EVERY ROW: no activation gate.
+                meeting_rows=list(tab.rows), meeting_state=meeting_state,
             )
         )
+        # R8: THE MEETING DATES THE SHEET SHOWS TODAY ARE NOTED (idempotent: the
+        # first day a date was seen is kept). This is how a meeting that MOVED
+        # is told from one newly booked. Only for the bot's own today, and
+        # never on a rehearsal against the live database (`_r8_may_record`).
+        dates = ((result.get("reports") or {}).get("R8") or {}).get("dates") or []
+        if dates and (simulation.in_simulation()
+                      or (today == dl.today_ist() and self._r8_may_record())):
+            try:
+                await asyncio.to_thread(
+                    lambda: self.db.note_meeting_dates(dates, on_date=dl.iso(today)))
+            except Exception:
+                log.exception("[rules] R8: the meeting dates could not be noted")
         result["tab"] = tab
         result["total_rows"] = len(tab.rows)
         try:
@@ -13725,7 +14093,8 @@ class SalesBot(discord.Client):
         if rule == "li_no_dm":
             who = " ".join(f'"{x}"' for x in (person, company) if x)
             return [{"q": f"{who} email contact", "n": 8}] if who else []
-        if rule in ("meeting_prep", "closure_support"):
+        # (R8, meeting prep, left this on 12 Oct 2026: it searches nothing.)
+        if rule == "closure_support":
             return [{"q": company, "news": True, "days": 7, "n": 8}] if company else []
         return []
 
@@ -14363,7 +14732,7 @@ class SalesBot(discord.Client):
             # send, no queue is read and nothing is planned — exactly as live —
             # but the day's two stops still happen, for the reminders and the
             # hourly news check, which have no weekday rule.
-            sending = drip.is_sending_day(today)
+            sending = drip.plans_on(today)
             queue = await self._run_next_actions(today=today) if sending else None
             rules_run = list((queue or {}).get("rules_run") or [])
             if not sending:
@@ -14375,6 +14744,9 @@ class SalesBot(discord.Client):
             elif queue is None:
                 note = ("the rules engine is off (NEXT_ACTION_ENABLED) or there is "
                         "no canonical tab to read, so there was nothing to plan.")
+            elif not drip.is_sending_day(today):
+                note = (f"only meeting posts go out on a {today.strftime('%A')}: a "
+                        "meeting today, or one 3 or 5 days away.")
             try:
                 already = await asyncio.to_thread(self.db.drip_sent_today, marker)
             except Exception:

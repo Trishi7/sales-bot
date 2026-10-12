@@ -1599,3 +1599,65 @@ read; 5 package(s) not ready, order=completion_desc: 5 in the post, 0 held back 
 row describes asking for "the status", it is out of date and is edited by hand.
 
 `python verify_packages.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R8 rebuild (12 Oct): meeting preparation
+
+What changes for the team: meeting prep becomes **two posts**. **"Meeting today"** at 10 AM lists the meetings
+happening that day, on its own. **"Meeting preparation"** after 2 PM lists the meetings 3 days away and then those
+5 days away. Every meeting is named (there is no limit of three any more), with the date and, when there is one, a
+recent headline about the company. Both posts go out on Saturdays and Sundays too. Answer under either with
+"remind me about 2 the day before" and Saley books it.
+
+**Three things the team should know before the first post:**
+
+- **Only the Meeting Date is read.** A meeting marked Completed or cancelled that still has a date in the future is
+  listed. Clear the date, or let it pass, to stop it.
+- **A row needs no first contact to qualify.** A Meeting Date on a row nobody has contacted is listed.
+- **A date Saley cannot read is asked for once a week**, on its own line in the afternoon post.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** One new variable; the default is what was
+specified, so the line is optional:
+
+```
+MEETING_PREP_TIME=14:00
+```
+
+Nothing changed its default and nothing is retired. `MEETING_DAYOF_TIME` (10:00) and `MEETING_PREP_DAYS_BEFORE`
+(5,3) keep their meaning. Then, on the laptop, `python tools/redact_env.py`.
+
+**One line to check on the server.** If `NEWS_RSS_FEEDS` in `/opt/sales-bot/.env` has an entry that starts
+`//news.google.com/...`, put `https:` in front of it. The code now reads such an entry as `https://...` and logs
+`[feeds] NEWS_RSS_FEEDS entry '//...' has no scheme` once, so the polls stop raising InvalidSchema either way; the
+line in the file is still wrong and is yours to fix.
+
+**Database.** Two new tables, created on boot: `meeting_touches` (which touch went out for which meeting) and
+`meeting_dates_seen` (the dates each contact has had). One new column, `drip_sends.people`, added by the usual
+migration. Nothing to run by hand. **Both tables start empty**, so on the first day every touch due that day goes
+out once, as it would have before.
+
+**What to look for in the boot log:**
+
+```
+[config] R8 meeting preparation (every day, weekends included): reads the Meeting Date on every Outreach PoCs row and nothing else; touches 5,3 days before and on the day; "Meeting today" at 10:00 on its own, "Meeting preparation" after 14:00; no cap, outside the 2-hour gap and DAILY_MESSAGE_CAP; the news line is read from the stored feed (last 14 days), nothing is fetched; a touch goes out once (meeting_touches)
+```
+
+When the queue is computed, one summary line, and one line a skipped row:
+
+```
+[R8] 33 row(s) read: 1 for today's post, 2 for the afternoon one; 3 not on a touch today, 0 touch(es) already out, 9 past, 1 beyond 7 days, 0 unreadable date(s) asked inside the last week, 0 blank name(s), 0 duplicate(s)
+[R8] row 14 has a Meeting Date ('15-10-2026') and no Name; skipped
+[news] R8: 212 stored story/stories first seen in the last 14 days; 1 of 2 meeting line(s) have a story; nothing was fetched
+[rules] R8: recorded 2 touch(es) sent on 2026-10-12 (prep)
+```
+
+(the numbers are illustrative). On a Saturday or Sunday the drip line reads `no proactive messages but N meeting
+post(s)`. A reminder: `[R8] <name> asked to be reminded about <person> (meeting <date>) on <date> at <time>:
+reminder #N`, and when a meeting moves, `[R8] reminder #N for <person>: the meeting moved from <date> to <date>`.
+An `[R8]` ERROR saying there is "no Meeting Date column I can find by its header" means the header was renamed to
+something Saley does not recognise; nothing is posted until it is put back.
+
+**The Bot Rules tab and the Weekly Schedule tab, by hand.** Rule 8's "What the Bot Shares / Checks" wording is new
+(`sheet_wording` in `bot_rules.yaml`), and the schedule has two meeting rows now where it had one; both are in
+`docs/rules-for-the-sheet-oct8.md`, ready to paste.
+
+`python verify_meeting_prep.py --show` checks all of it offline and prints the messages.
