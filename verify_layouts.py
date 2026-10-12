@@ -177,21 +177,19 @@ def assert_layouts(bodies, label):
                           "(<https://techcrunch.com/2026/09/29/wispr-flow-series-b/>))"])
     check(f"{label}: no closing line after the stories",
           news_body.rstrip().splitlines()[-1].startswith("- "))
-    deliv = next((b for h, b in by_head.items() if h == "**This week's deliverables**"),
+    deliv = next((b for h, b in by_head.items() if h == "**Deliverables to chase**"),
                  "")
     lines = deliv.splitlines()
     check(f"{label}: deliverable point, line 1", "1. Pulse Product Overview Document" in lines)
-    check(f"{label}: line 2 — the due date, with the days overdue",
-          any(re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3} · 3 days overdue", l)
-              for l in lines))
-    check(f"{label}: no overdue note when not past due",
-          any(re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3}", l) for l in lines))
+    check(f"{label}: the due date, with no overdue count (12 Oct 2026)",
+          (any(re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3}", l) for l in lines),
+           any("overdue" in l for l in lines)), (True, False))
     check(f"{label}: no remarks", "waiting on the lawyer" in deliv, False)
     check(f"{label}: a Team line and a Due line under each title (S3)",
           (len([l for l in lines if l.startswith("   Team: ")]),
            len([l for l in lines if l.startswith("   Due: ")])), (2, 2))
-    check(f"{label}: the plain close",
-          lines[-1] == drip.DELIVERABLES_CLOSE)
+    check(f"{label}: no closing line: the post ends on its last item",
+          lines[-1].startswith("   Due: ") or lines[-1].startswith("   There's no deadline"))
     r6 = next((b for h, b in by_head.items() if h == "**LinkedIn connected, no DM yet**"), "")
     check(f"{label}: R6 has its heading", bool(r6))
     check(f"{label}: R11 has its heading", "**New in the pipeline**" in heads)

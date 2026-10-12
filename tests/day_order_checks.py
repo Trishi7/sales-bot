@@ -658,7 +658,7 @@ def settings(check) -> None:
     check("config.py: SALES_DRIP_END falls back to 20:00", ').strip() or "20:00"' in source, True)
     check(".env.example: fixed times 10:00 (meetings) and 15:00 (next steps); R11 after 1 working day, window 7",
           [env(n) for n in ("MEETING_DAYOF_TIME", "NEXT_STEP_TIME", "NEW_COMPANY_AFTER_WORKING_DAYS",
-                            "NEW_COMPANY_WINDOW_DAYS", "SUNDAY_RULE_IDS")], ["10:00", "15:00", "1", "7", "R4"])
+                            "NEW_COMPANY_WINDOW_DAYS", "SUNDAY_RULE_IDS")], ["10:00", "15:00", "1", "7", ""])
     check("NEWS_MAIN_TIME is not a live setting any more", env("NEWS_MAIN_TIME"), None)
     check("...it is in the RETIRED block, commented, saying what replaced it",
           bool(re.search(r"^# NEWS_MAIN_TIME=14:00\s+-> `daily_order`", retired, re.M)), True)

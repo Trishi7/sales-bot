@@ -267,7 +267,7 @@ def fixture_for(day: date) -> list:
         row(4, "Case study: Hinglish STT", "P2", "", day + timedelta(days=2), "Sales"),
         row(5, "Dashboard SSO", "P3", "Not started", day - timedelta(days=10),
             "Engineering"),
-        row(6, "NDA", "P1", "Done", day + timedelta(days=1), "Legal"),
+        row(6, "NDA", "P1", "Completed", day + timedelta(days=1), "Legal"),
         row(7, "Q1 plan", "P1", "", day + timedelta(days=9), "Sales"),
     ]
 
@@ -475,20 +475,15 @@ async def three_ways(day: date, label: str) -> None:
         check("R4: one R4 post", len(r4["real"]), 1)
         check("R4: every item is its title, then \"Team: ...\", then \"Due: ...\"",
               all(i + 2 < len(lines) and lines[i + 1].startswith("   Team: ")
-                  and re.fullmatch(
-                      r"   Due: \w{3} \d{1,2} \w{3}(?: · \d+ days? overdue)?",
-                      lines[i + 2])
+                  and re.fullmatch(r"   Due: \w{3} \d{1,2} \w{3}", lines[i + 2])
                   for i in items))
-        check("R4: a link is a [Doc](<…>) line of its own, and no remarks are shown",
-              ([l for l in lines if "http" in l and not l.startswith("   [Doc](<")],
-               "waiting on" in body), ([], False))
-        urls = re.findall(r"\(<(https?://[^>]+)>\)", body)
-        check("R4: no link appears twice", len(urls), len(set(urls)))
+        # REBUILT 12 Oct 2026: no overdue count, no link, no closing line.
+        check("R4: no link, no overdue count and no remarks are shown",
+              ([l for l in lines if "http" in l or "overdue" in l], "waiting on" in body), ([], False))
         head = [l for l in lines if l.startswith("**")]
-        check("R4: the heading, the opener and the close are there",
-              (head[:1], bool(re.search(r"^\d+ (still )?open:|what's open", body, re.M)),
-               lines[-1] in drip.DELIVERABLES_CLOSES),
-              (["**This week's deliverables**"], True, True))
+        check("R4: the heading and the one opener are there, and the post ends on its last item",
+              (head[:1], bool(re.search(r"^\d+ open:$", body, re.M)), lines[-1].startswith("   Due: ")),
+              (["**Deliverables to chase**"], True, True))
         check("R4: it was posted verbatim, never composed", "echo " in body, False)
         titles = [re.sub(r"^\d+\. ", "", lines[i]) for i in items]
         print(f"   the {len(titles)} item(s): {titles}")
@@ -610,7 +605,7 @@ def bot_rules_wording() -> None:
     print("\n(vii) THE WORDING FOR THE SHEET — printed from the rules the bot loads")
     rules_mod.reload()
     r4 = rules_mod.by_id("R4")
-    want = "P1 deliverables due this week — title, team, due date and link"
+    want = "every open P1 deliverable — title, team and due date"      # rebuilt 12 Oct 2026
     print("\n   Bot Rules tab — rule 4, column \"What the Bot Shares / Checks\":")
     print("     " + rules_mod.sheet_wording_for("R4"))
     print("\n   Global Rules tab — row \"Voice\":")

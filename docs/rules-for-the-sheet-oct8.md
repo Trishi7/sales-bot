@@ -36,7 +36,7 @@ Under the table:
 | Monday to Friday, 3 PM | Next steps for connected contacts (rule 13) |
 | The minute it was asked for | A reminder somebody asked for |
 | Hourly, 11 AM to 11 PM, weekends too | Urgent AI news, only when something is major |
-| Sunday, 2 PM | Deliverables checklist, only when a P1 item is due on the Monday. Nothing else |
+| Sunday | Nothing but the two meeting posts above (the Sunday deliverables post ended on 12 Oct 2026) |
 | Saturday | Nothing but the two meeting posts above |
 
 - At most 7 posts a day count (5 until 13 Oct 2026; the longest day above has 4). Meeting posts, next-step follow-ups, reminders,

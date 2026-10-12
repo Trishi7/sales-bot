@@ -2205,7 +2205,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R1** | AI news | weekdays | `ai_news` | 5 | yes |
 | **R2** | News-company screen | Tue, Fri | `news_company_screen` | 5 | yes |
 | **R3** | AI events & summits — three lines: registered soon, registration closing, suggestions | Wed | `events` | 3 | yes |
-| **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
+| **R4** | Deliverables to chase — every open P1 whatever its date; leaves only when Completed | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
 | **R6** | Connected, no DM yet, and the email check (LI DM Sent blank; 5 names + up to 5 with email news) | Tue, Fri | `li_no_dm` | 5 | yes |
 | **R7** | No meeting booked yet — the escalation behind R13, rotating | Mon | `dm_no_meeting` | 3 | yes |
@@ -2378,6 +2378,86 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 4: deliverables to chase
+
+**Rebuilt 12 Oct 2026.** One post every Monday listing every open P1 on the
+Deliverables Checklist, whatever its date. `python verify_deliverables.py
+--show` prints the messages.
+
+```
+**Deliverables to chase**
+@Vaishnavi @Sid
+11 open:
+1. New Hinglish STT Demo/Sales Package
+   Team: Sales
+   Due: Mon 14 Sep
+2. MSA template
+   Team: Legal
+   There's no deadline for this
+(+3 more — the rest are on the Deliverables Checklist.)
+```
+
+**Two conditions, nothing else** (`nextaction._r_deliverables`):
+
+1. **Priority is `P1`**, that exact value after trimming and lower-casing
+   (`DELIVERABLE_P1_MARKERS`, now `p1`). "High", "1", "Critical" and "P 1" no
+   longer count. A row that is not P1 is never mentioned, and each one skipped
+   is logged with its priority:
+   `[R4] skipped 'Case study: Hinglish STT' (row 4): priority 'P2' is not P1 (DELIVERABLE_P1_MARKERS), deadline '30-Sep'`.
+   A blank Priority is not P1.
+2. **Status is not `Completed`**, that exact word (`DELIVERABLE_DONE_MARKERS`,
+   now `completed`). Blank is open. "Done", "Closed", "Shipped", "Complete",
+   "Finished", "Delivered" and "Live" **no longer drop a row**: it stays, and
+   the log says
+   `[R4] 'NDA' (row 9): status 'Done' is not recognised as Completed (DELIVERABLE_DONE_MARKERS), so it stays on the list`.
+
+A blank Action Item is no row. The team, the link, the remarks, the Reminder
+Freq and the week are not read for the selection. Every column is found by its
+header.
+
+**There is no deadline window.** A P1 due in 2028 is listed today, and one a
+year overdue still is. **One thing drops a deliverable: its Status becomes
+Completed.** No clock, no drop after N weeks, no rotation, so a P1 nobody
+finishes appears every Monday. The same shape as R7, R12 and R13. **The list
+grows**: past `max_items_per_post` (20) one plain line says how many more are
+on the tab.
+
+**The order:** earliest deadline first; no deadline, or one that cannot be
+read, last; two rows on one date in the sheet's own order, so the list does not
+reshuffle from week to week. Deadlines carry no year ("25-Sep"): one that
+passed within 90 days is read as this year's (`nextaction._deliverable_due`).
+That decides where a row sorts and what its Due line says, never whether it
+appears.
+
+**The message** (`wording.deliverables_post`, through
+`drip.render_deliverables`; R4 is in `drip.VERBATIM_TYPES`):
+
+- One opener, `{n} open:`, the same every Monday. The three variants are gone.
+- Three lines an item: the Action Item exactly as the sheet spells it, `Team:`
+  (the Functional Dependency cell, or `DELIVERABLE_DEFAULT_OWNER` when blank),
+  and `Due: Mon 14 Sep`. A row with no readable deadline gets `There's no
+  deadline for this` in place of the Due line.
+- **No overdue count, no link, no closing line.** The old closes promised "I'll
+  update my list", and nothing writes to this tab. Status and remarks are not
+  shown and do not travel on the item.
+- A title over 180 characters is cut with an ellipsis; at or under 180 it
+  prints whole. The same Action Item on two rows appears once.
+- A list past Discord's 2,000 characters is split between lines into
+  consecutive messages that count as one slot.
+
+**Timing.** Monday only, first in Monday's order (14:00), and it counts toward
+`DAILY_MESSAGE_CAP`. **Sunday is silent**: `SUNDAY_RULE_IDS` is empty by
+default, and the Sunday exception ("a P1 due on Monday") went with the deadline
+window. Nothing qualifying means no post and no "all clear" line. If the bot
+was down on Monday it posts when it is back, the same day, unless
+`SALES_DRIP_END` has passed; then it waits for next Monday (the live sweep no
+longer sends a post from the day's order after the end of the window, whatever
+its slot was).
+
+One selection, one renderer, one sender, on a real day, a test day and a
+simulation. `bot._today_due` (the "what's due" answer) uses the same two exact
+conditions; it still reads the date, because it answers about a span of days.
 
 ### Rule 8: meeting preparation
 
@@ -3004,63 +3084,10 @@ a conference in November whose registration shut in September is not a November
 problem. An event whose date the sheet *cannot read* is **not** skipped; it is
 carried with the reason, because that is a thing somebody should fix.
 
-**R4 is P1 only — title and due date only — in ONE Monday post.** A row is in
-the post when all three hold:
-
-1. its **Priority** matches `DELIVERABLE_P1_MARKERS` — **P1 is the filter**. A
-   P2 or P3 row is **never mentioned, whatever its deadline**, and each one
-   skipped is logged with its priority:
-   `[R4] skipped 'Case study: Hinglish STT' (row 4): priority 'P2' is not P1 (DELIVERABLE_P1_MARKERS), deadline '30-Sep'`;
-2. its **Status** is not in `DELIVERABLE_DONE_MARKERS` (blank counts as open —
-   chasing a finished item costs one correction, skipping an unfinished one
-   costs the deadline);
-3. its deadline falls **on or before the end of this week (the Sunday)** or has
-   **already passed**.
-
-Each item is **exactly two lines** — the title, then the due date. No team, no
-remarks, no link. The heading, a one-line opener and a one-line close stay.
-**No open P1 means no message.**
-
-```
-**This week's deliverables**
-@Vaishnavi @Sid
-Here's what's open — 2:
-1. Pulse Product Overview Document
-   Due: Fri 25 Sep · 3 days overdue
-2. MSA template
-   Due: Thu 1 Oct
-Anything here already done? Say which and I'll take it off.
-```
-
-- **One selection, one renderer, one sender — on a real day, a test day and a
-  simulation.** The selection is `nextaction._r_deliverables`, the lines are
-  `drip.render_deliverables` (the only caller is `drip.points_of`), and every
-  path posts through `_send_drip_message`. `verify_parity.py` runs all three for
-  the same pretend date and asserts the bodies are identical apart from the
-  `[TEST]` prefix and how a mention is written.
-- **The rules the bot loads say the same thing.** `bot_rules.yaml` R4 carries
-  `plain` and `description` — *"P1 deliverables due this week — title and due
-  date only"* — and `sheet_wording`, the text for the Bot Rules tab's **What the
-  Bot Shares / Checks** cell; `sales_strategy.md` §7 rule 4 says it in a
-  sentence. `python verify_parity.py` prints the wording for the sheet.
-- **Grouped by rule only** (`drip.RULE_ONLY_TYPES`), never by team, so Monday is
-  one post; `max_items_per_post: 20`. A list past Discord's 2000 characters is
-  split **between lines** into consecutive messages that count as **one** slot.
-- **Posted verbatim** (`drip.VERBATIM_TYPES`): the lines are rendered in code and
-  the model never recomposes them. The item's team (the **Functional
-  Dependency** cell; blank means `DELIVERABLE_DEFAULT_OWNER`) still decides who
-  the item belongs to — it is just not shown.
-- **Yearless deadlines that just passed are overdue.** `parse_bare_deadline`
-  reads "25-Sep" as the NEXT 25 September, which on 29 Sep made an open row
-  due four days ago look a year away — "already past" could never fire. R4
-  reads a date that passed within 90 days as overdue (`nextaction._deliverable_due`),
-  and passes the rule's own day through so a test day reads the sheet as of
-  the day it pretends.
-- **Sunday** keeps the narrower window — P1 and within `DELIVERABLE_NEAR_DAYS`
-  — for the `SUNDAY_RULE_IDS` exception. R4 is `weekdays: [mon]` in
-  bot_rules.yaml; `rules.for_day` lets a `SUNDAY_RULE_IDS` rule look on a
-  Sunday anyway, and `drip.plan` posts it only when an item is due on the
-  Monday. See [Weekends](#weekends).
+**R4 lists every open P1, whatever its date, in ONE Monday post** (rebuilt
+12 Oct 2026): Priority is exactly P1, Status is not exactly Completed, three
+lines an item, no overdue count, no link, no closing line, and Sunday is
+silent. See [Rule 4](#rule-4-deliverables-to-chase).
 
 **R10 is supportive, and in points.** Every deal is a numbered line, person
 first, with one offer of help as the close; one deal is a list of one. See
@@ -3505,7 +3532,7 @@ would follow, and outbound text is translated on the way out:
 | Rule | `name` (the tab's heading) | `plain` (what a person reads) |
 |---|---|---|
 | R1 | AI news | today's AI news worth reading |
-| R4 | Deliverables checklist | P1 deliverables due this week — title and due date only |
+| R4 | Deliverables checklist | every open P1 deliverable — title, team and due date |
 | R6 | LinkedIn connected, no DM | people connected on LinkedIn with no DM yet |
 | R9 | Meeting done, no next steps | meetings that happened with no next steps recorded |
 | R10 | Closure support | deals close enough to push over the line |
@@ -3916,8 +3943,8 @@ answerable — *"yes, done"* means something. A document is not.
   minute, urgent news at `NEWS_CHECK_TIMES`. None moves a spaced post and no
   spaced post waits for one. Every fixed-time post that is due goes on the same
   tick.
-- **Sunday has no order:** `SUNDAY_RULE_IDS` (R4), one post, only when a P1 is
-  due on the Monday. Saturday is silent.
+- **Sunday has no order and, since 12 Oct 2026, no post:** `SUNDAY_RULE_IDS` is
+  empty. Saturday is silent too. (R8's meeting posts go on their own days.)
 
 **`weekdays` and `daily_order` must agree.** A rule's `weekdays` decide whether
 it is evaluated; `daily_order` decides where its post goes. A rule listed on a
@@ -4228,8 +4255,13 @@ the window opening at 14:00 sent R8's 10:00 day-of note at 14:00.
 
 ### Weekends
 
-**Saturday is silent, full stop.** **Sunday carries one post**, at
-`SALES_DRIP_START`, and only for `SUNDAY_RULE_IDS` (default `R4`, the
+**Since 12 Oct 2026 Sunday is silent too:** `SUNDAY_RULE_IDS` is empty by
+default (it was `R4`), because R4 lists every open P1 every Monday and has no
+"due on Monday" to single out. The mechanism below is still there for a rule
+named in that list. What it used to do:
+
+**Saturday is silent, full stop.** **Sunday carried one post**, at
+`SALES_DRIP_START`, and only for `SUNDAY_RULE_IDS` (then `R4`, the
 Deliverables Checklist) **when a P1 is due on the Monday**. A P1 due Monday
 morning is the one thing that cannot wait until Monday morning to be mentioned;
 a deliverable due Thursday is not a Sunday problem and does not spend the one
@@ -4401,13 +4433,14 @@ python -m news                 # choose_main, rendering and the scoring prompt, 
 
 ### S3 — deliverables, R7, R10, R5's emails, R3's events
 
-**R4 — deliverables.** P1 only, and each item is now a short block:
+**R4 — deliverables.** P1 only, and each item is a short block. (As S3 built
+it; the overdue count and the link line were removed on 12 Oct 2026, see
+[Rule 4](#rule-4-deliverables-to-chase).)
 
 ```
 1. Pulse Product Overview Document
    Team: Sales
-   Due: Fri 18 Sep · 3 days overdue
-   [Doc](<https://docs.google.com/…>)
+   Due: Fri 18 Sep
 ```
 
 `Team` is the Functional Dependency cell, or `DELIVERABLE_DEFAULT_OWNER` when
@@ -6353,7 +6386,8 @@ python verify_interim.py                  # typing indicator, interim line, late
 python verify_replies.py                  # replies, acknowledgements, votes, offers and on-demand objectives (NFT2-1063)
 python -m replies                         # the pure judgements: is it an ack, a bare yes, an offer
 python verify_reminders.py                # one-off reminders at an exact minute (real 60 s loop)
-python verify_points.py                   # R4 as one Monday list (P1 only, two lines an item), R10 as points, the structure check
+python verify_deliverables.py             # R4: exactly P1 and not exactly Completed ("High" and "Done" logged, not obeyed), no deadline window (2028 and a year overdue both listed), the order, the exact heading / opener / three-line items, no overdue, no link, no close, the 180-character trim, 23 items and the overflow line, a 40-item split, no Sunday post, the 8 PM cutoff (--show prints the messages)
+python verify_points.py                   # R4 as one Monday list (P1 only, three lines an item), R10 as points, the structure check
 python verify_parity.py                   # real day vs test day vs simulation: identical bodies, order and cap decisions
 python verify_replies_oct8.py             # REPLIES-OCT8: "take ur time" under an interim line (one reaction, no second answer), the 8 Oct 11:21 exchange, the "today" answer, the grouped Next steps post, the test clock; --show prints the three
 python verify_poc_crosscheck.py           # R11: the Outreach PoCs cross-check (three branches), the agreed messages M1-M4, no search before the first yes and no write before the second, Branch B never writes, the new row's columns; --show prints the messages

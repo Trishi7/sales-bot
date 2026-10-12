@@ -90,8 +90,9 @@ logging.getLogger("nextaction").propagate = False
 
 MON = date(2026, 10, 5)                   # a Monday; the week ends Sun 11 Oct
 
-# THE TEST SHEET: 6 open rows, 3 teams (+ one blank), mixed priorities — and
-# three rows R4 must NOT pick up (done, next week, no deadline).
+# THE TEST SHEET: 6 open rows, 3 teams (+ one blank), mixed priorities. Since
+# the 12 Oct 2026 rebuild R4 has no deadline window: the P1 due NEXT week is
+# listed too, and only the Completed row and the P2s are left out.
 SHEET = [
     {"_row": 2, "_extra": {}, "action_item": "Pulse product overview doc", "priority": "P2",
      "status": "In progress", "deadline": "9-Oct", "dependency": "Sales",
@@ -109,7 +110,7 @@ SHEET = [
     {"_row": 7, "_extra": {}, "action_item": "DPA review", "priority": "P1",
      "status": "", "deadline": "7-Oct", "dependency": ""},
     {"_row": 8, "_extra": {}, "action_item": "NDA", "priority": "P1",
-     "status": "Done", "deadline": "6-Oct", "dependency": "Legal"},
+     "status": "Completed", "deadline": "6-Oct", "dependency": "Legal"},
     {"_row": 9, "_extra": {}, "action_item": "Q1 plan", "priority": "P1",
      "status": "", "deadline": "14-Oct", "dependency": "Sales"},
     {"_row": 10, "_extra": {}, "action_item": "Some idea", "priority": "P2",
@@ -154,9 +155,9 @@ async def main():
     for line in body.splitlines():
         print("     | " + line)
     numbered = [l for l in body.splitlines() if re.match(r"^\d+\. ", l)]
-    check("3 numbered lines — the P1s, and only the P1s", len(numbered), 3)
-    # THE TWO-LINE LAYOUT: each point is its numbered line plus ONE indented
-    # line under it ("Due: ...", with the days overdue when it is late).
+    check("4 numbered lines — the open P1s, and only the P1s", len(numbered), 4)
+    # THE THREE-LINE LAYOUT: each point is its numbered line plus a Team line
+    # and a Due line. No overdue count, no link, no closing line (12 Oct 2026).
     blocks, cur = [], None
     for l in body.splitlines():
         if re.match(r"^\d+\. ", l):
@@ -165,24 +166,23 @@ async def main():
         elif cur is not None and l.startswith("   "):
             cur.append(l)
     blocks = ["\n".join(b) for b in blocks]
-    check("by deadline: MSA, DPA, API rate limits",
+    check("by deadline: MSA, DPA, API rate limits, then next week's Q1 plan",
           [l.split(". ", 1)[1] for l in numbered],
-          ["MSA template", "DPA review", "API rate limits"])
+          ["MSA template", "DPA review", "API rate limits", "Q1 plan"])
     # S3: each item is its title, a Team line, a Due line, and the row's link
     # when it has one.
     check("line 2 is the team", [b.splitlines()[1].startswith("   Team: ")
-                                 for b in blocks], [True, True, True])
-    check("line 3 is the due date",
+                                 for b in blocks], [True, True, True, True])
+    check("line 3 is the due date, with no overdue count on the one that is late",
           [b.splitlines()[2] for b in blocks],
-          ["   Due: Wed 30 Sep · 5 days overdue", "   Due: Wed 7 Oct",
-           "   Due: Thu 8 Oct"])
-    check("a fourth line only for a link, written [Doc](<…>)",
-          [l for b in blocks for l in b.splitlines()[3:]
-           if not l.startswith("   [Doc](<")], [])
+          ["   Due: Wed 30 Sep", "   Due: Wed 7 Oct", "   Due: Thu 8 Oct", "   Due: Wed 14 Oct"])
+    check("three lines an item: no link line, and no closing line after the list",
+          ([len(b.splitlines()) for b in blocks], "http" in body, body.splitlines()[-1]),
+          ([3, 3, 3, 3], False, "   Due: Wed 14 Oct"))
     check("no remarks anywhere",
           [x for x in ("load test", "pricing table") if x in body], [])
-    check("done / next week / undated rows are left out",
-          any(x in body for x in ("NDA", "Q1 plan", "Some idea")), False)
+    check("the Completed row and the P2 with no deadline are left out; next week's P1 is in",
+          [x for x in ("NDA", "Q1 plan", "Some idea") if x in body], ["Q1 plan"])
     check("addressed to the checklist's owner", msg["owner"], "Vaishnavi")
 
     engine, fm = fake_engine()

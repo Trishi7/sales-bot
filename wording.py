@@ -1307,6 +1307,76 @@ def meeting_lines_for_check() -> list:
         meeting_remind_moved(who, "Fri 17 Oct", "Thu 16 Oct at 2 PM")]
 
 
+# -- the deliverables checklist (rule 4) -----------------------------------------
+#
+# THE POST, AGREED 12 Oct 2026:
+#
+#     **Deliverables to chase**
+#     @Vaishnavi @Sid
+#     11 open:
+#     1. New Hinglish STT Demo/Sales Package
+#        Team: Sales
+#        Due: Mon 14 Sep
+#     2. MSA template
+#        Team: Legal
+#        There's no deadline for this
+#     (+3 more — the rest are on the Deliverables Checklist.)
+#
+# ONE OPENER, the count, the same every Monday (the three variants are gone).
+# THREE LINES AN ITEM: the Action Item as the sheet spells it, the team, the
+# deadline. NO OVERDUE COUNT, NO LINK, NO CLOSING LINE: the old closes promised
+# "I'll update my list" and nothing writes to that tab, so nothing is promised
+# and nothing is asked. A title over DELIVERABLES_TITLE_MAX characters is cut
+# with an ellipsis; one at or under it prints whole.
+DELIVERABLES_OPENER = "{n} open:"
+DELIVERABLES_TEAM = "   Team: {team}"
+DELIVERABLES_DUE = "   Due: {when}"
+DELIVERABLES_NO_DEADLINE = "   There's no deadline for this"
+DELIVERABLES_MORE = "(+{n} more — the rest are on the Deliverables Checklist.)"
+DELIVERABLES_TITLE_MAX = 180
+
+
+def deliverable_title(title) -> str:
+    """The Action Item as the post shows it: whole up to
+    DELIVERABLES_TITLE_MAX characters, cut there with an ellipsis past it."""
+    text = " ".join(str(title or "").split())
+    if len(text) <= DELIVERABLES_TITLE_MAX:
+        return text
+    return text[:DELIVERABLES_TITLE_MAX].rstrip() + "…"
+
+
+def deliverables_post(items, *, limit=20) -> list:
+    """The lines of R4's post under its heading and tags. There is no close.
+
+    `items` are dicts with `title`, `team` and `deadline` (an ISO date, or ""
+    when the row has none that can be read), IN THE ORDER GIVEN. The count in
+    the opener is ALL of them; the first `limit` are listed and one plain line
+    says how many more there are. [] with no items, and then nothing is
+    posted.
+    """
+    items = list(items or ())
+    if not items:
+        return []
+    limit = max(1, int(limit or 20))
+    lines = [DELIVERABLES_OPENER.format(n=len(items))]
+    for i, item in enumerate(items[:limit], 1):
+        lines.append(f"{i}. {deliverable_title(item.get('title'))}")
+        lines.append(DELIVERABLES_TEAM.format(team=str(item.get("team") or "").strip()))
+        when = day_date(item.get("deadline"))
+        lines.append(DELIVERABLES_DUE.format(when=when) if when else DELIVERABLES_NO_DEADLINE)
+    if len(items) > limit:
+        lines.append(DELIVERABLES_MORE.format(n=len(items) - limit))
+    return lines
+
+
+def deliverables_lines_for_check() -> list:
+    """Every fixed line R4 can post, with stand-in values."""
+    return deliverables_post(
+        [{"title": "Pulse overview doc", "team": "Sales", "deadline": "2026-09-14"},
+         {"title": "MSA template", "team": "Legal", "deadline": ""},
+         {"title": "Pricing page", "team": "Vaishnavi", "deadline": "2026-12-31"}], limit=2)
+
+
 # -- every line, rendered, for the register check ----------------------------
 
 
@@ -1334,6 +1404,7 @@ def all_lines() -> list:
         *events_lines_for_check(),
         *packages_lines_for_check(),
         *meeting_lines_for_check(),
+        *deliverables_lines_for_check(),
     ]
 
 

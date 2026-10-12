@@ -128,11 +128,10 @@ global_rules:
     rule's next day. Meeting prep and meeting follow-ups post at 10 AM and
     next-step follow-ups at 3 PM, outside this order; reminders and urgent
     news keep their own times. None of those moves a post in the order.
-  # Row "Weekends". SUNDAY_RULE_IDS=R4, one post at SALES_DRIP_START.
+  # Row "Weekends". SUNDAY_RULE_IDS is empty since 12 Oct 2026.
   weekends: >-
-    Saturday is silent. Sunday carries one post at most — the Deliverables
-    Checklist, and only when a P1 is due on Monday. Reminders somebody asked for
-    and urgent news still post at the weekend.
+    Saturday and Sunday are silent. Reminders somebody asked for, urgent news
+    and the two meeting posts still go at the weekend.
   # Row "Reminders". One sender: the exact-minute loop.
   reminders: >-
     A reminder posts once, at the minute it was asked for, in the channel it was
@@ -162,7 +161,8 @@ global_rules:
 # R8, R9 AND R13 ARE IN NO LIST. They post at fixed times (MEETING_DAYOF_TIME
 # 10:00 for R9 and R8's "Meeting today", MEETING_PREP_TIME 14:00 for R8's
 # "Meeting preparation", NEXT_STEP_TIME 15:00 for R13), outside the order and
-# the gap. Sunday has no order: SUNDAY_RULE_IDS (R4), one post.
+# the gap. Sunday has no order and, since 12 Oct 2026, no post
+# (SUNDAY_RULE_IDS is empty).
 daily_order:
   mon: [R4, R7, R1, R10]
   tue: [R5, R6, R2, R1]
@@ -360,43 +360,52 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R4
-  # P1 deliverables due this week — title, team, due date and link.
+  # EVERY OPEN P1 ON THE DELIVERABLES CHECKLIST, WHATEVER ITS DATE (rebuilt
+  # 12 Oct 2026). MONDAY ONLY: the Sunday exception is gone.
   #
-  # P1 ONLY (Priority matches DELIVERABLE_P1_MARKERS), status not in
-  # DELIVERABLE_DONE_MARKERS (blank counts as open), deadline on or before the
-  # end of this week (the Sunday) or already past. A P2 or P3 row is never
-  # mentioned, whatever its deadline; each one skipped is logged with its
-  # priority. Each item is:
-  #     1. <Action Item>
+  # TWO CONDITIONS, NOTHING ELSE: Priority is exactly P1
+  # (DELIVERABLE_P1_MARKERS) and Status is not exactly Completed
+  # (DELIVERABLE_DONE_MARKERS; blank counts as open). NO DEADLINE WINDOW: a P1
+  # due in December is listed today. ONE THING DROPS A ROW: its Status becomes
+  # Completed. Nothing ages out and nothing rotates, so the list grows.
+  # Each row skipped for its priority is logged with it; a Status that looks
+  # finished and is not "Completed" ("Done", "Closed") is logged and STAYS.
+  # Each item is:
+  #     1. <Action Item, as the sheet spells it>
   #        Team: <Functional Dependency, or DELIVERABLE_DEFAULT_OWNER if blank>
-  #        Due: Thu 2 Oct  (· 3 days overdue)
-  #        [Doc](<link>)          <- only if the row has one
-  # NO REPEATS: the same Action Item appears once, and each link appears once
-  # in the whole message. No remarks. No open P1 means no message. The same on
-  # a real day, a test day and a simulation: one selection
-  # (nextaction._r_deliverables), one renderer (drip.render_deliverables), one
-  # sender.
+  #        Due: Mon 14 Sep        (or: There's no deadline for this)
+  # EARLIEST DEADLINE FIRST, no deadline last, a tie in sheet order. NO OVERDUE
+  # COUNT, NO LINK, NO CLOSING LINE (nothing writes to this tab, so nothing is
+  # promised). The same Action Item appears once. No remarks, no status. No
+  # open P1 means no message. The same on a real day, a test day and a
+  # simulation: one selection (nextaction._r_deliverables), one renderer
+  # (drip.render_deliverables), one sender.
+  #
+  # counts_toward_cap: true, deliberately: a checklist is not time-critical and
+  # must not crowd out a meeting post.
   - id: R4
     name: Deliverables checklist
-    plain: P1 deliverables due this week — title, team, due date and link
-    description: P1 deliverables due this week — title, team, due date and link
+    plain: every open P1 deliverable — title, team and due date
+    description: every open P1 deliverable — title, team and due date
     # The Bot Rules tab, rule 4, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      P1 deliverables due this week — title, team, due date and link.
-      Checks the Deliverables Checklist for rows with Priority P1 whose
-      Status is not done and whose Tentative Deadline is on or before
-      the end of this week, or has already passed. Shares one Monday
-      post: a numbered list where each item is its Action Item, then
-      "Team: <Functional Dependency>" (the default owner when that is
-      blank), then "Due: <day date>" (with "· N days overdue" when it is
-      late), then the row's link as [Doc] if it has one. The same Action
-      Item appears once, and each link appears once in the message. No
-      remarks. P2 and P3 items are never mentioned. If no P1 is open,
-      nothing is posted.
+      Every open P1 deliverable — title, team and due date. Checks the
+      Deliverables Checklist for rows whose Priority is P1 and whose
+      Status is not Completed, whatever the Tentative Deadline. Shares
+      one post every Monday: a numbered list, earliest deadline first,
+      where each item is its Action Item, then "Team: <Functional
+      Dependency>" (the default owner when that is blank), then "Due:
+      <day date>", or "There's no deadline for this" when the row has
+      none. No overdue count, no link and no closing question. The same
+      Action Item appears once. An item leaves the list only when its
+      Status is set to Completed; nothing drops off with time. Past 20
+      items the post says how many more are on the tab. P2 and P3 items
+      are never mentioned. If no P1 is open, nothing is posted. Nothing
+      is posted on Sunday.
     weekdays: [mon]
     trigger: deliverables
-    # The week's P1 checklist in ONE Monday post, grouped by rule (not by
-    # team), in numbered points; a list past 2000 characters is split between
+    # Every open P1 in ONE Monday post, grouped by rule (not by team), in
+    # numbered points, twenty at most and one line for the rest; a list past 2000 characters is split between
     # lines into consecutive messages that count as one slot.
     max_items_per_post: 20
     destination: channel

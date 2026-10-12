@@ -158,15 +158,17 @@ ones further down show the shape for each rule in the same voice.
 > Sid, two names from today's AI news aren't in our pipeline: one builds voice
 > agents, the other does evals. Want me to add either? Say skip if not.
 
-**Deliverables** (the week's P1 list — title and due date only; the lines
-themselves are added in code and posted exactly as rendered)
+**Deliverables** (every open P1 — title, team and due date; the lines
+themselves are added in code and posted exactly as rendered, with no closing
+line)
 
-> Here's what's open — 2:
+> 2 open:
 > 1. NDA
->    Due: Fri 18 Sep · 10 days overdue
+>    Team: Legal
+>    Due: Fri 18 Sep
 > 2. Pulse overview doc
->    Due: Wed 30 Sep
-> If any of these have moved, just tell me and I'll update my list.
+>    Team: Sales
+>    There's no deadline for this
 
 **A reminder** (somebody asked to be reminded)
 

@@ -1074,13 +1074,9 @@ _ASK = {
         "{companies} {is} coming up and nobody's registered yet. Shall we go, or "
         "should I take {them} off my list?",
     ),
-    # R4 IS ALWAYS POINTS (see `points_of`); these are only the never-expected
-    # case of a deliverables message with no items on it.
-    nextaction.R_DELIVERABLES: (
-        "{hey}here's this week's deliverables list. {close}",
-        "{name}this week's deliverables are below. {close}",
-        "Here's where this week's deliverables stand. {close}",
-    ),
+    # (R4 has no template here since 12 Oct 2026: it is always its rendered
+    # list, `wording.deliverables_post`, and with no open P1 there is no
+    # message at all.)
     nextaction.R_PROSPECTS: (
         "{hey}nobody's contacted {companies} yet. Want to reach out this week? Tell "
         "me when it's done and I'll move to the next ones.",
@@ -1248,7 +1244,9 @@ HEADINGS = {
     "R1_breaking": "Breaking AI News, {day}",
     "R2": "New companies in the news",
     "R3": "AI events & summits",
-    "R4": "This week's deliverables",
+    # "Deliverables to chase" since 12 Oct 2026 (it was "This week's
+    # deliverables"): the list is every open P1, and can run to 31 December.
+    "R4": "Deliverables to chase",
     # R5 HAS NO HEADING HERE: its bold first line carries the company
     # ("**PoCs to contact — Wisprlow.ai**") and a blank line under it, so it is
     # part of the rendered block (`prospects.post_parts`), like R11's opener.
@@ -1514,11 +1512,9 @@ def with_sources(body: str, message: dict) -> str:
 # THE OPENERS AND CLOSES AROUND THEM COME IN THREES, like the templates: one is
 # picked per message (`_voice`) and used everywhere that message needs it.
 
-DELIVERABLES_CLOSES = (
-    "If any of these have moved, just tell me and I'll update my list.",
-    "Anything here already done? Say which and I'll take it off.",
-    "Tell me if any of these have changed and I'll fix my list.",
-)
+# (R4 HAS NO CLOSE since 12 Oct 2026. Its three closes all promised "I'll
+# update my list" or "I'll take it off", and Saley has no write path to the
+# Deliverables Checklist tab. Nothing replaces them: the post ends on its list.)
 # (R10's close is ONE agreed line, `wording.CLOSURE_CLOSE`; the three variants
 # were deleted on 13 Oct 2026.)
 GENERIC_CLOSES = (
@@ -1533,17 +1529,13 @@ NEW_COMPANY_CLOSES = (
 )
 # The first variant of each, under the old names, for callers that want "a"
 # close rather than this message's.
-DELIVERABLES_CLOSE = DELIVERABLES_CLOSES[0]
 CLOSURE_CLOSE = wording.CLOSURE_CLOSE
 GENERIC_CLOSE = GENERIC_CLOSES[0]
 NEW_COMPANY_CLOSE = NEW_COMPANY_CLOSES[0]
 
-# R4's first line. {n} is how many are open.
-DELIVERABLES_OPENERS = (
-    "{n} open:",
-    "{n} still open:",
-    "Here's what's open — {n}:",
-)
+# (R4's first line is ONE fixed line, `wording.DELIVERABLES_OPENER`, "{n}
+# open:", so Monday reads the same every week. The three variants and the pick
+# between them were deleted on 12 Oct 2026.)
 # (R10's first line is ONE agreed line, `wording.CLOSURE_OPENER`, above one
 # deal or twenty.)
 # R11's first line: (one company, several). {count} is "two", "three", ...
@@ -1634,73 +1626,61 @@ def _plural(n: int, word: str) -> str:
 
 
 def render_deliverables(items: list, *, today: Optional[date] = None,
-                        limit: int = 20, opener: str = "") -> list:
-    """R4's lines: a count, then each P1 deliverable as its own short block.
+                        limit: int = 20) -> list:
+    """R4's lines: a count, then each open P1 as its own short block.
 
         2 open:
         1. Pulse Product Overview Document
            Team: Sales
-           Due: Thu 2 Oct · 3 days overdue
-           [Doc](<https://docs.google.com/…>)
+           Due: Thu 2 Oct
         2. MSA template
            Team: Legal
-           Due: Wed 7 Oct
+           There's no deadline for this
 
-    THE TITLE, THE TEAM, THE DUE DATE, AND THE LINK IF THE ROW HAS ONE. The
-    team is the Functional Dependency cell, or DELIVERABLE_DEFAULT_OWNER when
-    that is blank. "· N days overdue" only when past due. No remarks. The week
-    is in the heading (`HEADINGS["R4"]`), not here.
+    THE TITLE, THE TEAM AND THE DUE DATE (`wording.deliverables_post`). The
+    title is the Action Item exactly as the sheet spells it. The team is the
+    Functional Dependency cell, or DELIVERABLE_DEFAULT_OWNER when that is
+    blank. NO OVERDUE COUNT: a past date shows plainly as its date. NO LINK:
+    the Link/Destination column is not read here at all. No remarks, no
+    status. NO CLOSING LINE: the old ones promised "I'll update my list", and
+    nothing writes to this tab.
 
     NO REPEATS. The same Action Item appears once — the checklist sometimes
-    carries one deliverable on two rows, and two lines for one thing reads as
-    two things. And each link appears once in the whole message: three items
-    pointing at one tracker get the link under the first of them only.
+    carries one deliverable on two rows, and two blocks for one thing read as
+    two things.
 
     P1 ONLY. The selection is `nextaction._r_deliverables`; an item that says
     it is not P1 (`is_p1` False) is dropped here as well, so no caller can put
-    a P2 into the post by building the list by hand. Sorted by deadline, then
-    title. Past `limit` the rest are counted in one closing line, never
-    dropped silently.
+    a P2 into the post by building the list by hand.
+
+    THE ORDER IS THE RULE'S (`pick_order`): earliest deadline first, no
+    deadline last, a tie in the sheet's own order. A caller that hands over
+    items with no `pick_order` gets the same order worked out here. Past
+    `limit` the rest are counted in one plain line that asks for nothing.
 
     THE ONE RENDERER. The real drip, a test day and a simulation all reach it
     through `points_of` -> `compose_fallback` in `_send_drip_message`; R4 is
     posted verbatim (VERBATIM_TYPES), so what this returns is what is sent.
+    `today` is accepted for older callers and not used: nothing here counts
+    days any more.
     """
-    today = today or dl.today_ist()
-    ordered = sorted(
-        (a for a in (items or [])
-         if (a.get("item") or a.get("deliverable")) and a.get("is_p1") is not False),
-        key=lambda a: (str(a.get("deadline") or "9999"),
-                       str(a.get("item") or a.get("deliverable") or "").lower()),
-    )
+    kept = [a for a in (items or [])
+            if (a.get("item") or a.get("deliverable")) and a.get("is_p1") is not False]
+    ordered = sorted(enumerate(kept), key=lambda pair: (
+        int(pair[1]["pick_order"]) if pair[1].get("pick_order") is not None else 10 ** 9,
+        str(pair[1].get("deadline") or "9999-99-99"),
+        int(pair[1].get("sheet_row") or 0), pair[0]))
     rows: list = []
     titles: set = set()
-    for a in ordered:
+    for _i, a in ordered:
         title = " ".join(str(a.get("item") or a.get("deliverable")).split())
         if title.lower() in titles:
             continue                       # the same Action Item, on another row
         titles.add(title.lower())
-        rows.append((title, a))
-    lines = [(opener or DELIVERABLES_OPENERS[0]).format(n=len(rows))]
-    pad = "   "
-    links_shown: set = set()
-    for i, (name, a) in enumerate(rows[:max(1, int(limit))], 1):
-        due = f"Due: {a.get('deadline_pretty') or a.get('deadline') or 'not set'}"
-        days = a.get("days_left")
-        if isinstance(days, int) and days < 0:
-            due += f" · {_plural(-days, 'day')} overdue"
-        team = " ".join(str(a.get("team") or a.get("owner") or "").split()) \
-            or config.DELIVERABLE_DEFAULT_OWNER
-        lines.append(f"{i}. {name}")
-        lines.append(f"{pad}Team: {team}")
-        lines.append(pad + due)
-        url = str(a.get("link") or "").strip().strip("<>")
-        if url.lower().startswith(("http://", "https://")) and url not in links_shown:
-            links_shown.add(url)
-            lines.append(f"{pad}[Doc](<{url}>)")
-    if len(rows) > limit:
-        lines.append(f"(+{len(rows) - limit} more due this week — ask and I'll list them)")
-    return lines
+        rows.append({"title": title, "deadline": str(a.get("deadline") or ""),
+                     "team": " ".join(str(a.get("team") or a.get("owner") or "").split())
+                     or config.DELIVERABLE_DEFAULT_OWNER})
+    return wording.deliverables_post(rows, limit=max(1, int(limit)))
 
 
 # -- R7: no meeting booked yet — three people, two blocks, fixed wording -------
@@ -2210,16 +2190,14 @@ def points_of(message: dict) -> Optional[dict]:
     actions = list(message.get("actions") or [])
     cap = int(message.get("max_items_per_post") or 0) or 20
     if kind == nextaction.R_DELIVERABLES:
-        rendered = render_deliverables(
-            actions, limit=cap,
-            opener=_voice(message, "r4_opener", DELIVERABLES_OPENERS))
-        # NO OPEN P1, NO MESSAGE: only the count line came back.
+        rendered = render_deliverables(actions, limit=cap)
+        # NO OPEN P1, NO MESSAGE, and no "all clear" line.
         if len(rendered) < 2:
             return None
-        # SEVERAL LINES AN ITEM, so every line is kept, in order. R4 is posted
-        # verbatim (VERBATIM_TYPES) and never recomposed.
-        return {"header": rendered[0], "lines": rendered[1:], "extra": [],
-                "close": _voice(message, "r4_close", DELIVERABLES_CLOSES)}
+        # THREE LINES AN ITEM, so every line is kept, in order. R4 is posted
+        # verbatim (VERBATIM_TYPES) and never recomposed. ONE OPENER AND NO
+        # CLOSE (12 Oct 2026): nothing is picked from variants any more.
+        return {"header": rendered[0], "lines": rendered[1:], "extra": [], "close": ""}
     if kind == nextaction.R_NEW_COMPANY:
         lines = new_company_lines(message)
         if not lines:
@@ -2533,8 +2511,7 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
                 int(message.get("overdue_days") or 0))
     body = _fill(
         template, name=_first_name(address or message.get("owner") or ""),
-        companies=message.get("companies") or [], days=days,
-        close=_voice(message, "r4_close", DELIVERABLES_CLOSES))
+        companies=message.get("companies") or [], days=days)
     note = note_of(message)
     return f"{body} ({note})" if note else body
 
@@ -3090,8 +3067,7 @@ def _self_test() -> int:
         for many in (["Acme"], ["Acme", "Borealis"]):
             for v in variants:
                 for name in ("Vaishnavi", ""):
-                    filled = _fill(v, name=name, companies=many, days=9,
-                                   close=DELIVERABLES_CLOSES[0])
+                    filled = _fill(v, name=name, companies=many, days=9)
                     bad = ("{" in filled or filled[:1].islower()
                            or any(p in filled.lower() for p in banned)
                            or " is are " in filled or "  " in filled)
@@ -3128,10 +3104,8 @@ def _self_test() -> int:
     check("a DM with no date says 'a while ago', never '0 days'",
           "a while ago" in _fill(_ASK[nextaction.R_DM_NO_MEETING][0], name="Sid",
                                  companies=["Acme"], days=0), True)
-    for label, options in (("deliverables close", DELIVERABLES_CLOSES),
-                         ("list close", GENERIC_CLOSES),
+    for label, options in (("list close", GENERIC_CLOSES),
                          ("new-company close", NEW_COMPANY_CLOSES),
-                         ("deliverables opener", DELIVERABLES_OPENERS),
                          ("new-company opener", NEW_COMPANY_OPENERS),
                          ("reminder line", REMINDER_LINES)):
         check(f"{label}: three different variants", len(set(options)), 3)
@@ -3151,7 +3125,7 @@ def _self_test() -> int:
     print("\nthe headings")
     check("AI News", heading("R1", day=date(2026, 9, 29)), "**AI News, Tue 29 Sep**")
     check("deliverables", heading("R4", day=date(2026, 9, 29)),
-          "**This week's deliverables**")
+          "**Deliverables to chase**")
     check("new company: no heading, the post opens on its own first line", heading("R11"), "")
     check("reminder", heading("reminder"), "**Reminder**")
     check("no heading uses a dash as a separator",

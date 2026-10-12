@@ -503,6 +503,7 @@ class SalesBot(discord.Client):
         # The day "the cap is reached" was last logged, so it is said once a
         # day rather than on every tick after the fifth counted post.
         self._cap_logged_on: str = ""
+        self._late_logged_on: str = ""
         # The day the proposal sweep last ran. ONE sweep per day, in the
         # first slot — a per-process marker rather than a database row,
         # because a restart re-running it once is harmless (the nudged
@@ -4084,10 +4085,12 @@ class SalesBot(discord.Client):
 
         for row in await self._rule_tab_rows(gtm_sheet.DELIVERABLES, "today"):
             title = gtm_sheet.clean_cell(row.get("action_item"))
-            if not title or nextaction._matches_any(row.get("status"),
-                                                    config.DELIVERABLE_DONE_MARKERS):
+            # THE RULE'S OWN TWO CONDITIONS (12 Oct 2026): exactly Completed,
+            # exactly P1. This answer is about a span of DAYS, so it still
+            # reads the date; rule 4's list does not.
+            if not title or nextaction.deliverable_done(row):
                 continue
-            if not nextaction._matches_any(row.get("priority"), config.DELIVERABLE_P1_MARKERS):
+            if not nextaction.deliverable_p1(row):
                 continue
             due = nextaction._deliverable_due(row.get("deadline"), today=today)
             if inside(due):
@@ -10422,6 +10425,21 @@ class SalesBot(discord.Client):
 
         due = [m for m in planned["messages"] if m["send_at"] <= now]
         if gap_held:
+            due = [m for m in due if m.get("pinned")]
+        # NOTHING IN THE DAY'S ORDER GOES OUT AFTER SALES_DRIP_END, WHENEVER ITS
+        # SLOT WAS. The planner refuses a SLOT past the end; it cannot see the
+        # clock. So a bot that was down all Monday and came back at 21:30 used
+        # to post the 14:00 checklist then. It now waits for the next day its
+        # rule runs. (A slot AT the end is the last one, and the sweep ticks
+        # every few minutes, hence the slack.) Fixed-time posts are outside it.
+        if now > drip.window_end(today) + timedelta(minutes=drip.ON_TIME_SLACK_MINUTES):
+            late = [m for m in due if not m.get("pinned")]
+            if late and self._late_logged_on != marker:
+                self._late_logged_on = marker
+                log.info("[drip] %s: %d post(s) in the day's order are past %s and are NOT "
+                         "sent late (%s); each waits for the next day its rule runs",
+                         marker, len(late), config.SALES_DRIP_END,
+                         ", ".join(str(m.get("rule_id") or m.get("type")) for m in late))
             due = [m for m in due if m.get("pinned")]
         if not due:
             return

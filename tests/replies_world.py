@@ -356,7 +356,7 @@ def deliverables_for(day: date):
              "https://docs.example/pricing"],
             ["Security questionnaire", "P1", "", bare(day + timedelta(days=2)), "Legal", "", ""],
             ["Case study: Hinglish STT", "P2", "", bare(day + timedelta(days=1)), "Sales", "", ""],
-            ["NDA", "P1", "Done", bare(day + timedelta(days=1)), "Legal", "", ""]]
+            ["NDA", "P1", "Completed", bare(day + timedelta(days=1)), "Legal", "", ""]]
 
 
 def _pocs_headers():

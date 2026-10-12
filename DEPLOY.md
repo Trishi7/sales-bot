@@ -1661,3 +1661,65 @@ something Saley does not recognise; nothing is posted until it is put back.
 `docs/rules-for-the-sheet-oct8.md`, ready to paste.
 
 `python verify_meeting_prep.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R4 rebuild (12 Oct): deliverables to chase
+
+What changes for the team: Monday's post is now headed **"Deliverables to chase"** and lists **every open P1** on
+the Deliverables Checklist, not only what is due this week. Each item is three lines: the title, the team and the
+due date. There is no "N days overdue", no link and no closing question any more.
+
+**Three things the team should know before the first post:**
+
+- **The list no longer ages out.** An item leaves only when its Status is set to **Completed**. Nothing drops off
+  with time, so the list will grow; past 20 items the post says how many more are on the tab.
+- **Only the word "Completed" finishes an item.** "Done", "Closed" or "Shipped" in the Status column no longer take
+  a row off the list. Only "P1" in the Priority column puts one on it: "High" or "1" do not.
+- **Sunday goes silent.** The Sunday post for a P1 due on the Monday is gone. (The two meeting posts still go at
+  the weekend.)
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Three defaults changed. A default only applies
+when the line is absent, and **the laptop's `.env` has all three lines with the old values**, so change them (and
+check the server's):
+
+```
+DELIVERABLE_P1_MARKERS=p1
+DELIVERABLE_DONE_MARKERS=completed
+SUNDAY_RULE_IDS=
+```
+
+Left as they are, "High" still counts as P1, "Done" still drops a row, and Sunday still has its post. One variable
+is retired and can be deleted (it does nothing now):
+
+```
+DELIVERABLE_NEAR_DAYS
+```
+
+Nothing is new. Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** Nothing to migrate.
+
+**What to look for in the boot log:**
+
+```
+[config] R4 deliverables (Mondays only): every row whose Priority is exactly p1 and whose Status is not exactly completed, whatever its deadline; earliest deadline first, no deadline last; the title, the team and the due date, with no overdue count, no link and no closing line; a row leaves only when it is Completed
+[config] daily cap: 7 counted post(s) on every weekday; ... Saturday is silent; Sunday is silent too (SUNDAY_RULE_IDS is empty). Meeting posts (R8) go on their own days, weekends included.
+```
+
+If the first line names more than `p1` or `completed`, or the second names a Sunday rule, the `.env` still has the
+old lines. On a Monday, when the queue is computed:
+
+```
+[R4] skipped 'Case study: voice agents' (row 5): priority 'P2' is not P1 (DELIVERABLE_P1_MARKERS), deadline '15-Oct'
+[R4] 'NDA' (row 9): status 'Done' is not recognised as Completed (DELIVERABLE_DONE_MARKERS), so it stays on the list
+[R4] 17 row(s) read: 11 open P1 listed (2 with no readable deadline); 4 not P1, 2 Completed, 0 with no Action Item, 1 with a status that looks finished and is not Completed
+```
+
+(the numbers are illustrative). The second kind of line is the one to act on: a status somebody typed that is not
+"Completed". If the bot comes back on a Monday after `SALES_DRIP_END`, it logs `[drip] ... past 20:00 and are NOT
+sent late` and the checklist waits for the next Monday.
+
+**The Bot Rules tab and the Weekly Schedule tab, by hand.** Rule 4's "What the Bot Shares / Checks" wording is new
+end to end (`sheet_wording` in `bot_rules.yaml`), the Global Rules "Weekends" row now says both days are silent, and
+the schedule's Sunday row no longer has a deliverables post.
+
+`python verify_deliverables.py --show` checks all of it offline and prints the messages.

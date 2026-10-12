@@ -2247,10 +2247,9 @@ EVENT_KEYWORDS = _str_list("EVENT_KEYWORDS")
 # on its searches alone.
 EVENTS_CALENDAR_URLS = _str_list("EVENTS_CALENDAR_URLS")
 
-# R4 — DELIVERABLES. An item is chased when its tentative deadline is within
-# this many days OR has already passed. 3 is the plan's number: close enough to
-# be actionable, far enough that the answer is not "I know, it is today".
-DELIVERABLE_NEAR_DAYS = _int("DELIVERABLE_NEAR_DAYS", 3)
+# (DELIVERABLE_NEAR_DAYS was R4's deadline window, and after 6 Oct only the
+# Sunday exception's. RETIRED 12 Oct 2026 with both: R4 lists every open P1
+# whatever its date, and Sunday is silent. Nothing reads it.)
 
 # R4 — who a deliverable is addressed to when its Functional Dependency cell is
 # blank. Blank is common and it is not the same as unowned.
@@ -2258,17 +2257,21 @@ DELIVERABLE_DEFAULT_OWNER = (
     os.getenv("DELIVERABLE_DEFAULT_OWNER", "") or ""
 ).strip() or "Vaishnavi"
 
-# R4 — which Priority values count as P1.
-DELIVERABLE_P1_MARKERS: list[str] = _str_list(
-    "DELIVERABLE_P1_MARKERS", "p1,p 1,1,high,highest,critical,urgent",
-)
+# R4 — which Priority value counts as P1: "p1", THAT EXACT VALUE after trimming
+# and lower-casing (12 Oct 2026). It was "p1,p 1,1,high,highest,critical,
+# urgent", matched as a word anywhere in the cell: a guess at what people might
+# type. The column holds P1, P2 and P3, and a rule that reads "High" as P1 puts
+# things on the list nobody marked P1. Still a list, so it can be widened.
+DELIVERABLE_P1_MARKERS: list[str] = _str_list("DELIVERABLE_P1_MARKERS", "p1")
 
-# R4 — Status values that mean the item IS done, and so is never chased.
-# Everything else, blank included, is not done.
-DELIVERABLE_DONE_MARKERS: list[str] = _str_list(
-    "DELIVERABLE_DONE_MARKERS",
-    "done,completed,complete,closed,shipped,live,finished,delivered",
-)
+# R4 — the Status that means the item IS finished, and so leaves the list:
+# "completed", THAT EXACT WORD after trimming and lower-casing (12 Oct 2026).
+# The team confirmed the column only ever holds "Completed". "done", "complete",
+# "closed", "shipped", "live", "finished" and "delivered" used to drop a row as
+# well; they no longer do, and a row carrying one is logged as "not recognised
+# as Completed" so a mistyped status is seen. Everything else, blank included,
+# is open.
+DELIVERABLE_DONE_MARKERS: list[str] = _str_list("DELIVERABLE_DONE_MARKERS", "completed")
 
 # R5 — PROSPECTS. ONE company is open at a time (11 Oct; it was two a week, in
 # sheet order). The open company is chosen by score and held until nobody there
@@ -3132,14 +3135,18 @@ DRIP_MAX_ITEMS_PER_POST = _int(
 # from the new one so the two can never hold different numbers.
 DRIP_MAX_COMPANIES_PER_MESSAGE = DRIP_MAX_ITEMS_PER_POST
 
-# WHICH RULES MAY SEND ON A SUNDAY, and nothing else may. Saturday is silent
-# outright; Sunday carries ONE post, at SALES_DRIP_START, and only for
-# Deliverables Checklist items whose deadline falls on the Monday.
+# WHICH RULES MAY SEND ON A SUNDAY. NONE BY DEFAULT SINCE 12 Oct 2026: Sunday
+# is as silent as Saturday. (Meeting posts, R8, go on their own days whatever
+# the day, and are not part of this.)
 #
-# A rule id list rather than a boolean because "the weekend is silent except for
-# this one thing" is a rule about WHICH thing, and encoding it as a flag would
-# put the answer in code where nobody can change it.
-SUNDAY_RULE_IDS: list[str] = _str_list("SUNDAY_RULE_IDS", "R4")
+# It was "R4": one Sunday post for a P1 deliverable due on the Monday. That
+# went with R4's deadline window. R4 now lists every open P1 every Monday, so
+# there is no "due Monday" to single out and nothing a Sunday post would add.
+#
+# Still a rule-id list: naming a rule here gives it one Sunday post at
+# SALES_DRIP_START, and only for items whose due date is the Monday
+# (`drip.sunday_due_monday`).
+SUNDAY_RULE_IDS: list[str] = _str_list("SUNDAY_RULE_IDS", "")
 
 # NO PUBLIC-HOLIDAY HANDLING. Deliberately, and stated rather than left as an
 # absence: the bot posts on a public holiday exactly as it would on any weekday.
@@ -3631,11 +3638,11 @@ def validate() -> list[str]:
     if NEXT_ACTION_ENABLED:
         log.info(
             "[config] the thirteen rules are ON (computation only — the engine has no "
-            "send path). rules_file=%s deliverables<=%dd prospects=%d open company "
+            "send path). rules_file=%s deliverables=every open P1 prospects=%d open company "
             "li_no_dm=%dd dm_no_meeting=%dd prep=%s@%s+day-of@%s "
             "followup=%dd/every %dd ladder=%s closure>%d%% new_company=+%dwd "
             "window=%dd weekend_shift=%s",
-            BOT_RULES_FILE, DELIVERABLE_NEAR_DAYS, PROSPECT_COMPANIES_PER_WEEK,
+            BOT_RULES_FILE, PROSPECT_COMPANIES_PER_WEEK,
             LI_NO_DM_DAYS, DM_NO_MEETING_DAYS,
             ",".join(MEETING_PREP_DAYS_BEFORE) or "(none)", MEETING_PREP_TIME,
             MEETING_DAYOF_TIME,
@@ -3837,6 +3844,20 @@ def validate() -> list[str]:
                 "DELIVERABLE_P1_MARKERS is empty, so R4 recognises no item as P1 and "
                 "the deliverables chase never fires."
             )
+        if not DELIVERABLE_DONE_MARKERS:
+            log.warning(
+                "DELIVERABLE_DONE_MARKERS is empty, so R4 recognises no item as "
+                "Completed and nothing ever leaves the list."
+            )
+        log.info(
+            "[config] R4 deliverables (Mondays only): every row whose Priority is exactly "
+            "%s and whose Status is not exactly %s, whatever its deadline; earliest "
+            "deadline first, no deadline last; the title, the team and the due date, "
+            "with no overdue count, no link and no closing line; a row leaves only "
+            "when it is Completed",
+            " / ".join(DELIVERABLE_P1_MARKERS) or "(nothing)",
+            " / ".join(DELIVERABLE_DONE_MARKERS) or "(nothing)",
+        )
         bad_prep = [d for d in MEETING_PREP_DAYS_BEFORE if not str(d).strip().isdigit()]
         if bad_prep:
             log.warning(
@@ -4178,10 +4199,12 @@ def validate() -> list[str]:
         log.info(
             "[config] daily cap: %d counted post(s) on every weekday; meeting prep, "
             "meeting follow-ups, reminders, urgent news and answers to questions do "
-            "not count. Saturday is silent; Sunday sends at most %d post and only for "
-            "rule(s) %s.",
-            DAILY_MESSAGE_CAP, SUNDAY_MAX_POSTS,
-            ", ".join(SUNDAY_RULE_IDS) or "(none — Sunday is silent too)",
+            "not count. Saturday is silent; %s. Meeting posts (R8) go on their own "
+            "days, weekends included.",
+            DAILY_MESSAGE_CAP,
+            (f"Sunday sends at most {SUNDAY_MAX_POSTS} post and only for rule(s) "
+             + ", ".join(SUNDAY_RULE_IDS)) if SUNDAY_RULE_IDS
+            else "Sunday is silent too (SUNDAY_RULE_IDS is empty)",
         )
         if DRIP_MAX_ITEMS_PER_POST < 1:
             log.warning(

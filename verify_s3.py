@@ -599,7 +599,7 @@ def monday_sheet() -> None:
              "", ""],                                      # no link at all
             ["Case study: Hinglish STT", "P2", "", bare(MON + timedelta(days=1)), "Sales",
              "", "https://docs.google.com/document/d/1CaSe/edit"],
-            ["NDA", "P1", "Done", bare(MON + timedelta(days=1)), "Legal", "", ""],
+            ["NDA", "P1", "Completed", bare(MON + timedelta(days=1)), "Legal", "", ""],
         ],
     )
 
@@ -621,10 +621,11 @@ async def the_monday() -> None:
     body = "\n".join(live["posts"].get("R4") or [])
     lines = body.splitlines()
     items = [i for i, l in enumerate(lines) if re.match(r"^\d+\. ", l)]
-    blocks = [lines[i:(items[n + 1] if n + 1 < len(items) else len(lines) - 1)]
+    # REBUILT 12 Oct 2026: three lines an item, and nothing after the list.
+    blocks = [lines[i:(items[n + 1] if n + 1 < len(items) else len(lines))]
               for n, i in enumerate(items)]
     titles = [re.sub(r"^\d+\. ", "", b[0]) for b in blocks]
-    check("four items: the P1s that are open — no P2, no Done",
+    check("four items: the P1s that are open — no P2, no Completed",
           titles, ["Pulse Product Overview Document", "Security questionnaire",
                    "MSA template", "Pricing page copy"])
     check("the same Action Item on two rows appears once",
@@ -635,17 +636,13 @@ async def the_monday() -> None:
     check("the team is the Functional Dependency — or the default owner when blank",
           [b[1].strip() for b in blocks],
           ["Team: Sales", "Team: Legal", "Team: Vaishnavi", "Team: Marketing"])
-    check("overdue says by how much; the rest just the date",
+    check("just the date, on every item: no overdue count",
           [b[2].strip() for b in blocks],
-          ["Due: Fri 18 Sep · 3 days overdue", "Due: Wed 23 Sep", "Due: Thu 24 Sep",
-           "Due: Fri 25 Sep"])
-    check("a link only where the row has one",
-          [len(b) for b in blocks], [4, 3, 4, 3])
-    check("each link appears once in the whole message — two items share the tracker",
-          (body.count(OVERVIEW), body.count(TRACKER)), (1, 1))
-    check("links are written [Doc](<…>)",
-          [b[3].strip() for b in blocks if len(b) > 3],
-          [f"[Doc](<{OVERVIEW}>)", f"[Doc](<{TRACKER}>)"])
+          ["Due: Fri 18 Sep", "Due: Wed 23 Sep", "Due: Thu 24 Sep", "Due: Fri 25 Sep"])
+    check("three lines an item, whether or not the row has a link",
+          [len(b) for b in blocks], [3, 3, 3, 3])
+    check("no link is shown at all",
+          (body.count(OVERVIEW), body.count(TRACKER), "[Doc]" in body), (0, 0, False))
     check("no remarks anywhere", "waiting on pricing" in body, False)
     same("R4", live, test, sim)
 
