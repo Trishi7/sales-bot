@@ -119,7 +119,10 @@ RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES, nextaction.R_NEXT_STEPS,
                              nextaction.R_LI_NO_DM,
                              # R7 (13 Oct 2026): ONE post, three people across two
                              # blocks, numbered straight through.
-                             nextaction.R_DM_NO_MEETING})
+                             nextaction.R_DM_NO_MEETING,
+                             # R10 (13 Oct 2026): ONE list of every deal, highest
+                             # closure percentage first, whoever owns each.
+                             nextaction.R_CLOSURE_SUPPORT})
 
 
 def group_key(action: dict) -> str:
@@ -1053,19 +1056,9 @@ _ASK = {
         "{companies} is down as met, with nothing after it. Can you give me the "
         "next step, the package and a rough size? If there's nothing yet, just say.",
     ),
-    # THE SUPPORTIVE VERSION, from the call. Two or more deals go as points
-    # with the same offer as the close (see `points_of`).
-    nextaction.R_CLOSURE_SUPPORT: (
-        "{hey}{companies} {is} in the closure stage. Can I help? I can pull together "
-        "the PoC's background, a note on the company, or a package summary — just "
-        "tell me which.",
-        "{name}quick one: {companies} {is} close to closing. Want anything from me — "
-        "the PoC's background, a company note, a package summary? Say no if you're "
-        "set.",
-        "{companies} {is} at the closure stage. Shall I prepare something for it — "
-        "the PoC's background, a company note or a package summary — or are you all "
-        "set?",
-    ),
+    # (R10, closure support, has no template here since 13 Oct 2026: one deal
+    # is a list of one, rendered in code like any other number,
+    # `wording.closure_post`.)
     # R11 IS ALWAYS POINTS (see `points_of`); these are the never-expected case
     # of a new-company message with no company on it.
     nextaction.R_NEW_COMPANY: (
@@ -1298,7 +1291,11 @@ VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             # R7 (13 Oct): two blocks, their order, the continuous
                             # numbering and both sentences are the agreed shape
                             # (`wording.dm_no_meeting_post`).
-                            nextaction.R_DM_NO_MEETING})
+                            nextaction.R_DM_NO_MEETING,
+                            # R10 (13 Oct): the opener, the deal lines, the news
+                            # lines and the close are the agreed shape
+                            # (`wording.closure_post`).
+                            nextaction.R_CLOSURE_SUPPORT})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1455,14 +1452,8 @@ DELIVERABLES_CLOSES = (
     "Anything here already done? Say which and I'll take it off.",
     "Tell me if any of these have changed and I'll fix my list.",
 )
-CLOSURE_CLOSES = (
-    "Can I help with any of these? I can pull together the PoC's background, a "
-    "note on the company, or a package summary — just tell me which.",
-    "Want anything from me on these — the PoC's background, a company note, a "
-    "package summary? Say no if you're set.",
-    "Shall I prepare something for one of them — the PoC's background, a company "
-    "note or a package summary — or are you all set?",
-)
+# (R10's close is ONE agreed line, `wording.CLOSURE_CLOSE`; the three variants
+# were deleted on 13 Oct 2026.)
 GENERIC_CLOSES = (
     "Tell me when they're done and I'll move to the next ones.",
     "Already done some? Just say which and I'll take them off.",
@@ -1476,7 +1467,7 @@ NEW_COMPANY_CLOSES = (
 # The first variant of each, under the old names, for callers that want "a"
 # close rather than this message's.
 DELIVERABLES_CLOSE = DELIVERABLES_CLOSES[0]
-CLOSURE_CLOSE = CLOSURE_CLOSES[0]
+CLOSURE_CLOSE = wording.CLOSURE_CLOSE
 GENERIC_CLOSE = GENERIC_CLOSES[0]
 NEW_COMPANY_CLOSE = NEW_COMPANY_CLOSES[0]
 
@@ -1486,12 +1477,8 @@ DELIVERABLES_OPENERS = (
     "{n} still open:",
     "Here's what's open — {n}:",
 )
-# R10's first line, above two or more deals.
-CLOSURE_OPENERS = (
-    "These deals are in the closure stage:",
-    "In the closure stage right now:",
-    "These are close to closing:",
-)
+# (R10's first line is ONE agreed line, `wording.CLOSURE_OPENER`, above one
+# deal or twenty.)
 # R11's first line: (one company, several). {count} is "two", "three", ...
 NEW_COMPANY_OPENERS = (
     ("Hey team — a new company landed in the pipeline:",
@@ -1788,6 +1775,11 @@ def shown_contacts(message: dict) -> list:
         return next_step_order(actions)
     if kind == nextaction.R_LI_NO_DM:
         return li_no_dm_shown(actions, plain_cap=cap)
+    if kind == nextaction.R_CLOSURE_SUPPORT:
+        # NO CAP, ON PURPOSE. A closure stage AND above 50% should never be
+        # more than a handful; if it is ever twenty, that is a good week and all
+        # twenty show. The rule's `max_items_per_post` is not applied.
+        return closure_order(actions)
     return actions[:cap]
 
 
@@ -1873,22 +1865,56 @@ def nothing_to_say(message: dict) -> bool:
     return not event_lines(message) and not research_of(message)
 
 
-def render_closure(items: list) -> list:
-    """R10's lines: one numbered line per deal. "1. Acme AI — Ada Lovelace, 70% at Quote" """
-    lines = []
-    seen = set()
-    for a in items or []:
-        key = (a.get("company"), a.get("poc"))
-        if key in seen or not a.get("company"):
+def closure_order(actions: list) -> list:
+    """R10's deals in the order the rule put them (`nextaction.closure_order`):
+    HIGHEST CLOSURE PERCENTAGE FIRST, a tie in sheet order. One contact once;
+    two people at one company are two deals. The carrier of the empty-columns
+    notice names nobody. NO ROTATION AND NO CAP: see the rule."""
+    seen: set = set()
+    rows: list = []
+    for a in actions or []:
+        key = a.get("contact_key") or (a.get("company"), a.get("poc"))
+        if key in seen or a.get("notice") or not (a.get("poc") or a.get("company")):
             continue
         seen.add(key)
-        bits = [str(a.get("poc") or "").strip()]
-        pct, stage = a.get("closure_pct"), str(a.get("stage") or "").strip()
-        if pct is not None:
-            bits.append(f"{pct}% at {stage}" if stage else f"{pct}%")
-        detail = ", ".join(b for b in bits if b)
-        lines.append(f"{len(lines) + 1}. {a['company']}" + (f" — {detail}" if detail else ""))
-    return lines
+        rows.append(a)
+    return sorted(rows, key=lambda a: (-int(a.get("closure_pct") or 0),
+                                       int(a.get("sheet_row") or 0)))
+
+
+def closure_news_link(story) -> str:
+    """A stored story's headline as a masked link, embed suppressed, or "".
+
+    THROUGH `links.link`, AND ONLY WITH A SCHEME. A url with no http(s) scheme
+    would go out as dead text (`links.mask_bare` matches only strings that
+    carry one), so such a story is not shown at all. THE HEADLINE AND THE LINK
+    COME FROM THE NEWS STORE or there is no line."""
+    story = story or {}
+    headline = " ".join(str(story.get("headline") or "").split()).replace("@", "@\u200b")
+    url = str(story.get("url") or "").strip().strip("<>")
+    if not headline or not re.match(r"^https?://\S+$", url):
+        return ""
+    return link(headline, url)
+
+
+def render_closure(items: list) -> list:
+    """R10's lines under its heading: the opener, then EVERY deal in
+    `closure_order`, each with its news line when the caller found a story
+    (`bot._closure_news` puts it on the item as `news`).
+
+        These deals are in the closure stage:
+        1. Ada Lovelace (Acme AI) — 70% at Quote
+           In the news: [Acme AI raises $40M](<https://…>), 8 Oct
+        2. Bo Chen (Borealis) — 65% at Demo
+    """
+    deals = []
+    for a in closure_order(items):
+        news = a.get("news") or {}
+        deals.append({
+            "who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
+            "closure_pct": a.get("closure_pct") or 0, "stage": a.get("stage") or "",
+            "news_link": closure_news_link(news), "news_date": news.get("date_iso") or ""})
+    return wording.closure_post(deals)
 
 
 def points_of(message: dict) -> Optional[dict]:
@@ -1988,12 +2014,14 @@ def points_of(message: dict) -> Optional[dict]:
     if kind == nextaction.R_CLOSURE_SUPPORT:
         if notice_of(message):
             return None                    # the notice IS the message
+        # ONE DEAL IS A LIST OF ONE (13 Oct 2026). It used to fall through to
+        # a composed sentence; the opener, the lines and the close are now the
+        # same fixed text for one deal or twenty.
         lines = render_closure(actions)
-        if len(lines) < 2:
+        if not lines:
             return None
-        return {"header": _voice(message, "r10_opener", CLOSURE_OPENERS),
-                "lines": lines, "extra": [],
-                "close": _voice(message, "r10_close", CLOSURE_CLOSES)}
+        return {"header": lines[0], "lines": lines[1:] + [""], "extra": [],
+                "close": wording.CLOSURE_CLOSE}
     companies = [c for c in (message.get("companies") or []) if str(c).strip()]
     if len(companies) >= 3:
         lines = []
@@ -2163,7 +2191,8 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         lead = "" if points.get("opener_in_block") else who
         body = (lead + points_block(points)
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
-        if message.get("type") in (nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING):
+        if message.get("type") in (nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING,
+                                   nextaction.R_CLOSURE_SUPPORT):
             # R6 IS ITS FOUR BLOCKS AND NOTHING ELSE: no source link under it and
             # no bracketed note about a search that could not run. R7 is its
             # two blocks and nothing else, for the same reason.
@@ -2447,10 +2476,12 @@ def _self_test() -> int:
         dict(action("Borealis", "Sam", nextaction.R_MEETING_PREP, "Vaishnavi",
                     nextaction.P_MEETING, date(2026, 9, 8), 1, "R8"),
              dayof_time="10:00"),
-        action("Cinder", "Dev", nextaction.R_CLOSURE_SUPPORT, "Vaishnavi",
-               nextaction.P_REPLY, date(2026, 9, 5), 4, "R10"),
-        action("Delta", "Dee", nextaction.R_CLOSURE_SUPPORT, "Kushal",
-               nextaction.P_REPLY, date(2026, 9, 6), 3, "R10"),
+        # (These two were closure-support items until 13 Oct 2026, when R10 became
+        # one post whatever the owners. Sales packages still groups by owner.)
+        action("Cinder", "Dev", nextaction.R_PACKAGES, "Vaishnavi",
+               nextaction.P_REPLY, date(2026, 9, 5), 4, "R12"),
+        action("Delta", "Dee", nextaction.R_PACKAGES, "Kushal",
+               nextaction.P_REPLY, date(2026, 9, 6), 3, "R12"),
         action("Echo", "Eve", nextaction.R_DM_NO_MEETING, "Kushal",
                nextaction.P_CHASE, date(2026, 9, 2), 7),
         action("Fathom", "Fay", nextaction.R_DM_NO_MEETING, "Kushal",
@@ -2753,11 +2784,9 @@ def _self_test() -> int:
           "a while ago" in _fill(_ASK[nextaction.R_DM_NO_MEETING][0], name="Sid",
                                  companies=["Acme"], days=0), True)
     for label, options in (("deliverables close", DELIVERABLES_CLOSES),
-                         ("closure close", CLOSURE_CLOSES),
                          ("list close", GENERIC_CLOSES),
                          ("new-company close", NEW_COMPANY_CLOSES),
                          ("deliverables opener", DELIVERABLES_OPENERS),
-                         ("closure opener", CLOSURE_OPENERS),
                          ("new-company opener", NEW_COMPANY_OPENERS),
                          ("reminder line", REMINDER_LINES)):
         check(f"{label}: three different variants", len(set(options)), 3)

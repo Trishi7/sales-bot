@@ -690,28 +690,51 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R10
-  # Prospect status deal / demo / quote AND closure probability strictly above
+  # Prospect Status at a closure stage (CLOSURE_SUPPORT_STAGES, matched as whole
+  # words: "No deal" is not a deal) AND Closure Prob% strictly above
   # CLOSURE_SUPPORT_MIN (50). Exactly 50 is EXCLUDED — "above 50" is the rule
   # as written, and a boundary a bot decides for itself is a boundary nobody
-  # agreed to. Asks what is needed for the next stage and shares relevant news.
+  # agreed to. A closure-stage row with NO percentage is left out silently.
+  # Only active rows are read.
   #
-  # S3: when Prospect Status (or Closure Prob%) is blank on EVERY active row
-  # the rule cannot run, and says so in one line rather than staying silent
-  # (nextaction.CLOSURE_EMPTY_NOTICE). When the columns have values and no deal
-  # qualifies, it stays silent and the log says why.
+  # REBUILT 13 Oct 2026. The post is rendered in code (wording.closure_post):
+  #   These deals are in the closure stage:
+  #   1. Ada Lovelace (Acme AI) — 70% at Quote
+  #      In the news: [headline](link), 8 Oct
+  # then one closing offer. Person first, company in brackets. One deal is
+  # still a list of one.
+  #
+  # NO CAP AND NO ROTATION. Every qualifying deal is named every Monday,
+  # HIGHEST PERCENTAGE FIRST (ties in sheet order): they are the deals closest
+  # to landing and they stay in front of the team until they close.
+  # `max_items_per_post` below is kept because the loader needs the field; it
+  # is NOT applied to this rule (drip.shown_contacts).
+  #
+  # THE NEWS LINE COSTS NOTHING: it is read from what rule 1 has already
+  # stored, one story a deal, the most important one for that company (full
+  # name, never a substring), first seen since the last closure support post
+  # (rule_last_posted, row 'R10'; the first run looks back
+  # CLOSURE_NEWS_FIRST_RUN_DAYS). No story, no line.
+  #
+  # When Prospect Status (or Closure Prob%) is blank on EVERY active row the
+  # rule cannot run, and says so in one line naming the empty column(s)
+  # (wording.closure_empty_notice), EVERY MONDAY while that is so. When the
+  # columns have values and no deal qualifies, it stays silent and the log
+  # says why.
   - id: R10
     name: Closure support
     plain: deals close enough to push over the line
     # The Bot Rules tab, rule 10, column "What the Bot Shares / Checks".
     sheet_wording: >-
-      Deals close enough to push over the line. Mondays: rows whose
-      Prospect Status is deal / demo / quote and whose Closure Prob% is
-      above 50 (exactly 50 doesn't count); offers help and shares
-      relevant news. If Prospect Status or Closure Prob% is blank on
-      every active row, posts "No closure support this week — Prospect
-      Status and Closure Prob% are empty in the GTM sheet. Fill them in
-      and I'll pick it up next Monday." If the columns have values but
-      no deal qualifies, stays silent.
+      Every Monday: every deal whose Prospect Status is at a closure
+      stage (deal / demo / quote) and whose Closure Prob% is above 50
+      (50 itself doesn't count), highest first, with no cap. Each one
+      shows the person, the company, the percentage and the stage, and
+      any news about that company since the last closure support post.
+      Ends by offering help. If Prospect Status or Closure Prob% is
+      blank on every active row, posts one line saying so instead,
+      every Monday until they are filled in. If the columns have values
+      but no deal qualifies, stays silent.
     weekdays: [mon]
     trigger: closure_support
     max_items_per_post: 5

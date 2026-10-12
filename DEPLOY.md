@@ -1458,3 +1458,47 @@ Monday, when the queue is computed:
 (`daily_cap`). Both are pasted into the sheet by hand; `docs/rules-for-the-sheet-oct8.md` has the rule 7 text.
 
 `python verify_dm_no_meeting.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R10 rebuild (13 Oct): closure support
+
+What changes for the team: **at first, almost nothing you can see.** Closure Prob% and Prospect Status are blank
+on nearly every row, so the Monday post goes on being the one line saying so, now worded "No closure support this
+week — Prospect Status and Closure Prob% have empty values in the GTM sheet." **It will keep posting that line every
+Monday until somebody fills in Closure Prob%.** Once rows have a closure stage (deal / demo / quote) and a
+percentage above 50, the post becomes a list of every such deal, highest percentage first, with no cap: the person,
+the company in brackets, the percentage and the stage. Under a deal there is one line of news about that company
+when Saley already has a story since its last closure support post. It ends by offering help, as before.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** One new variable; the default is what was
+specified, so the line is optional:
+
+```
+CLOSURE_NEWS_FIRST_RUN_DAYS=7
+```
+
+Nothing changed its default and nothing is retired. `CLOSURE_SUPPORT_MIN`, `CLOSURE_SUPPORT_STAGES` and
+`CLOSURE_STOP_MARKERS` are read as before. Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** No new table. The news window's marker is one new ROW, `R10`, in the existing `rule_last_posted`
+table (R2's row there is untouched). The row appears the first time a deals post really goes out; until then the
+first run looks back 7 days. A test day, a preview and the empty-columns line never write it.
+
+**No extra searches.** Until now each deal asked for a news search before the post. That is gone: the news line is
+read from what rule 1 has already stored.
+
+**What to look for in the boot log:**
+
+```
+[config] R10 closure support (Mondays): a closure stage (deal,demo,quote,demo done,quote sent,proposal,negotiation, whole words) AND Closure Prob% strictly above 50%; a stage with no percentage is left out silently; EVERY qualifying deal is named, highest percentage first, no cap and no rotation; one news line a deal, READ from the stored news first seen since the last closure support post (rule_last_posted 'R10'; the first run looks back 7d), nothing fetched; the empty-columns notice posts every Monday while either column is blank on every active row
+[sheet.world] 0 row(s) have Closure Prob% = 0 and are stopped for every rule
+```
+
+If the second line counts rows, check them: a 0 typed to mean "not assessed yet" silences that person for every
+rule. On a Monday with deals: `[R10] 2 deal(s) in a closure stage above 50%, highest first, all handed on (no cap):
+...`, then `[news] R10: ... N of M deal(s) get a news line; nothing was fetched`, and after the post `[news] R10:
+posted M deal(s); the last-posted marker is now ...` (the numbers are illustrative).
+
+**The Bot Rules tab, by hand.** Rule 10's "What the Bot Shares / Checks" wording is new (`sheet_wording` in
+`bot_rules.yaml`); paste it into the sheet.
+
+`python verify_closure_support.py --show` checks all of it offline and prints the messages.

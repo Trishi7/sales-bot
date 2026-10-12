@@ -1044,8 +1044,10 @@ CREATE INDEX IF NOT EXISTS ix_news_feed_published ON news_feed_items(published_a
 CREATE INDEX IF NOT EXISTS ix_news_feed_headline ON news_feed_items(headline_key);
 CREATE INDEX IF NOT EXISTS ix_news_feed_seen ON news_feed_items(seen_at);
 
--- WHEN A RULE LAST POSTED, ONE ROW A RULE. Today only R2 (the news-company
--- screen) keeps one: its news window starts at "last time we posted".
+-- WHEN A RULE LAST POSTED, ONE ROW A RULE. R2 (the news-company screen) keeps
+-- one: its news window starts at "last time we posted". Since 13 Oct 2026 R10
+-- (closure support) keeps its own row, 'R10', for the same reason; each rule
+-- reads and writes only its own row.
 --
 -- WRITTEN ONLY AFTER A LIVE POST HAS LANDED. A test day ("make it Friday") and
 -- a simulation must never move it: a tester checking the message would
@@ -3601,6 +3603,24 @@ class DB:
                 "AND importance > 0 AND COALESCE(kind, '') != 'poc' "
                 "ORDER BY importance DESC, published_at DESC LIMIT ?",
                 (str(since_utc), str(until_utc), max(1, int(limit))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def news_feed_seen_after(self, since_utc: str, until_utc: str) -> list[dict]:
+        """R10's stories: EVERY item FIRST SEEN after `since` and up to and
+        including `until`. READ-ONLY.
+
+        BY `seen_at`, for the reason `news_feed_seen_between` gives: a story
+        published before the last post and picked up after it would otherwise
+        fall into a gap. Unlike that method this one KEEPS the PoC items: they
+        are the ones found by searching for a company on our sheets, which is
+        exactly what a deal's news line is.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_feed_items WHERE seen_at > ? AND seen_at <= ? "
+                "ORDER BY importance DESC, published_at DESC",
+                (str(since_utc), str(until_utc)),
             ).fetchall()
         return [dict(r) for r in rows]
 

@@ -266,15 +266,20 @@ async def main():
     check("the deals are points", sum(l[:2] in ("1.", "2.") for l in b10.splitlines()), 2)
     check("the supportive offer is the close",
           b10.splitlines()[-1], drip.CLOSURE_CLOSE)
-    check("each item carries the supportive sentence",
-          # (web-pending items carry the research marker after it)
-          (
-              "is in the closure stage — anything I can pull together to help it "
-              "along: the PoC's background, the company, a package summary? Say the word.")
-          in out10["actions"][0]["text"])
+    # REBUILT 13 Oct 2026: person first, highest percentage first, and the post is fixed text. (Each item used
+    # to carry a composed "anything I can pull together" sentence, and one deal went out as a sentence.)
+    check("person first, company in brackets, highest percentage first",
+          [l for l in b10.splitlines() if l[:2] in ("1.", "2.")],
+          ["1. Pratyush Kumar (Sarvam AI) — 70% at Quote", "2. Ravi Jain (Krutrim) — 60% at Demo"])
+    check("no item waits on a search any more", [a["web_pending"] for a in out10["actions"]], [False, False])
     one = drip.compose_fallback({**m10, "actions": m10["actions"][:1],
                                  "companies": m10["companies"][:1]}, address="Vaishnavi")
-    print(f"   one deal: {one}")
+    print("   one deal:")
+    for line in one.splitlines():
+        print("     | " + line)
+    check("one deal is still a list of one, with the same opener and close",
+          (one.splitlines()[0], one.splitlines()[1][:2], one.splitlines()[-1]),
+          ("These deals are in the closure stage:", "1.", drip.CLOSURE_CLOSE))
 
     # ------------------------------------------------------------------ split
     print("\n(+) TWENTY ITEMS, ONE SLOT")

@@ -754,6 +754,85 @@ def dm_no_meeting_lines_for_check() -> list:
         DM_NO_MEETING_NONE.format(span=days_span(10))]
 
 
+# -- closure support (rule 10) -------------------------------------------------
+#
+# THE POST, AGREED 13 Oct 2026:
+#
+#     **Closure support**
+#     @Vaishnavi @Sid
+#
+#     These deals are in the closure stage:
+#     1. Ada Lovelace (Acme AI) — 70% at Quote
+#        In the news: [Acme AI raises $40M](url), 8 Oct
+#     2. Bo Chen (Borealis) — 65% at Demo
+#
+#     Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+#
+# PERSON FIRST, COMPANY IN BRACKETS, then the percentage and the stage. The
+# news line is indented under its deal, one story a deal; no story, no line,
+# and nothing ever says "no news". One deal is still a list of one. The opener
+# and the close are these two lines and no others (the three-way variants and
+# the composed one-deal sentence were deleted).
+CLOSURE_OPENER = "These deals are in the closure stage:"
+CLOSURE_CLOSE = ("Can I help with any of these? I can pull together the PoC's background, a "
+                 "note on the company, or a package summary")
+CLOSURE_NEWS = "   In the news: {link}, {when}"
+CLOSURE_NEWS_UNDATED = "   In the news: {link}"
+# WHEN THE COLUMNS ARE EMPTY. One sentence; the old second one ("Fill them in
+# and I'll pick it up next Monday.") is gone. It names whichever column is
+# blank on every active row, and it is posted every Monday while that is so.
+CLOSURE_EMPTY = "No closure support this week \u2014 {columns} {have} empty values in the GTM sheet."
+
+
+def closure_empty_notice(columns) -> str:
+    """R10's notice, naming the empty column(s): "Prospect Status and Closure
+    Prob% have…", or "Closure Prob% has…" when it is the only one."""
+    names = [str(c).strip() for c in (columns or ()) if str(c).strip()]
+    if not names:
+        names = ["Prospect Status", "Closure Prob%"]
+    return CLOSURE_EMPTY.format(columns=" and ".join(names),
+                                have="have" if len(names) > 1 else "has")
+
+
+def closure_deal_line(n, who, pct, stage="") -> str:
+    """"1. Ada Lovelace (Acme AI) — 70% at Quote"."""
+    stage = " ".join(str(stage or "").split())
+    detail = f"{int(pct)}% at {stage}" if stage else f"{int(pct)}%"
+    return f"{int(n)}. {str(who or '').strip() or '(unnamed row)'} \u2014 {detail}"
+
+
+def closure_post(deals) -> list:
+    """The lines of R10's deals post under its heading and tags, WITHOUT the
+    close (the caller adds `CLOSURE_CLOSE` after a blank line).
+
+    `deals` are dicts with `who`, `closure_pct`, `stage` and, when a story was
+    found, `news_link` (the headline already as a masked link) and
+    `news_date` (an ISO date). They are listed IN THE ORDER GIVEN, every one of
+    them: this function has no cap. [] with no deals, and then nothing is
+    posted.
+    """
+    lines: list = []
+    n = 0
+    for deal in deals or ():
+        n += 1
+        lines.append(closure_deal_line(n, deal.get("who"), deal.get("closure_pct") or 0,
+                                       deal.get("stage")))
+        link = str(deal.get("news_link") or "").strip()
+        if link:
+            when = short_date(deal.get("news_date"))
+            lines.append(CLOSURE_NEWS.format(link=link, when=when) if when
+                         else CLOSURE_NEWS_UNDATED.format(link=link))
+    return ([CLOSURE_OPENER] + lines) if lines else []
+
+
+def closure_lines_for_check() -> list:
+    """Every fixed line R10 can post, with stand-in values."""
+    who = next_step_who("Priya Rao", "Acme Labs")
+    return closure_post([{"who": who, "closure_pct": 70, "stage": "Quote"}]) + [
+        CLOSURE_CLOSE, closure_empty_notice(["Prospect Status", "Closure Prob%"]),
+        closure_empty_notice(["Closure Prob%"])]
+
+
 # -- every line, rendered, for the register check ----------------------------
 
 
@@ -777,6 +856,7 @@ def all_lines() -> list:
         *reply_lines_for_check(),
         *next_step_lines_for_check(),
         *[l for l in dm_no_meeting_lines_for_check() if l],
+        *closure_lines_for_check(),
     ]
 
 

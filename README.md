@@ -2211,7 +2211,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R7** | No meeting booked yet — the escalation behind R13, rotating | Mon | `dm_no_meeting` | 3 | yes |
 | **R8** | Meeting preparation | **anchored**, 10:00 | `meeting_prep` | 3 | **no** |
 | **R9** | Meeting done, no next steps | **anchored**, 10:00 | `meeting_followup` | 3 | **no** |
-| **R10** | Closure support | Mon | `closure_support` | 5 | yes |
+| **R10** | Closure support — every deal, highest first, with stored news | Mon | `closure_support` | no cap | yes |
 | **R11** | New company in Master Pipeline | Wed | `new_pipeline_company` | 10 | yes |
 | **R12** | Sales packages | Thu | `sales_packages` | 5 | yes |
 | **R13** | Next steps for connected contacts | weekdays, 15:00 | `next_step_followups` | 5 | **no** |
@@ -2378,6 +2378,98 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 10: closure support
+
+**Rebuilt 13 Oct 2026.** Mondays. One of two posts, never both: the deals, or
+the empty-columns line. `python verify_closure_support.py --show` prints the
+messages.
+
+**It has never named a deal, and that is not a bug**: Closure Prob% and
+Prospect Status are blank on almost every active row, so the rule posts its
+empty-columns line. It will keep doing that every Monday until somebody fills
+them in.
+
+**Who is in** (`nextaction._r_closure_support`), two columns, both needed:
+
+1. **Prospect Status is a closure stage** (`CLOSURE_SUPPORT_STAGES`). Matched
+   on **whole words, and not when negated** (`nextaction.closure_stage`):
+   "Quote sent" and "In negotiation" are stages, "Demoted" is not a demo, and
+   "No deal" is not a deal (a negating word in front of the stage: no, not,
+   non, never, without).
+2. **Closure Prob% is strictly above `CLOSURE_SUPPORT_MIN` (50).** Exactly 50
+   does not qualify; the reason line on every item says so.
+
+A closure-stage row with **no percentage is left out silently**: logged, never
+posted, never counted. Out as everywhere: a stop word in Prospect Status or
+Deal Status, and a closure of exactly 0. **Only active rows are read**; this
+rule does not read the whole tab.
+
+**No cap, highest first, no rotation.** Every qualifying deal is named every
+Monday, highest closure percentage first, ties in sheet order
+(`nextaction.closure_order`). The rule's `max_items_per_post` is not applied to
+it. There is no rotation on purpose: these are the deals closest to landing
+and they stay in front of the team until they close. R6, R7 and R13 rotate
+because they work a long backlog; this is not one.
+
+**The post.** Fixed text from `wording.py` (`closure_post`); R10 is in
+`drip.VERBATIM_TYPES` and is one post whatever the owners. One deal is a list
+of one. The composed one-deal sentence and the alternative openers and closes
+were deleted.
+
+```
+**Closure support**
+@Vaishnavi @Sid
+
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI raises $40M](<https://…>), 8 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+```
+
+**The news line costs nothing** (`bot._closure_news`). Nothing is fetched: it
+is read from `news_feed_items`, where R1 already stores every story from the
+feeds and from its one Google News search per company on our sheets.
+
+- **The window** is "first SEEN after the last closure support post, up to
+  now" (`seen_at`, not the publication time, so a story published before the
+  last post and picked up after it is not lost). Not "since last Monday": if a
+  Monday is missed the next post covers both weeks. The first run ever looks
+  back `CLOSURE_NEWS_FIRST_RUN_DAYS` (7). The store itself only keeps
+  `NEWS_FEED_KEEP_DAYS`, so a longer gap than that reads what is still there.
+- **The marker** is R10's own row, `'R10'`, in R2's table `rule_last_posted`.
+  It is written only after a live deals post has landed
+  (`bot._is_live_send`): never by a preview, a test day, a simulation or the
+  empty-columns line. R2's row is never touched.
+- **Which story:** one a deal, the most important by the importance R1 gave
+  it, for the deal's company matched as R2 matches it: the FULL name,
+  normalised (`news_screen.name_key`), never a substring. Only a story found
+  by searching for that COMPANY counts (its `sheet_ref`); a story found by
+  searching for a person, or an industry story that merely mentions the name,
+  is not attached, because nothing in the store says which company it is
+  about. Two deals at one company each get the line.
+- **The line** is `In the news: [headline](<link>), 8 Oct`, indented under its
+  deal. The headline goes through `links.link` (masked, embed suppressed, at
+  most six words) and a link with no http(s) scheme is never emitted. No
+  story, no line; nothing ever says "no news".
+
+**When the columns are empty.** If Prospect Status or Closure Prob% is blank on
+every active row: *"No closure support this week — Prospect Status and Closure
+Prob% have empty values in the GTM sheet."*, naming whichever is empty. It
+posts **every Monday** while that is so; there is no "said this already"
+check. When the columns have values and nothing qualifies, nothing is posted
+and the log says why.
+
+**Replies are unchanged.** The post asks a question and the ordinary reply path
+answers it.
+
+**One contact, one mention a day, still.** R13 is listed first, so a deal whose
+person R13 names that Monday is not in this list that day.
+
+**At startup** the log says how many rows have Closure Prob% = 0, because a 0
+typed to mean "not assessed yet" stops that contact for every rule.
 
 ### Rule 7: no meeting booked yet, the escalation behind rule 13
 
@@ -2666,11 +2758,9 @@ Anything here already done? Say which and I'll take it off.
   Sunday anyway, and `drip.plan` posts it only when an item is due on the
   Monday. See [Weekends](#weekends).
 
-**R10 is supportive, and in points.** Each deal's line is *"{deal} is in the
-closure stage — anything I can pull together to help it along: the PoC's
-background, the company, a package summary? Say the word."* Two or more deals
-go out as a numbered list (company — PoC, % at stage) with that offer as the
-close.
+**R10 is supportive, and in points.** Every deal is a numbered line, person
+first, with one offer of help as the close; one deal is a list of one. See
+[Rule 10](#rule-10-closure-support) (rebuilt 13 Oct 2026).
 
 ### The structure rule — everywhere Saley writes something long
 
@@ -4029,10 +4119,9 @@ the last note, founders first on a tie, and "+N more next Monday".)
 
 **R10 — closure support.** When Prospect Status (or Closure Prob%) is blank on
 *every* active row the rule cannot run, and a silent Monday read exactly like
-"no deal is close" — so that one case posts *"No closure support this week —
-Prospect Status and Closure Prob% are empty in the GTM sheet. Fill them in and
-I'll pick it up next Monday."* When the columns have values and no deal
-qualifies, it stays silent and logs why.
+"no deal is close" — so that one case posts a line saying so (reworded on 13
+Oct 2026: see [Rule 10](#rule-10-closure-support)). When the columns have
+values and no deal qualifies, it stays silent and logs why.
 
 **R5 — prospects.**
 
@@ -4469,7 +4558,7 @@ nothing at all there is no model call: the result is `NOTHING FOUND`.
 | **R3 discovery** | `fetch_page` on each url in `EVENTS_CALENDAR_URLS` (default empty) plus `search("AI conference <month> <year> India OR global", n=10)` for this month and next; MODEL_LIGHT returns EVENT lines |
 | **R3 deadlines** | `fetch_page(row link)` first, read around the registration words; `search('"<event>" registration deadline', n=5)` second, only for what the page did not answer |
 | **R6 email** | `search('"<name>" "<company>" email contact', n=8)` → MODEL_LIGHT extracts an address **with its url**, else "no public email found". **Never guessed, and checked:** an address that is not in a snippet character for character is dropped (`websearch.verified_emails`) |
-| **R8 / R10** | `news(company, days=7, n=8)` — Google News RSS, falling back to `search(company, news=True, days=7)` only when the feed is empty → snippets → the existing brief format via MODEL_LIGHT; Sonnet composes the message as before |
+| **R8** (R10 fetches nothing since 13 Oct 2026: it reads the stored news) | `news(company, days=7, n=8)` — Google News RSS, falling back to `search(company, news=True, days=7)` only when the feed is empty → snippets → the existing brief format via MODEL_LIGHT; Sonnet composes the message as before |
 | **R11 yes, `find_people`** | `search('site:linkedin.com/in "<company>" <department>', n=10)` — the result title already reads "Name - Title - Company" — plus `fetch_page` on the company's own team/about page when a second search finds one. MODEL_LIGHT extracts name, title, url, source; `parse_people` still drops anyone the results do not name. LinkedIn itself is never fetched |
 | **Channel questions** | The server-side tool is replaced by two **client** tools: `web_search(query)` → up to 8 snippets, at most `WEB_QUESTION_MAX_SEARCHES` (4) per question, and `fetch_page(url)`. **Cheap first, one extension:** a question that reaches the limit and asks for a search it has not run yet gets `WEB_QUESTION_EXTENDED_SEARCHES` (6) in all and `QUERY_ENGINE_EXTENDED_TOOL_ITERATIONS` (9) tool rounds — once per question, logged as `[engine] msg=… LIMIT EXTENDED ONCE`, never more; a repeated query never extends (`query_engine.QuestionLimits`). Both are offered on **every** question except "what do we need to do today?", whatever the question's route, and a `profile` route covers "LinkedIn / profile / link / url / scholar / X" questions. At the limit the tool returns what was searched and what was not, and the answer says per person what was found, what was not found and what is "not checked yet". The engine (Sonnet) reasons over the snippets |
 
@@ -4595,7 +4684,7 @@ header.
 | **R3** | Events not already on the tab, in the current and next month — plus the **registration-deadline backfill** for rows that lack one |
 | **R6** | A published public email — **only when column F is empty** (see below) |
 | **R8** | Recent news about the person and company, for meeting prep |
-| **R10** | Recent news relevant to a deal in progress |
+| **R10** | Nothing searched since 13 Oct 2026: one stored story a deal, read from `news_feed_items` |
 | **R11** | Funding, location, industry, and PoCs worth contacting |
 
 The queries live in `websearch.RULE_QUERIES`, not in `nextaction.py` — the rules
@@ -5962,6 +6051,7 @@ python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
 python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the six tiers, the rotation (nobody is dropped), replies not read (--show prints the messages)
+python verify_closure_support.py          # R10: a closure stage above 50% (whole words), the empty-columns line, person first, no cap, highest first, no rotation, the news line read from the store since the last post, the marker (--show prints the messages)
 python verify_dm_no_meeting.py            # R7, the escalation behind R13: who is in (four columns), On Hold out for R7 only, the rotation, the two blocks, the sentence that follows the setting, nothing recorded by a preview or a test day (--show prints the messages)
 python verify_sheet_locks.py              # the write lock by ROLE: three header orders, a missing header refuses every write, ranges only add, the Email cell and the signed new row (--show prints the startup lock log)
 python verify_rule13.py                   # STALE since 12 Oct 2026 for rule 13's behaviour (see its header); the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send

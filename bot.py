@@ -760,6 +760,18 @@ class SalesBot(discord.Client):
             return
         for line in text.splitlines():
             log.info("[sheet.world] %s", line)
+        # A CLOSURE OF EXACTLY 0 STOPS A ROW FOR EVERY RULE. Somebody typing 0
+        # to mean "not assessed yet" silences that contact across all thirteen
+        # rules, and nothing else says so.
+        try:
+            zeros = [r for r in (getattr(tab, "rows", None) or [])
+                     if nextaction.closure_percent(r) == 0]
+            log.info("[sheet.world] %d row(s) have Closure Prob%% = 0 and are stopped for "
+                     "every rule%s", len(zeros),
+                     (": " + ", ".join(f"row {r.get('_row')}" for r in zeros[:20])
+                      + (" …" if len(zeros) > 20 else "")) if zeros else "")
+        except Exception:
+            log.debug("[sheet.world] could not count the rows at 0%% closure", exc_info=True)
         state.audit(
             "sheet_world",
             reason="startup: which tab, which columns, how many rows are active",
@@ -9957,6 +9969,18 @@ class SalesBot(discord.Client):
                     a["web_pending"] = False
             message["web_pending"] = False
             return message
+        if message.get("type") == nextaction.R_CLOSURE_SUPPORT:
+            # R10 FETCHES NOTHING. Each deal's news line is read from what R1
+            # has already stored (`_closure_news`).
+            try:
+                await self._closure_news(message, today=today)
+            except Exception:
+                log.exception("[news] R10's news lookup failed; the deals post goes out "
+                              "with no news lines")
+                for a in actions:
+                    a.pop("news", None)
+            message["web_pending"] = False
+            return message
         # WHICH CONTACTS GET AN EMAIL LOOKUP is decided now, for the ones this
         # post will name.
         self._request_email_lookups(message)
@@ -11184,6 +11208,95 @@ class SalesBot(discord.Client):
             await self._record_next_steps(message, sent=sent, marker=marker)
         elif kind == nextaction.R_DM_NO_MEETING:
             await self._record_dm_no_meeting(message, marker=marker)
+        elif kind == nextaction.R_CLOSURE_SUPPORT:
+            # R10's NEWS WINDOW STARTS AT ITS LAST DEALS POST. The marker is its
+            # own row in R2's table (`rule_last_posted`, 'R10'), written under
+            # R2's rule exactly: only after a LIVE post has landed. The
+            # empty-columns notice names no deal and shows no news, so it does
+            # not move it.
+            if drip.notice_of(message) or not drip.shown_contacts(message):
+                pass
+            elif not self._is_live_send(marker):
+                log.info("[news] R10: %s is a test day, a simulation or a pretend date — "
+                         "the last-posted marker is NOT touched", marker)
+            else:
+                at = feeds.utc_iso(dl.real_now_ist())
+                mid = str(getattr(sent, "id", "") or "")
+                ledger = self._ledger()
+                await asyncio.to_thread(
+                    lambda: ledger.set_rule_last_posted("R10", posted_at=at, message_id=mid))
+                log.info("[news] R10: posted %d deal(s); the last-posted marker is now %s",
+                         len(drip.shown_contacts(message)), at)
+
+    def _closure_window(self, today) -> tuple:
+        """(since, until, why) for R10's news: both real datetimes, IST.
+
+        since   the moment R10 last posted its deals (its own row in
+                `rule_last_posted`). NOT "last Monday" and not a fixed number
+                of days: if a Monday is missed, the next post covers both
+                weeks rather than losing one. With no marker at all (the first
+                run ever): CLOSURE_NEWS_FIRST_RUN_DAYS back.
+        until   now; on a day in the past (a test of last Monday) the end of
+                that day, and a marker later than that is ignored.
+        A story counts when it was first SEEN after `since`, up to and
+        including `until` (`db.news_feed_seen_after`).
+        """
+        until = (dl.real_now_ist() if today >= dl.real_today_ist()
+                 else datetime.combine(today, time(23, 59, 59), dl.IST))
+        marker = None
+        raw = self._ledger().rule_last_posted("R10")
+        if raw:
+            try:
+                marker = datetime.fromisoformat(raw).astimezone(dl.IST)
+            except ValueError:
+                log.warning("[news] R10: the last-posted marker %r is not a date; ignored", raw)
+        if marker is not None and marker > until:
+            marker = None
+        days = max(1, int(config.CLOSURE_NEWS_FIRST_RUN_DAYS))
+        if marker is None:
+            return until - timedelta(days=days), until, f"no marker yet: looking back {days} days"
+        return marker, until, "from the last closure support post"
+
+    async def _closure_news(self, message: dict, *, today) -> int:
+        """Put ONE stored news story on each deal an R10 post names. How many
+        deals got one.
+
+        IT COSTS NOTHING AND FETCHES NOTHING. R1 already polls the feeds and
+        runs a Google News search for each company on our sheets, and every
+        story lands in `news_feed_items` with the time we first saw it. This
+        only READS that store: one query for the window, then
+        `nextaction.closure_news_pick` for each deal (the full company name,
+        the most important story). No search, no model call, no write.
+
+        NO STORY, NO LINE: the item is left without `news` and the post says
+        nothing about it. Two deals at one company each get their own line,
+        which may be the same story.
+        """
+        deals = drip.shown_contacts(message)
+        if drip.notice_of(message) or not deals:
+            return 0
+        since, until, why = await asyncio.to_thread(lambda: self._closure_window(today))
+        stories = await asyncio.to_thread(
+            lambda: self._ledger().news_feed_seen_after(feeds.utc_iso(since), feeds.utc_iso(until)))
+        found = 0
+        for action in deals:
+            action.pop("news", None)
+            story = nextaction.closure_news_pick(action.get("company"), stories)
+            if not story:
+                continue
+            when = story.get("published_at") or story.get("seen_at") or ""
+            try:
+                date_iso = dl.iso(datetime.fromisoformat(when).astimezone(dl.IST).date())
+            except ValueError:
+                date_iso = ""
+            action["news"] = {"headline": story["headline"], "url": story["url"],
+                              "date_iso": date_iso}
+            found += 1
+        log.info("[news] R10: %d stored story/stories first seen %s to %s (%s); %d of %d "
+                 "deal(s) get a news line; nothing was fetched",
+                 len(stories), since.strftime("%a %d %b %H:%M"), until.strftime("%a %d %b %H:%M"),
+                 why, found, len(deals))
+        return found
 
     async def _record_dm_no_meeting(self, message: dict, *, marker: str) -> int:
         """Record who an R7 post named. How many people were recorded.

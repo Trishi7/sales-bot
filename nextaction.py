@@ -28,7 +28,8 @@ THE THIRTEEN, with the trigger name the file uses:
                                                     post, rotating, behind R13
      R8  meeting_prep           anchored, 10:00     T-5, T-3, and on the day
      R9  meeting_followup       anchored, 10:00     done + 3d, no next steps, laddered
-    R10  closure_support        Mon                 deal/demo/quote AND closure > 50
+    R10  closure_support        Mon                 a closure stage AND closure > 50;
+                                                    highest first, no cap, stored news
     R11  new_pipeline_company   Wed                 appeared since last Wednesday
     R12  sales_packages         Thu                 Ready? is No or blank
     R13  next_step_followups    weekdays, 15:00     connected contacts: the next step
@@ -1521,82 +1522,229 @@ def _r_meeting_followup(rule, ctx) -> list:
     return out
 
 
-# What R10 posts when it cannot run because the columns it reads are empty.
-CLOSURE_EMPTY_NOTICE = (
-    "No closure support this week — Prospect Status and Closure Prob% are empty "
-    "in the GTM sheet. Fill them in and I'll pick it up next Monday.")
+# -- R10: closure support ------------------------------------------------------
+# What R10 posts when it cannot run because the columns it reads are empty
+# (both of them, here; `wording.closure_empty_notice` names whichever is).
+CLOSURE_EMPTY_NOTICE = wording.closure_empty_notice(["Prospect Status", "Closure Prob%"])
+
+# A word in front of a stage that turns it into its opposite: "No deal" is not
+# a deal, "Not a demo yet" is not a demo.
+_STAGE_NEGATIONS = frozenset({"no", "not", "non", "never", "without"})
+
+
+def closure_stage(value) -> str:
+    """The CLOSURE_SUPPORT_STAGES phrase this Prospect Status names, or "".
+
+    WHOLE WORDS, AND NOT NEGATED (13 Oct 2026). A stage matches when its words
+    appear in the cell as whole words, in order ("Quote sent", "In
+    negotiation"), never as part of a longer word ("demoted" is not "demo").
+    A whole-word match is still not enough on its own: "No deal" carries the
+    word "deal". So a cell with a negating word in front of the stage ("no",
+    "not", "non", "never", "without") names no stage at all.
+    """
+    words = gtm_sheet.normalise_header(gtm_sheet.clean_cell(value)).replace("?", " ").split()
+    if not words:
+        return ""
+    for phrase in config.CLOSURE_SUPPORT_STAGES or ():
+        key = gtm_sheet.normalise_header(str(phrase)).replace("?", " ").split()
+        if not key:
+            continue
+        for i in range(len(words) - len(key) + 1):
+            if words[i:i + len(key)] == key:
+                if _STAGE_NEGATIONS & set(words[:i]):
+                    break
+                return phrase
+    return ""
+
+
+def closure_order(deal: dict) -> tuple:
+    """R10's ORDER, in one place: HIGHEST CLOSURE PERCENTAGE FIRST; a tie goes
+    to sheet order.
+
+    NO ROTATION, DELIBERATELY. R6, R7 and R13 rotate because they work a long
+    backlog. Closure support is a short list of the deals closest to landing,
+    and they stay in front of the team every week until they close: rotating a
+    90% deal out because it appeared last Monday would hide the thing the post
+    exists for. DO NOT "HARMONISE" THIS WITH THE ROTATING RULES. With no cap,
+    a rotation would have nothing to do anyway.
+    """
+    return (-int(deal.get("closure_pct") or 0), int(deal.get("sheet_row") or 0))
+
+
+def closure_news_company(sheet_ref) -> str:
+    """The COMPANY a stored story was searched for, from its `sheet_ref`
+    ("Synthflow AI — on Master Pipeline"), or "" when the story was not found
+    by a company search.
+
+    ONLY A COMPANY SEARCH COUNTS. A story found by searching for a PERSON reads
+    "Jane Doe, Synthflow AI — on Outreach PoCs": it is about her, not news
+    about the company, so it names no company here. A story from the industry
+    feeds has no `sheet_ref` at all: nothing in the store says which company it
+    is about, and working that out would take a model call or a substring
+    match on the headline. This rule does neither.
+    """
+    who = str(sheet_ref or "").split(" \u2014 on ")[0].strip()
+    return "" if (not who or ", " in who) else who
+
+
+def closure_news_pick(company, stories) -> Optional[dict]:
+    """The ONE story to show under a deal at `company`, or None.
+
+    `stories` are rows of the news store first seen inside R10's window. THE
+    COMPANY IS MATCHED THE WAY R2 MATCHES IT: the FULL NAME, normalised
+    (`news_screen.name_key`), never a substring: "Nudge Security" is not
+    "Nudge". THE MOST IMPORTANT STORY WINS, by the importance R1 already gave
+    it; then the newest. A story with no headline, or whose link carries no
+    http(s) scheme, is not a story to show: a headline and its link come from
+    the store or they are not shown.
+    """
+    import news_screen
+
+    key = news_screen.name_key(company)
+    if not key:
+        return None
+    best = None
+    for story in stories or ():
+        if news_screen.name_key(closure_news_company(story.get("sheet_ref"))) != key:
+            continue
+        title = " ".join(str(story.get("title") or "").split())
+        url = str(story.get("url") or "").strip()
+        if not title or not re.match(r"^https?://\S+$", url):
+            continue
+        rank = (int(story.get("importance") or 0), str(story.get("published_at") or ""),
+                str(story.get("seen_at") or ""))
+        if best is None or rank > best[0]:
+            best = (rank, {"headline": title, "url": url,
+                           "published_at": str(story.get("published_at") or ""),
+                           "seen_at": str(story.get("seen_at") or "")})
+    return best[1] if best else None
 
 
 def _r_closure_support(rule, ctx) -> list:
-    """R10 — deal / demo / quote AND closure strictly above CLOSURE_SUPPORT_MIN.
+    """R10 — a closure stage AND a closure probability strictly above
+    CLOSURE_SUPPORT_MIN. Mondays.
 
     EXACTLY 50 IS EXCLUDED. "Above 50" is the rule as written, and a boundary a
     bot decides for itself is a boundary nobody agreed to. `>` not `>=`, and the
     reason line says so, so nobody has to read this file to find out.
 
-    Asks what is needed for the next stage and shares relevant news — the news
-    half is WEB-DEPENDENT.
+    A CLOSURE-STAGE ROW WITH NO PERCENTAGE IS SKIPPED SILENTLY: logged, never
+    posted, never counted in the message. Nothing can be said about how close
+    a deal is without a number.
+
+    ONLY ACTIVE ROWS (`ctx["rows"]`), on purpose: a deal at a closure stage
+    has been contacted. This rule does not read the whole tab.
+
+    EVERY QUALIFYING DEAL IS HANDED ON, IN `closure_order`. THERE IS NO CAP: a
+    closure stage AND above 50% should never be more than a handful, and if it
+    is ever twenty that is a good week and all twenty should show. The rule's
+    `max_items_per_post` is not applied to it (`drip.shown_contacts`).
+
+    NO FETCH. Until 13 Oct 2026 each deal asked the research layer for a news
+    search. The news line now comes from what R1 has already stored
+    (`bot._closure_news`, which reads; this function is handed nothing and
+    asks for nothing).
 
     AN EMPTY COLUMN IS SAID OUT LOUD; AN EMPTY RESULT IS NOT. When Prospect
     Status — or Closure Prob% — is blank on EVERY active row, the rule cannot
     run at all, and a silent Monday reads exactly like "no deal is close".
-    So that one case posts a line saying which columns are empty
-    (CLOSURE_EMPTY_NOTICE). When the columns have values and no deal
-    qualifies, that is an answer: nothing is posted, and the log says why.
+    So that one case posts a line naming the empty column(s)
+    (`wording.closure_empty_notice`), EVERY MONDAY for as long as they are
+    empty: it is the weekly reminder that they have not been filled in, so
+    there is no "said this already" check. When the columns have values and no
+    deal qualifies, that is an answer: nothing is posted, and the log says why.
     """
     today = ctx["today"]
     floor = int(config.CLOSURE_SUPPORT_MIN)
-    out = []
-    looked = with_status = with_pct = in_stage = 0
-    for row in ctx.get("rows") or ():
+    rule_id = getattr(rule, "id", "") or "R10"
+    rows = list(ctx.get("rows") or ())
+    report = {"rows": len(rows), "looked": 0, "in_stage": 0, "no_percentage": [],
+              "at_or_below": 0, "deals": []}
+    ctx.setdefault("reports", {})[rule_id] = report
+    if not rows:
+        log.error("[R10] no active Outreach PoCs rows were handed over (the tab is empty, "
+                  "unreadable, or nothing on it is active), so nothing is posted. That is "
+                  "not the same as no deal being close.")
+        return []
+    deals = []
+    with_status = with_pct = 0
+    for row in rows:
         ok, _reason, _until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
         if not ok:
             continue
-        looked += 1
+        report["looked"] += 1
         with_status += 1 if _text(row, "prospect_status") else 0
         with_pct += 1 if _text(row, "closure_prob") else 0
-        stage = _matches_any(row.get("prospect_status"), config.CLOSURE_SUPPORT_STAGES)
+        stage = closure_stage(row.get("prospect_status"))
         if not stage:
             continue
-        in_stage += 1
+        report["in_stage"] += 1
         pct = closure_percent(row)
-        if pct is None or pct <= floor:
+        if pct is None:
+            report["no_percentage"].append(
+                {"sheet_row": row.get("_row"), "poc": _text(row, "name"),
+                 "company": _text(row, "company")})
             continue
+        if pct <= floor:
+            report["at_or_below"] += 1
+            continue
+        deals.append({"row": row, "stage": stage, "closure_pct": pct,
+                      "sheet_row": row.get("_row")})
+    looked = report["looked"]
+    if report["no_percentage"]:
+        log.info("[R10] %d closure-stage row(s) have NO Closure Prob%% and are left out "
+                 "(not posted, not counted): %s", len(report["no_percentage"]),
+                 "; ".join(f"row {e['sheet_row']} {e['poc']} ({e['company']})"
+                           for e in report["no_percentage"]))
+    deals.sort(key=closure_order)
+    out = []
+    for order, deal in enumerate(deals):
+        row, pct = deal["row"], deal["closure_pct"]
+        who = wording.next_step_who(_text(row, "name"), _text(row, "company"))
+        report["deals"].append({"sheet_row": row.get("_row"), "poc": _text(row, "name"),
+                                "company": _text(row, "company"), "closure_pct": pct})
         out.append(_item(
             rule=rule, trigger=R_CLOSURE_SUPPORT, today=today, due=today,
             why=(f"R10 (Mondays): prospect status {_text(row, 'prospect_status')!r} "
-                 f"({stage}) and closure {pct}%, above CLOSURE_SUPPORT_MIN ({floor}%) "
-                 f"— exactly {floor}% would not qualify"),
-            # THE SUPPORTIVE VERSION, from the call: an offer of help, not a
-            # "what is needed" that reads as a chase.
-            text=(f"{_describe(row)} is in the closure stage — anything I can pull "
-                  "together to help it along: the PoC's background, the company, a "
-                  "package summary? Say the word."),
+                 f"({deal['stage']}) and closure {pct}%, above CLOSURE_SUPPORT_MIN "
+                 f"({floor}%) — exactly {floor}% would not qualify; {order + 1} of "
+                 f"{len(deals)}, highest first, no cap"),
+            text=f"{who} is in the closure stage: {pct}% at {_text(row, 'prospect_status')}",
             company=_text(row, "company"), poc=_text(row, "name"),
             designation=_text(row, "designation"), sheet_row=row.get("_row"),
             row_key=_contact_key(row), contact_key=_contact_key(row),
-            web_pending=True,
-            extra={"closure_pct": pct, "stage": _text(row, "prospect_status")},
+            extra={"closure_pct": pct, "stage": _text(row, "prospect_status"),
+                   "pick_order": order, "who": who},
         ))
-    if out or not looked:
+    if out:
+        log.info("[R10] %d deal(s) in a closure stage above %d%%, highest first, all "
+                 "handed on (no cap): %s", len(out), floor,
+                 "; ".join(f"{d['poc']} ({d['company']}) {d['closure_pct']}%"
+                           for d in report["deals"]))
+        return out
+    if not looked:
+        log.info("[R10] every active row is stopped or snoozed; nothing posted")
         return out
     if not with_status or not with_pct:
         empty = [name for name, n in (("Prospect Status", with_status),
                                       ("Closure Prob%", with_pct)) if not n]
         log.info("[R10] %s blank on all %d active row(s) — posting the empty-columns "
                  "notice instead of staying silent", " and ".join(empty), looked)
+        text = wording.closure_empty_notice(empty)
         notice = _item(
             rule=rule, trigger=R_CLOSURE_SUPPORT, today=today, due=today,
             why=f"R10 (Mondays): {' and '.join(empty)} blank on every active row",
-            text=CLOSURE_EMPTY_NOTICE,
-            extra={"notice": CLOSURE_EMPTY_NOTICE, "empty_columns": empty},
+            text=text,
+            extra={"notice": text, "empty_columns": empty},
         )
         notice["key"] = "R10:empty-columns"
         return [notice]
     log.info("[R10] no closure support today: %d active row(s), %d with a Prospect "
-             "Status (%d in %s), %d with a Closure Prob%% — none is in a closure "
-             "stage above %d%%. Nothing posted.", looked, with_status, in_stage,
-             "/".join(str(x) for x in config.CLOSURE_SUPPORT_STAGES), with_pct, floor)
+             "Status (%d in %s), %d with a Closure Prob%% (%d in a closure stage with "
+             "none, %d at or below %d%%) — none is in a closure stage above %d%%. "
+             "Nothing posted.", looked, with_status, report["in_stage"],
+             "/".join(str(x) for x in config.CLOSURE_SUPPORT_STAGES), with_pct,
+             len(report["no_percentage"]), report["at_or_below"], floor, floor)
     return out
 
 
@@ -3211,6 +3359,36 @@ def _self_test() -> int:
     check("...and it asks for no web research", [a["web_pending"] for a in got], [False])
     check("no active rows at all -> silent",
           run(today=MON, rows=[], day_rules=[rules_mod.by_id("R10")])["actions"], [])
+    # REBUILT 13 Oct 2026: whole-word stages, highest first, no cap, no fetch.
+    check("the notice names whichever column is empty, and has lost its second sentence",
+          (got[0]["notice"], "Fill them in" in CLOSURE_EMPTY_NOTICE),
+          ("No closure support this week \u2014 Closure Prob% has empty values in the GTM sheet.", False))
+    check("'No deal' is not a deal; 'Demoted' is not a demo; 'Quote sent' is a quote",
+          [bool(closure_stage(v)) for v in ("No deal", "Deal", "Demoted", "Quote sent", "Not a demo")],
+          [False, True, False, True, False])
+    many = [row(_row=10 + i, company=f"Co{i}", name=f"D{i}", prospect_status="Demo",
+                closure_prob=f"{60 + (i * 7) % 30}%") for i in range(12)]
+    got = run(today=MON, rows=many, day_rules=[rules_mod.by_id("R10")])["actions"]
+    check("twelve deals are twelve items, highest percentage first, ties in sheet order",
+          (len(got), [a["closure_pct"] for a in sorted(got, key=lambda a: a["pick_order"])]
+           == sorted((a["closure_pct"] for a in got), reverse=True),
+           [a["web_pending"] for a in got] == [False] * 12), (12, True, True))
+    check("a closure stage with no percentage is left out, with another deal present",
+          [a["poc"] for a in run(today=MON, day_rules=[rules_mod.by_id("R10")], rows=[
+              row(_row=2, name="NoPct", prospect_status="Demo"),
+              row(_row=3, company="B", name="HasPct", prospect_status="Quote", closure_prob="70%")])["actions"]],
+          ["HasPct"])
+    check("a stored story is matched on the full company name, the most important one",
+          (closure_news_pick("Nudge Security", [
+              {"sheet_ref": "Nudge \u2014 on Master Pipeline", "title": "a", "url": "https://x.example/a",
+               "importance": 5},
+              {"sheet_ref": "Nudge Security \u2014 on Outreach PoCs", "title": "b", "url": "https://x.example/b",
+               "importance": 2},
+              {"sheet_ref": "nudge security ltd", "title": "c", "url": "https://x.example/c", "importance": 4},
+              {"sheet_ref": "Nudge Security", "title": "no scheme", "url": "x.example/d", "importance": 5},
+              {"sheet_ref": "Jo Roe, Nudge Security \u2014 on Outreach PoCs", "title": "person",
+               "url": "https://x.example/e", "importance": 5}])["headline"],
+           closure_news_pick("Nudge Security", [])), ("c", None))
 
     print("\nR7 — seniority is not part of its order any more")
     got = run(today=MON, rows=[], dm_no_meeting_state={}, day_rules=[rules_mod.by_id("R7")],

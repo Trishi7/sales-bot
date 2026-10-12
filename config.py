@@ -2500,11 +2500,19 @@ MEETING_FOLLOWUP_LADDER: list[str] = _str_list(
 # to.
 CLOSURE_SUPPORT_MIN = _int("CLOSURE_SUPPORT_MIN", 50)
 
-# R10 — which prospect-status values count as deal / demo / quote.
+# R10 — which prospect-status values count as deal / demo / quote. Matched as
+# WHOLE WORDS, and not when a negating word comes first ("No deal" is not a
+# deal): `nextaction.closure_stage`.
 CLOSURE_SUPPORT_STAGES: list[str] = _str_list(
     "CLOSURE_SUPPORT_STAGES",
     "deal,demo,quote,demo done,quote sent,proposal,negotiation",
 )
+
+# R10 — how far back the very FIRST closure support post looks for news, when
+# it has no "last posted" marker yet. Every later run starts at its last post
+# (its own row in `rule_last_posted`), however long ago that was. The news is
+# READ from what R1 has already stored; R10 fetches nothing.
+CLOSURE_NEWS_FIRST_RUN_DAYS = _int("CLOSURE_NEWS_FIRST_RUN_DAYS", 7)
 
 # R11 — NEW COMPANY IN THE MASTER PIPELINE. This many WORKING days after a
 # company first appears. There is NO created-date column on that tab, so
@@ -3694,6 +3702,22 @@ def validate() -> list[str]:
                 "is meant to be public — starting on a DM means the first anyone else "
                 "hears of a stalled meeting is the escalation.",
                 MEETING_FOLLOWUP_LADDER[0],
+            )
+        log.info(
+            "[config] R10 closure support (Mondays): a closure stage (%s, whole words) AND "
+            "Closure Prob%% strictly above %d%%; a stage with no percentage is left out "
+            "silently; EVERY qualifying deal is named, highest percentage first, no cap and "
+            "no rotation; one news line a deal, READ from the stored news first seen since "
+            "the last closure support post (rule_last_posted 'R10'; the first run looks "
+            "back %dd), nothing fetched; the empty-columns notice posts every Monday while "
+            "either column is blank on every active row",
+            ",".join(CLOSURE_SUPPORT_STAGES) or "(none)", CLOSURE_SUPPORT_MIN,
+            CLOSURE_NEWS_FIRST_RUN_DAYS,
+        )
+        if CLOSURE_NEWS_FIRST_RUN_DAYS < 1:
+            log.warning(
+                "CLOSURE_NEWS_FIRST_RUN_DAYS=%d is below 1; R10's first run looks back 1 "
+                "day. The default is 7.", CLOSURE_NEWS_FIRST_RUN_DAYS,
             )
         if not 0 <= CLOSURE_SUPPORT_MIN <= 99:
             log.warning(
