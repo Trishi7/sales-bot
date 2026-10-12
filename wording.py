@@ -1009,6 +1009,76 @@ def events_lines_for_check() -> list:
             EVENTS_REMIND.format(when="on Monday")] + events_post([], [], [], days=14)["lines"])
 
 
+# -- sales packages (rule 12) ---------------------------------------------------
+#
+# THE POST, AGREED WORD FOR WORD ON 12 Oct 2026. Do not reword it and do not
+# re-punctuate it; the lower-case "these" is how it was written.
+#
+#     **Sales packages**
+#     @Vaishnavi @Sid
+#     these Sales Packages aren't ready yet:
+#     1. Evals_Vibe-check
+#     2. DPO Pack
+#     (+2 more next Thursday.)
+#     Could you let me know roughly when each might be ready?
+#
+# ONE PACKAGE A LINE, NUMBERED, NAMED EXACTLY AS THE SHEET SPELLS IT. No
+# status, no per cent, no dash, no trailing words. A list of ONE is still this
+# list. The heading and the tags line are the sender's, not part of the block.
+PACKAGES_OPENER = "these Sales Packages aren't ready yet:"
+PACKAGES_HELD_BACK = "(+{n} more next Thursday.)"
+PACKAGES_CLOSE = "Could you let me know roughly when each might be ready?"
+# THE PROMISED DAY HAS COME and Ready? is still not Yes. Posted once, by the
+# one reminder loop.
+PACKAGES_REMINDER = ("{name} was expected to be ready around today, and Ready? on the tab is "
+                     "still not Yes. Any update, or shall I check back later?")
+# A reply under the post with no day in it that can be read, or a day that has
+# already gone. Said once; nothing is guessed and nothing is recorded.
+PACKAGES_NO_DATE = ("I couldn't pick a date out of that \u2014 could you give me a day, like "
+                    "\"24 Oct\"? I'll check back then.")
+# A day with no package it belongs to, under a post that named several.
+PACKAGES_WHICH = "Which package is that date for? Name it and I'll note the day."
+# The day came for a package that is no longer on the tab (renamed or
+# deleted): the reminder is closed and this says so, once.
+PACKAGES_GONE = ("{name} isn't on the Sales Packages tab any more, so I've dropped the "
+                 "check-back I had for it today.")
+
+
+def packages_post(packages, *, held_back=0) -> list:
+    """The lines of R12's post under its heading and tags, WITHOUT the close
+    (the caller adds `PACKAGES_CLOSE`).
+
+    `packages` are the names IN THE ORDER GIVEN, each either a plain name or
+    the name already as a masked link (the caller builds it with `links.link`
+    when the row's product doc is a real url). `held_back` is how many more
+    qualify than the post has room for; its line is there only when that is
+    more than none. [] with no packages, and then nothing is posted.
+    """
+    names = [" ".join(str(p or "").split()) for p in (packages or ())]
+    names = [n for n in names if n]
+    if not names:
+        return []
+    lines = [PACKAGES_OPENER] + [f"{i}. {name}" for i, name in enumerate(names, 1)]
+    if int(held_back or 0) > 0:
+        lines.append(PACKAGES_HELD_BACK.format(n=int(held_back)))
+    return lines
+
+
+def packages_reminder(name) -> str:
+    return PACKAGES_REMINDER.format(name=" ".join(str(name or "").split()) or "That package")
+
+
+def packages_gone(name) -> str:
+    return PACKAGES_GONE.format(name=" ".join(str(name or "").split()) or "That package")
+
+
+def packages_lines_for_check() -> list:
+    """Every fixed line R12 can post, with stand-in values."""
+    return packages_post(["Evals_Vibe-check", "DPO Pack"], held_back=2) + [
+        PACKAGES_CLOSE, packages_reminder("DPO Pack"), PACKAGES_NO_DATE, PACKAGES_WHICH,
+        packages_gone("DPO Pack")]
+
+
 # -- every line, rendered, for the register check ----------------------------
 
 
@@ -1034,6 +1104,7 @@ def all_lines() -> list:
         *[l for l in dm_no_meeting_lines_for_check() if l],
         *closure_lines_for_check(),
         *events_lines_for_check(),
+        *packages_lines_for_check(),
     ]
 
 

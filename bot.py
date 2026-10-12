@@ -84,6 +84,7 @@ import leave
 import news
 import news_screen
 import nextaction
+import packages as packages_mod
 import rules
 import simulation
 import notes
@@ -772,6 +773,23 @@ class SalesBot(discord.Client):
                       + (" …" if len(zeros) > 20 else "")) if zeros else "")
         except Exception:
             log.debug("[sheet.world] could not count the rows at 0%% closure", exc_info=True)
+        # READY? SAYS YES AND % COMPLETION SAYS UNDER 100. Ready? wins (R12 does
+        # not list the package), and this one line is how the mismatch is seen
+        # by us without a post going to the team.
+        try:
+            rows = await self._rule_tab_rows(gtm_sheet.PACKAGES, "R12")
+            odd = packages_mod.ready_but_incomplete(rows)
+            missing = packages_mod.columns_missing(rows) if rows else []
+            if missing:
+                log.error("[gtm.packages] the Sales Packages tab has no %s column I can find; "
+                          "R12 posts nothing until it does", " or ".join(missing))
+            log.info("[gtm.packages] %d package(s) say Ready? Yes with %% Completion under "
+                     "100 (Ready? wins, they are not listed)%s", len(odd),
+                     (": " + "; ".join(f"{o['name']} at {o['completion']}% (row {o['sheet_row']})"
+                                       for o in odd)) if odd else "")
+        except Exception:
+            log.debug("[gtm.packages] could not check the Sales Packages tab at boot",
+                      exc_info=True)
         state.audit(
             "sheet_world",
             reason="startup: which tab, which columns, how many rows are active",
@@ -1695,6 +1713,11 @@ class SalesBot(discord.Client):
             # post: the rest of the list, or the next company. Before the
             # acknowledgement, which would give "yes" one reaction and stop.
             if await self._maybe_prospect_reply(message, text, ctx):
+                return True
+            # A DATE UNDER THE SALES-PACKAGES POST ("Vibe-check by 24 Oct") is
+            # written down, and Saley comes back on that day. Before the
+            # acknowledgement, which would give it a thumbs-up and forget it.
+            if await self._maybe_package_dates(message, text, ctx):
                 return True
             if await self._maybe_acknowledge(message, text, ctx):
                 return True
@@ -6987,6 +7010,16 @@ class SalesBot(discord.Client):
                     log.warning("[reminders] #%s is due but channel %s is not reachable; "
                                 "leaving it open", r["id"], cid)
                     continue
+            if str(r.get("row_key") or "").startswith(packages_mod.REMINDER_PREFIX):
+                # A PACKAGE'S PROMISED DAY (R12). Same loop, same claim-before-
+                # send; what it says, and whether it says anything, depends on
+                # the tab as it reads now.
+                try:
+                    if await self._fire_package_reminder(r, target, now=now, late=late):
+                        fired.append(r["id"])
+                except Exception:
+                    log.exception("[packages] reminder #%s failed; it stays as it is", r["id"])
+                continue
             claimed = await asyncio.to_thread(
                 lambda i=r["id"]: self.db.close_scheduled_reminder(i, status="done"))
             if not claimed:
@@ -7735,6 +7768,192 @@ class SalesBot(discord.Client):
         history = self.memory.recent(message.channel.id)
         if not await self._answer_with_engine(message, text, history=history, ask=act):
             await self._engine_no_progress_reply(message, text=act, history=history)
+        return True
+
+    async def _packages_on_post(self, drip_row: dict) -> list:
+        """The package names ONE Sales-packages post carried, as the tab spells
+        them today.
+
+        FROM THE POST'S OWN RECORD (`drip_sends.companies`, what was sent), so a
+        date can only be attached to a package that post named. The names are
+        read back against the tab so a comma inside a name cannot split it; a
+        name the tab no longer has is kept as the record wrote it.
+        """
+        stored = str((drip_row or {}).get("companies") or "")
+        if not stored.strip():
+            return []
+        padded = f", {stored}, "
+        rows = await self._rule_tab_rows(gtm_sheet.PACKAGES, "R12")
+        on_tab = [n for n in dict.fromkeys(packages_mod.name_of(r) for r in rows)
+                  if n and f", {n}, " in padded]
+        rest = padded
+        for n in on_tab:
+            rest = rest.replace(f", {n}, ", ", , ")
+        left = [x.strip() for x in rest.split(",") if x.strip()]
+        return on_tab + [x for x in left if x not in on_tab]
+
+    async def _maybe_package_dates(self, message, text: str, ctx: dict) -> bool:
+        """A reply under the Sales-packages post that gives a day: record it.
+        True when the reply was handled here.
+
+        THE POST ASKS "roughly when each might be ready?" and this is where the
+        answer goes: one row in `scheduled_reminders` a package (its name, the
+        day, who said it), at REMINDER_DEFAULT_TIME. `_fire_due_reminders` is
+        still the ONLY thing that sends it; nothing here posts on a clock.
+
+        WHICH PACKAGE: its name in the reply, a shortened form allowed, AMONG
+        THE PACKAGES ON THE POST BEING ANSWERED and no others
+        (`packages.promises`). WHICH DAY: `packages.dates_in`. Several packages
+        and days in one reply are all recorded.
+
+        ONE DATE A PACKAGE. A newer day REPLACES the older: the open reminder
+        for that name is closed first, so there are never two.
+
+        NOTHING IS GUESSED. A package named with no day that can be read, or a
+        day already gone, gets the ask-again line once and nothing is recorded
+        for it. A day with no package to belong to (under a post of several)
+        gets one question. A reply with neither, and any QUESTION, is left to
+        the ordinary reply handling.
+
+        A RECORDED DATE IS ACKNOWLEDGED WITH A REACTION, not a sentence: there
+        is no agreed wording for it, and the reminder itself is the answer.
+        """
+        if not config.PACKAGES_DATE_CAPTURE or not ctx.get("direct_is_bot"):
+            return False
+        drip_row = ctx.get("drip") or {}
+        if drip_row.get("action_type") != nextaction.R_PACKAGES:
+            return False
+        body = " ".join(str(text or "").split())
+        if not body or "?" in body or _STARTS_LIKE_A_QUESTION_RE.match(body):
+            return False
+        names = await self._packages_on_post(drip_row)
+        if not names:
+            return False
+        today = dl.today_ist()
+        found = packages_mod.promises(body, names, today=today)
+        if not any(found.values()):
+            return False
+        who = _display(message.author)
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        hhmm = sheetwrite.parse_reminder_time(config.REMINDER_DEFAULT_TIME) or "14:00"
+        for name, when in found["dated"]:
+            key = packages_mod.reminder_key(name)
+            existing = await asyncio.to_thread(self.db.scheduled_reminders_by_row)
+            replaced = 0
+            for old in existing.get(key) or []:
+                closed = await asyncio.to_thread(
+                    lambda i=old["id"]: self.db.close_scheduled_reminder(i, status="cancelled"))
+                replaced += 1 if closed else 0
+            rid = await asyncio.to_thread(
+                lambda n=name, k=key, w=when: self.db.add_scheduled_reminder(
+                    row_key=k, company=n, due_date=dl.iso(w), due_time=hhmm,
+                    what=f"check whether the {n} package is ready",
+                    requested_by=who, on_date=dl.iso(today), channel_id=channel_id,
+                    asker_id=str(getattr(message.author, "id", "") or "")))
+            state.audit("package_date_recorded", reason="a date under the Sales-packages post",
+                        package=name, due=f"{dl.iso(when)} {hhmm}", requested_by=who,
+                        reminder_id=rid, replaced=replaced)
+            log.info("[packages] %s said %r will be ready on %s — reminder #%s at %s%s",
+                     who, name, dl.iso(when), rid, hhmm,
+                     f" (replacing {replaced} earlier date)" if replaced else "")
+        if found["dated"]:
+            await self._react(message, reason="a package's ready date was recorded")
+        if found["undated"] or found["past"]:
+            log.info("[packages] no usable date for %s in %r — asking again, nothing "
+                     "recorded for it", ", ".join(found["undated"] + [n for n, _d in found["past"]]),
+                     body[:120])
+            await self._reply(message, wording.PACKAGES_NO_DATE,
+                              reason="a package was named with no date I could use")
+        elif found["unattached"] and not found["dated"]:
+            log.info("[packages] a date with no package named, under a post of %d — asking "
+                     "which, nothing recorded", len(names))
+            await self._reply(message, wording.PACKAGES_WHICH,
+                              reason="a date with no package it belongs to")
+        return True
+
+    async def _fire_package_reminder(self, r: dict, target, *, now, late: bool) -> bool:
+        """The day somebody gave for a package has come. True when a line was
+        posted. CALLED ONLY BY `_fire_due_reminders`, which stays the one
+        sender of reminders: this is its branch for a row whose key says it is
+        a package's date, not a second lane.
+
+        IN THIS ORDER:
+          the day is one the weekly post runs on (a Thursday)
+                    closed, nothing posted: the post already names the
+                    package that day, and nobody is chased twice in one day.
+                    Not re-queued.
+          the tab cannot be read
+                    left OPEN for the next tick, and logged. Nothing is said
+                    about a package on the strength of a tab nobody could read.
+          the package is no longer on the tab (renamed or deleted)
+                    closed, with ONE line saying so: a reminder can never
+                    outlive its package.
+          Ready? is Yes
+                    closed QUIETLY. No announcement when a package becomes
+                    ready, here or anywhere.
+          Ready? is still not Yes
+                    posted once: `wording.packages_reminder`.
+
+        CLAIMED BEFORE IT IS SENT, like every reminder, so two ticks cannot
+        post it twice. The package still appears on Thursdays until Ready? is
+        Yes: the reminder is extra, not instead.
+        """
+        rid = r["id"]
+        name = str(r.get("company") or "").strip()
+        due = dl.parse_date(r.get("due_date"))
+        rule = rules.by_id("R12")
+        weekly = set(getattr(rule, "weekdays", ()) or ()) if getattr(rule, "enabled", False) else set()
+
+        async def close(status="done") -> bool:
+            return await asyncio.to_thread(
+                lambda: self.db.close_scheduled_reminder(rid, status=status))
+
+        if due is not None and due.weekday() in weekly:
+            if await close():
+                log.info("[packages] reminder #%s for %r was due on %s, a day the weekly "
+                         "post runs and names it — skipped, closed, not re-queued",
+                         rid, name, r.get("due_date"))
+            return False
+        rows = await self._rule_tab_rows(gtm_sheet.PACKAGES, "R12")
+        if not rows or packages_mod.columns_missing(rows):
+            log.warning("[packages] reminder #%s for %r is due but the Sales Packages tab "
+                        "cannot be read; leaving it open for the next tick", rid, name)
+            return False
+        key = packages_mod.name_key(name)
+        mine = [row for row in rows if packages_mod.name_key(packages_mod.name_of(row)) == key]
+        if not mine:
+            line = wording.packages_gone(name)
+        elif any(packages_mod.is_ready(row) for row in mine):
+            if await close():
+                log.info("[packages] reminder #%s: %r is marked ready — closed quietly, "
+                         "nothing posted", rid, name)
+            return False
+        else:
+            line = wording.packages_reminder(packages_mod.name_of(mine[0]))
+        if not await close():
+            return False                         # another tick got there first
+        body = self._tag_test(drip.with_heading(line, drip.heading("R12")))
+        sent = await guardrails.send(
+            target, body,
+            reason=(f"package date reminder #{rid}" + (f" (late: it was due {r.get('due_date')})"
+                                                       if late else "")),
+            kind="reminder", item_key=f"reminder:{rid}",
+        )
+        if sent is None:
+            tries = self._reminder_failures.get(rid, 0) + 1
+            self._reminder_failures[rid] = tries
+            if tries < 3:
+                await asyncio.to_thread(lambda: self.db.reopen_scheduled_reminder(rid))
+            log.error("[packages] reminder #%s could not be posted (try %d)%s", rid, tries,
+                      "; re-opened" if tries < 3 else "; giving up — it stays closed")
+            return False
+        self._reminder_failures.pop(rid, None)
+        state.audit("package_reminder_fired", reason=line, reminder_id=rid, package=name,
+                    due=str(r.get("due_date") or ""), gone=not mine or None,
+                    channel_id=str(getattr(target, "id", "")))
+        log.info("[packages] reminder #%s for %r %s", rid, name,
+                 "closed: it is no longer on the tab, and the channel was told" if not mine
+                 else "fired: Ready? is still not Yes")
         return True
 
     @staticmethod

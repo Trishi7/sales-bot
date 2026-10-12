@@ -2672,6 +2672,28 @@ NEXT_ACTION_WEEKEND_SHIFT = _bool("NEXT_ACTION_WEEKEND_SHIFT", default=True)
 REMINDER_DEFAULT_TIME = (
     os.getenv("REMINDER_DEFAULT_TIME", "14:00") or ""
 ).strip() or "14:00"
+# -- R12 — SALES PACKAGES (redesigned 12 Oct 2026) ------------------------------
+# THE ORDER the Thursday post lists the packages that are not ready in.
+#   completion_desc   highest % Completion first (the default)
+#   completion_asc    lowest first
+# A blank or unreadable % sorts LAST either way, and a tie keeps the sheet's
+# own order. Anything else written here falls back to the default, with a
+# warning: a post in an order nobody chose is worse than the usual order.
+_PACKAGES_ORDERS = ("completion_desc", "completion_asc")
+_packages_order_raw = (os.getenv("PACKAGES_ORDER", "completion_desc") or "").strip().lower()
+PACKAGES_ORDER = (_packages_order_raw if _packages_order_raw in _PACKAGES_ORDERS
+                  else "completion_desc")
+if _packages_order_raw not in _PACKAGES_ORDERS:
+    log.warning(
+        "PACKAGES_ORDER=%r is not one of %s; using completion_desc (highest %% "
+        "Completion first).", _packages_order_raw, ", ".join(_PACKAGES_ORDERS))
+# WHEN SOMEBODY ANSWERS THE POST WITH A DATE, write it down and come back on
+# that day if Ready? still is not Yes. Stored in `scheduled_reminders` and sent
+# by the one reminder loop, at REMINDER_DEFAULT_TIME; there is no second
+# sender and no extra table. false: replies under the post are handled like
+# any other message and no date is recorded.
+PACKAGES_DATE_CAPTURE = _bool("PACKAGES_DATE_CAPTURE", default=True)
+
 # How often the reminder loop looks. It is one SQLite query per tick, so a
 # minute costs nothing and means a reminder is at most a minute late.
 REMINDER_CHECK_SECONDS = _int("REMINDER_CHECK_SECONDS", 60)
@@ -3745,6 +3767,15 @@ def validate() -> list[str]:
                 "in the post saying why. The agreed numbers are 3 a run and 12 a month.",
                 EVENTS_DISCOVERY_MAX_PER_MONTH, EVENTS_DISCOVERY_MAX_PER_RUN,
             )
+        log.info(
+            "[config] R12 sales packages (Thursdays): every package whose Ready? is not Yes "
+            "(blank is not ready), by name only, order=%s with a blank per cent last; the "
+            "rule's max_items_per_post a post and \"(+N more next Thursday.)\" for the "
+            "rest; nothing drops on a clock; a date given in a reply is %s (a reminder on "
+            "that day at %s, skipped when Ready? is Yes or the day is a Thursday)",
+            PACKAGES_ORDER, "recorded" if PACKAGES_DATE_CAPTURE else "NOT recorded",
+            REMINDER_DEFAULT_TIME,
+        )
         log.info(
             "[config] R10 closure support (Mondays): a closure stage (%s, whole words) AND "
             "Closure Prob%% strictly above %d%%; a stage with no percentage is left out "

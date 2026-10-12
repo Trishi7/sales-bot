@@ -1919,27 +1919,84 @@ def _r_sales_packages(rule, ctx) -> list:
     ready is a package nobody has said is ready, and the two mistakes do not
     cost the same: calling a finished package unready costs one question, and
     offering a prospect a half-built one costs a promise somebody else keeps.
+
+    THE SALES PACKAGES TAB AND NOTHING ELSE (`ctx["packages"]`): no Outreach
+    PoCs row, no activation gate, and no contact key, so the cross-rule dedup
+    never touches it.
+
+    WHO AND IN WHAT ORDER is `packages.not_ready`: one package a name (two rows
+    with one name are logged and the furthest-along kept), highest % Completion
+    first unless PACKAGES_ORDER says otherwise, a blank or unreadable per cent
+    last, ties in sheet order. A row with a blank name is skipped. READY WINS:
+    a package whose Ready? is Yes is not listed whatever its per cent says.
+
+    THE CAP IS THE RULE'S `max_items_per_post` AND THERE IS NO SECOND ONE. The
+    first that many are handed on, each carrying how many were held back, and
+    the post says "(+N more next Thursday.)". NOTHING DROPS ON A CLOCK AND
+    NOTHING ROTATES: a package leaves the list only when Ready? is set to Yes,
+    which is also when a held-back one moves up.
+
+    NOTHING QUALIFIES: no item, so no post. There is no "everything is ready"
+    line, and no announcement when a package becomes ready.
+
+    THE TAB WILL NOT READ, OR THE NAME OR READY? COLUMN IS MISSING: no post,
+    said at ERROR. A column the team moved is found by its header; one renamed
+    to something no alias matches reads as missing, and the rule stays silent
+    rather than guess.
     """
+    import packages as packages_mod
+
     today = ctx["today"]
+    rule_id = getattr(rule, "id", "") or "R12"
+    rows = list(ctx.get("packages") or ())
+    report = {"rows": len(rows), "listed": [], "held_back": [], "duplicates": [],
+              "blank_names": 0, "missing_columns": []}
+    ctx.setdefault("reports", {})[rule_id] = report
+    if not rows:
+        log.error("[R12] the Sales Packages tab came back with NO ROWS (empty or "
+                  "unreadable), so nothing is posted.")
+        return []
+    missing = packages_mod.columns_missing(rows)
+    if missing:
+        report["missing_columns"] = missing
+        log.error("[R12] the Sales Packages tab has no %s column I can find (a header was "
+                  "renamed to something I don't recognise), so nothing is posted. I don't "
+                  "guess which column it is.", " or ".join(missing))
+        return []
+    found = packages_mod.not_ready(rows)
+    report["blank_names"] = found["blank_names"]
+    report["duplicates"] = found["duplicates"]
+    for dup in found["duplicates"]:
+        log.warning("[R12] %r is on the tab twice (rows %s and %s); keeping row %s, the "
+                    "furthest along", dup["name"], dup["kept_row"], dup["dropped_row"],
+                    dup["kept_row"])
+    waiting = found["packages"]
+    cap = max(1, int(getattr(rule, "max_items_per_post", 5) or 5))
+    shown, held = waiting[:cap], waiting[cap:]
+    report["listed"] = [p["name"] for p in shown]
+    report["held_back"] = [p["name"] for p in held]
+    log.info("[R12] %d row(s) read; %d package(s) not ready, order=%s: %d in the post, %d "
+             "held back for a later Thursday; %d blank name(s) skipped, %d duplicate "
+             "name(s)", len(rows), len(waiting), packages_mod.order(), len(shown), len(held),
+             found["blank_names"], len(found["duplicates"]))
     out = []
-    for row in ctx.get("packages") or ():
-        name = _text(row, "name") or _text(row, "package")
-        if not name:
-            continue
-        if gtm_sheet.ready_flag(row.get("ready")) == "Yes":
-            continue
-        completion = _text(row, "completion")
-        status = _text(row, "status") or "(blank)"
-        raw_ready = _text(row, "ready") or "blank"
+    for order, pkg in enumerate(shown):
         out.append(_item(
             rule=rule, trigger=R_PACKAGES, today=today, due=today,
-            why=f"R12 (Thursdays): Ready? is {raw_ready}, status {status}",
-            text=(f"{name} — {status}"
-                  + (f", {completion} complete" if completion else "")
-                  + ". What is the status, and when will it be ready?"),
-            company=name, sheet_row=row.get("_row"),
-            extra={"completion": completion, "status": status,
-                   "ready": gtm_sheet.ready_flag(row.get("ready"))},
+            why=(f"R12 (Thursdays): Ready? is {pkg['ready_raw'] or 'blank'}, status "
+                 f"{pkg['status'] or '(blank)'}; {order + 1} of {len(shown)} in the post, "
+                 f"{len(held)} held back"),
+            # THE NAME ALONE. The renderer owns the wording
+            # (`wording.packages_post`), and the agreed post is NAMES ONLY.
+            text=pkg["name"],
+            company=pkg["name"], sheet_row=pkg["sheet_row"],
+            # `completion`, `status` and `ready` DECIDE THE ORDER AND WHO IS IN;
+            # `product_doc` is the link behind the name. NONE OF THEM IS PRINTED.
+            # The post shows no per cent, no status and no number of any kind:
+            # do not add one back to the line.
+            extra={"completion": pkg["completion"], "status": pkg["status"],
+                   "ready": pkg["ready"], "product_doc": pkg["doc"],
+                   "pick_order": order, "held_back": len(held)},
         ))
     return out
 

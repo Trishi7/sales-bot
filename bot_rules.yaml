@@ -805,9 +805,29 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R12
-  # Every package on the Sales Packages tab where Ready? is No or blank. Asks
-  # for the status and the expected ready date. Blank reads as No — see
-  # gtm_sheet.ready_flag for why that direction and not the other.
+  # Every package on the Sales Packages tab where Ready? is No or blank. Blank
+  # reads as No — see gtm_sheet.ready_flag for why that direction and not the
+  # other. The Sales Packages tab only: no Outreach PoCs row, no activation
+  # gate, no cross-rule dedup.
+  #
+  # REDESIGNED 12 Oct 2026. The post is rendered in code (wording.packages_post):
+  #   these Sales Packages aren't ready yet:
+  #   1. <Package Name>
+  #   (+N more next Thursday.)        only when more qualify than fit
+  #   Could you let me know roughly when each might be ready?
+  # NAMES ONLY, exactly as the sheet spells them: no status, no per cent. One
+  # package is still a list. The name is a link when the product-doc cell holds
+  # a real url.
+  #
+  # ORDER: PACKAGES_ORDER (completion_desc: highest % Completion first), a blank
+  # per cent last, ties in sheet order. `max_items_per_post` below is the only
+  # cap. Nothing drops on a clock and nothing rotates: a package leaves when
+  # Ready? is Yes, silently. Nothing qualifying: no post.
+  #
+  # A DATE GIVEN IN A REPLY is recorded (PACKAGES_DATE_CAPTURE) as a one-off
+  # reminder: on that day, if Ready? is still not Yes, one line; if it is Yes,
+  # nothing; if the day is a Thursday, nothing, because the weekly post names
+  # the package anyway.
   - id: R12
     name: Sales packages
     plain: sales packages that aren't ready yet

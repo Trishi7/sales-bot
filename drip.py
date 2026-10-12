@@ -1069,14 +1069,9 @@ _ASK = {
         "A new company just showed up in the pipeline. I can look up who to reach "
         "out to — want me to? Say skip if not.",
     ),
-    nextaction.R_PACKAGES: (
-        "{hey}{companies} {is} still not marked ready. What's left on it, and "
-        "roughly when? No rush — I just don't want us to offer it early.",
-        "{name}quick one: {companies} {isnt} marked ready yet. Anything blocking "
-        "it? A rough date is plenty.",
-        "{companies} {is} still open on the packages list. Is there a date I should "
-        "know, or shall I check back next week?",
-    ),
+    # (R12, sales packages, has no template here since 12 Oct 2026: it is
+    # VERBATIM now. One package is a list of one, rendered in code like any
+    # other number, `wording.packages_post`; this entry could not be reached.)
     nextaction.SCHEDULED_REMINDER: (
         "{hey}you asked me to remind you about {companies} today. Tell me when it's "
         "done, or give me a new date.",
@@ -1295,7 +1290,12 @@ VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             # R10 (13 Oct): the opener, the deal lines, the news
                             # lines and the close are the agreed shape
                             # (`wording.closure_post`).
-                            nextaction.R_CLOSURE_SUPPORT})
+                            nextaction.R_CLOSURE_SUPPORT,
+                            # R12 (12 Oct): the opener, the numbered names and the
+                            # closing question were agreed word for word. A
+                            # composer could renumber, reorder or add a per cent
+                            # (`wording.packages_post`).
+                            nextaction.R_PACKAGES})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1859,6 +1859,8 @@ def shown_contacts(message: dict) -> list:
         return next_step_order(actions)
     if kind == nextaction.R_LI_NO_DM:
         return li_no_dm_shown(actions, plain_cap=cap)
+    if kind == nextaction.R_PACKAGES:
+        return packages_order(actions)[:cap]
     if kind == nextaction.R_CLOSURE_SUPPORT:
         # NO CAP, ON PURPOSE. A closure stage AND above 50% should never be
         # more than a handful; if it is ever twenty, that is a good week and all
@@ -1950,6 +1952,50 @@ def nothing_to_say(message: dict) -> bool:
     # nothing (the one-line "nothing anywhere" post), or when the research
     # found a deadline to propose. With no line and no search, nothing.
     return not render_events(message)[0] and not research_of(message)
+
+
+def packages_order(actions: list) -> list:
+    """R12's packages in the order the rule put them (`pick_order`, which is
+    `packages.not_ready`: highest % Completion first unless PACKAGES_ORDER
+    says otherwise, a blank per cent last, ties in sheet order). One name once.
+    Nothing here reorders them."""
+    seen: set = set()
+    rows: list = []
+    for a in actions or []:
+        name = str(a.get("company") or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        rows.append(a)
+    return sorted(rows, key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        int(a.get("sheet_row") or 0)))
+
+
+def package_name(action: dict) -> str:
+    """One package as the post shows it: ITS NAME, exactly as the sheet spells
+    it, and nothing else. When the row's product-doc cell holds a real url the
+    name is that masked link (`links.link`), so the visible text is still only
+    the name. A value with no http(s) scheme is NOT a url (`links.mask_bare`
+    matches only strings that carry one), so it is ignored and the name goes
+    out as plain text, never as dead link text. (`links.link` shortens its
+    text to six words; a longer name is left plain so it is not cut.)"""
+    name = " ".join(str(action.get("company") or "").split())
+    url = str(action.get("product_doc") or "").strip().strip("<>")
+    if not name or not re.match(r"^https?://\S+$", url):
+        return name
+    masked = link(name, url)
+    return masked if masked.startswith(f"[{name}](") else name
+
+
+def render_packages(message: dict) -> list:
+    """R12's lines under its heading: the opener, the numbered names, and the
+    held-back line when more qualify than the post has room for
+    (`wording.packages_post`). NO PER CENT AND NO STATUS: the items carry them
+    for the order, and the post does not show them."""
+    shown = shown_contacts(message)
+    held = max([int(a.get("held_back") or 0) for a in shown] or [0])
+    return wording.packages_post([package_name(a) for a in shown], held_back=held)
 
 
 def closure_order(actions: list) -> list:
@@ -2110,6 +2156,16 @@ def points_of(message: dict) -> Optional[dict]:
             return None
         return {"header": lines[0], "lines": lines[1:] + [""], "extra": [],
                 "close": wording.CLOSURE_CLOSE}
+    if kind == nextaction.R_PACKAGES:
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py, FOR ONE PACKAGE OR FIVE
+        # (12 Oct 2026). It used to reach the generic tail below with three or
+        # more ("Sales packages — 5:" and a composed close) and fall through to
+        # a composed sentence with one or two. A list of ONE is still a list.
+        lines = render_packages(message)
+        if not lines:
+            return None
+        return {"header": lines[0], "lines": lines[1:], "extra": [],
+                "close": wording.PACKAGES_CLOSE}
     companies = [c for c in (message.get("companies") or []) if str(c).strip()]
     if len(companies) >= 3:
         lines = []
@@ -2283,7 +2339,7 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         body = (lead + points_block(points)
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
         if message.get("type") in (nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING,
-                                   nextaction.R_CLOSURE_SUPPORT):
+                                   nextaction.R_CLOSURE_SUPPORT, nextaction.R_PACKAGES):
             # R6 IS ITS FOUR BLOCKS AND NOTHING ELSE: no source link under it and
             # no bracketed note about a search that could not run. R7 is its
             # two blocks and nothing else, for the same reason.
@@ -2861,10 +2917,8 @@ def _self_test() -> int:
                            or " is are " in filled or "  " in filled)
                     if bad:
                         check(f"{kind}: fills cleanly ({many}, {name!r})", filled, "")
-    check("one company agrees", _fill(_ASK[nextaction.R_PACKAGES][1], name="",
-                                      companies=["Hinglish STT"]),
-          "Quick one: Hinglish STT isn't marked ready yet. Anything blocking it? "
-          "A rough date is plenty.")
+    check("R12 has no composed template any more: its post is rendered in code",
+          (nextaction.R_PACKAGES in _ASK, nextaction.R_PACKAGES in VERBATIM_TYPES), (False, True))
     check("two companies agree", _fill(_ASK[nextaction.R_PROSPECTS][1], name="Vaishnavi",
                                        companies=["PolyAI", "Agoda"]),
           "Vaishnavi, quick one: PolyAI and Agoda are still waiting on a first message. "
@@ -2883,7 +2937,7 @@ def _self_test() -> int:
         check(f"{label}: three different variants", len(set(options)), 3)
 
     print("\nthe facts the composer is held to")
-    two = {"type": nextaction.R_PACKAGES, "companies": ["PolyAI", "Agoda"],
+    two = {"type": nextaction.SCHEDULED_REMINDER, "companies": ["PolyAI", "Agoda"],
            "actions": [{"company": "PolyAI", "poc": "A", "why": "x"},
                        {"company": "PolyAI", "poc": "B", "why": "y"},
                        {"company": "Agoda", "poc": "C", "why": "z"}]}

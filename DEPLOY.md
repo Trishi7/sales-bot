@@ -1559,3 +1559,43 @@ already suggested in 2026-10, which is the monthly limit of 12`.
 (`sheet_wording` in `bot_rules.yaml`); paste it into the sheet.
 
 `python verify_events.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R12 redesign (12 Oct): sales packages
+
+What changes for the team: the Thursday post is now the same short list every week: "these Sales Packages aren't
+ready yet:", the packages by name only (no status, no per cent), five at most, highest % Completion first, and
+"Could you let me know roughly when each might be ready?". **Answer under the post with a date** ("Vibe-check by
+24 Oct") and Saley reacts, writes it down, and comes back on that day, but only if Ready? on the tab is still not
+Yes. A package leaves the list when Ready? is set to Yes, with no announcement.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Two new variables; the defaults are what was
+specified, so the lines are optional:
+
+```
+PACKAGES_ORDER=completion_desc
+PACKAGES_DATE_CAPTURE=true
+```
+
+Nothing changed its default and nothing is retired. `REMINDER_DEFAULT_TIME` (14:00) is the time a package's
+date-reminder fires. Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** Nothing to migrate and no new table. A package's date is a row in the existing `scheduled_reminders`
+table whose `row_key` starts `package|`.
+
+**What to look for in the boot log:**
+
+```
+[config] R12 sales packages (Thursdays): every package whose Ready? is not Yes (blank is not ready), by name only, order=completion_desc with a blank per cent last; the rule's max_items_per_post a post and "(+N more next Thursday.)" for the rest; nothing drops on a clock; a date given in a reply is recorded (a reminder on that day at 14:00, skipped when Ready? is Yes or the day is a Thursday)
+[gtm.packages] 0 package(s) say Ready? Yes with % Completion under 100 (Ready? wins, they are not listed)
+```
+
+If the second line names packages, the tab disagrees with itself; nothing is posted about it. An `[gtm.packages]`
+or `[R12]` ERROR saying there is "no Name or Ready? column I can find" means a header was renamed to something
+Saley does not recognise, and the Thursday post is silent until it is put back. On a Thursday: `[R12] 8 row(s)
+read; 5 package(s) not ready, order=completion_desc: 5 in the post, 0 held back ...`. When somebody gives a date:
+`[packages] <name> said '<package>' will be ready on <date> — reminder #N at 14:00`.
+
+**The Bot Rules tab.** Rule 12 has no `sheet_wording` in `bot_rules.yaml` and none was added; if the tab's rule 12
+row describes asking for "the status", it is out of date and is edited by hand.
+
+`python verify_packages.py --show` checks all of it offline and prints the messages.

@@ -2213,7 +2213,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R9** | Meeting done, no next steps | **anchored**, 10:00 | `meeting_followup` | 3 | **no** |
 | **R10** | Closure support — every deal, highest first, with stored news | Mon | `closure_support` | no cap | yes |
 | **R11** | New company in Master Pipeline | Wed | `new_pipeline_company` | 10 | yes |
-| **R12** | Sales packages | Thu | `sales_packages` | 5 | yes |
+| **R12** | Sales packages — names only, highest % first; a date in a reply is recorded | Thu | `sales_packages` | 5 | yes |
 | **R13** | Next steps for connected contacts | weekdays, 15:00 | `next_step_followups` | 5 | **no** |
 
 **"Anchored" means an empty weekday list** — R8 and R9 key off a meeting date on
@@ -2378,6 +2378,99 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 12: sales packages
+
+**Redesigned 12 Oct 2026.** One post every Thursday naming every package on the
+Sales Packages tab whose Ready? is not Yes. `python verify_packages.py --show`
+prints the messages.
+
+```
+**Sales packages**
+@Vaishnavi @Sid
+these Sales Packages aren't ready yet:
+1. DPO Pack
+2. Evals_Vibe-check
+(+2 more next Thursday.)
+Could you let me know roughly when each might be ready?
+```
+
+**The post is rendered in code** (`wording.packages_post`; R12 is in
+`drip.VERBATIM_TYPES`). The opener (lower-case "these", as written), the
+numbered names and the closing question were agreed word for word. **A list of
+one is still a list.** Until this change the model wrote it: three or more
+packages reached a generic tail ("Sales packages — 5:") and one or two became a
+composed sentence.
+
+**Names only.** One package a line, numbered, named exactly as the sheet spells
+it: no status, no per cent, no dash, no trailing words. The rule's items still
+carry `completion`, `status`, `ready` and the product-doc url, because the
+order and the link need them; none of them is printed. When the
+Pulse_Product Doc cell holds a real url the name is that masked link
+(`links.link`); a value with no http(s) scheme is not a url and the name goes
+out as plain text.
+
+**Who is listed** (`packages.not_ready`, read by `nextaction._r_sales_packages`):
+
+- The Sales Packages tab only. No Outreach PoCs row, no activation gate, no
+  contact key, so no cross-rule dedup.
+- `gtm_sheet.ready_flag(Ready?)` is not "Yes". **Blank is not ready.** Ready?
+  Yes wins over a % Completion under 100; such rows get one line in the
+  startup log (`[gtm.packages]`) and no post.
+- A row with a blank Name is skipped. Two rows with one name are one package:
+  the furthest-along is kept and it is logged.
+- **The tab will not read, or the Name or Ready? column is missing: no post**,
+  logged at ERROR. A column the team moved is found by its header; one renamed
+  to something no alias matches reads as missing. No column letter is
+  hardcoded.
+
+**The order** is `PACKAGES_ORDER`: `completion_desc` (highest % Completion
+first, the default) or `completion_asc`. A blank or unreadable per cent sorts
+last either way (an explicit 0 and a missing number are different), and a tie
+keeps the sheet's own order. An unrecognised value falls back to the default
+with a warning.
+
+**The cap** is the rule's `max_items_per_post` (5) and nothing else. When more
+qualify the post carries `(+N more next Thursday.)` with the real N. **Nothing
+drops on a clock and nothing rotates**: a package leaves only when Ready? is
+set to Yes, silently, and that is also when a held-back one moves up. Nothing
+qualifying: no post, and no "everything is ready" line.
+
+**A date given in a reply is recorded** (`PACKAGES_DATE_CAPTURE`,
+`bot._maybe_package_dates`). No new table and no second sender: one row in
+`scheduled_reminders` a package (row key `package|<name>`), at
+`REMINDER_DEFAULT_TIME`, sent by `bot._fire_due_reminders` like every reminder.
+
+- **Which package:** its name in the reply, case and punctuation ignored, a
+  shortened form allowed ("Vibe-check" is "Evals_Vibe-check"), **among the
+  packages on the post being answered only** (`drip_sends.companies`). A
+  one-word short form must be at least five letters, and a word two packages
+  share names neither.
+- **Which day** (`packages.dates_in`): "next Friday", "end of the month", "24
+  Oct", "the 24th", "24/10", ISO dates, "tomorrow", "in 2 weeks". Ambiguous
+  numerics are day-first. Several packages and days in one reply are all
+  recorded.
+- **One date a package:** a newer day replaces the older (the open reminder
+  for that name is closed first).
+- A recorded date is acknowledged with a reaction. A package named with no day
+  that can be read, or a day already gone, gets *"I couldn't pick a date out of
+  that — could you give me a day, like "24 Oct"? I'll check back then."* and
+  nothing is recorded. A day with no package named, under a post of several,
+  gets one question asking which. A question under the post is answered as a
+  question.
+
+**On the day** (`bot._fire_package_reminder`, a branch of the one sender):
+
+| The tab says | What happens |
+|---|---|
+| the day is a Thursday | skipped and closed: the weekly post names the package that day |
+| the tab cannot be read | nothing is said; the reminder stays open for the next tick |
+| the package is no longer on the tab | closed, with one line saying so |
+| Ready? is Yes | closed quietly, nothing posted |
+| Ready? is still not Yes | *"<Package> was expected to be ready around today, and Ready? on the tab is still not Yes. Any update, or shall I check back later?"*, once |
+
+The reminder is extra, not instead: until Ready? is Yes the package still
+appears on Thursdays.
 
 ### Rule 3: AI events and summits
 
@@ -6161,6 +6254,7 @@ python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
 python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the six tiers, the rotation (nobody is dropped), replies not read (--show prints the messages)
+python verify_packages.py                 # R12: blank Ready? listed, Yes excluded, the exact post for 1, 5 and 7 packages, the order and PACKAGES_ORDER, no per cent anywhere, a date recorded from a reply and replaced, the reminder fired / closed quietly / skipped on a Thursday (--show prints the messages)
 python verify_events.py                   # R3: blocks A, B and C, three lines in all by urgency, no-deadline rows skipped, the live date strings, the assumed year, suggestions in the room left and only from the three places, "add 2", the closing line (--show prints the messages)
 python verify_closure_support.py          # R10: a closure stage above 50% (whole words), the empty-columns line, person first, no cap, highest first, no rotation, the news line read from the store since the last post, the marker (--show prints the messages)
 python verify_dm_no_meeting.py            # R7, the escalation behind R13: who is in (four columns), On Hold out for R7 only, the rotation, the two blocks, the sentence that follows the setting, nothing recorded by a preview or a test day (--show prints the messages)
@@ -6638,6 +6732,7 @@ guardrails forbid.
 | `clock.py` | **what time the bot thinks it is**, and the only place that decides. Real IST, or the persistent pretend clock a tester set with "make it Monday" (stored in SQLite, so it survives a restart). No dependencies but `config` |
 | `news_screen.py` | **R2, new companies in the news**: the full-name matcher against both sheets (known / PoCs only / new, and the partial-match question), the news window, the names and verdict prompts and their parsers, the repeat-and-drop merge, the fixed message, and the reply reader. Pure |
 | `news.py` | **R1 and R2**: the one sweep prompt (main and check), STORY parsing, the url and headline keys, `choose` (no-repeats, per-topic, per-week, cap, breaking bar), rendering, the check-slot clock, and R2's screen prompt. No I/O — the search is `llm.web_research(lean=True)`, made by bot.py |
+| `packages.py` | **R12, sales packages** (pure): which packages are not ready and in what order (`not_ready`), which package a reply names (`match_names`), and which day it promises (`dates_in`, `promises`). `python -m packages` is its self-test |
 | `events_discovery.py` | **R3's web half**: event discovery in the current and next month, tolerant matching against what the tab already has, the per-run and per-month limits, and the registration-deadline backfill. Proposes; never writes. No I/O |
 | `gtm_sheet.write_cells_on` | a **tab-aware** single-cell write for the Events tab: allow-listed tabs, mapped columns, one cell at a time, and it **never overwrites a non-empty cell** |
 | `deadlines.py` | IST working-day maths, cadence resolution, the announcement. `today_ist()`/`now_ist()` go through `clock`, and they are the ONLY functions in the codebase that answer "what time is it" |
