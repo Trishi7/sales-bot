@@ -500,19 +500,62 @@ rules:
     enabled: true
 
   # ---------------------------------------------------------------- R6
-  # LinkedIn connected, no DM after 3 days. Says whether an email is on file;
-  # if not, the research layer will look for a verified public one and say
-  # where it was found, or that none was.
+  # CONNECTED, NO DM YET, AND DO WE HOLD A WORKING EMAIL (rebuilt 12 Oct 2026).
   #
-  # 7 OCT 2026: THIS IS THE EMAIL CHECK (Vaishnavi: "Bot to find whether a
-  # verified email ID exists for the contact"). Its trigger, days and lookup
-  # are unchanged; its item line no longer says "no DM logged", because in the
-  # sequence the sheet now follows the DM comes after three emails and R13 owns
-  # the step reminders. The name, `plain` and the post's heading still say "no
-  # DM" and wait for wording from Vaishnavi.
+  # THREE COLUMNS, NOTHING ELSE: LI Connected Date, LI DM Sent, Email id. Not
+  # "Sid - LI Addition".
+  #
+  # WHO: LI DM Sent is BLANK (Sent, Replied or Received take a person out), and
+  # the LI Connected Date is LI_NO_DM_DAYS (3) or more days old, OR THERE IS NO
+  # LI CONNECTED DATE AT ALL. The whole tab is read, not only the active rows:
+  # most of these people carry no activating date. The usual stop markers apply.
+  #
+  # THE ORDER: people with a connected date first, oldest first; then people
+  # with none, in sheet order. NO ROTATION AND NO DROP. The people at the top
+  # are named on every post until their LI DM Sent cell is filled in. The rule
+  # keeps no state.
+  #
+  # THE EMAIL WORK, for the people the post names:
+  #   Email cell blank or not an address   ONE search; an address is kept only
+  #                                        if a snippet shows it word for word
+  #   one or more addresses                each checked: is it an address, can
+  #                                        its domain receive mail (a DNS MX
+  #                                        lookup), does it look like the
+  #                                        company's (for the log only)
+  # No SMTP probe, no verification API. The post never claims an address
+  # exists, and NEVER PRINTS AN ADDRESS THAT IS ALREADY ON THE SHEET.
+  #
+  # THE POST: four blocks numbered straight through, each person once.
+  #   (no heading)                           their email is fine, or nothing to do
+  #   Found missing or alternate emails:     the bot found one; shown by the name
+  #   These domains can't receive mail:      the DOMAIN only, never the address
+  #   Couldn't find an email for:            nothing on file, nothing found
+  # A block with nobody in it does not appear. `max_items_per_post` (5) caps the
+  # plain list; LI_NO_DM_EMAIL_NAMES_PER_POST (5) is shared by the three email
+  # blocks. Nobody qualifies: "All clear, nobody is waiting on a DM."
+  #
+  # THE ADD: the closing question appears only when an address was found and
+  # EMAIL_WRITE_ALLOWED is true. An approver's yes writes the found address into
+  # that person's Email cell, only if it is still blank. Nothing writes on its
+  # own.
   - id: R6
     name: LinkedIn connected, no DM
     plain: people connected on LinkedIn with no DM yet
+    # The Bot Rules tab, rule 6, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Connected, no DM yet. Tuesday and Friday: anyone on Outreach PoCs
+      whose LI DM Sent is blank 3 days or more after they connected (or
+      with no connected date at all), longest-connected first. One post
+      with up to 5 names, plus up to 5 more with email news: "Found
+      missing or alternate emails" (an address Saley found for someone
+      with none on the sheet), "These domains can't receive mail" (an
+      address on the sheet whose domain cannot get email; only the domain
+      is named) and "Couldn't find an email for". Saley finds and checks
+      emails but only adds one to the sheet after a yes, and only into a
+      blank Email cell; it never shows an address that is already on the
+      sheet. Nobody is ever dropped: a person is named on every post
+      until the DM is logged in LI DM Sent. When nobody is waiting it says
+      "All clear, nobody is waiting on a DM."
     weekdays: [tue, fri]
     trigger: li_no_dm
     max_items_per_post: 5

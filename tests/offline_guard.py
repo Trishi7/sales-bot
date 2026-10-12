@@ -92,6 +92,14 @@ class Guard:
 
             self._patch(AuthorizedSession, "request",
                         lambda s, *a, **k: self._block("AuthorizedSession.request (Drive/Sheets REST)")())
+        with contextlib.suppress(ImportError):
+            # R6's MX CHECK (12 Oct 2026) is a real DNS lookup. An offline check that
+            # reaches it is counted like any other live call; the checks that are
+            # about it put a stand-in on `email_checks.mx_status` first.
+            import dns.resolver
+
+            self._patch(dns.resolver.Resolver, "resolve",
+                        lambda s, *a, **k: self._block("dns.resolver.Resolver.resolve (an MX lookup)")())
         self._canned_sources()
         self.installed = True
         return self

@@ -214,6 +214,8 @@ async def _open_email(w, sent, *, marker="2026-10-06"):
     msg = {"type": nextaction.R_LI_NO_DM, "rule_id": "R6", "max_items_per_post": 5,
            "actions": [{"sheet_row": 5, "row_key": "acme|ada", "company": "Acme AI", "poc": "Ada Lovelace",
                         "email_found": "ada@acme.ai", "email_source": "https://acme.example/team",
+                        # 12 Oct 2026: R6's offer covers the people in its "found" block
+                        "block": "found", "emails_found": ["ada@acme.ai"],
                         "contact_key": ("Acme AI", "Ada Lovelace")}]}
     await w.bot._open_email_proposal(msg, sent=sent, marker=marker)
     keys = [k for k in w.proposals() if k.startswith("email_write:")]

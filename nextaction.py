@@ -974,52 +974,157 @@ def _r_prospects(rule, ctx) -> list:
     return out
 
 
+# How many people R6 hands on, in order, for the sender to check emails for
+# and choose its two lists from. More than the ten a post can name, because
+# some will be kept by an earlier rule for the day and the email blocks may
+# need to look past the first ten to find anybody with email news.
+LI_NO_DM_SCAN = 30
+
+
+def li_dm_state(row: dict) -> str:
+    """What "LI DM Sent" says: "blank", "replied", "sent" or "other".
+
+    THE CELL, NOT THE DATE (12 Oct 2026). The rule used to decide a DM had gone
+    out by finding an LI DM Date. LI DM Sent is the column that answers it.
+    The replied markers are checked FIRST; both lists take a person out, and
+    they are separate so a later release can treat a reply differently. A
+    ticked checkbox is "sent". Anything else that is not blank is "other", and
+    is out too: the rule is for people whose cell is BLANK.
+    """
+    value = row.get("li_dm_sent")
+    said = _norm(value)
+    if not said:
+        return "blank"
+
+    def marks(names):
+        return {gtm_sheet.normalise_header(str(m)) for m in (names or []) if str(m).strip()}
+    if said in marks(config.LI_NO_DM_DM_REPLIED_MARKERS):
+        return "replied"
+    if said in marks(config.LI_NO_DM_DM_SENT_MARKERS) or gtm_sheet.parse_flag(value) is True:
+        return "sent"
+    return "other"
+
+
+def li_no_dm_order(person: dict) -> tuple:
+    """R6's ORDER, in one place: people WITH an LI Connected Date first,
+    oldest connection first; then people with none, in sheet order. NOTHING
+    ELSE REORDERS THEM: no rotation, no "whose turn is it"."""
+    connected = person.get("connected")
+    row_no = int(person.get("sheet_row") or 0)
+    if connected is None:
+        return (1, "", row_no)
+    return (0, dl.iso(connected), row_no)
+
+
 def _r_li_no_dm(rule, ctx) -> list:
-    """R6 — connected on LinkedIn more than LI_NO_DM_DAYS ago, still no DM.
+    """R6 — connected on LinkedIn, no DM yet; and do we hold a working email.
 
-    THIS IS THE EMAIL CHECK. It says whether an email is on file; when none
-    is, the research layer looks for a verified public address and says where
-    it found it, or that it found none — hence WEB-DEPENDENT, but only for the
-    half of the rule that needs it.
+    THREE COLUMNS AND NOTHING ELSE: LI Connected Date, LI DM Sent, Email id.
+    It does not read "Sid - LI Addition".
 
-    THE LINE TALKS ABOUT THE EMAIL ONLY. It used to add "no DM logged". Since
-    7 Oct 2026 the sheet's sequence puts the DM after three emails and R13
-    owns the step reminders, so a line chasing the DM here would ask for a
-    step that is not due. Who is selected has not changed.
+    WHO IS IN:
+      - LI DM Sent is BLANK (`li_dm_state`). Sent, Replied (or Received) take a
+        person out; so does anything else written there.
+      - an LI Connected Date LI_NO_DM_DAYS or more days old, OR NO LI CONNECTED
+        DATE AT ALL: with no date there is nothing to count from, so the
+        person is in straight away.
+      - the row passes the stop and snooze gates, like every rule.
+
+    IT READS THE WHOLE TAB (`ctx["prospect_rows"]`), NOT ONLY THE ACTIVE ROWS,
+    for the reason R13 gives: a row is "active" once it carries a first-contact
+    date or an LI Connected Date, and most of the people this rule is for carry
+    neither. Fed only active rows it would see about a fifth of them.
+
+    THE ORDER IS `li_no_dm_order` AND THERE IS NO ROTATION AND NO DROP. The
+    people at the top are named on every post until their LI DM Sent cell is
+    filled in. No drop clock, no mention counter, no "first named" date: this
+    rule keeps NO state. The list moves when the sheet moves.
+
+    WHAT IS HANDED ON: the first LI_NO_DM_SCAN people in that order, each with
+    its place (`pick_order`) and its Email cell as written. The EMAIL WORK IS
+    NOT DONE HERE: the search and the DNS lookup are network calls and belong
+    to the sender (`bot._li_no_dm_email_work`), which also decides which of the
+    post's two lists each person lands in.
+
+    NOBODY QUALIFIES: one item carrying the all-clear notice, so a post still
+    goes out in R6's slot (`drip.notice_of`, the way R10 says its columns are
+    empty). AN EMPTY TAB is not "nobody qualifies": nothing is produced and it
+    is logged at ERROR.
     """
     today = ctx["today"]
     days = max(0, int(config.LI_NO_DM_DAYS))
-    out = []
-    for row in ctx.get("rows") or ():
+    rule_id = getattr(rule, "id", "") or "R6"
+    source = ctx.get("prospect_rows")
+    rows = list((source if source is not None else ctx.get("rows")) or ())
+    report = {"rows": len(rows), "qualify": 0, "dated": 0, "undated": 0, "sent": 0,
+              "replied": 0, "other": 0, "not_yet": 0, "handed_on": 0}
+    ctx.setdefault("reports", {})[rule_id] = report
+    if not rows:
+        log.error("[rules] %s: the Outreach PoCs tab came back with NO ROWS, so nothing is "
+                  "posted. An empty tab is not the same as nobody waiting on a DM.", rule_id)
+        return []
+
+    people = []
+    for row in rows:
+        if not (_text(row, "name") or _text(row, "company")):
+            continue
         ok, _reason, until = row_gate(row, today=today, snoozes=ctx.get("snoozes") or {})
         if not ok:
             continue
+        said = li_dm_state(row)
+        if said != "blank":
+            report[said] += 1
+            continue
         connected = _date(row, "li_connected_date")
-        if connected is None:
+        if connected is not None and _due(connected, days) > today:
+            report["not_yet"] += 1
             continue
-        if gtm_sheet.parse_flag(row.get("li_dm_sent")) is True:
-            continue
-        if _date(row, "li_dm_date") is not None:
-            continue
-        due = _due(connected, days)
-        if due > today:
-            continue
-        email = _text(row, "email")
-        elapsed = (today - connected).days
-        text = (f"{_describe(row)} — connected {elapsed} day(s) ago. "
-                + (f"Email on file: {email}" if email else "No email on file"))
+        report["dated" if connected is not None else "undated"] += 1
+        people.append({"row": row, "connected": connected, "sheet_row": row.get("_row"),
+                       "until": until})
+    report["qualify"] = len(people)
+    people.sort(key=li_no_dm_order)
+    handed = people[:max(1, int(LI_NO_DM_SCAN))]
+    report["handed_on"] = len(handed)
+    log.info("[rules] %s: %d row(s) read (the whole tab); %d qualify (%d with a connected date "
+             "%d+ days old, %d with no connected date); out: %d DM sent, %d replied, %d other "
+             "value, %d connected too recently; the first %d in order are handed on",
+             rule_id, len(rows), len(people), report["dated"], days, report["undated"],
+             report["sent"], report["replied"], report["other"], report["not_yet"], len(handed))
+    if not people:
+        return [_item(
+            rule=rule, trigger=R_LI_NO_DM, today=today, due=today,
+            why="R6: nobody has a blank LI DM Sent and a connection old enough",
+            text=wording.LI_NO_DM_ALL_CLEAR,
+            extra={"notice": wording.LI_NO_DM_ALL_CLEAR},
+        )]
+
+    out = []
+    for order, person in enumerate(handed):
+        row, connected = person["row"], person["connected"]
+        elapsed = (today - connected).days if connected is not None else None
+        who = wording.next_step_who(_text(row, "name"), _text(row, "company"))
         out.append(_item(
             rule=rule, trigger=R_LI_NO_DM, today=today,
-            due=until or due,
-            why=(f"R6 (Tue/Fri): connected {dl.format_date(connected)}, "
-                 f"{elapsed}d ago, more than LI_NO_DM_DAYS ({days})"),
-            text=text, company=_text(row, "company"), poc=_text(row, "name"),
+            due=person["until"] or today,
+            why=(f"R6 (Tue/Fri): LI DM Sent is blank; "
+                 + (f"connected {dl.format_date(connected)}, {elapsed}d ago, "
+                    f"LI_NO_DM_DAYS is {days}" if connected is not None
+                    else "no LI Connected Date, so in straight away")
+                 + f"; {order + 1} of {len(handed)} handed on, {len(people)} qualify"),
+            text=f"{who}: connected, no DM yet",
+            company=_text(row, "company"), poc=_text(row, "name"),
             designation=_text(row, "designation"), sheet_row=row.get("_row"),
             row_key=_contact_key(row), contact_key=_contact_key(row),
-            # THE LOOKUP IS A REQUEST: the sender asks for it, for the contacts
-            # that make the post, up to EMAIL_LOOKUP_MAX_PER_POST.
-            extra={"email_on_file": email, "connected_days": elapsed,
-                   "email_lookup": not email},
+            extra={"pick_order": order, "who": who,
+                   # R6 GIVES WAY to any other rule naming the same person
+                   # today, wherever that rule sits in the file (see the dedup
+                   # in `run`). It must never cost somebody their meeting prep.
+                   "yields": True,
+                   # THE EMAIL CELL AS WRITTEN. Read by the sender; NEVER
+                   # printed: an address already in the sheet is not shown back.
+                   "email_on_file": _text(row, "email"),
+                   "connected_days": elapsed},
         ))
     return out
 
@@ -2237,12 +2342,27 @@ def run(
         produced,
         key=lambda it: (rule_order.get(it.get("rule_id"), 10_000), sort_key(it)),
     )
+    # A RULE THAT GIVES WAY (`yields`, today only R6). R6 reads the whole tab and
+    # hands on thirty people so the sender can choose ten; the other twenty were
+    # never going to be named. Under plain file order it would still have taken
+    # all thirty away from every rule listed after it, so on a Tuesday the
+    # meeting prep (R8) or the follow-up (R9) for one of them simply vanished.
+    # So an item marked `yields` loses to ANY other rule naming the same
+    # contact, earlier OR later in the file, and never takes a contact from
+    # one. Among themselves, and for every other rule, file order is unchanged.
+    firm = {}
+    for item in ordered:
+        key = item.get("contact_key") or ""
+        if key and not item.get("yields") and key not in firm:
+            firm[key] = item
     seen: dict = {}
     actions: list = []
     deduped: list = []
     for item in ordered:
         key = item.get("contact_key") or ""
-        if key and key in seen:
+        if key and item.get("yields") and key in firm:
+            seen.setdefault(key, firm[key])
+        if key and key in seen and seen[key] is not item:
             keeper = seen[key]
             deduped.append({
                 **item,
@@ -2250,8 +2370,10 @@ def run(
                 "dropped_why": (
                     f"{item.get('rule_id') or item.get('rule')} also selected this contact, "
                     f"but {keeper.get('rule_id') or keeper.get('rule')} "
-                    f"({keeper.get('rule_name')}) is listed first and one contact is "
-                    f"named at most once a day"
+                    f"({keeper.get('rule_name')}) "
+                    + ("names them today and this rule gives way to every other rule"
+                       if item.get("yields") else "is listed first")
+                    + " and one contact is named at most once a day"
                 ),
             })
             continue
@@ -2542,19 +2664,38 @@ def _self_test() -> int:
 
 
     print("\nR6 / R7 — the day thresholds")
+    r6_rule = [rules_mod.by_id("R6")]
+
+    def r6_run(rows_, **kw):
+        got = run(today=MON, rows=rows_, day_rules=r6_rule, **kw)["actions"]
+        return [a for a in got if not a.get("notice")], [a.get("notice") for a in got if a.get("notice")]
+
     r6 = row(li_connected_date="15-09-2026")
-    check("connected 6d, no DM -> due",
-          len(run(today=MON, rows=[r6], day_rules=[rules_mod.by_id("R6")])["actions"]), 1)
+    check("connected 6d, LI DM Sent blank -> in", len(r6_run([r6])[0]), 1)
     r6b = row(li_connected_date="20-09-2026")
-    check("connected 1d -> not due",
-          len(run(today=MON, rows=[r6b], day_rules=[rules_mod.by_id("R6")])["actions"]), 0)
-    r6c = row(li_connected_date="15-09-2026", li_dm_sent="TRUE")
-    check("DM already sent -> not due",
-          len(run(today=MON, rows=[r6c], day_rules=[rules_mod.by_id("R6")])["actions"]), 0)
-    check("R6's line is about the email, not the DM",
-          "no DM logged" in run(today=MON, rows=[r6],
-                                day_rules=[rules_mod.by_id("R6")])["actions"][0]["text"],
-          False)
+    check("connected 1d -> not yet, and with nobody else the all-clear notice",
+          (len(r6_run([r6b])[0]), r6_run([r6b])[1]), (0, [wording.LI_NO_DM_ALL_CLEAR]))
+    check("connected 3d -> in on day 3",
+          (len(r6_run([row(li_connected_date="19-09-2026")])[0]),
+           len(r6_run([row(li_connected_date="18-09-2026")])[0])), (0, 1))
+    check("NO connected date -> in straight away", len(r6_run([row()])[0]), 1)
+    for said in ("TRUE", "Sent", "sent", "Replied", "Received", "in progress"):
+        check(f"LI DM Sent says {said!r} -> out",
+              len(r6_run([row(li_connected_date="15-09-2026", li_dm_sent=said)])[0]), 0)
+    check("an LI DM Date with LI DM Sent blank does NOT take a person out (the cell decides)",
+          len(r6_run([row(li_connected_date="15-09-2026", li_dm_date="16-09-2026")])[0]), 1)
+    check("it reads the whole tab: a row that is not 'active' is still picked",
+          [a["poc"] for a in run(today=MON, rows=[], prospect_rows=[row(name="Hidden")],
+                                 day_rules=r6_rule)["actions"]], ["Hidden"])
+    order6 = [row(_row=2, name="NoDate2"), row(_row=3, name="New", li_connected_date="10-09-2026"),
+              row(_row=4, name="Old", li_connected_date="01-09-2026"), row(_row=5, name="NoDate5")]
+    check("the order: a connected date first, oldest first; then no date, in sheet order",
+          [a["poc"] for a in sorted(r6_run(order6)[0], key=lambda a: a["pick_order"])],
+          ["Old", "New", "NoDate2", "NoDate5"])
+    check("an empty tab is not 'all clear': nothing at all",
+          run(today=MON, rows=[], prospect_rows=[], day_rules=r6_rule)["actions"], [])
+    check("R6's line never prints the email on file",
+          "@" in r6_run([row(li_connected_date="15-09-2026", email="a@b.co")])[0][0]["text"], False)
     check("R7 is back on Mondays in the shipped file",
           ("R7" in [r.id for r in rules_mod.for_day(MON)],
            "R7" in [r.id for r in rules_mod.for_day(TUE)]), (True, False))

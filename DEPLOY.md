@@ -1243,3 +1243,62 @@ A warning follows if `NEXT_STEP_DROP_AFTER_DAYS` is under 7 or `NEXT_STEP_DM_SEN
 `bot_rules.yaml`); paste it into the sheet by hand.
 
 `python verify_next_steps.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to the R6 rebuild (12 Oct): connected, no DM yet, and the email check
+
+What changes for the team: the Tuesday and Friday post is now headed "Connected, no DM yet" and is a numbered list
+of people whose **LI DM Sent** cell is blank, three days or more after they connected, or with no connected date
+at all, longest-connected first. Up to five names, plus up to five more with email news in three short blocks:
+addresses Saley found for people with none on the sheet, domains that cannot receive mail (the domain only), and
+people it could find nothing for. It never shows an address that is already on the sheet. When it found something
+it ends by asking whether to add those emails; an approver's yes writes each into that person's blank Email cell.
+Nobody is ever dropped: a person is named on every post until the DM is logged. When nobody is waiting it says
+"All clear, nobody is waiting on a DM."
+
+**Install the new dependency**, on the laptop and on the server:
+
+```
+pip install -r requirements.txt        # adds dnspython
+```
+
+Without it the bot still runs; the "These domains can't receive mail" check is skipped and the log says so.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** To let the closing question appear and a found
+address be added, set this in BOTH files (the laptop already has it; the code's default stays false):
+
+```
+EMAIL_WRITE_ALLOWED=true
+```
+
+Four new variables; the defaults are what was specified, so the lines are optional:
+
+```
+LI_NO_DM_EMAIL_NAMES_PER_POST=5
+LI_NO_DM_DM_SENT_MARKERS=sent
+LI_NO_DM_DM_REPLIED_MARKERS=replied,received
+LI_NO_DM_VERIFY_MX=true
+```
+
+Then, on the laptop, `python tools/redact_env.py`. Nothing changed its default and nothing is retired. No database
+change: this rule keeps no state.
+
+**What to look for in the boot log:**
+
+```
+[config] R6 connected, no DM yet: in after 3d connected, or straight away with no connected date; out when LI DM Sent says sent=sent or replied=replied,received; the plain list has R6's max_items_per_post, the three email blocks share 5 name(s); at most 5 email search(es) a post; MX check=True; EMAIL_WRITE_ALLOWED=True
+```
+
+If `EMAIL_WRITE_ALLOWED` is false a warning follows: the closing question will never appear and no found address can
+be added. On a Tuesday or Friday:
+
+```
+[rules] R6: 670 row(s) read (the whole tab); 664 qualify (31 with a connected date 3+ days old, 633 with no connected date); out: 5 DM sent, 1 replied, ...; the first 30 in order are handed on
+[email] R6: 30 handed on -> 5 in the plain list (cap 5), 3 with email news (cap 5: 1 found, 1 dead domain(s), 1 not found); ...
+```
+
+(the numbers are illustrative).
+
+**The Bot Rules tab.** Rule 6's "What the Bot Shares / Checks" wording is new (`sheet_wording` in
+`bot_rules.yaml`); paste it into the sheet by hand.
+
+`python verify_li_no_dm.py --show` checks all of it offline and prints the messages.

@@ -2190,7 +2190,7 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R3** | AI events & summits | alternate Wed | `events` | 5 | yes |
 | **R4** | Deliverables checklist | Mon | `deliverables` | 20 | yes |
 | **R5** | Prospects to contact | Tue, Thu | `prospects` | 5 | yes |
-| **R6** | LinkedIn connected, no DM (the email check) | Tue, Fri | `li_no_dm` | 5 | yes |
+| **R6** | Connected, no DM yet, and the email check (LI DM Sent blank; 5 names + up to 5 with email news) | Tue, Fri | `li_no_dm` | 5 | yes |
 | **R7** | DM sent, no meeting — never a person R13 covers | Mon | `dm_no_meeting` | 5 | yes |
 | **R8** | Meeting preparation | **anchored**, 10:00 | `meeting_prep` | 3 | **no** |
 | **R9** | Meeting done, no next steps | **anchored**, 10:00 | `meeting_followup` | 3 | **no** |
@@ -2355,6 +2355,125 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 6: connected, no DM yet, and the email check
+
+**Two things in one post (rebuilt 12 Oct 2026):** a reminder that these people
+are connected and have had no DM, and a check on whether we hold a working
+email for them. Tuesday and Friday. `python verify_li_no_dm.py --show` prints
+the messages.
+
+**It reads three columns and nothing else:** LI Connected Date, LI DM Sent,
+Email id. Not "Sid - LI Addition".
+
+**Who is picked** (`nextaction._r_li_no_dm`):
+
+- **LI DM Sent is blank.** Sent, Replied or Received take a person out
+  (`LI_NO_DM_DM_SENT_MARKERS`, `LI_NO_DM_DM_REPLIED_MARKERS`, the replied list
+  checked first); so does anything else written there, and a ticked checkbox.
+  The LI DM Date is no longer what decides whether a DM went out.
+- **The LI Connected Date is `LI_NO_DM_DAYS` (3) or more days old, or there is
+  no LI Connected Date at all.** With no date there is nothing to count from,
+  so the person is in straight away. (Until 12 Oct a row with no date was
+  never picked.)
+- The usual stop markers and snoozes apply.
+
+**It reads the whole tab, not only the active rows** (`ctx["prospect_rows"]`,
+as rule 13 does). A row is "active" once it carries a first-contact date or an
+LI Connected Date, and most of the people this rule is for carry neither: fed
+only active rows it would see about a fifth of them.
+
+**The order, and nothing else:** people with a connected date first, oldest
+connection first; then people with none, in sheet order. **No rotation and no
+drop.** The people at the top are named on every post until their LI DM Sent
+cell is filled in. The rule keeps no state at all: the list moves when the
+sheet moves. One consequence, agreed for this release: the rows with no
+connected date sit behind the dated ones and are not reached while any dated
+row is still unattended.
+
+**The email work**, done by the sender for the people the post names
+(`bot._li_no_dm_email_work`, `email_checks.py`):
+
+| The Email cell | What happens |
+|---|---|
+| blank, or not an address ("not available", a phone number) | **one search**, `"<name>" "<company>" email`, cached `RESEARCH_CACHE_DAYS`. An address is kept only if a snippet the search returned shows it character for character. Never a guessed pattern |
+| one or more addresses | each is checked: is it an address at all; **can its domain receive mail** (one DNS MX lookup, `dnspython`); does the domain look like the company's (for the log only) |
+
+There is **no SMTP probe and no verification API**: there is no free way to
+confirm a mailbox exists, and the post never claims one does. The only email
+failure it reports is the one it can prove, a domain that cannot receive mail
+(it does not exist, publishes a null MX, or has neither an MX nor an address
+record). A timeout or a resolver error is "unknown" and nothing is said. If
+`dnspython` is not installed, or `LI_NO_DM_VERIFY_MX` is false, the MX check is
+skipped and logged, and no domain is reported dead.
+
+*When the company comparison cannot run it is skipped, never failed.* A
+company cell that is not a company name ("Multiple", a university, a
+consortium, two organisations together) has no domain to compare against, and
+a personal address (gmail and the like) is not an error. Nobody is flagged for
+either.
+
+**The post** is fixed text (`wording.li_no_dm_post`; R6 is in
+`drip.VERBATIM_TYPES` and is one post whatever the owners): four blocks,
+numbered straight through, each person once.
+
+```
+**Connected, no DM yet**
+@Vaishnavi @Sid
+
+1. Daisy Leigh (PolyAI)
+2. Ioana Mocanu (Agoda)
+
+Found missing or alternate emails:
+3. Joel Georgie J. (ARTPARK) — joel@artpark.in
+4. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai
+
+These domains can't receive mail:
+5. Angus Addlesee (PolyAI) — addleseehq.co.uk
+
+Couldn't find an email for:
+6. Ishan Mishra (AI Security Institute)
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+```
+
+| Block | Who is in it |
+|---|---|
+| (no heading) | their email checks out, or there was nothing to do |
+| Found missing or alternate emails: | the bot found an address; shown next to the name (two found: both, comma separated) |
+| These domains can't receive mail: | an address on file whose domain fails the MX check; **the domain only** |
+| Couldn't find an email for: | nothing on file and the search found nothing |
+
+A block with nobody in it does not appear. **An address that is already on the
+sheet is never printed**, in any block; a found address that turns out to be in
+the cell already is dropped and the person counts as having a working email.
+No column name appears. **The closing question appears only when an address was
+found** and `EMAIL_WRITE_ALLOWED` is true. When nobody qualifies a post still
+goes out in R6's slot: "All clear, nobody is waiting on a DM." An empty tab is
+not "all clear": nothing is posted and it is logged at ERROR.
+
+**Two caps, counted separately.** The plain list takes R6's
+`max_items_per_post` (5). The three email blocks share
+`LI_NO_DM_EMAIL_NAMES_PER_POST` (5) between them. So a post names at most ten
+people, at most five of them with email news, and a quiet week cannot fill
+every place with names that need nothing. `EMAIL_LOOKUP_MAX_PER_POST` (5)
+matches the email allowance: about ten searches a week, each cached.
+
+**The add.** The post is the offer: one `email_write` proposal carrying every
+address it showed. An approver's yes writes each into that person's Email cell,
+only if the cell is still blank (`gtm_sheet.write_email`, the one exception to
+the restricted band). Two addresses found for one person go into the one cell
+on two lines, which is how the sheet already holds two, and the proposal text
+says so. Nothing writes on its own.
+
+**Who wins an overlap: R6 always gives way.** One contact is named once a day.
+Rule 13 and R5 are listed before R6 in `bot_rules.yaml` and keep anybody they
+name. R6 also gives way to rules listed AFTER it (its items are marked
+`yields`, see the dedup in `nextaction.run`): it reads the whole tab and hands
+on its first `nextaction.LI_NO_DM_SCAN` (30) people so the sender can choose
+ten, and under plain file order it would have taken all thirty away from
+meeting prep (R8), the meeting follow-up (R9) and the rest on a Tuesday or
+Friday. File order is unchanged for every other pair of rules.
 
 ### The rules that need saying out loud
 
@@ -2568,7 +2687,8 @@ for it, and it closes nothing.
 
 *The email lookup still runs* for the people named whose Email cell is blank,
 because R6 reads the same cache, but R5's message neither prints the result
-nor offers to write it. R6 still does both.
+nor offers to write it. R6 shows what it FOUND and offers to add it (see
+"Rule 6").
 
 *Ad-hoc questions use the same order* and are answered by code, with no model
 call (`bot._answer_prospects`): "who's left at ElevenLabs?" (everybody left
@@ -4827,6 +4947,8 @@ Recorded under the rule's own id (`R1`, `R1-check`, `R2`, `R3`, `R3-deadlines`),
 
 ### R6's order: column F first, web second
 
+> **Superseded on 12 Oct 2026.** R6 no longer prints what column F holds: an address already on the sheet is never shown. See "Rule 6: connected, no DM yet, and the email check". The search rule below (only when F holds no address; a published address only) still stands.
+
 1. **Column F (Email id)** is read first. If an address is there, the item says
    *"Email on file: …"* and **no search runs** — `web_pending` is False.
 2. Only when F is empty does R6 search for a **published, public** address, and
@@ -5713,6 +5835,7 @@ python verify_s2.py                       # AI news: PoC slots, "More AI News", 
 python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one A:I write, R3 weekly + the reminder offer
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
+python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)
 python verify_next_steps.py               # R13 as a reminder: who is in, the asks, the agreed lines, the order, the three-week drop, replies not read (--show prints the messages)
 python verify_rule13.py                   # STALE since 12 Oct 2026 for rule 13's behaviour (see its header); the 7 Oct layout, rule 13's rotation, call clock and post four ways; state only after a real send
 python verify_voice_profile.py            # LIVE: builds the voice profile (1 light call) + the "ignore your rules" test
@@ -6151,6 +6274,7 @@ guardrails forbid.
 | `bot.py` | the Discord client: routing, question answering, chasing, and the one daily digest — its only proactive send |
 | `digest.py` | **the digest format is retired.** What is left is the clock: `parse_time` and `is_due` |
 | `evidence.py` | **suppress-or-convert**: the staged evidence ladder, the identifier matching, and the record-offer text. Almost pure — only `gather` does I/O |
+| `email_checks.py` | **R6's three cheap checks on an email address**: is it an address at all (`addresses_in`), can its domain receive mail (`mx_status`, one DNS MX lookup, dnspython imported defensively), does it look like the company's (`company_check`, log only). No SMTP probe, no API |
 | `events.py` | **events & summits and the weekly funnel line**: the T-minus window, the permanent dedup key, and the counts-only Friday message. Pure — rows in, action dicts out |
 | `research.py` | **research briefs**: link extraction, the domain allow-list, the bounded fetch, the LinkedIn status, and the brief prompt. Copy material only — never sent, never written |
 | `approvals.py` | **permission before every write**: reading a yes/no from a message, the Sid-wins tie-break computed from *all* the votes, the proposal text, and the one wording of the add offer (`ROW_ADD_OFFER`, `row_add_offer`, `row_add_question`). Pure |

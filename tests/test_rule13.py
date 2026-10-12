@@ -751,9 +751,11 @@ class TestShippedRules:
         res = nextaction.run(today=TUESDAY, rows=list(tab.rows), day_rules=[rule], next_step_state={})
         items = [a for a in res["by_rule"]["R6"]]
         assert items, "R6 must still select a connected contact with no DM"
+        # CHANGED 12 Oct 2026: R6's item line is the name and "connected, no DM yet"; how long ago they
+        # connected is carried as a field (the post is four blocks rendered in code and prints no day count).
         for it in items:
             assert "no dm logged" not in it["text"].lower()
-            assert "connected" in it["text"].lower() and "10 day" in it["text"]
+            assert "connected, no dm yet" in it["text"].lower() and it["connected_days"] == 10
 
     def test_O1_R6_keeps_its_trigger_and_days(self):
         r = rules_mod.by_id("R6")

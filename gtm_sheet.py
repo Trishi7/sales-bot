@@ -3280,7 +3280,8 @@ class GTMSheets:
 
           1. EMAIL_WRITE_ALLOWED is true (off by default);
           2. the role is `email` and nothing else — it is not a parameter;
-          3. the value is one plain address (no spaces, one "@", a dotted host);
+          3. the value is one plain address (no spaces, one "@", a dotted host),
+             or up to three of them, written one a line;
           4. the sheet is RE-READ FRESH, the row still names `expect_company`
              (and `expect_name`, when given) — the same interlock every write
              has, against a re-sorted sheet;
@@ -3300,7 +3301,12 @@ class GTMSheets:
         """
         out = {"ok": False, "written": [], "skipped": "", "error": ""}
         undo = bool(restore_from)
-        value = "" if undo else " ".join(str(email or "").split())
+        # ONE ADDRESS, OR A FEW ON SEPARATE LINES (12 Oct 2026): when the bot
+        # found two addresses for one person an approver may say yes to both,
+        # and they go into the cell the way the sheet already holds two (one a
+        # line). Each part must be a plain address on its own.
+        parts = str(email or "").split()
+        value = "" if undo else "\n".join(parts)
         try:
             import simulation as _sim
             if _sim.in_simulation():
@@ -3318,8 +3324,8 @@ class GTMSheets:
         if not config.SHEET_WRITES_ENABLED:
             out["error"] = "sheet writing is off (SHEET_WRITES_ENABLED=false)"
             return out
-        if not undo and not re.fullmatch(
-                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+", value):
+        if not undo and (not parts or len(parts) > 3 or not all(re.fullmatch(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+", part) for part in parts)):
             out["error"] = f"{value!r} is not a plain email address; nothing written"
             return out
         refusal = self._refuse_if_read_only()

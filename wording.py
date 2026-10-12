@@ -576,6 +576,84 @@ def next_step_lines_for_check() -> list:
     out.append(next_step_person(who))
     return [x for x in out if x]
 
+# -- connected, no DM yet (rule 6) --------------------------------------------
+#
+# ONE POST, FOUR BLOCKS, NUMBERED STRAIGHT THROUGH, each person once:
+#
+#     **Connected, no DM yet**
+#     @Vaishnavi @Sid
+#
+#     1. Daisy Leigh (PolyAI)
+#     2. Ioana Mocanu (Agoda)
+#
+#     Found missing or alternate emails:
+#     3. Joel Georgie J. (ARTPARK) — joel@artpark.in
+#
+#     These domains can't receive mail:
+#     4. Angus Addlesee (PolyAI) — addleseehq.co.uk
+#
+#     Couldn't find an email for:
+#     5. Ishan Mishra (AI Security Institute)
+#
+#     Would you like me to add these emails to the Outreach PoCs sheet?
+#
+# THE STRINGS LIVE HERE AND NOWHERE ELSE. What is never in the message: an
+# address that is already in the sheet, a column name, a claim that an address
+# does or does not exist, and anything about a person whose email is fine
+# beyond their name and company.
+LI_NO_DM_ALL_CLEAR = "All clear, nobody is waiting on a DM."
+LI_NO_DM_FOUND = "Found missing or alternate emails:"
+LI_NO_DM_DEAD = "These domains can't receive mail:"
+LI_NO_DM_NONE = "Couldn't find an email for:"
+LI_NO_DM_ADD_QUESTION = "Would you like me to add these emails to the Outreach PoCs sheet?"
+LI_NO_DM_BLOCKS = ("plain", "found", "dead", "none")
+
+
+def li_no_dm_post(people, *, ask: bool = True) -> list:
+    """The lines of R6's post under its heading and tags.
+
+    `people` are dicts with `who`, `block` (one of LI_NO_DM_BLOCKS) and, for
+    "found", `emails` (the addresses the bot FOUND), for "dead", `domains`
+    (the domains that cannot receive mail: the DOMAIN ONLY, never the
+    address). The blocks appear in the agreed order whatever order people
+    arrive in; a block with nobody in it does not appear; the numbering runs
+    straight through all of them. THE CLOSING QUESTION is there only when the
+    "found" block has somebody in it, and `ask` is true (it is false when the
+    bot may not write emails, because an offer it cannot honour is not made).
+    """
+    blocks: dict = {name: [] for name in LI_NO_DM_BLOCKS}
+    for person in people or ():
+        block = str(person.get("block") or "plain")
+        blocks.get(block, blocks["plain"]).append(person)
+    lines: list = []
+    n = 0
+    for name, heading in (("plain", ""), ("found", LI_NO_DM_FOUND), ("dead", LI_NO_DM_DEAD),
+                          ("none", LI_NO_DM_NONE)):
+        if not blocks[name]:
+            continue
+        if lines:
+            lines.append("")
+        if heading:
+            lines.append(heading)
+        for person in blocks[name]:
+            n += 1
+            line = f"{n}. {str(person.get('who') or '').strip() or '(unnamed row)'}"
+            extra = [str(x).strip() for x in (person.get("emails") if name == "found"
+                                              else person.get("domains") if name == "dead"
+                                              else ()) or () if str(x).strip()]
+            if extra:
+                line += " \u2014 " + ", ".join(extra)
+            lines.append(line)
+    if blocks["found"] and ask and lines:
+        lines += ["", LI_NO_DM_ADD_QUESTION]
+    return lines
+
+
+def li_no_dm_lines_for_check() -> list:
+    """Every fixed line R6's post can carry."""
+    return [LI_NO_DM_ALL_CLEAR, LI_NO_DM_FOUND, LI_NO_DM_DEAD, LI_NO_DM_NONE,
+            LI_NO_DM_ADD_QUESTION]
+
 
 # -- every line, rendered, for the register check ----------------------------
 

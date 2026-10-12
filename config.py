@@ -2165,6 +2165,28 @@ PROSPECT_DESIGNATION_MAX_CHARS = _int("PROSPECT_DESIGNATION_MAX_CHARS", 60)
 # R6 — LinkedIn connected, no DM after this many days.
 LI_NO_DM_DAYS = _int("LI_NO_DM_DAYS", 3)
 
+# R6 — how many names the three EMAIL blocks may carry between them on one
+# post: found addresses, dead domains and nothing-found share this ONE
+# allowance. The plain list has its own cap (`max_items_per_post` on R6 in
+# bot_rules.yaml), so a post names at most that many plus this many. They are
+# separate so a quiet week cannot fill every place with names that need
+# nothing and push the email work off the post.
+LI_NO_DM_EMAIL_NAMES_PER_POST = _int("LI_NO_DM_EMAIL_NAMES_PER_POST", 5)
+
+# R6 — what "LI DM Sent" says when the DM has gone out, and when they
+# answered. Compared normalised, on the whole cell. The replied list is
+# checked FIRST. BOTH take the person out of the rule; they are two lists so a
+# later release can treat a reply differently without touching the other.
+LI_NO_DM_DM_SENT_MARKERS: list[str] = _str_list("LI_NO_DM_DM_SENT_MARKERS", "sent")
+LI_NO_DM_DM_REPLIED_MARKERS: list[str] = _str_list(
+    "LI_NO_DM_DM_REPLIED_MARKERS", "replied,received",
+)
+
+# R6 — whether to run the DNS MX check on addresses already on the sheet. Off
+# skips the "These domains can't receive mail" block entirely; it never
+# reports every domain as fine.
+LI_NO_DM_VERIFY_MX = _bool("LI_NO_DM_VERIFY_MX", default=True)
+
 # R7 — DM sent, no meeting after this many days. R7 IS SWITCHED OFF in
 # bot_rules.yaml since 7 Oct 2026 (R13's call reminders replaced it); the
 # evaluator is kept, so these two are still read if somebody re-enables it.
@@ -3407,6 +3429,38 @@ def validate() -> list[str]:
             CLOSURE_SUPPORT_MIN, NEW_COMPANY_AFTER_WORKING_DAYS,
             NEW_COMPANY_WINDOW_DAYS, NEXT_ACTION_WEEKEND_SHIFT,
         )
+        log.info(
+            "[config] R6 connected, no DM yet: in after %dd connected, or straight away "
+            "with no connected date; out when LI DM Sent says sent=%s or replied=%s; "
+            "the plain list has R6's max_items_per_post, the three email blocks share "
+            "%d name(s); at most %d email search(es) a post; MX check=%s; "
+            "EMAIL_WRITE_ALLOWED=%s",
+            LI_NO_DM_DAYS, ",".join(LI_NO_DM_DM_SENT_MARKERS) or "(none)",
+            ",".join(LI_NO_DM_DM_REPLIED_MARKERS) or "(none)",
+            LI_NO_DM_EMAIL_NAMES_PER_POST, EMAIL_LOOKUP_MAX_PER_POST, LI_NO_DM_VERIFY_MX,
+            EMAIL_WRITE_ALLOWED,
+        )
+        r6_on = True
+        try:
+            import rules as _rules
+            r6 = _rules.by_id("R6")
+            r6_on = bool(r6 is not None and r6.enabled)
+        except Exception:
+            pass                       # the rules file is reported on its own
+        if r6_on and not EMAIL_WRITE_ALLOWED:
+            log.warning(
+                "EMAIL_WRITE_ALLOWED=false while R6 is enabled \u2014 R6 will still FIND "
+                "and show email addresses, but its closing question (\"Would you like me "
+                "to add these emails to the Outreach PoCs sheet?\") will never appear and "
+                "no found address can be added. Set EMAIL_WRITE_ALLOWED=true in .env to "
+                "let an approver's yes write one."
+            )
+        if not LI_NO_DM_DM_SENT_MARKERS and not LI_NO_DM_DM_REPLIED_MARKERS:
+            log.warning(
+                "LI_NO_DM_DM_SENT_MARKERS and LI_NO_DM_DM_REPLIED_MARKERS are both empty. "
+                "R6 still leaves out anybody whose LI DM Sent is not blank, but it can no "
+                "longer tell a sent DM from a reply in its log."
+            )
         log.info(
             "[config] R13 next steps (a reminder; replies are not read): post at %s "
             "IST; first reminder +%dd, after the previous step +%dd, next email "

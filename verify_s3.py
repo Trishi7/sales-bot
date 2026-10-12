@@ -100,6 +100,10 @@ SETTINGS = {
     "PROSPECT_UK_MARKERS": ["UK", "United Kingdom", "London", "Cambridge", "Oxford",
                             "Edinburgh", "Manchester", "Bristol", "Glasgow"],
     "PROSPECT_DESIGNATION_MAX_CHARS": 60, "LI_NO_DM_DAYS": 3,
+    # R6 (12 Oct 2026). THE MX CHECK IS OFF HERE: it is a real DNS lookup, and
+    # this script reaches no network. verify_li_no_dm.py covers it with a stand-in.
+    "LI_NO_DM_EMAIL_NAMES_PER_POST": 5, "LI_NO_DM_DM_SENT_MARKERS": ["sent"],
+    "LI_NO_DM_DM_REPLIED_MARKERS": ["replied", "received"], "LI_NO_DM_VERIFY_MX": False,
     "EMAIL_LOOKUP_MAX_PER_POST": 5,
     "EMAIL_WRITE_ALLOWED": True, "SHEET_WRITES_ENABLED": True,
     "EVENTS_WINDOW_DAYS": 14, "EVENTS_REMIND_AGAIN_WEEKDAY": 0,
@@ -777,22 +781,32 @@ async def the_tuesday() -> None:
     print("\n   R6 — the email check, as posted by the live sweep:")
     show(live, "R6")
     body6 = "\n".join(live["posts"].get("R6") or [])
-    # R6 IS COMPOSED BY THE MODEL (an echo here), so its wording is not pinned.
-    # What is pinned: the page the address was found on is on the post, and the
-    # offer is a proposal keyed to it (checked under "THE YES" below). The exact
-    # "email found: ... / Want me to add the email" lines were R5's renderer,
-    # which no longer prints an email at all.
-    check("R6's post carries the page the email was found on",
-          "[voicesummit.example](<https://voicesummit.example/speakers/ada-lovelace>)"
-          in body6, True)
+    # CHANGED 12 Oct 2026: R6 IS RENDERED IN CODE NOW, so its text is pinned exactly.
+    # It reads the whole tab and the LI DM Sent cell: Ada (connected five days) and
+    # then, in sheet order, everybody with no connected date and no DM logged. Bo is
+    # R5's today; Al is stopped. Cy has an address on the sheet, which is NEVER
+    # printed back; Ada's was found; nothing was found for the other two. It used to
+    # be one model-composed line about Ada with the source link under it.
+    check("R6's post: the plain list, the found address by the name, who nothing was found for, the question",
+          body6, "**Connected, no DM yet**\n"
+                 "1. Cy Diaz (Acme AI)\n\n"
+                 "Found missing or alternate emails:\n"
+                 "2. Ada Lovelace (Acme AI) \u2014 ada@acme.ai\n\n"
+                 "Couldn't find an email for:\n"
+                 "3. Dee Evans (Cinder)\n"
+                 "4. Done Already (Borealis)\n\n"
+                 "Would you like me to add these emails to the Outreach PoCs sheet?")
+    check("...the address already on the sheet is not printed, and no source link rides under the post",
+          [w for w in ("cy@acme.ai", "voicesummit.example", "http") if w in body6], [])
     check("...and R6's lookup found the address in a snippet",
           [x for x in live["logs"] if x.startswith("[email] R6") and "ada@acme.ai" in x] != [],
           True)
     check("a contact whose email is on file is not looked up",
           [q for q in live["searches"] if "Cy Diaz" in q], [])
-    check("exactly two searches, in the spec's words: R5's person and R6's",
-          live["searches"], ['"Bo Chen" "Borealis" email',
-                             '"Ada Lovelace" "Acme AI" email'])
+    check("one search a person with no address on the sheet, in the spec's words: R5's person, then R6's "
+          "three in its own order",
+          live["searches"], ['"Bo Chen" "Borealis" email', '"Ada Lovelace" "Acme AI" email',
+                             '"Dee Evans" "Cinder" email', '"Done Already" "Borealis" email'])
     same("R6", live, test, sim)
     check("nothing has been written to the sheet by any of the three", UPDATES, [])
 

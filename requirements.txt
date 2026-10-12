@@ -42,3 +42,10 @@ google-auth>=2.28.0
 # restart rather than a code change. Without PyYAML that file cannot be read and
 # the bot runs NO rules at all — loudly, at ERROR, rather than quietly.
 PyYAML>=6.0
+
+# --- R6: can an email's domain receive mail ---------------------------------
+# One DNS MX lookup per domain, for addresses already on the sheet
+# (email_checks.mx_status). Plain DNS: no API, no key, no cost, and no SMTP
+# probe. Imported defensively: without it the MX check is SKIPPED and logged,
+# and no domain is ever reported as unable to receive mail.
+dnspython>=2.4.0

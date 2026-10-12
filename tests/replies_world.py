@@ -84,6 +84,9 @@ PINS = {
     "EVENTS_REMIND_AGAIN_WEEKDAY": 0,                 # mon
     "WEB_SEARCH_ENABLED": True, "SEARCH_BACKEND": "searxng", "SEARCH_FALLBACKS": [],
     "TODO_SHEET_ENABLED": False,
+    # R6's MX CHECK IS A REAL DNS LOOKUP, so it is off in every test world. The
+    # checks that are about it (tests/li_no_dm_checks.py) turn it on over a stand-in.
+    "LI_NO_DM_VERIFY_MX": False,
 }
 _ABSENT = object()
 

@@ -112,7 +112,11 @@ def owner_label(action: dict) -> str:
 # names its own team. R13 is one post a day about up to five people; it is
 # addressed the way the other Outreach PoCs rules are, by the tags line, and
 # has no owner of its own (see `group`).
-RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES, nextaction.R_NEXT_STEPS})
+RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES, nextaction.R_NEXT_STEPS,
+                             # R6 (12 Oct 2026): ONE post, four blocks numbered straight
+                             # through. Split by owner the numbering, the two caps and
+                             # the closing question would each be per person's slice.
+                             nextaction.R_LI_NO_DM})
 
 
 def group_key(action: dict) -> str:
@@ -1015,14 +1019,8 @@ _ASK = {
         "No first contact with {companies} yet. Do you want to pick {them} up this "
         "week? If it's already done, just tell me.",
     ),
-    nextaction.R_LI_NO_DM: (
-        "{hey}{companies} accepted your connection a few days ago but there's no DM "
-        "yet. Want to send one this week? If you already have, just tell me.",
-        "{name}quick one: {companies} {is} connected but un-messaged. Worth a DM "
-        "while they still remember the name? Say skip if not.",
-        "The connection with {companies} went through and nobody's followed up yet. "
-        "Shall I note it as done, or do you want a nudge in a few days?",
-    ),
+    # (R6, "connected, no DM yet", has no template here since 12 Oct 2026: its
+    # post is four blocks rendered in code, `wording.li_no_dm_post`.)
     nextaction.R_DM_NO_MEETING: (
         "{hey}the DM to {companies} went out {ago} and there's no meeting booked "
         "yet. Want to follow up? If they've replied, just tell me.",
@@ -1205,7 +1203,7 @@ HEADINGS = {
     # ("**PoCs to contact — Wisprlow.ai**") and a blank line under it, so it is
     # part of the rendered block (`prospects.post_parts`), like R11's opener.
     "R5": "",
-    "R6": "LinkedIn connected, no DM yet",
+    "R6": "Connected, no DM yet",
     "R7": "DM sent, no meeting yet",
     "R8": "Meeting prep for {company}",
     "R9": "Follow-up on the {company} meeting",
@@ -1286,7 +1284,11 @@ VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             # R2 (12 Oct): its list is built and checked in code
                             # (`news_screen.render`). On 11 Oct a composed post put
                             # a tracked company under "not in the pipeline".
-                            nextaction.R_NEWS_SCREEN})
+                            nextaction.R_NEWS_SCREEN,
+                            # R6 (12 Oct): four blocks, their order, the numbering
+                            # and the closing question are the agreed shape
+                            # (`wording.li_no_dm_post`).
+                            nextaction.R_LI_NO_DM})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1808,7 +1810,49 @@ def shown_contacts(message: dict) -> list:
         # NO CAP HERE: the rule picked the five, and the people under the drop
         # line come on top of them (`nextaction._r_next_step_followups`).
         return next_step_order(actions)
+    if kind == nextaction.R_LI_NO_DM:
+        return li_no_dm_shown(actions, plain_cap=cap)
     return actions[:cap]
+
+
+def li_no_dm_order(actions: list) -> list:
+    """R6's people in the order the rule put them (`nextaction.li_no_dm_order`):
+    a connected date first, oldest first; then no date, in sheet order. One
+    contact once. The carrier of the all-clear notice names nobody."""
+    seen: set = set()
+    rows: list = []
+    for a in actions or []:
+        key = a.get("contact_key") or ""
+        if not key or key in seen or a.get("notice"):
+            continue
+        seen.add(key)
+        rows.append(a)
+    return sorted(rows, key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        int(a.get("sheet_row") or 0)))
+
+
+LI_NO_DM_BLOCK_ORDER = {"plain": 0, "found": 1, "dead": 2, "none": 3}
+
+
+def li_no_dm_shown(actions: list, *, plain_cap: int = 5) -> list:
+    """The people R6's post NAMES, in the order it names them: block by block
+    (plain, found, dead domains, nothing found), and inside a block the rule's
+    order.
+
+    TWO CAPS, NOT ONE SLICE. The sender's email work (`bot._li_no_dm_email_work`)
+    walks the rule's order and gives each person it will name a `block`: up to
+    `max_items_per_post` in the plain list and up to
+    LI_NO_DM_EMAIL_NAMES_PER_POST across the three email blocks. BEFORE that
+    work has run (a plan, a preview) nobody has a block yet, and the first
+    `plain_cap` in order are shown as the plain list: who will be named, with
+    no email news claimed for anybody.
+    """
+    rows = li_no_dm_order(actions)
+    placed = [a for a in rows if a.get("block") in LI_NO_DM_BLOCK_ORDER]
+    if not placed:
+        return rows[:max(1, int(plain_cap or 5))]
+    return sorted(placed, key=lambda a: LI_NO_DM_BLOCK_ORDER[a["block"]])
 
 
 def next_step_order(actions: list) -> list:
@@ -1927,6 +1971,23 @@ def points_of(message: dict) -> Optional[dict]:
             return None
         return {"header": _voice(message, "r3_opener", EVENT_OPENERS),
                 "lines": lines, "extra": extra, "close": offer}
+    if kind == nextaction.R_LI_NO_DM:
+        people = shown_contacts(message)
+        if not people:
+            return None
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py: four blocks in the
+        # agreed order, numbered straight through. The closing question is
+        # its `close`, so it is left off wherever an offer must not be made
+        # (`compose_fallback(offers=False)`), and it is there only when an
+        # address was found AND the bot may write one.
+        lines = wording.li_no_dm_post([
+            {"who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
+             "block": a.get("block") or "plain", "emails": a.get("emails_found") or [],
+             "domains": a.get("dead_domains") or []} for a in people], ask=False)
+        offer = wording.LI_NO_DM_ADD_QUESTION if (
+            config.EMAIL_WRITE_ALLOWED and any(a.get("block") == "found" for a in people)) else ""
+        return {"header": "", "lines": lines + ([""] if offer else []), "extra": [],
+                "close": offer}
     if kind == nextaction.R_NEXT_STEPS:
         people = shown_contacts(message)
         if not people:
@@ -2031,7 +2092,8 @@ def _offer_pattern(template: str):
 # THE TWO POSTS THAT END ON AN OFFER a "yes" answers: R3's "remind you again?"
 # and R5's "add the email I found?". Matched by their FIXED words, built from
 # the templates themselves so a reworded offer cannot drift from its matcher.
-_OFFER_LINES = (_offer_pattern(EVENTS_OFFER), _offer_pattern(EMAIL_OFFER))
+_OFFER_LINES = (_offer_pattern(EVENTS_OFFER), _offer_pattern(EMAIL_OFFER),
+                _offer_pattern(wording.LI_NO_DM_ADD_QUESTION))
 
 
 def is_offer_line(line: str) -> bool:
@@ -2118,6 +2180,10 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
         lead = "" if points.get("opener_in_block") else who
         body = (lead + points_block(points)
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
+        if message.get("type") == nextaction.R_LI_NO_DM:
+            # R6 IS ITS FOUR BLOCKS AND NOTHING ELSE: no source link under it and
+            # no bracketed note about a search that could not run.
+            return body
         if message.get("type") == nextaction.R_PROSPECTS:
             # R5 IS ITS AGREED SHAPE AND NOTHING ELSE. Its only research is the
             # email lookup, whose result the message does not print, so a note
@@ -2397,10 +2463,10 @@ def _self_test() -> int:
         dict(action("Borealis", "Sam", nextaction.R_MEETING_PREP, "Vaishnavi",
                     nextaction.P_MEETING, date(2026, 9, 8), 1, "R8"),
              dayof_time="10:00"),
-        action("Cinder", "Dev", nextaction.R_LI_NO_DM, "Vaishnavi",
-               nextaction.P_REPLY, date(2026, 9, 5), 4, "R6"),
-        action("Delta", "Dee", nextaction.R_LI_NO_DM, "Kushal",
-               nextaction.P_REPLY, date(2026, 9, 6), 3, "R6"),
+        action("Cinder", "Dev", nextaction.R_CLOSURE_SUPPORT, "Vaishnavi",
+               nextaction.P_REPLY, date(2026, 9, 5), 4, "R10"),
+        action("Delta", "Dee", nextaction.R_CLOSURE_SUPPORT, "Kushal",
+               nextaction.P_REPLY, date(2026, 9, 6), 3, "R10"),
         action("Echo", "Eve", nextaction.R_DM_NO_MEETING, "Kushal",
                nextaction.P_CHASE, date(2026, 9, 2), 7),
         action("Fathom", "Fay", nextaction.R_DM_NO_MEETING, "Kushal",
@@ -2693,10 +2759,12 @@ def _self_test() -> int:
                                       companies=["Hinglish STT"]),
           "Quick one: Hinglish STT isn't marked ready yet. Anything blocking it? "
           "A rough date is plenty.")
-    check("two companies agree", _fill(_ASK[nextaction.R_LI_NO_DM][1], name="Vaishnavi",
+    check("two companies agree", _fill(_ASK[nextaction.R_PROSPECTS][1], name="Vaishnavi",
                                        companies=["PolyAI", "Agoda"]),
-          "Vaishnavi, quick one: PolyAI and Agoda are connected but un-messaged. "
-          "Worth a DM while they still remember the name? Say skip if not.")
+          "Vaishnavi, quick one: PolyAI and Agoda are still waiting on a first message. "
+          "Got time for them this week? Say skip if not.")
+    check("R6 has no composed template any more: its post is rendered in code",
+          (nextaction.R_LI_NO_DM in _ASK, nextaction.R_LI_NO_DM in VERBATIM_TYPES), (False, True))
     check("a DM with no date says 'a while ago', never '0 days'",
           "a while ago" in _fill(_ASK[nextaction.R_DM_NO_MEETING][0], name="Sid",
                                  companies=["Acme"], days=0), True)
@@ -2711,7 +2779,7 @@ def _self_test() -> int:
         check(f"{label}: three different variants", len(set(options)), 3)
 
     print("\nthe facts the composer is held to")
-    two = {"type": nextaction.R_LI_NO_DM, "companies": ["PolyAI", "Agoda"],
+    two = {"type": nextaction.R_PACKAGES, "companies": ["PolyAI", "Agoda"],
            "actions": [{"company": "PolyAI", "poc": "A", "why": "x"},
                        {"company": "PolyAI", "poc": "B", "why": "y"},
                        {"company": "Agoda", "poc": "C", "why": "z"}]}

@@ -70,6 +70,7 @@ import deadlines as dl
 import digest
 import drip
 import drive
+import email_checks
 import events as events_mod
 import events_discovery
 import evidence
@@ -7483,7 +7484,8 @@ class SalesBot(discord.Client):
             emails = list(payload.get("emails") or [])
             one = emails[0] if len(emails) == 1 else {}
             return wording.proposal_label(
-                kind, poc=str(one.get("poc") or ""), email=str(one.get("email") or ""),
+                kind, poc=str(one.get("poc") or ""),
+                email=" and ".join(str(one.get("email") or "").split()),
                 count=len(emails))
         if kind == "row_add":
             return wording.proposal_label(
@@ -9935,6 +9937,20 @@ class SalesBot(discord.Client):
         research is worse than one with it, and better than none.
         """
         actions = list(message.get("actions") or [])
+        if message.get("type") == nextaction.R_LI_NO_DM:
+            # R6 DOES ITS OWN EMAIL WORK: who is searched for, whose address is
+            # checked, and which of the post's two lists each person lands in
+            # are one decision (`_li_no_dm_email_work`).
+            try:
+                await self._li_no_dm_email_work(message, today=today)
+            except Exception:
+                log.exception("[email] R6's email work failed; the post goes out as the "
+                              "plain list, with no email news claimed for anybody")
+                for a in actions:
+                    a.pop("block", None)
+                    a["web_pending"] = False
+            message["web_pending"] = False
+            return message
         # WHICH CONTACTS GET AN EMAIL LOOKUP is decided now, for the ones this
         # post will name.
         self._request_email_lookups(message)
@@ -10312,9 +10328,10 @@ class SalesBot(discord.Client):
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
-            # R2's and R13's agreed shapes have a blank line between the tags
-            # and the list.
-            gap=message.get("type") in (nextaction.R_NEWS_SCREEN, nextaction.R_NEXT_STEPS),
+            # R2's, R13's and R6's agreed shapes have a blank line between the
+            # tags and the list.
+            gap=message.get("type") in (nextaction.R_NEWS_SCREEN, nextaction.R_NEXT_STEPS,
+                                        nextaction.R_LI_NO_DM),
         )
         opener_text = body
         # THE HEADING GOES ON LAST, ABOVE THE TAGS LINE: one bold line per
@@ -10616,7 +10633,9 @@ class SalesBot(discord.Client):
         — a lookup for the ninth contact of a five-line post is a search
         nobody reads.
         """
-        if message.get("type") not in (nextaction.R_PROSPECTS, nextaction.R_LI_NO_DM):
+        # R5 ONLY. R6 decides its own lookups while it sorts people into its
+        # blocks (`_li_no_dm_email_work`); both share one cache.
+        if message.get("type") != nextaction.R_PROSPECTS:
             return 0
         shown = drip.shown_contacts(message)
         room = max(0, int(config.EMAIL_LOOKUP_MAX_PER_POST))
@@ -10645,7 +10664,11 @@ class SalesBot(discord.Client):
 
         WHAT IT LEAVES ON THE ITEM: `email_checked` (a lookup ran — found or
         not, and both are cached for RESEARCH_CACHE_DAYS), and when one was
-        found `email_found` and `email_source` (the result page it was on).
+        found `email_found` and `email_source` (the result page it was on),
+        and `emails_found`, every verified address, two at most. STRUCTURED
+        FIELDS ONLY: it writes no sentence for the post. R6 renders its own
+        blocks from them (`wording.li_no_dm_post`), R5's message does not
+        print them, and R11 reads them.
         When the lookup could not run — search off, a budget spent — nothing
         is claimed: the line says nothing about email and the note says why.
         """
@@ -10681,29 +10704,27 @@ class SalesBot(discord.Client):
             log.warning("[email] %s: dropped %d address(es) no snippet contains: %s",
                         rule_id, len(invented), ", ".join(invented))
         item["email_checked"] = True
-        offer = (" Want me to add it to the sheet? Say yes."
-                 if config.EMAIL_WRITE_ALLOWED else "")
-        if kept:
-            email = kept[0]
+        found: list = []
+        for address in kept:
+            if address.lower() not in [f.lower() for f in found]:
+                found.append(address)
+        found = found[:2]
+        item["emails_found"] = found
+        if found:
+            email = found[0]
             source = next(
                 (str(r.get("url") or "") for r in results
                  if email.lower() in f"{r.get('title') or ''} {r.get('snippet') or ''}".lower()),
                 "")
             item["email_found"], item["email_source"] = email, source
             item["sources"] = [{"url": source, "title": ""}] if source else []
-            if item.get("rule") == nextaction.R_LI_NO_DM:
-                item["research"] = (f"Email found: {email}"
-                                    + (f" ({drip.link('', source)})" if source else "")
-                                    + "." + offer)
         else:
             item["email_found"], item["email_source"] = "", ""
-            if item.get("rule") == nextaction.R_LI_NO_DM:
-                item["research"] = websearch.NO_EMAIL.capitalize() + "."
         item["research_note"] = ""
         log.info("[email] %s %s at %s: %d result(s) for %r -> %s", rule_id, person,
                  company, len(results or []), query,
-                 f"found {item['email_found']} on {item['email_source'] or '?'}"
-                 if kept else "no public email found")
+                 f"found {', '.join(found)} on {item['email_source'] or '?'}"
+                 if found else "no public email found")
         state.audit(
             "email_lookup", reason="one search, one light extraction, the address "
                                    "kept only if a snippet shows it",
@@ -10711,6 +10732,133 @@ class SalesBot(discord.Client):
             found=item["email_found"] or None, source=item["email_source"] or None,
             invented=invented or None,
         )
+
+    async def _li_no_dm_email_work(self, message: dict, *, today) -> None:
+        """R6: check or look for each person's email, and decide who the post
+        names and in which block. Sets `block` on the actions it names.
+
+        THE WALK. People are taken in the rule's order (a connected date
+        first, oldest first; then no date, in sheet order). Each lands in one
+        of two lists, and the walk stops when both are full:
+
+          the PLAIN list, R6's `max_items_per_post` (5)
+              an address on file whose domain can receive mail, or nothing to
+              report. Nothing is said about them beyond the name.
+          the EMAIL blocks, LI_NO_DM_EMAIL_NAMES_PER_POST (5) between them
+              "found"  nothing usable on file, and the search found one
+              "dead"   an address on file whose domain cannot receive mail
+              "none"   nothing on file and the search found nothing
+
+        Two caps, kept apart, so a quiet week cannot fill every place with
+        names that need nothing and push the email work off the post.
+
+        THE EMAIL CELL:
+          blank, or not an address ("not available", a phone number)
+              ONE search, through `_email_lookup` and its cache, at most
+              EMAIL_LOOKUP_MAX_PER_POST a post. An address is kept only when
+              it is in a snippet the search returned, character for character.
+          one or more addresses
+              each is checked (`email_checks`): the domain's MX record, and,
+              for the log only, whether the domain looks like the company's.
+              THERE IS NO SMTP PROBE. The post never claims an address exists.
+
+        WHAT MAY REACH THE POST: addresses the bot FOUND, and the DOMAIN of an
+        address that cannot receive mail. AN ADDRESS ALREADY ON THE SHEET IS
+        NEVER PRINTED BACK. A found address that is already in the cell is
+        dropped, and the person counts as having a working email.
+
+        WHEN A CHECK CANNOT RUN, NOTHING IS CLAIMED: search off or its budget
+        spent, dnspython missing, a DNS timeout, a date that has not happened.
+        The person goes in the plain list, and the log says why.
+        """
+        people = drip.li_no_dm_order(list(message.get("actions") or []))
+        for a in people:
+            for field in ("block", "dead_domains"):
+                a.pop(field, None)
+            a["web_pending"] = False
+        if not people:
+            return
+        plain_cap = max(1, int(message.get("max_items_per_post") or 0) or 5)
+        news_cap = max(0, int(config.LI_NO_DM_EMAIL_NAMES_PER_POST))
+        lookups = max(0, int(config.EMAIL_LOOKUP_MAX_PER_POST))
+        future = self._is_future(today)
+        verify = bool(config.LI_NO_DM_VERIFY_MX) and not future
+        if verify and not email_checks.have_dns():
+            log.warning("[email] R6: dnspython is not installed, so the MX check is SKIPPED "
+                        "for this post. No domain is reported as unable to receive mail.")
+            verify = False
+        plain = news = searched = 0
+        told: dict = {"found": 0, "dead": 0, "none": 0, "unchecked": 0}
+
+        def to_plain(a) -> None:
+            nonlocal plain
+            if plain < plain_cap:
+                a["block"] = "plain"
+                plain += 1
+
+        for a in people:
+            if plain >= plain_cap and news >= news_cap:
+                break
+            cell = str(a.get("email_on_file") or "")
+            on_file = email_checks.addresses_in(cell)
+            if on_file:
+                dead: list = []
+                for address in on_file:
+                    domain = email_checks.domain_of(address)
+                    fit = email_checks.company_check(address, str(a.get("company") or ""))
+                    status = email_checks.SKIPPED
+                    if verify:
+                        status = await asyncio.to_thread(email_checks.mx_status, domain)
+                    if status == email_checks.DEAD and domain not in dead:
+                        dead.append(domain)
+                    # THE LOG NAMES THE DOMAIN AND THE VERDICTS, never the address.
+                    log.info("[email] R6 %s (%s): an address at %s is on file; mail: %s; "
+                             "company: %s", a.get("poc"), a.get("company"), domain, status, fit)
+                if dead and news < news_cap:
+                    a["block"], a["dead_domains"] = "dead", dead
+                    news += 1
+                    told["dead"] += 1
+                elif not dead:
+                    to_plain(a)
+                continue
+            if news >= news_cap:
+                continue
+            if future or searched >= lookups:
+                told["unchecked"] += 1
+                to_plain(a)
+                continue
+            a["email_lookup"] = True
+            a["web_pending"] = True
+            searched += 1
+            await self._research_items([a], today=today)
+            a["web_pending"] = False
+            if not a.get("email_checked"):
+                log.info("[email] R6 %s (%s): the email search could not run (%s); nothing "
+                         "is said about their email", a.get("poc"), a.get("company"),
+                         a.get("research_note") or "no reason given")
+                told["unchecked"] += 1
+                to_plain(a)
+                continue
+            found = [str(e) for e in (a.get("emails_found") or (
+                [a["email_found"]] if a.get("email_found") else [])) if str(e).strip()]
+            fresh = [e for e in found if e.lower() not in cell.lower()][:2]
+            if found and not fresh:
+                # ALREADY IN THE CELL: dropped, and they count as having an email.
+                to_plain(a)
+                continue
+            a["emails_found"] = fresh
+            a["block"] = "found" if fresh else "none"
+            news += 1
+            told["found" if fresh else "none"] += 1
+        for a in people:
+            # THE POST IS ITS FOUR BLOCKS AND NOTHING ELSE: no sentence from the
+            # lookup, no source link under it, no bracketed note.
+            a["research"], a["sources"], a["research_note"] = "", [], ""
+        log.info("[email] R6: %d handed on -> %d in the plain list (cap %d), %d with email "
+                 "news (cap %d: %d found, %d dead domain(s), %d not found); %d search(es) "
+                 "asked for; %d could not be checked; MX check %s", len(people), plain,
+                 plain_cap, news, news_cap, told["found"], told["dead"], told["none"],
+                 searched, told["unchecked"], "on" if verify else "off")
 
     async def _open_email_proposal(self, message: dict, *, sent, marker: str) -> None:
         """The post showed an email it found — record the offer to write it.
@@ -10728,14 +10876,24 @@ class SalesBot(discord.Client):
             return
         if not config.EMAIL_WRITE_ALLOWED:
             return
+        # EVERY ADDRESS THE POST SHOWED, AND ONLY THOSE: the people in its
+        # "found" block. TWO ADDRESSES FOR ONE PERSON go into the one blank
+        # cell on two lines, which is how the sheet already holds two.
         emails = [
             {"sheet_row": a.get("sheet_row"), "row_key": a.get("row_key") or "",
              "company": a.get("company") or "", "poc": a.get("poc") or "",
-             "email": a["email_found"], "source": a.get("email_source") or ""}
+             "email": "\n".join(a["emails_found"]), "emails": list(a["emails_found"]),
+             "source": a.get("email_source") or ""}
             for a in drip.shown_contacts(message)
-            if a.get("email_found") and a.get("sheet_row")]
+            if a.get("block") == "found" and a.get("emails_found") and a.get("sheet_row")]
         if not emails:
-            return
+            return                      # nothing was shown, so nothing is offered
+
+        def what(e: dict) -> str:
+            if len(e["emails"]) > 1:
+                return (" and ".join(e["emails"]) + f" (both, one a line in the one cell) "
+                        f"to {e['poc']} ({e['company']})")
+            return f"{e['email']} to {e['poc']} ({e['company']})"
         rule_id = str(message.get("rule_id") or "R5")
         key = f"email_write:{marker}:{getattr(sent, 'id', 0)}"
         await asyncio.to_thread(
@@ -10743,8 +10901,7 @@ class SalesBot(discord.Client):
                 proposal_key=key, kind="email_write", tab=gtm_sheet.POCS, sheet_row=0,
                 row_key="", company="", poc="", payload={"emails": emails},
                 reply_text="", trigger=rule_id,
-                proposed_text="add " + ", ".join(
-                    f"{e['email']} to {e['poc']} ({e['company']})" for e in emails),
+                proposed_text="add " + ", ".join(what(e) for e in emails),
                 requested_by=rule_id,
                 channel_id=int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
                 message_id=str(getattr(sent, "id", "") or ""),
@@ -10819,7 +10976,8 @@ class SalesBot(discord.Client):
         parts: list = []
         if wrote:
             parts.append("Done — added " + "; ".join(
-                f"{e['email']} to {e['poc']}'s row ({e['company']})" for e in wrote)
+                f"{' and '.join(str(e['email']).split())} to {e['poc']}'s row ({e['company']})"
+                for e in wrote)
                 + ". Only the Email cell was touched.")
         for e, reason in left:
             parts.append(f"Left {e['poc']}'s row alone — {reason}.")
@@ -13002,6 +13160,7 @@ class SalesBot(discord.Client):
     _RESEARCH_PAYLOAD_FIELDS = (
         "text", "web_pending", "event_proposals", "deadline_proposals",
         "news_overflow", "email_checked", "email_found", "email_source",
+        "emails_found",
     )
 
     def _research_store(self, item: dict) -> tuple:

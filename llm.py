@@ -1084,6 +1084,8 @@ class LLM:
             "person's own (not a generic info@/press@/support@ address, not somebody "
             "else's), reply with exactly:",
             "  EMAIL | <the address, copied character for character> | <result number>",
+            "If the snippets show TWO different addresses that are both clearly this "
+            "person's own, write one EMAIL line for each. Never more than two.",
             "Otherwise reply with exactly: NONE",
             "NEVER build an address from a name and a domain, and never complete one "
             "that is cut off. An address that is not written out in a snippet is NONE.",
