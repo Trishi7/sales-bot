@@ -1079,6 +1079,101 @@ def packages_lines_for_check() -> list:
         packages_gone("DPO Pack")]
 
 
+# -- the reconnect follow-up (rule 14, NFT2-1086) --------------------------------
+#
+# THE POST, AS THE TICKET WROTE IT. Do not reword it and do not re-punctuate
+# it; the em dashes are part of it.
+#
+#     **Time to reconnect**
+#
+#     Hey @Vaishnavi, @Sid — it's been a while since we last connected with these PoCs, do get in touch when you can:
+#
+#     1. **Dr. David Gamez** (Middlesex University London)
+#     2. **Daisy Leigh** (PolyAI)
+#
+#     there are 36 more — would you like to look at the rest?
+#
+# FIVE NAMES AT MOST, numbered, the name in bold, the company in brackets. No
+# date and no reason on the line. THE GREETING AND ITS TAGS ARE PART OF THIS
+# BLOCK, not the sender's tags line: this post is addressed inside its own
+# first sentence. Only the bold heading is the sender's.
+#
+# THE "MORE" LINE IS THERE ONLY WHEN THERE ARE MORE. A post of five or fewer
+# ends at the last name. One person reads in the singular.
+RECONNECT_GREETING = ("Hey {tags} \u2014 it's been a while since we last connected with these "
+                      "PoCs, do get in touch when you can:")
+RECONNECT_GREETING_ONE = ("Hey {tags} \u2014 it's been a while since we last connected with "
+                          "this PoC, do get in touch when you can:")
+# Who the greeting names when no id is configured to tag (SALES_ALWAYS_TAG_IDS).
+RECONNECT_ADDRESSEES = "Vaishnavi, Sid"
+# After the company of somebody whose Reconnect Date cell holds something that
+# is not a date, so somebody fixes the cell.
+RECONNECT_UNCLEAR = "(reconnect date unclear)"
+RECONNECT_MORE = "there are {n} more \u2014 would you like to look at the rest?"
+RECONNECT_MORE_ONE = "there is 1 more \u2014 would you like to look at them too?"
+# Above the full list a "yes" under the post gets.
+RECONNECT_REST = "everyone due to reconnect today:"
+
+
+def reconnect_line(name, company, *, unclear=False) -> str:
+    """One person as the post shows them: "**Name** (Company)", and the
+    unclear flag after the company when their Reconnect Date could not be
+    read. No number: the caller numbers the list."""
+    name = " ".join(str(name or "").split())
+    company = " ".join(str(company or "").split())
+    return f"**{name}** ({company})" + (f" {RECONNECT_UNCLEAR}" if unclear else "")
+
+
+def _reconnect_numbered(people) -> list:
+    return [f"{i}. {reconnect_line(p.get('name'), p.get('company'), unclear=p.get('unclear'))}"
+            for i, p in enumerate(people, 1)]
+
+
+def reconnect_post(people, *, more=0, tags="") -> list:
+    """The lines of R14's post under its heading, WITHOUT the close (the caller
+    adds `reconnect_more(more)` when there is one).
+
+    `people` are the ones the post NAMES, in order, each {"name", "company",
+    "unclear"}. `more` is how many others are due today and not named; it is
+    not printed here, but one name with more behind it is still "these PoCs".
+    `tags` is who the greeting addresses, already as mention tokens. [] with
+    nobody, and then nothing is posted: there is no "nobody today" line.
+    """
+    people = [p for p in (people or ()) if str(p.get("name") or "").strip()
+              and str(p.get("company") or "").strip()]
+    if not people:
+        return []
+    alone = len(people) == 1 and int(more or 0) <= 0
+    greeting = (RECONNECT_GREETING_ONE if alone else RECONNECT_GREETING).format(
+        tags=" ".join(str(tags or "").split()) or RECONNECT_ADDRESSEES)
+    return [greeting, ""] + _reconnect_numbered(people)
+
+
+def reconnect_more(n) -> str:
+    """The closing question, or "" when nobody is left out."""
+    n = int(n or 0)
+    if n <= 0:
+        return ""
+    return RECONNECT_MORE_ONE if n == 1 else RECONNECT_MORE.format(n=n)
+
+
+def reconnect_rest(people) -> list:
+    """What a "yes" under the post gets: EVERYONE due that day, in the post's
+    own order and its own line format, numbered straight through. The caller
+    splits it between names at Discord's limit."""
+    people = list(people or ())
+    return ([RECONNECT_REST] + _reconnect_numbered(people)) if people else []
+
+
+def reconnect_lines_for_check() -> list:
+    """Every fixed line R14 can post, with stand-in values."""
+    two = [{"name": "Daisy Leigh", "company": "PolyAI"},
+           {"name": "Ioana Mocanu", "company": "Agoda", "unclear": True}]
+    return ([l for l in reconnect_post(two, more=36, tags="Vaishnavi, Sid") if l]
+            + [l for l in reconnect_post(two[:1]) if l]
+            + [reconnect_more(36), reconnect_more(1)] + reconnect_rest(two))
+
+
 # -- meeting preparation (rule 8) ------------------------------------------------
 #
 # THE TWO POSTS, AGREED 12 Oct 2026. Today's meetings are ALWAYS their own post:
@@ -1403,6 +1498,7 @@ def all_lines() -> list:
         *closure_lines_for_check(),
         *events_lines_for_check(),
         *packages_lines_for_check(),
+        *reconnect_lines_for_check(),
         *meeting_lines_for_check(),
         *deliverables_lines_for_check(),
     ]

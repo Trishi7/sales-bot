@@ -1097,6 +1097,27 @@ CREATE TABLE IF NOT EXISTS meeting_dates_seen (
     PRIMARY KEY (row_key, meeting_date)
 );
 
+-- R14: WHO THE RECONNECT FOLLOW-UP HAS ALREADY POSTED ABOUT (NFT2-1086).
+--
+-- THE RULE FIRES ONCE A PERSON. A person with a row here never fires again,
+-- with one way back: a NEW Reconnect Date, which is a trigger date this table
+-- has not seen for them. `trigger_date` is the day the rule worked out (the
+-- Reconnect Date itself, or 45 days after the meeting or the last contact),
+-- BEFORE any move off a weekend; `sent_on` is the day the post went out.
+--
+-- IT STARTS EMPTY, and that is safe: a trigger whose day has already gone is
+-- skipped by the rule itself, so an empty table is not a backlog.
+--
+-- WRITTEN ONLY BY THE SENDER, after a real send, in the style of
+-- meeting_touches. The evaluator is handed a copy and writes nothing.
+CREATE TABLE IF NOT EXISTS reconnect_fired (
+    row_key      TEXT NOT NULL,
+    trigger_date TEXT NOT NULL,              -- YYYY-MM-DD
+    sent_on      TEXT NOT NULL,              -- YYYY-MM-DD IST
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (row_key, trigger_date)
+);
+
 -- R2: WHAT HAS BEEN PROPOSED, AND WHAT BECAME OF IT. Keyed on the normalised
 -- company name (`news_screen.name_key`).
 --
@@ -1215,6 +1236,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # remind, and a reply says "2" or a name: this is what turns that into one
     # meeting, and only a meeting ON THAT POST. Empty on every other post.
     ("drip_sends", "people", "TEXT NOT NULL DEFAULT '[]'"),
+    # R14: WHEN THE REST OF A RECONNECT POST'S PEOPLE WERE LISTED, in answer to
+    # a "yes" under it ('' until then). A second yes finds it set and lists
+    # nothing. NOT the `offer` column: a yes under a post with an offer is a
+    # sheet write waiting to be applied, and this is a list.
+    ("drip_sends", "rest_listed", "TEXT NOT NULL DEFAULT ''"),
     # THE TOPIC FEED. R1 became an AI industry feed on a topic list (24/29 Sep),
     # and a posted story now carries its topic (for the spread rules), its
     # headline key (for the no-repeats check across outlets), the importance
@@ -2369,7 +2395,8 @@ class DB:
         if not mid:
             return None
         cols = ("on_date, slot, group_key, action_type, owner_label, companies, "
-                "stage, offer, body, message_id, channel_id, part_ids, people")
+                "stage, offer, body, message_id, channel_id, part_ids, people, "
+                "rest_listed")
         try:
             with self.conn() as c:
                 row = c.execute(
@@ -4112,9 +4139,65 @@ class DB:
                 new += int(cur.rowcount or 0)
         return new
 
+    # -- R14: who the reconnect follow-up has posted about -------------------
+
+    def reconnect_state(self) -> Optional[dict]:
+        """Who R14 has already fired for, or None when it cannot be read:
+        {row_key: [trigger_date, ...]}.
+
+        FAILS CLOSED, like `meeting_prep_state`. An empty dict would say
+        "nobody has ever been posted about" and today's people would go out
+        again on the next tick; None says "unknown" and the rule names nobody.
+        """
+        try:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT row_key, trigger_date FROM reconnect_fired ORDER BY trigger_date"
+                ).fetchall()
+        except Exception:
+            log.exception("[db] could not read who R14 has fired for")
+            return None
+        out: dict = {}
+        for r in rows:
+            out.setdefault(str(r["row_key"]), []).append(str(r["trigger_date"] or ""))
+        return out
+
+    def record_reconnect_fired(self, row_key: str, *, trigger_date: str,
+                               sent_on: str) -> None:
+        """A person's reconnect reminder really went out. CALLED BY THE SENDER,
+        NEVER BY THE ENGINE: a preview that recorded it would cancel the real
+        post. The first `sent_on` for a (person, trigger date) is kept."""
+        key = str(row_key or "").strip()
+        if not key or not str(trigger_date or "").strip():
+            return
+        with self.conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO reconnect_fired (row_key, trigger_date, sent_on) "
+                "VALUES (?, ?, ?)", (key, str(trigger_date), str(sent_on)))
+
+    def claim_drip_rest_listed(self, *, on_date: str, slot: int, at: str) -> bool:
+        """Mark that the rest of an R14 post's people have been listed. True
+        ONLY FOR THE FIRST CALLER: the row is updated only while the column is
+        still empty, so two people saying yes in the same second get one list."""
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE drip_sends SET rest_listed = ? WHERE on_date = ? AND slot = ? "
+                "AND COALESCE(rest_listed, '') = ''",
+                (str(at or "yes"), str(on_date), int(slot)),
+            )
+        return bool(cur.rowcount)
+
+    def release_drip_rest_listed(self, *, on_date: str, slot: int) -> None:
+        """Undo `claim_drip_rest_listed` when the list could not be sent at
+        all, so the next yes is not answered with silence."""
+        with self.conn() as c:
+            c.execute("UPDATE drip_sends SET rest_listed = '' WHERE on_date = ? AND slot = ?",
+                      (str(on_date), int(slot)))
+
     def set_drip_people(self, *, on_date: str, slot: int, people) -> bool:
-        """Attach the people a meeting post named, in its order, to its slot
-        (see the `people` migration)."""
+        """Attach the people a post named, in its order, to its slot (see the
+        `people` migration): R8's meetings, and everybody due on an R14 post's
+        day."""
         import json as _json
         with self.conn() as c:
             cur = c.execute(

@@ -1723,3 +1723,67 @@ end to end (`sheet_wording` in `bot_rules.yaml`), the Global Rules "Weekends" ro
 the schedule's Sunday row no longer has a deliverables post.
 
 `python verify_deliverables.py --show` checks all of it offline and prints the messages.
+
+## Upgrading to R14 (13 Oct): the reconnect follow-up (NFT2-1086)
+
+What changes for the team: a new post, **Time to reconnect**, in the **API Sales channel**. On the day a
+person's reconnect date falls it names up to five people (name in bold, company in brackets) and, when more are
+due, ends "there are N more — would you like to look at the rest?". A yes under that post lists everybody due
+that day. The day is the Reconnect Date; when that is empty, 45 days after the Meeting Date; with no meeting, 45
+days after the latest contact date. A day on a Saturday or Sunday is posted on the Monday. Each person is named
+once. Nothing else the bot posts changes.
+
+**Before the restart: invite the bot to the API Sales channel** and copy that channel's id.
+
+**`.env` on the laptop AND on the server (`/opt/sales-bot/.env`).** Two new variables. The first has no default
+and nothing works without it; the second is optional (15:30 is the default):
+
+```
+SALES_API_CHANNEL_ID=<the API Sales channel id>
+RECONNECT_TIME=15:30
+```
+
+`SALES_API_CHANNEL_ID` is added to `SALES_CHANNEL_IDS` automatically if it is missing from that line, with a
+warning; adding it to that line by hand removes the warning. The bot will then answer in that channel when
+@-mentioned or replied to, like in every sales channel. If your `.env` spells out `RESTRICTED_COLUMN_ROLES`, leave
+it as it is: Reconnect Date is locked in code (`ALWAYS_READ_ONLY_ROLES`), not through that line. No default changed
+and nothing is retired. Then, on the laptop, `python tools/redact_env.py`.
+
+**Database.** One new table, `reconnect_fired` (who has been posted about, and for which date), and one new column,
+`drip_sends.rest_listed`. Both are created on the first start; nothing to run. **The table starts empty, and that
+is safe:** a reconnect day that has already gone is skipped by the rule itself, so on the first day nobody whose
+date has passed is posted, and there is no backlog to work through. The first post is for the first day, from
+today on, that somebody's date falls on.
+
+**What to look for in the boot log:**
+
+```
+[config] R14 reconnect follow-up: one post at 15:30 IST in channel 1234567890, on the day a person's date falls (a weekend moves to the Monday), outside the cap and the gap; five names, and a yes under the post lists the rest
+[reconnect] R14 posts in #api-sales (1234567890) at 15:30 IST
+[gtm.lock] 'Outreach PoCs': restricted, read-only (never written, on any row): reconnect_date=AB 'Reconnect Date'
+[rules] R14: 670 row(s) with a company -> 0 due today, 142 still to come, 528 with no date anywhere (never), 0 already fired, 0 whose day has gone (skipped, no catch-up), 0 Lost or On Hold, 0 with a blank name or company, 0 named by the next-steps post today; by rule: reconnect date 0, meeting date 2, last contact 140
+```
+
+(the channel name, the id and the numbers are illustrative; the last line is the shape measured on 13 Oct). The
+letter on the `[gtm.lock]` line is today's layout: it follows the column if the team moves it.
+
+**What must NOT be in the boot log.** Each of these means R14 will post nothing:
+
+```
+SALES_API_CHANNEL_ID is unset — the reconnect follow-up (R14) has nowhere to post and will post NOTHING. ...
+[reconnect] SALES_API_CHANNEL_ID=... cannot be reached: no such channel, or the bot has not been added to it. ...
+[gtm.lock] 'Outreach PoCs': the role(s) reconnect_date map to NO column. ...
+```
+
+The first two are fixed in `.env` (and by inviting the bot). The third means no header on the tab says
+"Reconnect Date" any more: R14 still runs, on the meeting and contact dates alone, until the header is back.
+`RECONNECT_TIME=... is outside 14:00-16:00; using 15:30 instead` is a warning, and the post goes at 15:30.
+
+**On the day.** At 15:30, `[drip] SENT slot N (outside the cap) ... reconnect`, then
+`[rules] R14: recorded N person(s) as fired on <date>`. A yes under the post:
+`[reconnect] listed all N person(s) due on <date> in M message(s), for <who>`.
+
+**The Bot Rules tab, by hand.** Rule 14 is a new row; its "What the Bot Shares / Checks" wording is
+`sheet_wording` under R14 in `bot_rules.yaml`. Paste it into the sheet.
+
+`python verify_reconnect.py` checks all of it offline and prints a table of the 35 cases.

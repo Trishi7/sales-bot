@@ -747,8 +747,9 @@ def ids(day):
 class TestShippedRules:
     def test_O1_thirteen_rules_in_file_order_with_R13_before_R5(self):
         loaded = rules_mod.safe_load()
+        # R14 (NFT2-1086, 13 Oct) is a fourteenth rule, LAST in the file: it reads who R13 named today.
         assert [r.id for r in loaded] == ["R1", "R2", "R3", "R4", "R13", "R5", "R6", "R7", "R8", "R9", "R10",
-                                          "R11", "R12"]
+                                          "R11", "R12", "R14"]
 
     def test_O1_the_R13_entry(self):
         r = rules_mod.by_id(R13)
@@ -760,10 +761,11 @@ class TestShippedRules:
 
     def test_O1_the_days(self):
         # SINCE NFT2-1069 (8 Oct): R7 is back on Mondays and R11 runs on Wednesdays only.
-        assert ids(MONDAY) == ["R1", "R4", "R13", "R7", "R8", "R9", "R10"]
-        assert ids(THURSDAY) == ["R1", "R13", "R5", "R8", "R9", "R12"]
-        assert ids(date(2026, 10, 14)) == ["R1", "R3", "R13", "R8", "R9", "R11"]
-        assert ids(SATURDAY) == ["R8", "R9"]
+        # R14 is anchored (no weekdays), like R8 and R9, so it gets to look every day.
+        assert ids(MONDAY) == ["R1", "R4", "R13", "R7", "R8", "R9", "R10", "R14"]
+        assert ids(THURSDAY) == ["R1", "R13", "R5", "R8", "R9", "R12", "R14"]
+        assert ids(date(2026, 10, 14)) == ["R1", "R3", "R13", "R8", "R9", "R11", "R14"]
+        assert ids(SATURDAY) == ["R8", "R9", "R14"]
         assert R13 not in ids(SATURDAY) and R13 not in ids(SUNDAY)
         for d in (MONDAY, TUESDAY, date(2026, 10, 14), THURSDAY, date(2026, 10, 16)):
             assert R13 in ids(d)

@@ -86,6 +86,7 @@ import news
 import news_screen
 import nextaction
 import packages as packages_mod
+import reconnect as reconnect_mod
 import rules
 import simulation
 import notes
@@ -504,6 +505,9 @@ class SalesBot(discord.Client):
         # day rather than on every tick after the fifth counted post.
         self._cap_logged_on: str = ""
         self._late_logged_on: str = ""
+        # R14: the day its "nowhere to post" error was last logged, so a bad
+        # SALES_API_CHANNEL_ID is one ERROR a day and not one a tick.
+        self._reconnect_refused_on: str = ""
         # The day the proposal sweep last ran. ONE sweep per day, in the
         # first slot — a per-process marker rather than a database row,
         # because a restart re-running it once is harmless (the nudged
@@ -694,6 +698,12 @@ class SalesBot(discord.Client):
             await asyncio.to_thread(rules.log_startup)
         except Exception:
             log.exception("[rules] the rules file could not be reported at boot")
+        # R14's CHANNEL, CHECKED NOW AND LOUDLY. A wrong SALES_API_CHANNEL_ID
+        # must be an ERROR in the boot log, not a list nobody ever saw.
+        try:
+            self._check_reconnect_channel()
+        except Exception:
+            log.exception("[reconnect] the API Sales channel could not be checked at boot")
 
         roles = []
         try:
@@ -1720,6 +1730,11 @@ class SalesBot(discord.Client):
             # written down, and Saley comes back on that day. Before the
             # acknowledgement, which would give it a thumbs-up and forget it.
             if await self._maybe_package_dates(message, text, ctx):
+                return True
+            # A YES UNDER TODAY'S "TIME TO RECONNECT" POST lists everybody due
+            # that day. Anything else under it gets nothing at all. Before the
+            # acknowledgement, which would give a "no" a thumbs-up.
+            if await self._maybe_reconnect_rest(message, text, ctx):
                 return True
             # A REMINDER ASKED FOR UNDER A MEETING POST ("remind me about 2 the
             # day before"): the post's close offers one, so this books it.
@@ -5892,7 +5907,7 @@ class SalesBot(discord.Client):
                                     "prospects, li_no_dm, dm_no_meeting, meeting_prep, "
                                     "meeting_followup, closure_support, "
                                     "new_pipeline_company, sales_packages, "
-                                    "next_step_followups."
+                                    "next_step_followups, reconnect."
                                 ),
                             },
                             "owner": {
@@ -8072,6 +8087,192 @@ class SalesBot(discord.Client):
         log.info("[rules] R8: recorded %d touch(es) sent on %s (%s)", done, marker,
                  drip.meeting_post(message))
         return done
+
+    # -- R14: the reconnect follow-up (NFT2-1086) ---------------------------
+
+    def _reconnect_channel(self) -> tuple:
+        """(channel, problem) for the API Sales channel: the channel object and
+        "", or None and why it cannot be used.
+
+        THE ONLY CHANNEL R14 POSTS IN. Unset, zero, outside the scope, or not
+        a channel this bot can see: each is a reason to post nothing. THERE IS
+        NO FALLBACK, to the ask channel or anywhere else: a reconnect list in
+        the wrong channel is worse than none.
+        """
+        try:
+            cid = int(config.SALES_API_CHANNEL_ID or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid <= 0:
+            return None, "SALES_API_CHANNEL_ID is unset"
+        if cid not in config.SALES_CHANNEL_IDS:
+            return None, (f"SALES_API_CHANNEL_ID={cid} is not one of the sales channels "
+                          "(SALES_CHANNEL_IDS)")
+        channel = self.get_channel(cid)
+        if channel is None:
+            return None, (f"SALES_API_CHANNEL_ID={cid} cannot be reached: no such channel, "
+                          "or the bot has not been added to it")
+        return channel, ""
+
+    def _check_reconnect_channel(self) -> bool:
+        """AT STARTUP: is there somewhere for R14 to post? Logged at ERROR,
+        naming the variable, when there is not. True when there is (or when
+        the rule is switched off and the question does not arise)."""
+        if not any(r.enabled and r.trigger == nextaction.R_RECONNECT
+                   for r in rules.safe_load()):
+            log.info("[reconnect] R14 is not enabled in bot_rules.yaml; "
+                     "SALES_API_CHANNEL_ID is not checked")
+            return True
+        channel, problem = self._reconnect_channel()
+        if channel is None:
+            log.error("[reconnect] %s. The reconnect follow-up (R14) will post NOTHING, in "
+                      "any channel, until SALES_API_CHANNEL_ID names the API Sales channel "
+                      "and the bot can see it. It never falls back to another channel.",
+                      problem)
+            state.audit("reconnect_channel", reason=problem, ok=False)
+            return False
+        log.info("[reconnect] R14 posts in #%s (%s) at %s IST%s",
+                 getattr(channel, "name", "?"), getattr(channel, "id", "?"),
+                 config.RECONNECT_TIME,
+                 " — SALES_TEST_MODE is on, so the post goes to the test channel instead"
+                 if config.SALES_TEST_MODE else "")
+        return True
+
+    def _reconnect_target(self, channel, channel_id, *, marker: str) -> tuple:
+        """Where ONE R14 post goes: (channel, channel id), or (None, 0) when it
+        must not go anywhere.
+
+        THE API SALES CHANNEL MUST BE THERE ON EVERY PATH, the test ones
+        included, so a test shows exactly what the live day would do. Live, the
+        post goes to it. In SALES_TEST_MODE, on a test day and in a simulation
+        it goes where that run sends everything (the test channel): only the
+        audience changes.
+        """
+        api, problem = self._reconnect_channel()
+        if api is None:
+            if self._reconnect_refused_on != marker:
+                self._reconnect_refused_on = marker
+                log.error("[reconnect] %s: %s. Today's reconnect post is NOT sent, here or "
+                          "in any other channel.", marker, problem)
+                state.audit("reconnect_not_posted", reason=problem, date=marker)
+            return None, 0
+        if config.SALES_TEST_MODE or self._test_run_active():
+            return channel, channel_id
+        return api, int(getattr(api, "id", 0) or config.SALES_API_CHANNEL_ID)
+
+    async def _record_reconnect(self, message: dict, *, marker: str) -> int:
+        """Record everybody an R14 post was about. How many.
+
+        ONLY AFTER A REAL SEND. EVERYBODY DUE THAT DAY, not only the five the
+        post named: the others were offered in its last line, and the day does
+        not come again for any of them. This is what makes the rule fire once.
+        Where it writes, by path: `_r8_may_record` (a test day on the live
+        database records nothing, so a rehearsal cannot spend a real person's
+        one reminder).
+        """
+        if not self._r8_may_record():
+            log.info("[rules] R14: test day on a live database; nobody is recorded as fired")
+            return 0
+        done = 0
+        for action in drip.reconnect_everyone(message):
+            key = str(action.get("row_key") or "").strip()
+            when = str(action.get("trigger_iso") or "").strip()
+            if not key or not when:
+                continue
+            await asyncio.to_thread(
+                lambda k=key, w=when: self.db.record_reconnect_fired(
+                    k, trigger_date=w, sent_on=marker))
+            done += 1
+        log.info("[rules] R14: recorded %d person(s) as fired on %s; none of them is "
+                 "posted about again unless a new Reconnect Date is written", done, marker)
+        state.audit("reconnect_post", reason="one R14 post went out", date=marker,
+                    people=done, named=len(drip.shown_contacts(message)))
+        return done
+
+    async def _maybe_reconnect_rest(self, message, text: str, ctx: dict) -> bool:
+        """A reply under the "Time to reconnect" post. True when it was handled
+        here (which includes deciding to say nothing).
+
+        A YES LISTS EVERYBODY DUE THAT DAY, in the post's own order, split
+        between names across consecutive messages. FROM THE POST'S OWN RECORD
+        (`drip_sends.people`), so it is that day's people and only that day's,
+        whatever the sheet says by now.
+
+        ONLY A REPLY TO THAT DAY'S POST COUNTS. The reply walk has already
+        resolved which post this answers (`ctx["drip"]`); a yes under any
+        other post never reaches this, and a yes under an older reconnect post
+        gets nothing.
+
+        ANYTHING THAT IS NOT A YES GETS NO REPLY AT ALL: no sentence, no
+        reaction. Saley does not argue with a no. (A real question typed under
+        the post is still a question, and is answered like any other.)
+
+        ONCE. The post's row records that the rest were listed
+        (`db.claim_drip_rest_listed`), so a second yes lists nothing.
+        """
+        if not ctx.get("direct_is_bot"):
+            return False
+        drip_row = ctx.get("drip") or {}
+        if drip_row.get("action_type") != nextaction.R_RECONNECT:
+            return False
+        body = " ".join(str(text or "").split())
+        if not reconnect_mod.wants_the_rest(body):
+            if "?" in body or _STARTS_LIKE_A_QUESTION_RE.match(body):
+                return False
+            log.info("[reconnect] msg=%s under the reconnect post is not a yes (%r) — "
+                     "nothing is said", message.id, body[:80])
+            return True
+        on_date = str(drip_row.get("on_date") or "")
+        if on_date != dl.iso(dl.today_ist()):
+            log.info("[reconnect] msg=%s says yes under the post of %s, which is not "
+                     "today's — nothing is listed", message.id, on_date or "an unknown day")
+            return True
+        people = list(drip_row.get("people") or [])
+        if not any(not p.get("shown") for p in people):
+            log.info("[reconnect] msg=%s says yes, and today's post already named "
+                     "everybody (%d) — nothing more to list", message.id, len(people))
+            return True
+        slot = int(drip_row.get("slot") or 0)
+        claimed = await asyncio.to_thread(
+            lambda: self.db.claim_drip_rest_listed(
+                on_date=on_date, slot=slot,
+                at=dl.now_ist().isoformat(timespec="seconds")))
+        if not claimed:
+            log.info("[reconnect] msg=%s says yes, and the rest of today's list has "
+                     "already been posted — not listed twice", message.id)
+            return True
+        tagged = config.SALES_TEST_MODE or self._test_run_active()
+        room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
+        parts = drip.split_on_lines(
+            "\n".join(wording.reconnect_rest(people)),
+            limit=min(2000, int(config.QUERY_REPLY_CHUNK)) - room)
+        first = None
+        for i, part in enumerate(parts):
+            got = await guardrails.send(
+                message.channel, self._tag_test(part),
+                reason=f"the rest of the reconnect list for {on_date}, asked for with a yes"
+                       + (f" (part {i + 1}/{len(parts)})" if len(parts) > 1 else ""),
+                kind="reply", reply_to=message if i == 0 else None,
+                extra={"date": on_date, "people": len(people),
+                       "part": i + 1, "parts": len(parts)},
+            )
+            if got is None:
+                break
+            if i == 0:
+                first = got
+        if first is None:
+            await asyncio.to_thread(
+                lambda: self.db.release_drip_rest_listed(on_date=on_date, slot=slot))
+            log.warning("[reconnect] the rest of the list for %s could not be sent; a "
+                        "later yes will try again", on_date)
+            return True
+        self._remember_said(first, kind="reconnect_rest", date=on_date)
+        state.audit("reconnect_rest_listed", reason="a yes under today's reconnect post",
+                    date=on_date, people=len(people), parts=len(parts),
+                    requested_by=_display(message.author))
+        log.info("[reconnect] listed all %d person(s) due on %s in %d message(s), for %s",
+                 len(people), on_date, len(parts), _display(message.author))
+        return True
 
     async def _packages_on_post(self, drip_row: dict) -> list:
         """The package names ONE Sales-packages post carried, as the tab spells
@@ -10746,6 +10947,13 @@ class SalesBot(discord.Client):
         which is the right way round: the drip speaks less on a bad day rather
         than more.
         """
+        # R14 GOES TO THE API SALES CHANNEL OR NOWHERE (NFT2-1086). Decided
+        # before anything is claimed or composed: with no such channel there
+        # is no post and no slot, on a real day and on a test one.
+        if message.get("type") == nextaction.R_RECONNECT:
+            channel, channel_id = self._reconnect_target(channel, channel_id, marker=marker)
+            if channel is None:
+                return
         # NOTHING TO SAY IS NOT A POST. Only R3 can get here empty: its
         # carrier item is planned every Wednesday so the research layer can
         # look for new events, and in a week with no event close enough to
@@ -10945,7 +11153,10 @@ class SalesBot(discord.Client):
         # THE POST AS IT READS, before the tags line goes on: what "today's
         # objectives" shows once this has gone out (`_todays_objectives`).
         posted_text = body
-        body = drip.with_tags(
+        # R14 IS ADDRESSED INSIDE ITS OWN GREETING (drip.TAGS_IN_BLOCK_TYPES):
+        # no tags line goes above it, and its heading sits a blank line up.
+        in_block = drip.tags_in_block(message)
+        body = body if in_block else drip.with_tags(
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
@@ -10963,13 +11174,14 @@ class SalesBot(discord.Client):
             send_day = date.fromisoformat(marker)
         except ValueError:
             send_day = dl.today_ist()
-        body = drip.with_heading(body, drip.heading_for(message, day=send_day))
+        body = drip.with_heading(body, drip.heading_for(message, day=send_day),
+                                 gap=in_block)
         # Stored with its heading, WITHOUT the tags line and the test tag, so
         # the same text is shown live and in test mode. A post meant for one
         # person's DM is not kept: it is not the channel's to be shown.
         stored_body = "" if str(message.get("destination") or "") in (
             "dm", "escalation") else drip.with_heading(
-                posted_text, drip.heading_for(message, day=send_day))
+                posted_text, drip.heading_for(message, day=send_day), gap=in_block)
         if message.get("type") == nextaction.R_AI_NEWS:
             stored_body = news.layout(stored_body)
 
@@ -11077,6 +11289,17 @@ class SalesBot(discord.Client):
             except Exception:
                 log.exception("[R8] could not store who the post named; a reply asking "
                               "for a reminder will not find them")
+        if message.get("type") == nextaction.R_RECONNECT:
+            # EVERYBODY DUE TODAY, IN THE POST'S ORDER, so a yes under it lists
+            # exactly them (`_maybe_reconnect_rest`).
+            try:
+                await asyncio.to_thread(
+                    lambda: self.db.set_drip_people(
+                        on_date=marker, slot=int(message["slot"]),
+                        people=drip.reconnect_people(message)))
+            except Exception:
+                log.exception("[reconnect] could not store who today's post was about; "
+                              "a yes under it will list nobody")
 
         # R3's PROPOSALS ARE OPENED AGAINST THE MESSAGE THAT CARRIED THEM, so a
         # reply of "yes" finds them the same way it finds any other proposal
@@ -11802,6 +12025,8 @@ class SalesBot(discord.Client):
             await self._record_dm_no_meeting(message, marker=marker)
         elif kind == nextaction.R_MEETING_PREP:
             await self._record_meeting_touches(message, marker=marker)
+        elif kind == nextaction.R_RECONNECT:
+            await self._record_reconnect(message, marker=marker)
         elif kind == nextaction.R_CLOSURE_SUPPORT:
             # R10's NEWS WINDOW STARTS AT ITS LAST DEALS POST. The marker is its
             # own row in R2's table (`rule_last_posted`, 'R10'), written under
@@ -12418,6 +12643,13 @@ class SalesBot(discord.Client):
             meeting_state = None
         if meeting_state is None:
             meeting_state = {"unreadable": True}
+        # R14: WHO HAS ALREADY FIRED. None when it cannot be read, and the
+        # evaluator then names nobody.
+        try:
+            reconnect_state = await asyncio.to_thread(self.db.reconnect_state)
+        except Exception:
+            log.exception("[rules] R14's fired list could not be read")
+            reconnect_state = None
 
         result = await asyncio.to_thread(
             lambda: nextaction.run(
@@ -12439,6 +12671,8 @@ class SalesBot(discord.Client):
                     tab.find_company, pipeline_companies),
                 # R8 READS ONE COLUMN ON EVERY ROW: no activation gate.
                 meeting_rows=list(tab.rows), meeting_state=meeting_state,
+                # R14 READS EVERY ROW WITH A COMPANY NAME: no activation gate.
+                reconnect_rows=list(tab.rows), reconnect_state=reconnect_state,
             )
         )
         # R8: THE MEETING DATES THE SHEET SHOWS TODAY ARE NOTED (idempotent: the

@@ -89,6 +89,9 @@ _DATE_FORMATS = (
     "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
     "%d %b, %Y", "%d %B, %Y", "%b %d, %Y", "%B %d, %Y",
     "%d/%m/%y", "%d-%m-%y", "%d %b %y", "%d %B %y",
+    # Dotted with a two-digit year ("13.12.26"): the dotted form is typed as
+    # text beside real date cells on Outreach PoCs, and R14 reads those columns.
+    "%d.%m.%y",
     # Month-and-year only ("Mar 2026"): treated as the 1st, since a follow-up
     # cadence needs *a* day and the 1st is the only non-arbitrary choice.
     "%b-%Y", "%B-%Y", "%b %Y", "%B %Y",

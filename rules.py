@@ -60,6 +60,7 @@ KNOWN_TRIGGERS = (
     "new_pipeline_company",
     "sales_packages",
     "next_step_followups",
+    "reconnect",
 )
 
 # Triggers that cannot finish their item without web research. They still
@@ -127,6 +128,7 @@ PLAIN_BY_TRIGGER = {
     "new_pipeline_company": "new companies in the pipeline — asks before looking up PoCs",
     "sales_packages": "sales packages that aren't ready yet",
     "next_step_followups": "next steps for the people we're connected with",
+    "reconnect": "people it's time to get back in touch with",
 }
 
 # A rule id as it appears in text: R1 to R99. Two digits, because the schedule
@@ -218,7 +220,8 @@ class Rule:
 
     def weekday_label(self) -> str:
         if self.anchored:
-            return "anchored to the meeting date"
+            return ("anchored to the reconnect date" if self.trigger == "reconnect"
+                    else "anchored to the meeting date")
         return ", ".join(WEEKDAY_NAMES[i].capitalize() for i in self.weekdays) or "never"
 
     def describe(self) -> str:
@@ -254,7 +257,9 @@ _cache: dict = {"loaded": False, "rules": [], "source": {}, "error": "", "remedy
 # the trigger, like everything else here, because the trigger is what a rule
 # DOES; an id can be retired.
 FIXED_TIME_TRIGGERS = frozenset({"meeting_prep", "meeting_followup",
-                                 "next_step_followups"})
+                                 "next_step_followups",
+                                 # R14 (NFT2-1086), at RECONNECT_TIME.
+                                 "reconnect"})
 # The days a day order can be written for. Saturday is silent and Sunday is the
 # one-post exception (SUNDAY_RULE_IDS), so neither has an order.
 ORDER_DAYS = (0, 1, 2, 3, 4)
@@ -791,11 +796,11 @@ def _self_test() -> int:
 
     rules = reload()
     print("loading")
-    check("thirteen rules load", len(rules), 13)
+    check("fourteen rules load", len(rules), 14)
     # FILE ORDER IS NOT NUMBER ORDER: R13 sits before R5 so the one-mention-a-
     # day dedup keeps R13's five people rather than handing them to R6.
     check("ids, in file order", [r.id for r in rules],
-          ["R1", "R2", "R3", "R4", "R13"] + [f"R{i}" for i in range(5, 13)])
+          ["R1", "R2", "R3", "R4", "R13"] + [f"R{i}" for i in range(5, 13)] + ["R14"])
     check("every trigger is implemented",
           sorted({r.trigger for r in rules}) == sorted(set(KNOWN_TRIGGERS)), True)
 
@@ -858,13 +863,18 @@ def _self_test() -> int:
 
     print("\nfor_day")
     check("Monday's rules", [r.id for r in for_day(mon)],
-          ["R1", "R4", "R13", "R7", "R8", "R9", "R10"])
+          ["R1", "R4", "R13", "R7", "R8", "R9", "R10", "R14"])
     check("Wednesday's rules", [r.id for r in for_day(wed)],
-          ["R1", "R3", "R13", "R8", "R9", "R11"])
+          ["R1", "R3", "R13", "R8", "R9", "R11", "R14"])
     check("Thursday's rules", [r.id for r in for_day(thu)],
-          ["R1", "R13", "R5", "R8", "R9", "R12"])
+          ["R1", "R13", "R5", "R8", "R9", "R12", "R14"])
     check("Saturday's rules are the anchored ones only",
-          [r.id for r in for_day(date(2026, 9, 26))], ["R8", "R9"])
+          [r.id for r in for_day(date(2026, 9, 26))], ["R8", "R9", "R14"])
+    # R14 IS ANCHORED TOO, to a reconnect date. It gets to look on a Saturday
+    # and finds nobody: a weekend day has already moved to the Monday.
+    check("R14 is anchored, outside the cap, and last in the file",
+          (by_id("R14").anchored, by_id("R14").counts_toward_cap, rules[-1].id),
+          (True, False, "R14"))
 
     print("\nthe order of the day's posts")
     check("the file has a daily_order", has_daily_order(), True)
@@ -879,8 +889,8 @@ def _self_test() -> int:
           [order_index("R1", d) for d in (mon, tue, wed, thu, fri)], [2, 3, 1, 1, 2])
     check("a fixed-time rule has no place in the order",
           [order_index(r, mon) for r in ("R8", "R9", "R13")], [None, None, None])
-    check("R8, R9 and R13 are the fixed-time rules",
-          sorted(r.id for r in rules if is_fixed_time(r)), ["R13", "R8", "R9"])
+    check("R8, R9, R13 and R14 are the fixed-time rules",
+          sorted(r.id for r in rules if is_fixed_time(r)), ["R13", "R14", "R8", "R9"])
     check("no day has more spaced posts than the cap of 5",
           max(len(order_for(d)) for d in (mon, tue, wed, thu, fri)) <= 5, True)
 

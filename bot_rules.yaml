@@ -863,6 +863,67 @@ rules:
     counts_toward_cap: true
     enabled: true
 
+  # ---------------------------------------------------------------- R14
+  # THE RECONNECT FOLLOW-UP (NFT2-1086, 13 Oct 2026). ANCHORED, like R8 and R9:
+  # no weekday, it runs on whatever day a person's date falls. In NO
+  # daily_order list. It posts at RECONNECT_TIME (15:30, and only ever between
+  # 14:00 and 16:00), outside the day's order, the 2-hour gap and the cap, in
+  # the API SALES CHANNEL (SALES_API_CHANNEL_ID) and nowhere else: with that
+  # unset or unreachable it posts nothing.
+  #
+  # ONE DAY A PERSON, the first of these that matches (reconnect.trigger_for):
+  #   1  Reconnect Date holds a readable date     that date
+  #   2  Reconnect Date empty or FALSE, and a
+  #      Meeting Date                             Meeting Date + 45 days
+  #   3  no Meeting Date either                   the newest of First Contact
+  #                                               Date, LI Connected Date, LI DM
+  #                                               Date and the three email dates,
+  #                                               + 45 days
+  # A row with no date in any of those columns never produces a message. Every
+  # row with a company name is read: there is NO activation gate.
+  #
+  # A SATURDAY OR SUNDAY MOVES TO THE MONDAY. A day already gone is SKIPPED:
+  # no catch-up, no backfill. IT FIRES ONCE A PERSON (the reconnect_fired
+  # table); only a NEW Reconnect Date fires them again. Deal Status Lost or
+  # On Hold: never. Named by R13 that day: not repeated here.
+  #
+  # THE POST (wording.reconnect_post) names `max_items_per_post` people,
+  # numbered, "**Name** (Company)", and when more are due it ends "there are N
+  # more — would you like to look at the rest?". A yes under THAT DAY'S post
+  # lists everybody due that day, once. Anything else gets no reply. A
+  # Reconnect Date nobody could read: the person is listed "(reconnect date
+  # unclear)" on the day rule 2 or 3 gives them.
+  #
+  # LAST IN THE FILE ON PURPOSE: it reads who R13 has named today, so R13 must
+  # have run. It takes no contact from any rule and gives way only to R13.
+  #
+  # `counts_toward_cap` is false and the code holds it there whatever this says
+  # (drip.NEVER_COUNTED).
+  - id: R14
+    name: Reconnect follow-up
+    plain: people it's time to get back in touch with
+    # The Bot Rules tab, rule 14, column "What the Bot Shares / Checks".
+    sheet_wording: >-
+      Time to reconnect: on the day a person's Reconnect Date falls, one
+      post at 3:30 PM in the API Sales channel naming up to 5 people, name
+      and company. If Reconnect Date is empty the day is 45 days after the
+      Meeting Date, and with no Meeting Date 45 days after the latest of
+      First Contact Date, LI Connected Date, LI DM Date and the three
+      email dates. A row with none of those dates is never mentioned. A
+      day on a Saturday or Sunday moves to the Monday; a day already past
+      is skipped. Each person is named once and never again unless a new
+      Reconnect Date is written. Deal Status Lost or On Hold is never
+      named. If more than 5 are due the post says how many more, and a
+      yes under it lists them all. A Reconnect Date that can't be read is
+      flagged "(reconnect date unclear)". Saley never fills this column.
+      Doesn't count toward the 7 posts a day.
+    weekdays: []
+    trigger: reconnect
+    max_items_per_post: 5
+    destination: channel
+    counts_toward_cap: false
+    enabled: true
+
 # =============================================================================
 # THE DM NOTE
 #

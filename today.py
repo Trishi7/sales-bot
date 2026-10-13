@@ -65,6 +65,7 @@ POST_LABELS = {
     "sales_packages": "sales packages",
     "events": "AI events and summits",
     "next_step_followups": "next steps for connected contacts",
+    "reconnect": "people to reconnect with",
 }
 
 # How much of each group is shown. A "today" answer is a glance, not a report.

@@ -747,4 +747,5 @@ class TestRuleIdsNeverReachAPerson:
         import rules
         words = {r.id: r.plain for r in rules.safe_load()}
         assert words.get("R6") == "people connected on LinkedIn with no DM yet"
-        assert len(words) == 13   # R13 added 7 Oct 2026 (was 12); ids are never renumbered
+        assert len(words) == 14   # R13 added 7 Oct 2026, R14 on 13 Oct; ids are never renumbered
+        assert words.get("R14") == "people it's time to get back in touch with"

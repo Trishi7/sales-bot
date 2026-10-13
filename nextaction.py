@@ -38,6 +38,9 @@ THE THIRTEEN, with the trigger name the file uses:
     R12  sales_packages         Thu                 Ready? is No or blank
     R13  next_step_followups    weekdays, 15:00     connected contacts: the next step
                                                     on the Next Steps dropdown, 5 a post
+    R14  reconnect              anchored, 15:30     the Reconnect Date, else 45 days
+                                                    after the meeting or the last
+                                                    contact; once a person, 5 named
 
 TWO GATES SURVIVE THE REWRITE, and they run before any rule sees a row:
 
@@ -110,6 +113,7 @@ R_CLOSURE_SUPPORT = "closure_support"
 R_NEW_COMPANY = "new_pipeline_company"
 R_PACKAGES = "sales_packages"
 R_NEXT_STEPS = "next_step_followups"
+R_RECONNECT = "reconnect"
 
 # The one instruction lane that is NOT a rule: a one-off somebody asked for by
 # name ("remind me about Acme on Saturday"). It is kept out of bot_rules.yaml
@@ -135,6 +139,7 @@ TYPE_LABELS = {
     R_NEW_COMPANY: "New company in the pipeline",
     R_PACKAGES: "Sales packages not ready",
     R_NEXT_STEPS: "Next steps for connected contacts",
+    R_RECONNECT: "Time to reconnect",
     SCHEDULED_REMINDER: "Reminders you asked for",
 }
 
@@ -170,6 +175,7 @@ RULE_BANDS = {
     R_PROSPECTS: P_CHASE,
     R_NEW_COMPANY: P_CHASE,
     R_NEXT_STEPS: P_CHASE,
+    R_RECONNECT: P_CHASE,
     R_AI_NEWS: P_CONTEXT,
     R_NEWS_SCREEN: P_CONTEXT,
     R_EVENTS: P_CONTEXT,
@@ -2667,6 +2673,102 @@ def _r_next_step_followups(rule, ctx) -> list:
     return out
 
 
+def _r_reconnect(rule, ctx) -> list:
+    """R14 — the reconnect follow-up (NFT2-1086). ANCHORED: it runs on whatever
+    day a person's date falls, at RECONNECT_TIME, in the API Sales channel.
+
+    WHO AND WHEN is `reconnect.survey`: every row of Outreach PoCs with a
+    company name (`ctx["reconnect_rows"]`, NO ACTIVATION GATE: most of these
+    people have only a first-contact date), one day a person from the three
+    rules there, a weekend day moved to the Monday, a day already gone
+    skipped with no catch-up.
+
+    IT FIRES ONCE. `ctx["reconnect_state"]` is who has fired
+    (`db.reconnect_state`); the sender writes it after the post has gone. LEFT
+    AT None, R14 NAMES NOBODY: None is what an unreadable table returns, and
+    an empty one would post everybody again.
+
+    ANYONE R13 NAMED TODAY IS NOT REPEATED (`ctx["named_by"]`). That is the
+    ONLY rule it gives way to, which is why its items carry no `contact_key`:
+    the one-mention-a-day dedup in `run` would otherwise drop a person any
+    earlier rule named, and a dropped person's day does not come again.
+
+    EVERY PERSON DUE IS AN ITEM, in the post's order (`pick_order`). The post
+    shows the first `max_items_per_post` and says how many more there are; a
+    yes under it lists them all, so they all travel with the message.
+    """
+    import reconnect as reconnect_mod
+
+    today = ctx["today"]
+    rule_id = getattr(rule, "id", "R14")
+    report = ctx["reports"].setdefault(rule_id, {"state": "ok", "due": 0})
+    fired = ctx.get("reconnect_state")
+    if fired is None:
+        report["state"] = "unreadable"
+        log.warning("[rules] %s: who has already fired could not be read, so nobody is "
+                    "named today (an empty answer would post everybody again)", rule_id)
+        return []
+    rows = ctx.get("reconnect_rows")
+    rows = list(ctx["rows"] if rows is None else rows)
+    if rows and not any("reconnect_date" in r for r in rows):
+        report["state"] = "no_reconnect_column"
+        log.info("[rules] %s: no column on the tab maps to Reconnect Date; every day "
+                 "comes from the meeting date or the last contact date", rule_id)
+    named = set((ctx.get("named_by") or {}).get(R_NEXT_STEPS) or ())
+    found = reconnect_mod.survey(rows, today=today, already_fired=fired, named_by_r13=named)
+    due = found["due"]
+    report.update(
+        due=len(due), with_company=found["with_company"], never=found["never"],
+        dated=found["dated"], by_rule=dict(found["by_rule"]), pending=len(found["pending"]),
+        past=len(found["past"]), fired=len(found["fired"]), stopped=len(found["stopped"]),
+        blank=len(found["blank"]), by_r13=len(found["by_r13"]))
+    for entry in found["blank"][:20]:
+        log.info("[rules] %s: row %s has a blank %s (%s) — skipped: the line is built "
+                 "from both", rule_id, entry.get("sheet_row"), entry["missing"],
+                 entry.get("company") or entry.get("name") or "?")
+    for entry in found["early_meetings"][:20]:
+        log.info("[rules] %s: row %s (%s, %s) has a Meeting Date still to come, so its "
+                 "reconnect day is %s — the meeting was recorded early", rule_id,
+                 entry.get("sheet_row"), entry["name"], entry["company"],
+                 dl.format_date(entry["post_day"]))
+    for entry in found["by_r13"]:
+        log.info("[rules] %s: %s (%s) is due today and is in today's next-steps post — "
+                 "not repeated here", rule_id, entry["name"], entry["company"])
+    log.info(
+        "[rules] %s: %d row(s) with a company -> %d due today, %d still to come, %d with "
+        "no date anywhere (never), %d already fired, %d whose day has gone (skipped, no "
+        "catch-up), %d Lost or On Hold, %d with a blank name or company, %d named by the "
+        "next-steps post today; by rule: reconnect date %d, meeting date %d, last contact %d",
+        rule_id, found["with_company"], len(due), len(found["pending"]), found["never"],
+        len(found["fired"]), len(found["past"]), len(found["stopped"]), len(found["blank"]),
+        len(found["by_r13"]), found["by_rule"][1], found["by_rule"][2], found["by_rule"][3])
+
+    limit = max(1, int(getattr(rule, "max_items_per_post", 5) or 5))
+    more = max(0, len(due) - limit)
+    out = []
+    for position, person in enumerate(due):
+        line = wording.reconnect_line(person["name"], person["company"],
+                                      unclear=person["unclear"])
+        out.append(_item(
+            rule=rule, trigger=R_RECONNECT, today=today, due=person["post_day"],
+            why=(f"{rule_id}: " + {1: "the Reconnect Date", 2: "45 days after the meeting",
+                                   3: "45 days after the last contact"}[person["rule"]]
+                 + f" falls today; {position + 1} of {len(due)}"
+                 + (", listed when somebody says yes" if position >= limit else "")),
+            text=line, company=person["company"], poc=person["name"],
+            sheet_row=person.get("sheet_row"), row_key=person["key"],
+            extra={
+                # A FIXED TIME, read by drip.pinned_time like R13's.
+                "dayof_time": config.RECONNECT_TIME,
+                "key": f"{rule_id}:{person['key']}",
+                "pick_order": position, "unclear": bool(person["unclear"]),
+                "reconnect_rule": person["rule"],
+                "trigger_iso": dl.iso(person["trigger"]), "more": more,
+            },
+        ))
+    return out
+
+
 def next_step_report_lines(report: Optional[dict], rule_id: str = "R13") -> list:
     """The preview block that says who R13 did NOT name today, and why.
 
@@ -2736,6 +2838,7 @@ EVALUATORS = {
     R_NEW_COMPANY: _r_new_pipeline_company,
     R_PACKAGES: _r_sales_packages,
     R_NEXT_STEPS: _r_next_step_followups,
+    R_RECONNECT: _r_reconnect,
 }
 
 
@@ -2770,6 +2873,8 @@ def run(
     dm_no_meeting_state: Optional[dict] = None,
     meeting_rows: Optional[list] = None,
     meeting_state: Optional[dict] = None,
+    reconnect_rows: Optional[list] = None,
+    reconnect_state: Optional[dict] = None,
 ) -> dict:
     """THE QUEUE. Everything the thirteen rules make due today, deduped and ranked.
 
@@ -2803,6 +2908,11 @@ def run(
     means "no memory" (every touch due by its date; a preview); the SENDER
     passes {"unreadable": True} when the table cannot be read, and R8 then
     names nobody.
+
+    `reconnect_rows` is EVERY row of Outreach PoCs, for R14, which applies no
+    activation gate (None = use `rows`). `reconnect_state` is who has already
+    fired, from `db.reconnect_state()`: {row_key: [trigger dates]}. LEFT AT
+    None, R14 NAMES NOBODY, for R13's reason.
     """
     today = today or dl.today_ist()
     rows = list(rows or [])
@@ -2833,6 +2943,13 @@ def run(
         # its memory of which touches have gone out.
         "meeting_rows": list(meeting_rows) if meeting_rows is not None else None,
         "meeting_state": meeting_state,
+        # R14 READS EVERY ROW WITH A COMPANY NAME (None = use `rows`), and who
+        # has already fired. None (unreadable) is kept as None, like R13's.
+        "reconnect_rows": list(reconnect_rows) if reconnect_rows is not None else None,
+        "reconnect_state": (dict(reconnect_state)
+                            if reconnect_state is not None else None),
+        # WHO EACH RULE HAS NAMED SO FAR TODAY, by trigger. R14 reads R13's.
+        "named_by": {},
         # THE CONTACTS EARLIER-LISTED RULES HAVE NAMED SO FAR TODAY, filled in
         # as the rules run (below). A rule that picks a fixed few (R7) reads it
         # so it does not spend a place on somebody the dedup will take away.
@@ -2886,10 +3003,12 @@ def run(
         # are not "taken".
         ctx["taken"].update(it.get("contact_key") for it in items
                             if it.get("contact_key") and not it.get("yields"))
+        ctx["named_by"].setdefault(rule.trigger, set()).update(
+            it.get("contact_key") for it in items if it.get("contact_key"))
         rules_run.append({
             "id": rule.id, "name": rule.name, "ran": True,
             "why": (f"runs {rule.weekday_label()}" if not rule.anchored
-                    else "anchored to the meeting date"),
+                    else rule.weekday_label()),
             "items": len(items),
         })
 

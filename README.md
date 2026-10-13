@@ -2215,11 +2215,13 @@ and every one of them is listed in the **RETIRED block at the bottom of
 | **R11** | New company in Master Pipeline | Wed | `new_pipeline_company` | 10 | yes |
 | **R12** | Sales packages — names only, highest % first; a date in a reply is recorded | Thu | `sales_packages` | 5 | yes |
 | **R13** | Next steps for connected contacts | weekdays, 15:00 | `next_step_followups` | 5 | **no** |
+| **R14** | Reconnect follow-up — the Reconnect Date, else 45 days after the meeting or the last contact; once a person; API Sales channel | **anchored**, 15:30 | `reconnect` | 5 named | **no** |
 
 **"Anchored" means an empty weekday list** — R8 and R9 key off a meeting date on
 the sheet, not off the calendar, so they always get to look. Both sit **outside
 the daily cap**: a meeting is time-critical and must not be crowded out by a
-Monday chase.
+Monday chase. R14 is anchored the same way, to a reconnect date, and is outside
+the cap for its own reason: a person's day comes once and is skipped if missed.
 
 **The order of the entries in the file is not the order of the numbers.** R13
 is listed between R4 and R5. One contact is named at most once a day and the
@@ -2378,6 +2380,101 @@ outside the daily cap and never held by the re-ask clock.
 
 **Saley only reminds.** Q to W are a restricted band; no setting makes the bot
 fill them.
+
+### Rule 14: the reconnect follow-up
+
+**New 13 Oct 2026 (NFT2-1086).** Saley reads the Outreach PoCs tab, works out
+ONE reconnect day a person, and on that day posts in the **API Sales channel**
+(`SALES_API_CHANNEL_ID`), not the channel the other rules use. It fires once a
+person. `python verify_reconnect.py` checks all of it offline (35 numbered
+cases) and `python -m reconnect` is the module's own self-test.
+
+```
+**Time to reconnect**
+
+Hey @Vaishnavi, @Sid — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Dr. David Gamez** (Middlesex University London)
+2. **Daisy Leigh** (PolyAI)
+3. **Dr. Enrico Grisan** (London South Bank University)
+4. **Prof. George Magoulas** (Birkbeck, University of London)
+5. **Ioana Mocanu** (Agoda)
+
+there are 36 more — would you like to look at the rest?
+```
+
+**Which day** (`reconnect.trigger_for`), the first of these that matches:
+
+| | When | The day |
+|---|---|---|
+| 1 | Reconnect Date holds a readable date | that date |
+| 2 | Reconnect Date is empty or `FALSE`, and Meeting Date holds a date | Meeting Date + 45 days (Meeting Status is not read) |
+| 3 | Meeting Date is empty too | the newest of First Contact Date, LI Connected Date, LI DM Date and the three email dates, + 45 days |
+
+A row with no date in any of those columns never produces a message. Every row
+with a company name is read: **there is no activation gate**, because most of
+these people have only a first-contact date.
+
+**Reading the date** (`reconnect.read_date`). The column is typed by hand.
+`13/12/2026`, `13-12-2026`, `13.12.2026`, `Dec 13 2026`, `December 13, 2026`,
+`2026-12-13`, `13th dec`, `13 Dec` and a real date cell are all 13 December.
+**Day first, always**: `03/04/2026` is 3 April. A date with no year is the next
+time that day comes round, unless it passed within the last 90 days (the
+Deliverables tab's reading of "25-Sep", `nextaction._deliverable_due`).
+Ordinals, a trailing full stop and a double space are stripped first. Numbers
+that only read month-first (`12/13/2026`) are not read at all.
+
+| The cell | What happens |
+|---|---|
+| `FALSE` (the checkbox artefact) | read as empty: rule 2, then rule 3 |
+| something that is not a date (`banana`) | the person is still listed, on the day rule 2 or 3 gives them, with **(reconnect date unclear)** after the company |
+| a date already past | skipped entirely. No catch-up, no backfill |
+| a date far ahead | nothing until then |
+| a Saturday or Sunday | posted on the Monday (`NEXT_ACTION_WEEKEND_SHIFT`) |
+
+**The post** (`wording.reconnect_post`; R14 is in `drip.VERBATIM_TYPES`, so no
+model writes it). Five names at most, numbered, the name in bold, the company
+in brackets, no date and no reason. The greeting and its tags are part of the
+block, not a tags line above it. The "more" line is there only when more are
+due than the post names; five or fewer ends at the last name. One person reads
+"this PoC". Nothing due: **no post at all**. A row with a blank Name or Company
+is skipped and logged: a blank Name by the rule (`[rules] R14: row N has a blank
+Name`), a blank Company by the sheet read (`[gtm] ... row N has a blank
+Company`), because a row with no company is never handed to any rule.
+
+**When.** At `RECONNECT_TIME` (15:30; only 14:00 to 16:00 is accepted), on the
+same fixed-time path as R8 and R13: outside the day's order, the 2-hour gap and
+`DAILY_MESSAGE_CAP`. Never twice on one day. Anyone the next-steps post (R13)
+names that day is not repeated here; that is the only rule R14 gives way to.
+
+**A yes under the post** lists everybody due that day, in the post's order,
+split between names across consecutive messages under Discord's 2,000
+characters. The list is the post's own record (`drip_sends.people`), so it is
+that day's people only. It is listed once (`drip_sends.rest_listed`). Only a
+reply to **that day's** reconnect post counts; a yes under any other post is
+not this. Anything that is not a yes gets no reply at all, not even a reaction.
+(A real question typed under the post is answered like any other question.)
+
+**What ends it.** The reminder going out: every person due that day, the five
+named and the rest, is recorded in the `reconnect_fired` table **after** the
+post has landed and never fires again. Deal Status Lost or On Hold (whole
+words): never fires. Nothing else re-arms a person; a **new** Reconnect Date
+written afterwards is a new trigger and fires once more.
+
+**The channel.** `SALES_API_CHANNEL_ID` unset, zero, or not a channel the bot
+can see: an ERROR at startup naming the variable (`[reconnect]`), and R14 posts
+nothing, in any channel. It never falls back to `SALES_ASK_CHANNEL_ID`. In
+`SALES_TEST_MODE` and on a test day the post goes to the test channel like
+every other post, and the API Sales channel must still be configured.
+
+**The column is read and never written.** `reconnect_date` is matched by its
+header text ("Reconnect Date", "Reconnect", "Re-connect Date", "Reconnect on"),
+never by letter. It is locked by role wherever it sits
+(`config.ALWAYS_READ_ONLY_ROLES`): restricted on an existing row and on a new
+one, in no write tier and in no new-row list, and it shows on the `[gtm.lock]`
+lines at startup. If no header maps to it, startup logs an ERROR and every day
+comes from rules 2 and 3; unlike a role in `RESTRICTED_COLUMN_ROLES`, its
+absence does not stop other writes.
 
 ### Rule 4: deliverables to chase
 
@@ -3583,15 +3680,17 @@ strip to tidy up after it. Both halves are tested —
 
 ```bash
 python rules.py          # the YAML parses and means what it says
-python nextaction.py     # the thirteen rules on fixtures: no sheet, no network, no database
+python nextaction.py     # the rules on fixtures: no sheet, no network, no database
+python -m reconnect      # R14's dates, rules and yes-reading
+python verify_reconnect.py   # R14 end to end, 35 numbered cases
 ```
 
-`rules.py` asserts that thirteen rules load (R13 listed before R5), that R7 is on and Mondays only,
+`rules.py` asserts that fourteen rules load (R13 listed before R5, R14 last), that R7 is on and Mondays only,
 that R11 is Wednesdays only, that each weekday's order is the one in `daily_order`, that a file whose
 `weekdays` and `daily_order` disagree is refused, that every trigger
 they name is implemented, that each runs on the right weekdays and no others,
 that the anchored rules always get to look, and that Saturday yields only those
-two.
+three (R8, R9 and R14).
 
 `nextaction.py` runs ~60 assertions: that every known trigger has an evaluator
 and every rule in the file resolves to one; that all four stop values stop a row

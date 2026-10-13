@@ -123,7 +123,11 @@ RULE_ONLY_TYPES = frozenset({nextaction.R_DELIVERABLES, nextaction.R_NEXT_STEPS,
                              nextaction.R_DM_NO_MEETING,
                              # R10 (13 Oct 2026): ONE list of every deal, highest
                              # closure percentage first, whoever owns each.
-                             nextaction.R_CLOSURE_SUPPORT})
+                             nextaction.R_CLOSURE_SUPPORT,
+                             # R14 (NFT2-1086): ONE post a day about everybody
+                             # whose date falls on it. It is addressed inside its
+                             # own greeting and has no owner.
+                             nextaction.R_RECONNECT})
 
 
 def group_key(action: dict) -> str:
@@ -486,6 +490,9 @@ def is_sending_day(day: date) -> bool:
 NEVER_COUNTED = frozenset({
     nextaction.R_MEETING_PREP, nextaction.R_MEETING_FOLLOWUP,
     nextaction.SCHEDULED_REMINDER,
+    # R14 (NFT2-1086): a person's reconnect day comes once and is skipped if
+    # it is missed, so the day being full must never be the reason.
+    nextaction.R_RECONNECT,
 })
 
 # NEW CONTENT EVERY DAY, so the re-ask clock does not apply: Monday's news is
@@ -511,6 +518,9 @@ NEVER_COUNTED = frozenset({
 NEVER_HELD = frozenset({
     nextaction.R_AI_NEWS, nextaction.R_MEETING_PREP, nextaction.R_MEETING_FOLLOWUP,
     nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING,
+    # R14: today's people are not yesterday's. Held as "asked recently", a
+    # Tuesday's list would be lost for good, because a day gone is skipped.
+    nextaction.R_RECONNECT,
 })
 
 # A POST THAT WENT OUT THIS CLOSE TO ITS SLOT WENT "ON TIME". The live sweep
@@ -604,7 +614,7 @@ def earliest_send_ist() -> tuple:
     """
     best = tuple(config.drip_start_ist())
     for raw in (config.MEETING_DAYOF_TIME, config.MEETING_PREP_TIME,
-                config.NEXT_STEP_TIME):
+                config.NEXT_STEP_TIME, config.RECONNECT_TIME):
         try:
             hh, mm = (int(x) for x in str(raw or "").strip().split(":")[:2])
         except (TypeError, ValueError):
@@ -1264,6 +1274,9 @@ HEADINGS = {
     "R11": "",
     "R12": "Sales packages",
     "R13": "Next steps",
+    # R14: the greeting, with its tags, is the first line of the block under
+    # this (`wording.reconnect_post`), after a blank line (TAGS_IN_BLOCK_TYPES).
+    "R14": "Time to reconnect",
     "reminder": "Reminder",
     "approvals": "Waiting for your yes",
 }
@@ -1274,7 +1287,7 @@ _HEADING_BY_TYPE = {
     nextaction.R_DM_NO_MEETING: "R7", nextaction.R_MEETING_PREP: "R8",
     nextaction.R_MEETING_FOLLOWUP: "R9", nextaction.R_CLOSURE_SUPPORT: "R10",
     nextaction.R_NEW_COMPANY: "R11", nextaction.R_PACKAGES: "R12",
-    nextaction.R_NEXT_STEPS: "R13",
+    nextaction.R_NEXT_STEPS: "R13", nextaction.R_RECONNECT: "R14",
     nextaction.SCHEDULED_REMINDER: "reminder",
 }
 
@@ -1304,12 +1317,34 @@ def heading_for(message: dict, *, day: Optional[date] = None) -> str:
     return heading(key, day=day, company=companies[0] if companies else "")
 
 
-def with_heading(body: str, head: str) -> str:
-    """`head` on its own first line above `body` (tags line included)."""
+def with_heading(body: str, head: str, *, gap: bool = False) -> str:
+    """`head` on its own first line above `body` (tags line included). `gap`
+    puts a blank line under it (R14's agreed shape)."""
     body = str(body or "").strip()
     if not head:
         return body
-    return f"{head}\n{body}" if body else head
+    return f"{head}\n{'' if not gap else chr(10)}{body}" if body else head
+
+
+# POSTS ADDRESSED INSIDE THEIR OWN FIRST SENTENCE. R14 opens "Hey @Vaishnavi,
+# @Sid — ...": the tags are part of the agreed block, so the sender adds no
+# tags line above it, and the heading sits a blank line above the greeting.
+TAGS_IN_BLOCK_TYPES = frozenset({nextaction.R_RECONNECT})
+
+
+def tags_in_block(message: dict) -> bool:
+    return message.get("type") in TAGS_IN_BLOCK_TYPES
+
+
+def greeting_tags() -> str:
+    """Who R14's greeting names: the always-tag ids (Vaishnavi and Sid), as
+    "<@id>, <@id>". Every token is `guardrails.mention_for`'s, so an id off
+    the roster is a plain name. "" when nothing is configured, and the wording
+    then names the two of them in plain text."""
+    import guardrails
+
+    tokens = [guardrails.mention_for(uid) for uid in config.always_tag_ids()]
+    return ", ".join(t for t in dict.fromkeys(tokens) if t)
 
 
 # TYPES POSTED EXACTLY AS RENDERED, never composed by the model: the news
@@ -1360,7 +1395,12 @@ VERBATIM_TYPES = frozenset({nextaction.R_AI_NEWS, nextaction.R_DELIVERABLES,
                             # composer could reorder the blocks or move a date
                             # from one person to the next
                             # (`wording.meeting_today_post`, `meeting_prep_post`).
-                            nextaction.R_MEETING_PREP})
+                            nextaction.R_MEETING_PREP,
+                            # R14 (NFT2-1086): the greeting, the numbered names and
+                            # the "more" question are the ticket's own words, and a
+                            # composer could move the unclear flag to another name
+                            # (`wording.reconnect_post`).
+                            nextaction.R_RECONNECT})
 
 
 def tag_prefix(*, owner_id=None, owner_name: str = "", is_dm: bool = False) -> str:
@@ -1917,7 +1957,42 @@ def shown_contacts(message: dict) -> list:
         # more than a handful; if it is ever twenty, that is a good week and all
         # twenty show. The rule's `max_items_per_post` is not applied.
         return closure_order(actions)
+    if kind == nextaction.R_RECONNECT:
+        # THE FIVE THE POST NAMES. Everybody due travels with the message
+        # (`reconnect_everyone`); the rest are listed when somebody says yes.
+        return reconnect_everyone(message)[:cap]
     return actions[:cap]
+
+
+def reconnect_everyone(message: dict) -> list:
+    """EVERYBODY due on an R14 post's day, in the rule's order (`pick_order`:
+    by trigger date, then sheet order). `group` sorts members by company,
+    which is not it. One person once."""
+    seen: set = set()
+    rows: list = []
+    for a in message.get("actions") or []:
+        key = str(a.get("row_key") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append(a)
+    return sorted(rows, key=lambda a: (
+        int(a["pick_order"]) if a.get("pick_order") is not None else 10 ** 9,
+        int(a.get("sheet_row") or 0)))
+
+
+def reconnect_people(message: dict) -> list:
+    """Everybody due on an R14 post's day as the post's record keeps them:
+    [{"n", "row_key", "name", "company", "unclear", "rule", "trigger"}]. Stored
+    on the post's row so a "yes" lists exactly that day's people, in that
+    order, whatever the sheet says by then. `shown` is whether the post itself
+    named them."""
+    named = len(shown_contacts(message))
+    return [{"n": i, "row_key": str(a.get("row_key") or ""),
+             "name": str(a.get("poc") or ""), "company": str(a.get("company") or ""),
+             "unclear": bool(a.get("unclear")), "rule": int(a.get("reconnect_rule") or 0),
+             "trigger": str(a.get("trigger_iso") or ""), "shown": i <= named}
+            for i, a in enumerate(reconnect_everyone(message), 1)]
 
 
 def li_no_dm_order(actions: list) -> list:
@@ -1988,7 +2063,7 @@ def nothing_to_say(message: dict) -> bool:
     enough to mention and nothing new found, there is nothing to post. The
     sender then spends the slot silently rather than posting a heading."""
     if message.get("type") in (nextaction.R_NEXT_STEPS, nextaction.R_DM_NO_MEETING,
-                               nextaction.R_MEETING_PREP):
+                               nextaction.R_MEETING_PREP, nextaction.R_RECONNECT):
         # Cannot happen (nobody due means no item, so no group); if it ever
         # did, an opener with nobody under it must not be posted.
         return not shown_contacts(message)
@@ -2302,6 +2377,23 @@ def points_of(message: dict) -> Optional[dict]:
             return None
         return {"header": lines[0], "lines": lines[1:] + ([""] if close else []),
                 "extra": [], "close": close}
+    if kind == nextaction.R_RECONNECT:
+        # THE WHOLE POST IS FIXED TEXT FROM wording.py, FOR ONE PERSON OR
+        # FORTY-ONE. A list of ONE is still a list: it must never reach the
+        # composed sentence below. The greeting (with its tags) opens the
+        # block; the "more" question is its close and is there only when more
+        # are due than the post names.
+        shown = shown_contacts(message)
+        more = len(reconnect_everyone(message)) - len(shown)
+        lines = wording.reconnect_post(
+            [{"name": a.get("poc"), "company": a.get("company"),
+              "unclear": a.get("unclear")} for a in shown],
+            more=more, tags=greeting_tags())
+        if not lines:
+            return None
+        close = wording.reconnect_more(more)
+        return {"header": lines[0], "lines": lines[1:] + ([""] if close else []),
+                "extra": [], "close": close, "opener_in_block": True}
     companies = [c for c in (message.get("companies") or []) if str(c).strip()]
     if len(companies) >= 3:
         lines = []
@@ -2476,7 +2568,7 @@ def compose_fallback(message: dict, *, address: str = "", offers: bool = True) -
                 + ("\n" + points["close"] if points.get("close") else "")).strip()
         if message.get("type") in (nextaction.R_LI_NO_DM, nextaction.R_DM_NO_MEETING,
                                    nextaction.R_CLOSURE_SUPPORT, nextaction.R_PACKAGES,
-                                   nextaction.R_MEETING_PREP):
+                                   nextaction.R_MEETING_PREP, nextaction.R_RECONNECT):
             # R6 IS ITS FOUR BLOCKS AND NOTHING ELSE: no source link under it and
             # no bracketed note about a search that could not run. R7 is its
             # two blocks and nothing else, for the same reason.

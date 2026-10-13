@@ -245,6 +245,27 @@ if SALES_ASK_CHANNEL_ID and SALES_ASK_CHANNEL_ID not in SALES_CHANNEL_IDS:
     )
     SALES_CHANNEL_IDS.append(SALES_ASK_CHANNEL_ID)
 
+# THE API SALES CHANNEL: where the reconnect follow-up (R14, NFT2-1086) posts,
+# and the ONLY place it posts. Not the channel the other rules use. There is no
+# default and NO FALLBACK: unset, zero, or a channel the bot cannot reach means
+# R14 says nothing anywhere, and startup says so at ERROR naming this variable
+# (`bot._reconnect_channel`). A reconnect list in the wrong channel is worse
+# than none.
+#
+# IT JOINS THE SCOPE like the ask channel, because a "yes" under the post has
+# to be read there and the hard rule is "post only in SALES_CHANNEL_IDS". Like
+# every sales channel it buys no answering exemption: the bot answers there
+# only when @-mentioned or replied to.
+SALES_API_CHANNEL_ID = _int("SALES_API_CHANNEL_ID", 0)
+
+if SALES_API_CHANNEL_ID and SALES_API_CHANNEL_ID not in SALES_CHANNEL_IDS:
+    log.warning(
+        "SALES_API_CHANNEL_ID=%s is not in SALES_CHANNEL_IDS — adding it, since the "
+        "reconnect follow-up posts there and reads a yes under its own post.",
+        SALES_API_CHANNEL_ID,
+    )
+    SALES_CHANNEL_IDS.append(SALES_API_CHANNEL_ID)
+
 # THE TEST CHANNEL JOINS THE SCOPE THE SAME WAY, and for the same reason: it is
 # by definition a channel the bot reads commands in and posts simulations to.
 # An operator sets one variable; forgetting to also list it here would make
@@ -1598,6 +1619,20 @@ STEP_ROLES = ("outreach_step", "email_1_sent", "email_1_date", "email_2_sent",
 COMMERCIAL_ROLES = ("next_steps", "package", "prospect_status", "closure_prob",
                     "deal_size", "deal_status", "poc_priority")
 
+# COLUMNS THE BOT READS AND MAY NEVER WRITE, WHATEVER THE SETTINGS SAY
+# (NFT2-1086). Reconnect Date sits among the commercial columns and the team
+# types it by hand; R14 only reads it. It is locked here, by role, and not by
+# adding it to RESTRICTED_COLUMN_ROLES, for two reasons. That list is an
+# environment setting, so a .env that spells it out would leave a new column
+# unlocked until somebody edited the file. And a restricted role that maps to
+# no column stops EVERY write to the tab; a missing Reconnect Date column
+# should cost R14 its first rule, not the team their approvals.
+#
+# So: when the column is there it is restricted on an existing row AND on a new
+# row; when it is not there nothing else changes, and startup says so at ERROR
+# ([gtm.lock]). This can only lock MORE. Nothing here is configurable.
+ALWAYS_READ_ONLY_ROLES = ("reconnect_date",)
+
 # The roles no write path may ever touch on an EXISTING row. Role names are
 # gtm_sheet's own (its ALIASES map); the three blocks above are the default.
 #
@@ -1748,6 +1783,11 @@ def resolve_column_lock(role_to_col: dict, headers=(), *,
     unmapped = [r for r in restricted_roles if r not in role_to_col]
     ranged = {i for lo, hi in parse_column_ranges(RESTRICTED_COLUMN_RANGES)
               for i in range(lo, hi + 1)}
+    # THE READ-ONLY ROLES JOIN THE LOCK WHEN THEIR COLUMN IS THERE, and are not
+    # counted as unmapped when it is not (see ALWAYS_READ_ONLY_ROLES).
+    for role in ALWAYS_READ_ONLY_ROLES:
+        if role in role_to_col:
+            by_role.setdefault(role, int(role_to_col[role]))
     restricted = set(by_role.values()) | ranged
     identity = {by_role[r] for r in by_role if r in IDENTITY_ROLES}
     locked_for_good = restricted - identity
@@ -2414,6 +2454,30 @@ def _hhmm(name: str, value, default: str) -> str:
 # touch: it takes no slot in the posting window and the window cannot move it.
 # (NFT2-1069 will move this to a `fixed_time` field on the rule.)
 NEXT_STEP_TIME = _hhmm("NEXT_STEP_TIME", os.getenv("NEXT_STEP_TIME", "15:00"), "15:00")
+
+# R14 — THE RECONNECT FOLLOW-UP (NFT2-1086). When its one post goes out, IST: a
+# fixed time like R8's and R13's, outside the day's order, the 2-hour gap and
+# DAILY_MESSAGE_CAP. 15:30 because 14:00 is meeting preparation and 15:00 is
+# next steps, and this must not land on top of either.
+#
+# ONLY BETWEEN 14:00 AND 16:00. A time outside that is REFUSED with a warning
+# and 15:30 is used: the team agreed a two-hour band, and a typo must not move
+# the post to the morning.
+RECONNECT_TIME_DEFAULT = "15:30"
+RECONNECT_TIME_BAND = ("14:00", "16:00")
+
+
+def _reconnect_time(value) -> str:
+    """RECONNECT_TIME as "HH:MM": `_hhmm`, then the 14:00-16:00 band."""
+    at = _hhmm("RECONNECT_TIME", value, RECONNECT_TIME_DEFAULT)
+    if not RECONNECT_TIME_BAND[0] <= at <= RECONNECT_TIME_BAND[1]:
+        log.warning("RECONNECT_TIME=%s is outside %s-%s; using %s instead", at,
+                    RECONNECT_TIME_BAND[0], RECONNECT_TIME_BAND[1], RECONNECT_TIME_DEFAULT)
+        return RECONNECT_TIME_DEFAULT
+    return at
+
+
+RECONNECT_TIME = _reconnect_time(os.getenv("RECONNECT_TIME", RECONNECT_TIME_DEFAULT))
 
 # WHICH "Sid - LI Addition" VALUES MEAN CONNECTED. Compared after normalising
 # (case, spaces, punctuation), exactly — "Not connected" is not "connected".
@@ -3305,6 +3369,20 @@ def validate() -> list[str]:
     # read or speak, and a bot that can't be scoped shouldn't be running at all.
     if not SALES_CHANNEL_IDS:
         missing.append("SALES_CHANNEL_IDS")
+
+    if not SALES_API_CHANNEL_ID:
+        log.error(
+            "SALES_API_CHANNEL_ID is unset — the reconnect follow-up (R14) has nowhere "
+            "to post and will post NOTHING. It never falls back to another channel. Set "
+            "it to the API Sales channel's id."
+        )
+    else:
+        log.info(
+            "[config] R14 reconnect follow-up: one post at %s IST in channel %s, on the "
+            "day a person's date falls (a weekend moves to the Monday), outside the cap "
+            "and the gap; five names, and a yes under the post lists the rest",
+            RECONNECT_TIME, SALES_API_CHANNEL_ID,
+        )
 
     if not SALES_ASK_CHANNEL_ID:
         log.warning(

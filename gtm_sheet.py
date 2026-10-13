@@ -231,6 +231,9 @@ NEXT_ACTION_ROLES = (
     "email_1_sent", "email_1_date", "email_2_sent", "email_2_date",
     "email_3_sent", "email_3_date",
     "poc_priority",
+    # R14 (NFT2-1086). Here and not in CADENCE_ROLES for the email columns'
+    # reason: nearly empty by design.
+    "reconnect_date",
 )
 
 # TWO PAIRS THAT MUST NEVER MAP, WHATEVER THE ALIASES OR THE OVERRIDE SAY.
@@ -245,6 +248,9 @@ NEXT_ACTION_ROLES = (
 _POCS_ROLE_VETO = {
     "next_steps":    lambda h: h in ("next steps", "next step"),
     "outreach_step": lambda h: "note" in h or "remark" in h,
+    # The loose pass tests `h in key`, and a column headed just "Date" is a
+    # substring of "reconnect date". Only a header that says so is this role.
+    "reconnect_date": lambda h: "reconnect" not in h.replace(" ", ""),
 }
 
 
@@ -566,6 +572,13 @@ ROLES: dict[str, dict[str, tuple[str, ...]]] = {
         # WHICH PACKAGE went out. Cross-referenced against the Sales Packages
         # tab, which is what says whether that package is finished enough to send.
         "package": ("package", "package sent", "package shared", "pack", "packages"),
+        # WHEN TO GET BACK IN TOUCH (R14, NFT2-1086). Typed by hand, in any
+        # shape; `reconnect.read_date` reads it. READ AND NEVER WRITTEN: it is
+        # locked by role wherever it sits (config.ALWAYS_READ_ONLY_ROLES), it
+        # is in no write tier and in no new-row list. `_POCS_ROLE_VETO` keeps
+        # the loose pass from handing it a column that does not say "reconnect".
+        "reconnect_date": ("reconnect date", "reconnect", "re-connect date",
+                           "reconnect on"),
         # WHERE THE PROSPECT IS. The quote chase fires off the value "Demo".
         "prospect_status": ("prospect status", "prospect", "prospect stage",
                             "pipeline stage", "funnel stage", "stage"),
@@ -2048,10 +2061,23 @@ class GTMSheets:
                 log.info("[gtm.lock] %r: restricted, %s block (NEVER written on an existing "
                          "row): %s", tab.title, name, ", ".join(at(r) for r in mine))
         other = [r for r in config.RESTRICTED_COLUMN_ROLES
-                 if r not in config.IDENTITY_ROLES + config.STEP_ROLES + config.COMMERCIAL_ROLES]
+                 if r not in config.IDENTITY_ROLES + config.STEP_ROLES + config.COMMERCIAL_ROLES
+                 + config.ALWAYS_READ_ONLY_ROLES]
         if other:
             log.info("[gtm.lock] %r: restricted, other roles: %s", tab.title,
                      ", ".join(at(r) for r in other))
+        # READ AND NEVER WRITTEN (R14's Reconnect Date). Locked when it is
+        # there; when it is not, no write is refused on its account, and R14
+        # has only the meeting and contact dates to go on.
+        log.info("[gtm.lock] %r: restricted, read-only (never written, on any row): %s",
+                 tab.title, ", ".join(at(r) for r in config.ALWAYS_READ_ONLY_ROLES))
+        gone = [r for r in config.ALWAYS_READ_ONLY_ROLES if r not in lock.by_role]
+        if gone:
+            log.error(
+                "[gtm.lock] %r: the role(s) %s map to NO column. Nothing else is locked "
+                "or unlocked by that, but the reconnect follow-up (R14) cannot read a "
+                "Reconnect Date until a header says so: it falls back to the meeting "
+                "date and the last contact date for everybody.", tab.title, ", ".join(gone))
         if config.RESTRICTED_COLUMN_RANGES:
             log.info("[gtm.lock] %r: also restricted by letter (RESTRICTED_COLUMN_RANGES): "
                      "%s. A range can only lock more.", tab.title,
@@ -2207,6 +2233,14 @@ class GTMSheets:
             # "TOTAL" line be counted as a deal and flagged as one.
             if kind in (MASTER, POCS, PRIORITY, PIPELINE, RESEARCHER_LINES) \
                     and not (row.get("company") or "").strip():
+                # A PERSON WITH NO COMPANY IS NOT A SPACER, and is still not a
+                # row: every rule keys a person on company and name, and R14
+                # builds its line from both (NFT2-1086). Said here, because
+                # no rule ever sees the row to say it.
+                if kind == POCS and (row.get("name") or "").strip():
+                    log.info("[gtm] %r: row %s has a blank Company (%s) — skipped: not "
+                             "read as a row by any rule", title, row.get("_row"),
+                             str(row.get("name")).strip())
                 continue
             if kind == EVENTS and not (row.get("event") or "").strip():
                 continue
