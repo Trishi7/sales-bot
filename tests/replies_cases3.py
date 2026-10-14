@@ -296,7 +296,7 @@ async def n1_news_content_comes_back_at_any_time_of_day(check, test_mode):
     a fixed 14:00, and the story sat at 16:00), so it is "since the previous post" at both times of asking.
 
     SINCE 8 OCT (docs/plans/NEWS-OCT8.md) the list is chosen and written by code and a plain news question makes no
-    model call, so the stories are read off the REPLY (the bold headlines), not off a tool result the model was given."""
+    model call, so the stories are read off the REPLY (the headlines, one plain line each since NFT2-1087), not off a tool result the model was given."""
     import re
     import deadlines as dl
     from datetime import datetime
@@ -319,7 +319,7 @@ async def n1_news_content_comes_back_at_any_time_of_day(check, test_mode):
             m = Mark(w)
             await w.say("top 5 AI headlines", who="member", mention=True)
             reply = rw.strip_tag(w.posted[-1].content) if w.posted else ""
-            items = re.findall(r"^- [*][*](.+?)[*][*] [(]", reply, re.M)
+            items = re.findall(r"^- (.+?) [(]\[", reply, re.M)      # NFT2-1087: the one plain line shape
             got[label] = items
             check(f"N1 {label}: the answer lists the collected stories", len(items), want_n)
             check(f"N1 {label}: with no model call", w.model.calls, 0)

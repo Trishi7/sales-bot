@@ -812,9 +812,16 @@ def settings(check):
     def default(name):
         m = re.search(rf'{name} = _int\("{name}", (\d+)\)', src)
         return int(m.group(1)) if m else None
-    check("NEWS_POC_TARGETS_PER_DAY is 40 in the code (not an env override) and in .env.example",
-          (default("NEWS_POC_TARGETS_PER_DAY"), example.get("NEWS_POC_TARGETS_PER_DAY")), (40, "40"))
-    check("382 names at 40 a day come round inside the 10 days the ticket asks for", -(-382 // 40), 10)
+    import config
+    check("NEWS_POC_TARGETS_PER_DAY is RETIRED (NFT2-1087): not a config attribute and not "
+          "an uncommented line of .env.example",
+          (hasattr(config, "NEWS_POC_TARGETS_PER_DAY"), "NEWS_POC_TARGETS_PER_DAY" in example),
+          (False, False))
+    check("every name is searched in batches now: NEWS_NAME_BATCH_SIZE is 15 in the code and "
+          "in .env.example", (default("NEWS_NAME_BATCH_SIZE"), example.get("NEWS_NAME_BATCH_SIZE")),
+          (15, "15"))
+    check("382 names at 15 a search is 26 Google searches, every name in exactly one",
+          -(-382 // 15), 26)
     check("the two new settings are in the contract with the code's defaults",
           (default("NEWS_SCREEN_STALE_DAYS"), example.get("NEWS_SCREEN_STALE_DAYS"),
            default("NEWS_SCREEN_FIRST_RUN_DAYS"), example.get("NEWS_SCREEN_FIRST_RUN_DAYS")), (14, "14", 7, "7"))

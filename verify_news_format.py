@@ -2,6 +2,8 @@
 
     python verify_news_format.py
 
+(NFT2-1087 replaced the bold line with one plain line shape and removed the
+follow-up message; the 8 Oct request below is what began the template.)
 The team, 8 Oct: "just make it headlines in bold with a link, each of the 5
 news should be bulleted and have spacing between each of the points ... make
 sure this template is followed throughout for all the news messages - when
@@ -16,20 +18,20 @@ behind fake Discord, no feed fetched, no search, no model (the engine's model
 is a script; the scorer counts any call it gets). Every source probe is
 stubbed and a real Sheets or Drive call fails the run (tests/offline_guard.py).
 
-  the template   news.render in all four modes, exact text for five stories:
-                 a Google News title ending " - Reuters", a direct-feed item,
-                 a headline ending in a full stop, a pipe tail, a PoC story
-  the cap        six stories give five; the follow-up's bar is 5
-  one story once the same link, the same headline key, the same headline
+  the template   news.render in every mode, exact text (NFT2-1087 section 16):
+                 templates A-G, the one line shape "- Headline ([Outlet](<url>))",
+                 no bold, no sheet tag, a blank line between two stories only
+  the cap        six stories give five; one story once (link, key, headline)
   one message    a full daily post is one message; past 2,000 characters the
                  split is between stories and the heading is repeated
   answers        9 unsent give the 5 highest-scored, newest first; then the 4
                  left; then, with nothing new, the top 5 again; recorded as
                  sent; zero model calls; no "2 PM", "already", "scheduled",
                  "since" or "ran"; a topic question goes to the engine with
-                 the same list; a quiet day
-  the daily post skips what an answer gave; top PoC story first; the follow-up
-                 carries only 5s, at most 5
+                 the same list; a quiet ANSWER still gets the quiet line
+  the daily post ONE message after an answer: ours first under "Our PoCs are
+                 in the news:", the industry under "Elsewhere in AI"; nothing
+                 the answer gave; no "More AI News" follow-up
   parity         every scenario live and in SALES_TEST_MODE
 """
 import asyncio

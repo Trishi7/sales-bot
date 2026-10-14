@@ -993,7 +993,7 @@ class LLM:
         if not items:
             return ""
         prompt = news.score_prompt(items, topics, today=today, mode=mode)
-        site = "score_news:" + ("check" if mode == news.MODE_CHECK else "main")
+        site = "score_news:" + ("cycle" if mode == news.MODE_CYCLE else "main")
         try:
             resp = await self._create(
                 system=websearch.SAFETY_PREAMBLE + "\n\n" + websearch.LEAN_LINE,

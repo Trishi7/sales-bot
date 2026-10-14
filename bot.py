@@ -444,10 +444,8 @@ class SalesBot(discord.Client):
         # every sweep tick.
         self._voice_task: Optional[asyncio.Task] = None
         self._voice_tried_at: float = 0.0
-        # When (real monotonic) the feeds were last polled.
-        self._feeds_polled_at: float = 0.0
-        # When (real monotonic) the PoC news rotation was last read off the sheet.
-        self._targets_synced_at: float = 0.0
+        # Said once: under SEARCH_BACKEND=anthropic there is no news cycle.
+        self._server_cycle_logged: bool = False
 
         self.memory = ConversationMemory(
             max_turns=config.QUERY_MEMORY_TURNS,
@@ -519,7 +517,7 @@ class SalesBot(discord.Client):
         # would be a database wipe authorised by a message somebody sent to a
         # process that no longer exists.
         self._pending_start_over: Optional[dict] = None
-        # THE WHOLE LIVE LOOP STANDS DOWN — drip, hourly news check, reminders —
+        # THE WHOLE LIVE LOOP STANDS DOWN — drip, breaking news, reminders —
         # while a test day or a simulation runs (and NEWS_HOLD_AFTER_TEST_SECONDS
         # after), and whenever the pretend clock is set. The test run owns the
         # day. >0 = running; else a real-clock monotonic deadline.
@@ -1976,163 +1974,107 @@ class SalesBot(discord.Client):
         simulated week must not pay to discover that."""
         return day > dl.real_today_ist()
 
-    # -- R1: whose news we look up (the PoC rotation) ------------------------
+    # -- R1: whose news we watch (the name list) -----------------------------
 
-    async def _news_poc_targets(self) -> Optional[list]:
-        """Every name PoC news may be looked up for, read off the sheet today.
+    async def _read_news_names(self) -> tuple:
+        """(names, complete): the name list read off the sheets today, and
+        whether BOTH tabs could be read. (None, False) when neither could.
 
-        PEOPLE on ACTIVE Outreach PoCs rows — past the activation gate and not
-        stopped (won, lost, dead, unresponsive) — and COMPANIES on Master
-        Pipeline and on those same Outreach PoCs rows. Each carries the tab it
-        is on, in the sheet's own name, which is what a posted story shows in
-        brackets; a company on both tabs says both.
+        THE TWO TABS: every company on Master Pipeline, and every company AND
+        every person on Outreach PoCs. THE "ACTIVE ROW" TEST IS NOT APPLIED
+        (NFT2-1087) — a row nobody has contacted, or one marked won, lost or
+        dead, is still somebody the team wants to hear about — and neither is
+        a stop reason. NEWS_WATCH_NAMES adds the names that are on no sheet.
+        The list itself is built by `feeds.build_names`, which is pure.
 
-        NEVER ANYONE ON THE MAPPING'S DEPARTURES LIST. And when that list could
-        not be read, NO PERSON IS LOOKED UP AT ALL — only companies. "Never"
+        NEVER ANYONE ON THE MAPPING'S DEPARTURES LIST. And when that list
+        could not be read, NO PERSON IS LISTED AT ALL — only companies. "Never"
         cannot be honoured against a list the bot does not have, and news about
         somebody who has left, posted as news about our contact, is the mistake
         the list exists to prevent.
-
-        None when neither tab could be read: the caller then leaves the
-        rotation as it is rather than emptying it on a bad read.
         """
-        people: list = []
-        companies: dict = {}                 # normalised name -> target
-        read_any = False
-
-        def add_company(name: str, source: str, sheet_row) -> None:
-            name = gtm_sheet.clean_cell(name)
-            key = gtm_sheet.normalise_header(name)
-            if not name or not key:
-                return
-            have = companies.get(key)
-            if have is None:
-                companies[key] = {"key": f"company|{key}", "kind": "company",
-                                  "name": name, "company": name, "source": source,
-                                  "sheet_row": sheet_row}
-            elif source and source not in have["source"].split(" and "):
-                have["source"] = f"{have['source']} and {source}"
-
-        # MASTER PIPELINE FIRST, so a company on both tabs reads "on Master
-        # Pipeline and Outreach PoCs".
         try:
             pipeline = await asyncio.to_thread(
                 gtm_sheet.SHEETS.tab, gtm_sheet.RESEARCHER_LINES)
         except Exception:
-            log.info("[news] PoC news: the pipeline tab could not be read", exc_info=True)
+            log.info("[news] name list: the pipeline tab could not be read", exc_info=True)
             pipeline = None
-        if pipeline is not None:
-            read_any = True
-            title = str(getattr(pipeline, "title", "") or "Master Pipeline")
-            for row in pipeline.rows:
-                add_company(row.get("company"), title, row.get("_row"))
-
         try:
             pocs, _source = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
         except Exception:
-            log.info("[news] PoC news: the Outreach PoCs tab could not be read",
+            log.info("[news] name list: the Outreach PoCs tab could not be read",
                      exc_info=True)
             pocs = None
+        if pipeline is None and pocs is None:
+            return None, False
+
+        departures = None
         if pocs is not None:
-            read_any = True
-            title = str(getattr(pocs, "title", "") or "Outreach PoCs")
-            active, _inactive = await asyncio.to_thread(
-                self._split_active, pocs.rows, "PoC news")
             try:
                 departures = await asyncio.to_thread(mapping_sheet.MAPPING.departures)
-                known = bool(departures.people)
+                if not departures.people:
+                    departures = None
             except Exception:
-                log.info("[news] PoC news: the departures list could not be read",
+                log.info("[news] name list: the departures list could not be read",
                          exc_info=True)
-                departures, known = None, False
-            left: list = []
-            for row in active:
-                if nextaction.stop_reason(row):
-                    continue
-                company = gtm_sheet.clean_cell(row.get("company"))
-                add_company(company, title, row.get("_row"))
-                name = gtm_sheet.clean_cell(row.get("name"))
-                if not name or not company or not known:
-                    continue
-                if departures.lookup(name):
-                    left.append(name)
-                    continue
-                people.append({
-                    "key": "poc|%s|%s" % (gtm_sheet.normalise_header(name),
-                                          gtm_sheet.normalise_header(company)),
-                    "kind": "poc", "name": name, "company": company,
-                    "source": title, "sheet_row": row.get("_row"),
-                })
-            if not known:
+                departures = None
+            if departures is None:
                 log.warning(
-                    "[news] PoC news: the mapping's departures list is not loaded, so "
-                    "NO PERSON is looked up — companies only. Share the mapping sheet "
+                    "[news] name list: the mapping's departures list is not loaded, so "
+                    "NO PERSON is listed — companies only. Share the mapping sheet "
                     "(or fix its DEPARTURES row) to turn people on.")
-            elif left:
-                log.info("[news] PoC news: %d person/people on the departures list "
-                         "left out: %s", len(left), ", ".join(left[:8]))
-        if not read_any:
-            return None
-        return list(companies.values()) + people
+        names = await asyncio.to_thread(
+            lambda: feeds.build_names(
+                list(pipeline.rows) if pipeline is not None else [],
+                list(pocs.rows) if pocs is not None else [],
+                departures=departures,
+                pipeline_title=str(getattr(pipeline, "title", "") or "Master Pipeline"),
+                poc_title=str(getattr(pocs, "title", "") or "Outreach PoCs")))
+        return names, pipeline is not None and pocs is not None
 
-    async def _sync_news_targets(self, *, force: bool = False) -> Optional[dict]:
-        """Keep the PoC rotation in step with the sheet. Never raises.
+    async def _rebuild_news_names(self, *, today) -> Optional[dict]:
+        """Rebuild the name list from the sheets and store it. Never raises.
 
-        Every six hours at most (the sheet is cached and this is
-        cheap, but it is not free), and before the first poll after a boot. A
-        name that left the sheet — or joined the departures list — is out of
-        the rotation at the next sync.
+        ONCE A DAY, AT THE BIG PULL — so a name added to a sheet at 15:00 is
+        watched from the next day's first cycle, and a name that left the
+        sheet, or joined the departures list, is gone from it.
+
+        A SHEET THAT CANNOT BE READ KEEPS YESTERDAY'S LIST (`news_names`), with
+        a warning: a failed read at 14:00 must not leave the team with no names
+        watched for a day. When only ONE tab could be read the stored list is
+        kept too — half a list would silently drop everybody on the other tab.
+        With no list ever built, what could be read is used; and with nothing
+        readable at all the pull reads the topics and the outlets only.
         """
-        if int(config.NEWS_POC_TARGETS_PER_DAY) <= 0:
-            return None
-        every = 6 * 3600
-        if not force and self._targets_synced_at and \
-                _monotonic() - self._targets_synced_at < every:
-            return None
-        self._targets_synced_at = _monotonic()
+        ledger = self._ledger()
         try:
-            targets = await self._news_poc_targets()
-            if targets is None:
-                log.info("[news] PoC news: no tab could be read; the rotation is "
-                         "left as it is")
+            names, complete = await self._read_news_names()
+            stored_on = await asyncio.to_thread(ledger.news_names_built_on)
+            if names is None or (not complete and stored_on):
+                log.warning(
+                    "[news] name list: %s could not be read; %s",
+                    "the sheets" if names is None else "one of the two tabs",
+                    f"keeping the list built on {stored_on}" if stored_on
+                    else "there is no stored list, so this pull reads the topics and "
+                         "the outlets only")
                 return None
-            got = await asyncio.to_thread(
-                lambda: self._ledger().news_targets_sync(targets))
-            log.info("[news] PoC rotation: %d name(s) (%d compan(y/ies), %d "
-                     "person/people); %d new, %d removed; %d looked up a day",
-                     got["total"], sum(1 for t in targets if t["kind"] == "company"),
-                     sum(1 for t in targets if t["kind"] == "poc"), got["added"],
-                     got["removed"], int(config.NEWS_POC_TARGETS_PER_DAY))
-            return got
+            count = await asyncio.to_thread(
+                lambda: ledger.news_names_replace(names, built_on=dl.iso(today)))
+            kinds: dict = {}
+            for e in names:
+                kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+            log.info("[news] name list rebuilt: %d name(s) — %d compan(y/ies), %d watch, "
+                     "%d person/people, %d at an institution; %d researcher(s), %d "
+                     "warm, %d generic", count, kinds.get("company", 0),
+                     kinds.get("watch", 0), kinds.get("person", 0),
+                     kinds.get("researcher", 0),
+                     sum(1 for e in names if e.get("researcher")),
+                     sum(1 for e in names if e.get("warm")),
+                     sum(1 for e in names if e.get("generic")))
+            return {"total": count, "kinds": kinds}
         except Exception:
-            log.exception("[news] the PoC rotation could not be synced; continuing "
-                          "with what is stored")
-            return None
-
-    async def _maybe_poll_feeds(self, *, force: bool = False) -> Optional[dict]:
-        """Poll the RSS feeds every NEWS_FEED_POLL_MINUTES. Zero API calls.
-
-        The outlets' feeds, one Google News query per topic, and one per PoC
-        name whose turn it is today (`_sync_news_targets` keeps that rotation
-        in step with the sheet).
-
-        Run from the sweep tick and before every news check. NOT HELD by a test
-        run or the pretend clock: a poll is free, and it reads the real world's
-        feeds on the real clock whatever date a tester is standing on.
-        """
-        if search_backend.backend() == "anthropic":
-            return None                     # that backend searches instead
-        every = max(1, int(config.NEWS_FEED_POLL_MINUTES)) * 60
-        if not force and self._feeds_polled_at and \
-                _monotonic() - self._feeds_polled_at < every:
-            return None
-        self._feeds_polled_at = _monotonic()
-        # WHOSE NEWS TO LOOK UP, read off the sheet before the poll that asks.
-        await self._sync_news_targets()
-        try:
-            return await asyncio.to_thread(feeds.poll)
-        except Exception:
-            log.exception("[feeds] the poll raised; continuing")
+            log.exception("[news] the name list could not be rebuilt; continuing with "
+                          "what is stored")
             return None
 
     # At most this many stories in one answer — the ceiling every news message
@@ -2190,7 +2132,6 @@ class SalesBot(discord.Client):
         days = min(days, keep_days) if days > 0 else 0
         today = dl.today_ist()
 
-        await self._maybe_poll_feeds()
         since, until = self._main_window(today)
         until = min(until, dl.real_now_ist())
         # Since the previous daily post OR the last 24 hours, whichever is longer.
@@ -7104,28 +7045,26 @@ class SalesBot(discord.Client):
         was removed, not disabled behind a knob, so there is nothing here that
         could start speaking again by accident.
 
-        THE ONE EXCEPTION is R1's hourly news check (`_maybe_breaking_news`):
-        it runs on every tick, weekends included, stays silent unless something
-        is MAJOR, and posts outside the drip and the cap — the 24/29 Sep
-        decision. It has its own valve, NEWS_BREAKING_MAX_PER_DAY.
+        THE ONE EXCEPTION is R1's hourly news cycle (`_news_cycle`): it runs
+        on every tick, weekends included, reads the feeds once an hour from
+        NEWS_PULL_FIRST, stays silent unless something is BREAKING, and posts
+        outside the drip and the cap. There is no daily limit on those posts;
+        the flood guard is per cycle (NEWS_BREAKING_MAX_PER_CYCLE).
 
         Guarded so a failing drip never stops the state summary being written.
         """
-        # THE FEEDS, every NEWS_FEED_POLL_MINUTES. Plain HTTP, zero API calls —
-        # so by the time a news slot comes round the day's stories are already
-        # in the store and nothing has to be searched for.
+        # THE NEWS CYCLE FIRST, THEN THE DRIP. When a cycle and the daily news
+        # post fall in the same tick, the post must be chosen from a store the
+        # cycle has just filled and scored — and a story the cycle sends as
+        # breaking must already be recorded, so the post skips it.
         try:
-            await self._maybe_poll_feeds()
+            await self._news_cycle()
         except Exception:
-            log.exception("[feeds] tick raised; continuing")
+            log.exception("[news-cycle] tick raised; continuing")
         try:
             await self._maybe_send_drip()
         except Exception:
             log.exception("[drip] tick raised; continuing")
-        try:
-            await self._maybe_breaking_news()
-        except Exception:
-            log.exception("[news-check] tick raised; continuing")
         # THE WEEKLY VOICE REBUILD. A date comparison on every tick; a channel
         # read and one light-model call when the profile is VOICE_REFRESH_DAYS
         # old. Posts nothing.
@@ -11156,7 +11095,11 @@ class SalesBot(discord.Client):
         # R14 IS ADDRESSED INSIDE ITS OWN GREETING (drip.TAGS_IN_BLOCK_TYPES):
         # no tags line goes above it, and its heading sits a blank line up.
         in_block = drip.tags_in_block(message)
-        body = body if in_block else drip.with_tags(
+        # THE NEWS POST CARRIES ITS TAGS ON THE HEADING LINE (NFT2-1087,
+        # section 16: "**AI News, Tue 13 Oct** @Vaishnavi @Sid"), so no tags
+        # line goes above its body either.
+        is_news = message.get("type") == nextaction.R_AI_NEWS
+        body = body if (in_block or is_news) else drip.with_tags(
             body,
             owner_id=config.roster_id_for_name(message.get("owner") or ""),
             owner_name=message.get("owner") or "",
@@ -11174,8 +11117,15 @@ class SalesBot(discord.Client):
             send_day = date.fromisoformat(marker)
         except ValueError:
             send_day = dl.today_ist()
-        body = drip.with_heading(body, drip.heading_for(message, day=send_day),
-                                 gap=in_block)
+        if is_news:
+            # Heading and tags on ONE line, then the rendered body with no
+            # blank line under it; `news.layout` sets the spacing once.
+            body = news.layout(
+                f"{drip.heading_for(message, day=send_day)} {drip.news_tags()}".rstrip()
+                + chr(10) + body)
+        else:
+            body = drip.with_heading(body, drip.heading_for(message, day=send_day),
+                                     gap=in_block)
         # Stored with its heading, WITHOUT the tags line and the test tag, so
         # the same text is shown live and in test mode. A post meant for one
         # person's DM is not kept: it is not the channel's to be shown.
@@ -11216,12 +11166,12 @@ class SalesBot(discord.Client):
         # anchor all belong to the first.
         room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
         if message.get("type") == nextaction.R_AI_NEWS:
-            # THE NEWS POST IS ONE MESSAGE: heading, the tags line, a blank
-            # line, the stories. Past Discord's 2,000 characters it is split
-            # BETWEEN stories and each later part carries the heading again
-            # (`news.split_message`) — it once arrived as two messages, the
-            # second a bare list.
-            body = news.layout(body)
+            # THE NEWS POST IS ONE MESSAGE: the heading with its tags, the
+            # opener, the stories under their labels, the closer. Past
+            # Discord's 2,000 characters it is split BETWEEN stories and each
+            # later part carries the heading again, marked "(continued)", and
+            # stories only (`news.split_message`) — it once arrived as two
+            # messages, the second a bare list.
             parts = news.split_message(body, limit=2000 - room)
         else:
             parts = drip.split_on_lines(body, limit=int(config.QUERY_REPLY_CHUNK) - room)
@@ -11327,12 +11277,6 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[approvals] could not open this post's offer; the message "
                           "went out but a yes will not find it")
-        # "MORE AI NEWS TODAY" FOLLOWS THE NEWS POST, at once: the stories that
-        # qualified and did not fit. Not a drip message — see the method.
-        try:
-            await self._post_news_overflow(channel, message, marker=marker)
-        except Exception:
-            log.exception("[news] the overflow post failed; the main post went out")
         # R9 CLIMBS ONE RUNG PER FOLLOW-UP THAT ACTUALLY WENT OUT. After the
         # send, like every other ledger here: a rung spent on a message that was
         # refused would escalate somebody who was never asked.
@@ -11384,98 +11328,6 @@ class SalesBot(discord.Client):
             f", {compose_retries} retry" if compose_retries else "",
             f": {fallback_reason}" if fallback_reason else "",
         )
-
-    async def _post_news_overflow(self, channel, message: dict, *, marker: str) -> int:
-        """"More AI News" — right after the main news post. How many
-        stories it carried.
-
-        EVERY STORY THAT QUALIFIED FOR THE MAIN POST AND DID NOT FIT IT, in ONE
-        message, PoC first, at most NEWS_OVERFLOW_MAX_ITEMS (`news.choose_main`
-        decided which; they rode here on the R1 item). Before this they were
-        written to the log and to a cache row, and nowhere a person could see.
-
-        NOT A DRIP MESSAGE AND NOT A BREAKING ONE. It goes straight to the
-        channel the main post went to through `guardrails.send`: no
-        `drip_sends` row, so the daily cap cannot count it; no `news_checks`
-        row, so the breaking valve does not count it either; no @-mentions.
-        Each story is recorded in `news_stories` with kind=overflow — after the
-        send, so a refused post does not bury its stories — and is never
-        posted again.
-
-        CALLED FROM `_send_drip_message`, so a real day, a test day and a
-        simulation all do it, in the same place, with the same stories.
-        """
-        if message.get("type") != nextaction.R_AI_NEWS:
-            return 0
-        stories: list = []
-        for action in message.get("actions") or []:
-            stories.extend(action.get("news_overflow") or [])
-        if not stories:
-            return 0
-        if not config.NEWS_OVERFLOW_ENABLED:
-            log.info("[news] %s: %d story/stories did not fit the main post and "
-                     "NEWS_OVERFLOW_ENABLED is false — not posted", marker, len(stories))
-            return 0
-        try:
-            day = date.fromisoformat(marker)
-        except ValueError:
-            day = dl.today_ist()
-        cutoff = news.cutoff_iso(day)
-
-        def still_new() -> list:
-            # A breaking check may have carried one of them since the sweep. A
-            # row saying "overflow, today" is this same post from an earlier
-            # run of the same pretend day, and does not count against it.
-            out = []
-            for s in stories:
-                seen = self.db.news_story_seen(
-                    s.get("url_key") or "", s.get("headline_key") or "",
-                    since_iso=cutoff)
-                if seen and not (seen.get("kind") == news.MODE_OVERFLOW
-                                 and seen.get("posted_on") == marker):
-                    continue
-                out.append(s)
-            return out
-
-        fresh = await asyncio.to_thread(still_new)
-        # AT MOST FIVE, like every news message; what is past that stays unsent.
-        fresh = news.unique(fresh)[:news.MAX_PER_MESSAGE]
-        body = news.render(fresh, mode=news.MODE_OVERFLOW, day=day)
-        if not body:
-            return 0
-        tagged = config.SALES_TEST_MODE or self._test_run_active()
-        room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
-        # ONE MESSAGE; past Discord's 2,000 characters it is split between
-        # stories and the heading is repeated (`news.split_message`).
-        parts = news.split_message(body, limit=2000 - room)
-        first = None
-        for i, part in enumerate(parts):
-            got = await guardrails.send(
-                channel, self._tag_test(part),
-                reason=f"more AI news for {marker}: {len(fresh)} story/stories that "
-                       "did not fit the main post"
-                       + (f" (part {i + 1}/{len(parts)})" if len(parts) > 1 else ""),
-                kind="news-overflow",
-            )
-            if i == 0:
-                first = got
-            if got is None:
-                break
-        if first is None:
-            log.warning("[news] %s: the overflow post was refused or failed; nothing "
-                        "recorded, so the stories are not marked as posted", marker)
-            return 0
-        await asyncio.to_thread(
-            lambda: self.db.record_news_stories(
-                fresh, on_date=marker, rule_id="R1", kind=news.MODE_OVERFLOW))
-        state.audit("news_overflow", reason="stories that did not fit the main post",
-                    date=marker, stories=len(fresh),
-                    poc=sum(1 for s in fresh if news.is_poc(s)),
-                    channel_id=str(getattr(channel, "id", "")))
-        log.info("[news] %s: posted \"More AI News\" — %d story/stories (%d "
-                 "about our PoCs), outside the drip, the daily cap and the breaking "
-                 "valve", marker, len(fresh), sum(1 for s in fresh if news.is_poc(s)))
-        return len(fresh)
 
     # -- R5 / R6: a missing email, looked up and offered -----------------------
 
@@ -12698,25 +12550,28 @@ class SalesBot(discord.Client):
     # -- R1 and R2: the news feed ------------------------------------------
 
     async def _news_run(self, items: list, *, today) -> list:
-        """R1's MAIN sweep and R2's screen. Returns the items it filled in.
+        """R1's DAILY POST and R2's screen. Returns the items it filled in.
 
-        R1 IS TWO KINDS OF NEWS (S2): the AI INDUSTRY, on a topic list, and OUR
-        PoCs — the people on active Outreach PoCs rows and the companies on
-        Master Pipeline and Outreach PoCs. NEITHER IS SEARCHED FOR. The feeds
-        are polled into `news_feed_items` all day (feeds.py: outlets, topic
-        queries and a rotating set of PoC names, all plain RSS, zero API
-        calls); the main sweep takes everything since the previous main sweep
-        that has not been posted, has MODEL_LIGHT score the ones not yet scored
-        — titles and summaries only, one call — and puts the result through
-        `news.choose_main` and the deterministic `news.render`. The main model
-        is not called for the news post. The item goes out in R1's place in
-        the day's order (`daily_order` in bot_rules.yaml).
+        R1 IS TWO KINDS OF NEWS: what is ABOUT US — a company or a person on
+        Master Pipeline or Outreach PoCs, a watch name, one of our researchers
+        — and the AI INDUSTRY. NEITHER IS SEARCHED FOR HERE. The hourly cycle
+        (`_news_cycle`) reads the feeds into `news_feed_items`, flags what
+        names us by rule and scores it; the daily post takes everything since
+        the previous daily post that has not been posted, plus what was
+        carried, and puts it through `news.choose_main` and the deterministic
+        `news.render`. The main model is not called for the news post. The
+        item goes out in R1's place in the day's order (`daily_order` in
+        bot_rules.yaml).
 
-        WHAT DID NOT FIT RIDES ON THE ITEM (`news_overflow`) and is posted
-        right after it as "More AI News" (`_post_news_overflow`).
+        ONE MESSAGE. What does not fit is carried when it is about us and
+        dropped when it is not (`_main_sweep`); "More AI News" is gone.
+
+        NOTHING TO SEND IS NO POST (NFT2-1087). A sweep that chose nothing
+        leaves the item empty, and `drip.nothing_to_say` then spends the slot
+        silently: no heading, no quiet line.
 
         A DATE THAT HAS NOT HAPPENED HAS NO NEWS. For a pretend date after the
-        real today the slot says so (`news.future_note`) and nothing is polled,
+        real today the slot says so (`news.future_note`) and nothing is
         scored or screened: zero cost.
 
         THE SWEEP IS CACHED FOR THE DAY under NEWS_RUN_CACHE_KEY — but only
@@ -12724,8 +12579,7 @@ class SalesBot(discord.Client):
         between it and the send, does not find its own stories in
         `news_stories` and skip them all.
 
-        R2 reads today's rows from `news_stories` — what the team was actually
-        shown — in its own slot.
+        R2 reads what R1 collected, in its own slot.
         """
         news_items = [i for i in items if i.get("rule") == nextaction.R_AI_NEWS]
         screen_items = [i for i in items if i.get("rule") == nextaction.R_NEWS_SCREEN]
@@ -12759,40 +12613,38 @@ class SalesBot(discord.Client):
                 payload = cached.get("payload") or {}
                 chosen = list(payload.get("stories") or [])
                 skipped = list(payload.get("skipped") or [])
-                overflow = list(payload.get("overflow") or [])
                 usage.count("cache_hits")
                 log.info("[research-cache] hit %s for %s: %d story/stories — not "
                          "scoring again", NEWS_RUN_CACHE_KEY, marker, len(chosen))
             else:
-                log.info("[research-cache] miss %s for %s — running the main sweep",
+                log.info("[research-cache] miss %s for %s — running the daily sweep",
                          NEWS_RUN_CACHE_KEY, marker)
                 ran = await self._main_sweep(news_items, today=today, marker=marker)
                 if ran is None:
-                    chosen, skipped, overflow = None, [], []
+                    chosen, skipped = None, []
                 else:
-                    chosen, skipped, overflow = ran
+                    chosen, skipped = ran
 
             for item in news_items:
                 if chosen is None:
                     pass                   # _main_sweep already said why
                 elif chosen:
-                    body = news.render(chosen, mode=news.MODE_MAIN)
+                    body = news.render(chosen, mode=news.MODE_MAIN, day=today)
                     item["text"] = body
                     item["research"] = body
                     item["sources"] = [{"url": s["url"], "title": s.get("headline", "")}
                                        for s in chosen]
                     item["research_note"] = ""
                     item["web_pending"] = False
-                    # WHAT DID NOT FIT, for "More AI News".
-                    item["news_overflow"] = list(overflow)
                 else:
-                    # A QUIET SWEEP POSTS EXACTLY ONE LINE under its heading.
-                    log.info("[news] %s: the sweep found nothing new%s", marker,
-                             f" ({len(skipped)} skipped — already posted or over "
-                             "the topic limits)" if skipped else "")
-                    quiet = news.quiet_line(today)
-                    item["text"] = quiet
-                    item["research"] = quiet
+                    # NOTHING TO SEND: NO POST AT ALL. The item is left empty
+                    # and the sender spends the slot without a word.
+                    log.info("[news] %s: nothing to send%s — no post, and no quiet "
+                             "line", marker,
+                             f" ({len(skipped)} skipped: already posted, below 3, or "
+                             "over the topic limits)" if skipped else "")
+                    item["text"] = ""
+                    item["research"] = ""
                     item["sources"] = []
                     item["research_note"] = ""
                     item["web_pending"] = False
@@ -12804,15 +12656,6 @@ class SalesBot(discord.Client):
         return touched
 
     # -- R1 from the feed store --------------------------------------------
-
-    @staticmethod
-    def _feed_window(until, hours: int) -> tuple:
-        """(since_utc, until_utc) for the feed store — never past the real now."""
-        if until.tzinfo is None:
-            until = until.replace(tzinfo=dl.IST)
-        until = min(until, dl.real_now_ist())
-        return (feeds.utc_iso(until - timedelta(hours=max(1, int(hours)))),
-                feeds.utc_iso(until))
 
     def _main_window(self, today) -> tuple:
         """(since, until) for the MAIN sweep, as IST datetimes: everything
@@ -12840,8 +12683,10 @@ class SalesBot(discord.Client):
         post went earlier than its slot (a Monday with no deliverables: 16:00,
         not 18:00). The stories collected between the two times were too late
         for that post and are before this window's start, so they are in
-        NEITHER main post. A major one still reaches the channel through the
-        hourly check, and all of them are there for anybody who asks for the
+        NEITHER main post (industry news only: a story about us is picked up
+        whatever the window — `_feed_candidates`). A major one still reaches
+        the channel through the
+        hourly cycle, and all of them are there for anybody who asks for the
         news (`_news_answer` looks back at least 24 hours). Closing the gap
         means reading the record of what was sent instead of the schedule, and
         then a test day and the real day stop agreeing; the team chose the
@@ -12866,11 +12711,46 @@ class SalesBot(discord.Client):
         floor = until - timedelta(days=max(1, int(config.NEWS_FEED_KEEP_DAYS)))
         return max(since, floor), until
 
+    # How far back the daily post looks for a story ABOUT US that no daily
+    # post has considered yet, in days (never past NEWS_FEED_KEEP_DAYS).
+    NEWS_OURS_LOOKBACK_DAYS = 7
+
     async def _feed_candidates(self, *, since_utc: str, until_utc: str, today) -> list:
-        """The stored feed items in a window that have NOT been posted — by
-        link or by headline, inside NEWS_REPEAT_DAYS."""
-        rows = await asyncio.to_thread(
-            lambda: self._ledger().news_feed_between(since_utc, until_utc))
+        """What the daily post may choose from, NOT yet posted (by link or by
+        headline, inside NEWS_REPEAT_DAYS):
+
+          - the stored items in the window (`_main_window`);
+          - EVERY story about us seen in the last NEWS_OURS_LOOKBACK_DAYS,
+            window or not. The window is read off the schedule, so on a day
+            the post went out early a story seen between the real post and
+            its slot is in neither day's window; for industry news that is
+            the cost the team accepted, for a story about us it is not — news
+            about a PoC is never missed;
+          - the stories about us CARRIED from an earlier daily post.
+
+        A story the carry queue dropped (carry_count < 0) is not offered
+        again, and a posted one is filtered out here, so looking further back
+        never shows anything twice."""
+        def read() -> list:
+            ledger = self._ledger()
+            rows = ledger.news_feed_between(since_utc, until_utc)
+            have = {r.get("url_key") for r in rows}
+            try:
+                until = datetime.fromisoformat(until_utc)
+            except ValueError:
+                until = datetime.now(timezone.utc)
+            back = min(self.NEWS_OURS_LOOKBACK_DAYS,
+                       max(1, int(config.NEWS_FEED_KEEP_DAYS)))
+            ours = [r for r in ledger.news_feed_seen_after(
+                        feeds.utc_iso(until - timedelta(days=back)), until_utc)
+                    if news.is_ours(r)]
+            for r in ours + ledger.news_feed_carried():
+                if r.get("url_key") not in have:
+                    have.add(r.get("url_key"))
+                    rows.append(r)
+            return [r for r in rows if int(r.get("carry_count") or 0) >= 0]
+
+        rows = await asyncio.to_thread(read)
         cutoff = news.cutoff_iso(today)
 
         def unposted() -> list:
@@ -12886,11 +12766,17 @@ class SalesBot(discord.Client):
         story dicts. None when there was something to score and it could not
         be — the token budget is spent, or the call failed.
 
-        NOTHING NEW, NO MODEL CALL. Rows already scored — by an earlier check,
-        or by the main sweep — are read from the store; only the rest are shown
-        to the model, NEWS_SCORE_MAX_ITEMS at most, titles and summaries only.
-        A row the model was shown and left out is recorded as filler (1), so
-        it is never paid for twice.
+        NOTHING NEW, NO MODEL CALL. Rows already scored — by an earlier cycle,
+        or by the daily post — are read from the store; only the rest are shown
+        to the model, NEWS_SCORE_MAX_ITEMS at most, titles and summaries only,
+        ITEMS ABOUT US FIRST (`news.preselect`). A row the model was shown and
+        left out is recorded as filler (1), so it is never paid for twice — a
+        flagged one too: it stays a candidate for the daily post, because the
+        flag wins.
+
+        THE MODEL NEVER SETS THE FLAG, with one exception written into the
+        rule itself: a generic name's item (NEWS_GENERIC_NAMES) becomes ours
+        when its score reaches NEWS_POC_BREAKING_MIN (`db.news_feed_set_scores`).
         """
         fresh = [r for r in rows if not int(r.get("importance") or 0)]
         known = [r for r in rows if int(r.get("importance") or 0)]
@@ -12908,7 +12794,7 @@ class SalesBot(discord.Client):
         # WHEN EVERYTHING FITS, EVERYTHING IS SHOWN. The per-topic limit only
         # applies when there are more unscored items than one call may carry —
         # otherwise an item held back by it would still be "new" at the next
-        # check, and a check with nothing new would not be free.
+        # cycle, and a cycle with nothing new would not be free.
         cap = max(1, int(config.NEWS_SCORE_MAX_ITEMS))
         shown = news.preselect(fresh, cap=cap,
                                per_hint=cap if len(fresh) <= cap else 3)
@@ -12935,20 +12821,37 @@ class SalesBot(discord.Client):
              for r in twins]
         await asyncio.to_thread(
             lambda: self._ledger().news_feed_set_scores(
-                verdicts, scored_at=feeds.utc_iso(dl.real_now_ist())))
-        log.info("[news] %s: scored %d of %d unscored item(s) in one %s call — %d "
-                 "worth 3 or more", mode, len(shown), len(fresh), config.MODEL_LIGHT,
+                verdicts, scored_at=feeds.utc_iso(dl.real_now_ist()),
+                generic_flag_min=config.NEWS_POC_BREAKING_MIN))
+        log.info("[news] %s: scored %d of %d unscored item(s) in one %s call (%d about "
+                 "us, shown first) — %d worth 3 or more", mode, len(shown), len(fresh),
+                 config.MODEL_LIGHT, sum(1 for r in shown if news.is_ours(r)),
                  len(scored))
         return stories + [s for s in scored if int(s.get("importance") or 0) >= 3]
 
     async def _main_sweep(self, items: list, *, today, marker: str):
-        """Take everything since the previous main sweep from the feed store,
-        score, choose, record and cache.
+        """THE DAILY POST'S STORIES: everything since the previous daily post
+        from the feed store, plus what was carried — scored, chosen, recorded
+        and cached.
 
-        Returns (chosen, skipped, overflow), or None when it could not run —
-        every item has then been told why, and NOTHING is cached, so a later
-        attempt tries again once the reason has gone. `overflow` is what
-        qualified and did not fit: "More AI News".
+        Returns (chosen, skipped), or None when it could not run (only under
+        SEARCH_BACKEND=anthropic) — every item has then been told why, and
+        NOTHING is cached, so a later attempt tries again.
+
+        NOTHING IS READ FROM THE WEB HERE. The hourly cycle (`_news_cycle`)
+        keeps the store filled and scored; this scores only what a cycle has
+        not reached (one light-model call, items about us first).
+
+        WHEN THE SCORER CANNOT RUN (budget, a failed call) THE POST STILL GOES.
+        What earlier cycles scored is used as it is; an UNSCORED story ABOUT US
+        goes in at 3 — the flag says the team must see it — and an unscored
+        industry story waits for a day it can be scored.
+
+        OURS FIRST, THEN THE INDUSTRY, FIVE IN ALL (`news.choose_main`). A
+        story about us that did not fit is CARRIED to the next daily post
+        (`db.news_feed_carry`: at most NEWS_CARRY_MAX_DAYS daily posts, then
+        dropped and logged). Industry news that did not fit is dropped. There
+        is no second message.
         """
         import websearch
 
@@ -12960,60 +12863,102 @@ class SalesBot(discord.Client):
         # used to post "web search is off" at 14:00 instead of the news. The
         # switch still governs the server-side path above (`_search_available`).
 
-        await self._maybe_poll_feeds()
         since, until = self._main_window(today)
         until = min(until, dl.real_now_ist())
         since_utc, until_utc = feeds.utc_iso(since), feeds.utc_iso(until)
         rows = await self._feed_candidates(since_utc=since_utc, until_utc=until_utc,
                                            today=today)
-        stories = await self._score_feed(rows, today=today, mode=news.MODE_MAIN)
-        if stories is None:
-            why = (usage.budget_note() if usage.over_budget()
-                   else websearch.unavailable_note("the news scoring call failed"))
-            for item in items:
-                self._mark_unresearched(item, why)
-            return None
+        scored = await self._score_feed(rows, today=today, mode=news.MODE_MAIN)
+        if scored is None:
+            log.warning("[news] %s daily post: the scoring could not run (%s). Stories "
+                        "about us not yet scored go in at 3; unscored industry news "
+                        "waits.", marker,
+                        "token budget spent" if usage.over_budget() else "the call failed")
 
+        def stories_now() -> list:
+            # READ BACK, so a flag the score just set (a generic name at 4)
+            # and a score written a moment ago are both on the story.
+            fresh = self._ledger().news_feed_get([r.get("url_key") for r in rows])
+            out = []
+            for r in fresh:
+                if news.is_ours(r):
+                    out.append(news.story_from_feed(r, default_importance=3))
+                elif int(r.get("importance") or 0):
+                    out.append(news.story_from_feed(r))
+            return out
+
+        stories = await asyncio.to_thread(stories_now)
         picked = await asyncio.to_thread(
             lambda: news.choose_main(
                 stories, today=today, db=self.db, cap=config.NEWS_MAX_ITEMS,
-                poc_slots=config.NEWS_POC_SLOTS,
                 per_topic=config.NEWS_PER_TOPIC_PER_DAY,
                 topics_per_week=config.NEWS_TOPICS_PER_WEEK,
                 min_importance=config.NEWS_BREAKING_MIN_IMPORTANCE,
                 offtopic_bypass=config.NEWS_OFFTOPIC_BYPASS_IMPORTANCE,
-                overflow_min=config.NEWS_OVERFLOW_MIN_IMPORTANCE,
-                overflow_max=config.NEWS_OVERFLOW_MAX_ITEMS,
             )
         )
         chosen, skipped = picked["keep"], picked["skipped"]
-        overflow = picked["overflow"] if config.NEWS_OVERFLOW_ENABLED else []
         for line in skipped:
-            log.info("[news] main sweep: %s", line)
-        log.info("[news] %s main sweep, %s to %s IST: %d feed item(s) not yet posted "
-                 "(%d about our PoCs), %d worth posting — %d in the post (%d PoC), %d "
-                 "for \"More AI News\", %d with no room anywhere", marker,
+            log.info("[news] daily post: %s", line)
+        log.info("[news] %s daily post, %s to %s IST: %d candidate(s) not yet posted "
+                 "(%d about us, %d of them carried) — %d in the post (%d ours, %d "
+                 "industry), %d of ours carried on, %d industry dropped", marker,
                  since.strftime("%a %d %b %H:%M"), until.strftime("%a %d %b %H:%M"),
-                 len(rows), sum(1 for r in rows if news.is_poc(r)), len(stories),
-                 len(chosen), sum(1 for s in chosen if news.is_poc(s)),
-                 len(picked["overflow"]), len(picked["dropped"]))
-        await self._store_main_sweep(chosen, skipped, marker=marker, overflow=overflow)
-        return chosen, skipped, overflow
+                 len(rows), sum(1 for r in rows if news.is_ours(r)),
+                 sum(1 for r in rows if news.is_carried(r)), len(chosen),
+                 len(picked["ours"]), len(picked["industry"]), len(picked["carry"]),
+                 len(picked["dropped"]))
+        if picked["carry"]:
+            await self._carry_news(picked["carry"], marker=marker)
+        await self._store_main_sweep(chosen, skipped, marker=marker)
+        return chosen, skipped
+
+    async def _carry_news(self, stories: list, *, marker: str) -> dict:
+        """Carry the stories about us that today's post had no room for. Never
+        raises: a carry that could not be written costs one story its place in
+        tomorrow's post, and the post itself must still go.
+
+        ONE CARRY PER DAILY POST, not per calendar day (Friday to Monday is
+        one). A story carried NEWS_CARRY_MAX_DAYS times that still has no room
+        is DROPPED, and the log names it. Its score is never touched, so a
+        carried story cannot become breaking news by waiting.
+        """
+        by_key = {s.get("url_key"): s for s in stories}
+        try:
+            got = await asyncio.to_thread(
+                lambda: self._ledger().news_feed_carry(
+                    list(by_key), on_date=marker,
+                    max_posts=config.NEWS_CARRY_MAX_DAYS))
+        except Exception:
+            log.exception("[news] %s: could not carry %d story/stories about us to the "
+                          "next daily post", marker, len(stories))
+            return {"carried": [], "dropped": []}
+        if got["carried"]:
+            log.info("[news] %s: %d story/stories about us carried to the next daily "
+                     "post: %s", marker, len(got["carried"]),
+                     "; ".join(str(by_key[k].get("headline")) for k in got["carried"]))
+        for key in got["dropped"]:
+            log.warning("[news] %s: DROPPED after %d daily posts without room "
+                        "(NEWS_CARRY_MAX_DAYS): %r", marker,
+                        int(config.NEWS_CARRY_MAX_DAYS),
+                        str(by_key[key].get("headline") or key))
+        if got["carried"] or got["dropped"]:
+            state.audit("news_carry", reason="stories about us that did not fit the "
+                        "daily post", date=marker, carried=len(got["carried"]),
+                        dropped=len(got["dropped"]))
+        return got
 
     async def _store_main_sweep(self, chosen: list, skipped: list, *,
-                                marker: str, overflow: Optional[list] = None) -> None:
+                                marker: str) -> None:
         """Record the chosen stories and cache the day's sweep.
-
-        THE OVERFLOW IS CACHED WITH IT but NOT recorded as posted here: it is
-        recorded when "More AI News" actually goes out
-        (`_post_news_overflow`), so a post that is refused does not bury them.
 
         RECORDED ONCE, WHEN CHOSEN — with the cache, which is what stops a
         second pass over the same day finding these in `news_stories`.
 
-        A QUIET SWEEP IS NOT CACHED. "Nothing new" is not a result worth
-        keeping: a second pass costs nothing when nothing is unscored, and a
-        cached empty would hide a story that arrived ten minutes later.
+        A SWEEP THAT CHOSE NOTHING IS NOT CACHED. "Nothing to send" is not a
+        result worth keeping: a second pass costs nothing when nothing is
+        unscored, and a cached empty would hide a story that arrived ten
+        minutes later.
         """
         if not chosen:
             return
@@ -13027,8 +12972,7 @@ class SalesBot(discord.Client):
                 NEWS_RUN_CACHE_KEY, on_date=marker, rule_id="R1",
                 sources=[{"url": s.get("url", ""), "title": s.get("headline", "")}
                          for s in chosen],
-                payload={"stories": chosen, "skipped": skipped,
-                         "overflow": list(overflow or [])},
+                payload={"stories": chosen, "skipped": skipped},
             )
         )
         if stored:
@@ -13037,7 +12981,8 @@ class SalesBot(discord.Client):
 
     async def _main_sweep_server(self, items: list, *, today, marker: str):
         """SEARCH_BACKEND=anthropic: the main sweep as ONE lean server-side
-        search of the last 24 hours — the old path, kept for comparison."""
+        search of the last 24 hours — the old path, kept for comparison. It
+        has no name list, so every story it finds is industry news."""
         ok, why = await self._search_available()
         if not ok:
             for item in items:
@@ -13070,11 +13015,11 @@ class SalesBot(discord.Client):
         log.info("[news] %s main sweep: %d story/stories found, %d kept, %d skipped",
                  marker, len(stories), len(chosen), len(skipped))
         await self._store_main_sweep(chosen, skipped, marker=marker)
-        return chosen, skipped, []
+        return chosen, skipped
 
     @contextlib.contextmanager
     def _hold_live_loop(self, why: str):
-        """Stand the WHOLE live loop down — drip, hourly news check, reminders —
+        """Stand the WHOLE live loop down — drip, breaking news, reminders —
         for the duration, and for NEWS_HOLD_AFTER_TEST_SECONDS after.
 
         A TEST DAY MOVES THE PRETEND CLOCK, AND THE LIVE SWEEP FOLLOWS IT:
@@ -13134,197 +13079,255 @@ class SalesBot(discord.Client):
             body = simulation.strip_mentions(body)
         return simulation.prefix(body)
 
-    async def _maybe_breaking_news(self, *, force: bool = False, channel=None,
-                                   at: Optional[datetime] = None
-                                   ) -> Optional[dict]:
-        """The hourly silent check. Posts ONLY when something is major.
+    async def _news_cycle(self, *, force: bool = False, channel=None,
+                          at: Optional[datetime] = None,
+                          now: Optional[datetime] = None) -> Optional[dict]:
+        """ONE NEWS CYCLE: read -> store -> flag -> score -> check (NFT2-1087).
 
-        Called from `_sweep_once` on every tick, weekdays AND weekends. Finds
-        the latest NEWS_CHECK_TIMES slot at or before now; if that slot has
-        already run today (news_checks), or there is none yet, it returns
-        without a word. Otherwise it CLAIMS the slot, polls the feeds (free),
-        has MODEL_LIGHT score ONLY the items published since the previous slot
-        (or the main sweep) that nobody has scored — NOTHING NEW MEANS NO MODEL
-        CALL AT ALL — and keeps only stories at or above
-        NEWS_BREAKING_MIN_IMPORTANCE that have not already been posted. Past
-        the token budget it skips silently. (Under SEARCH_BACKEND=anthropic it
-        is one lean server-side search of at most NEWS_CHECK_MAX_USES.)
+        Called from `_sweep_once` on every tick, BEFORE the drip, weekdays AND
+        weekends. It replaced three clocks — the 15-minute feed poll, the
+        hourly check slots and the breaking check — with one: the feeds are
+        read once an hour from NEWS_PULL_FIRST to NEWS_PULL_UNTIL, and a
+        breaking story is posted in the same cycle that finds it.
 
-        A POST IS NOT A DRIP MESSAGE. It goes straight to the sales channel
-        (the test channel under SALES_TEST_MODE) through `guardrails.send`,
-        never through `drip_sends`, never against DAILY_MESSAGE_CAP, with no
-        @-mentions, as ONE grouped "**Breaking AI news**" message. At most
-        NEWS_BREAKING_MAX_PER_DAY of those a day; past the valve nothing is
-        stored, so tomorrow's main sweep finds the story again.
+        WHICH CYCLE. The latest slot at or before the REAL now
+        (`news.cycle_slot`); before the first slot of the day, nothing. The
+        slot is CLAIMED in `news_cycles` before the pull, so an hour runs once
+        even across restarts. A CYCLE RUNS ON THE REAL CLOCK, whatever date a
+        tester is standing on: the feeds are the real world's.
 
-        `force` is the test day's "run one check now": it skips the slot clock,
-        the kill switch and the test-day hold, and records itself under the
-        SAME slot key the live check would claim at that moment (or "test
-        HH:MM" when there is none, or it is already taken). `channel` lets a
-        test or a simulation post where the tester is looking, and `at` is a
-        simulated day's "now". A post made during a test run carries "[TEST]"
-        (`_tag_test`), like everything else a test run sends.
+        THE BIG PULL is the first cycle of a day — decided by the table, not
+        the time: no cycle has COMPLETED today. A bot started at 16:30
+        therefore reads the whole day (`when:1d`), rebuilds the name list from
+        the sheets, and runs the once-a-day lanes (warm people, researchers,
+        arXiv). Every later cycle is a small pull.
+
+        THE WINDOW reaches back to the last cycle that completed — never less
+        than NEWS_PULL_WINDOW_HOURS, never more than 24 (`news.window_hours`).
+        A cycle Google cut short (429) ends `partial` and one whose scoring
+        could not run ends `unscored`; neither is completed, so the next one
+        reaches back over it. (Only a `partial` day repeats the big pull.)
+
+        THE FIVE STEPS:
+          1-3  `feeds.pull` reads every source in priority order, flags what
+               names us BY RULE, and stores what is new. Zero API calls.
+          4    ONE light-model call scores the items SEEN since the window
+               opened that nobody has scored (`_score_feed`) — seen, not
+               published: an outlet that publishes late is not missed. Nothing
+               new means no model call at all. Past the token budget, or when
+               the call fails, the items stay unscored, the breaking check is
+               skipped and the next cycle tries again.
+          5    THE BREAKING CHECK (`news.choose_breaking`): about us at
+               NEWS_POC_BREAKING_MIN, industry at NEWS_BREAKING_MIN_IMPORTANCE,
+               first seen within NEWS_BREAKING_MAX_AGE_HOURS, not already
+               posted; at most NEWS_BREAKING_MAX_PER_CYCLE, in ONE message.
+
+        A BREAKING POST IS NOT A DRIP MESSAGE. It goes straight to the sales
+        channel (the test channel under SALES_TEST_MODE) through
+        `guardrails.send`, never through `drip_sends`, never against
+        DAILY_MESSAGE_CAP, never inside the two-hour gap — any day of the
+        week, with NO daily limit. Its stories are recorded in `news_stories`
+        AFTER the send, which is what keeps them out of the daily post; a
+        story the flood guard held, a post that was refused and a cycle with
+        no reachable channel record nothing, so the next cycle still has them.
+
+        WHEN NOTHING MAY BE POSTED the cycle still reads, stores and scores,
+        and then posts and records nothing: the kill switch is off
+        (`config.digest_enabled`), or a test day or simulation is running or
+        has just ended (`_live_loop_held`). When it may post again, a story
+        still inside NEWS_BREAKING_MAX_AGE_HOURS goes out and an older one
+        waits for the daily post.
+
+        `force` is the test day's "run one news check now": it skips the slot
+        clock, the kill switch and the test hold, runs a small pull, and is
+        recorded as "test HH:MM" on the pretend date so it never takes a live
+        cycle's place. `channel` lets a test post where the tester is looking
+        and `at` is the pretend day's "now"; a post made during a test run
+        carries "[TEST]" (`_tag_test`). `now` is the real time, for a check
+        that needs to stand at a particular hour.
 
         Returns what happened, for the verify scripts; None when nothing ran.
         """
         import websearch
 
-        now = at or dl.now_ist()
-        today = now.date()
-        marker = dl.iso(today)
+        if websearch.server_side():
+            # SEARCH_BACKEND=anthropic searches for the news instead of reading
+            # feeds (the old path, kept for comparison): there is no cycle.
+            if not self._server_cycle_logged:
+                self._server_cycle_logged = True
+                log.info("[news-cycle] SEARCH_BACKEND=anthropic: the feeds are not "
+                         "read, so there is no hourly cycle and no breaking post")
+            return None
+
+        real = now or dl.real_now_ist()
+        if real.tzinfo is None:
+            real = real.replace(tzinfo=dl.IST)
+        real_utc = real.astimezone(timezone.utc)
+        ledger = self._ledger()
 
         if force:
-            # THE SAME SLOT KEY THE LIVE CHECK WOULD CLAIM, so the live loop —
-            # which follows the pretend clock — finds it done and does not run
-            # a second check for the same hour. Before the first slot of the
-            # day there is no live key, and "test HH:MM" stands in.
-            live = news.latest_slot(now)
-            slot = live or "test " + now.strftime("%H:%M")
-            since_from = live or now.strftime("%H:%M")
-        else:
-            if self._live_loop_held("news check"):
+            stamp = at or dl.now_ist()
+            today = stamp.date()
+            slot = "test " + stamp.strftime("%H:%M")
+            if self._is_future(today):
+                # A DATE THAT HAS NOT HAPPENED: nothing read, nothing scored.
+                log.info("[news-cycle] %s is after the real today; no pull and no "
+                         "scoring — zero cost", dl.iso(today))
                 return None
-            slot = news.latest_slot(now)
+        else:
+            today = real.date()
+            slot = news.cycle_slot(real)
             if slot is None:
                 return None
-            done = await asyncio.to_thread(
-                lambda: self.db.news_check_done(marker, slot))
-            if done:
+            if await asyncio.to_thread(
+                    lambda: ledger.news_cycle_claimed(dl.iso(today), slot)):
                 return None
-            # THE KILL SWITCH governs every proactive post; a check it stops is
-            # NOT recorded, so the next slot runs once the switch is back on.
-            if not config.digest_enabled():
-                return None
-            since_from = slot
-        # WEB_SEARCH_ENABLED GOVERNS THE SEARCHING PATH ONLY. The feed path
-        # below reads RSS and searches nothing, so the switch does not stop it.
-        if websearch.server_side() and not websearch.enabled():
-            return None
+        marker = dl.iso(today)
+
+        def previous() -> tuple:
+            return (ledger.news_cycle_last_done(),
+                    ledger.news_cycle_done_on(dl.iso(real.date())))
+
+        last, done_today = await asyncio.to_thread(previous)
+        big = (not done_today) and not force
+        last_at = None
+        if last:
+            try:
+                last_at = datetime.fromisoformat(str(last.get("started_at") or ""))
+            except ValueError:
+                last_at = None
+        hours = news.MAX_WINDOW_HOURS if big else news.window_hours(last_at, real_utc)
 
         claimed = await asyncio.to_thread(
-            lambda: self.db.claim_news_check(marker, slot, ran_at=now.isoformat()))
-        if not claimed and force:
-            # THE LIVE SLOT WAS ALREADY TAKEN (a simulated week re-using a day,
-            # or a real check that ran before the tester arrived). The tester
-            # still asked for a check, so it runs under its own test key.
-            slot = "test " + now.strftime("%H:%M")
-            claimed = await asyncio.to_thread(
-                lambda: self.db.claim_news_check(marker, slot, ran_at=now.isoformat()))
+            lambda: ledger.news_cycle_claim(
+                marker, slot, started_at=feeds.utc_iso(real_utc), big=big,
+                window_hours=hours))
         if not claimed:
             return None
-        log.debug("[news-check] %s %s: claimed (%s)", marker, slot,
-                 "forced by a test" if force else "live")
+        log.info("[news-cycle] %s %s: %s pull, the last %dh%s", marker, slot,
+                 "BIG" if big else "small", hours, " (forced by a test)" if force else "")
 
-        since_hours = news.hours_since_previous(since_from)
-        searches = 0
-        result: dict = {"ok": True}
-        if websearch.server_side():
-            # SEARCH_BACKEND=anthropic: one lean server-side search, as before.
-            already = await asyncio.to_thread(self.db.news_headlines_today, marker)
-            prompt = news.sweep_prompt(
-                config.NEWS_TOPICS, today=today, since_hours=since_hours,
-                mode=news.MODE_CHECK, already=already,
-                preferred=config.NEWS_PREFERRED_DOMAINS,
-            )
-            result = await self._one_search(
-                prompt, rule_id="R1-check", lean=True,
-                max_uses=config.NEWS_CHECK_MAX_USES,
-            )
-            searches = int(result.get("searches") or 0)
-            stories = self._stories_from(result)
-        elif self._is_future(today):
-            # A DATE THAT HAS NOT HAPPENED: nothing polled, nothing scored.
-            log.info("[news-check] %s %s is after the real today; no poll and no "
-                     "scoring — zero cost", marker, slot)
-            stories = []
-        else:
-            # THE FEEDS, THEN ONLY WHAT IS NEW. Poll (free), then score the
-            # items published since the last check that nobody has scored. With
-            # nothing new there is no model call at all.
-            await self._maybe_poll_feeds(force=True)
-            since_utc, until_utc = self._feed_window(now, since_hours)
-            rows = await self._feed_candidates(since_utc=since_utc,
-                                               until_utc=until_utc, today=today)
-            scored = await self._score_feed(rows, today=today, mode=news.MODE_CHECK)
-            if scored is None:
-                # PAST THE TOKEN BUDGET (or the call failed) A CHECK SKIPS
-                # SILENTLY: the items stay unscored and the next check, or
-                # tomorrow's main sweep, picks them up.
-                result = {"ok": False}
-                stories = []
-            else:
-                stories = scored
-        keep, skipped = await asyncio.to_thread(
-            lambda: news.choose(
-                stories, today=today, db=self.db, cap=99,
-                per_topic=config.NEWS_PER_TOPIC_PER_DAY,
-                topics_per_week=config.NEWS_TOPICS_PER_WEEK,
-                min_importance=config.NEWS_BREAKING_MIN_IMPORTANCE, breaking=True,
-            )
-        )
-        outcome = {"slot": slot, "since_hours": since_hours, "searches": searches,
-                   "found": len(stories), "kept": keep, "skipped": skipped,
-                   "posted": 0, "held": False, "body": ""}
+        outcome = {"slot": slot, "date": marker, "big": big, "hours": hours,
+                   "pull": {}, "scored": False, "partial": False, "unscored": False,
+                   "silent": "",
+                   "kept": [], "held": [], "skipped": [], "posted": 0, "body": "",
+                   "status": "partial"}
 
-        async def _finish(posted: int) -> None:
+        async def _finish(note: str = "") -> dict:
+            pulled = outcome["pull"] or {}
+            status = ("partial" if outcome["partial"]
+                      else "unscored" if outcome["unscored"] else "done")
+            outcome["status"] = status
             await asyncio.to_thread(
-                lambda: self.db.finish_news_check(
-                    marker, slot, searches=searches, found=len(stories), posted=posted))
+                lambda: ledger.news_cycle_finish(
+                    marker, slot, status=status,
+                    finished_at=feeds.utc_iso(datetime.now(timezone.utc)),
+                    fetched=int(pulled.get("fetched") or 0),
+                    new_items=int(pulled.get("new") or 0),
+                    flagged=int(pulled.get("flagged") or 0),
+                    posted=int(outcome["posted"]), note=note))
+            return outcome
 
+        # ---- 1-3: read, flag, store ------------------------------------------
+        if big:
+            await self._rebuild_news_names(today=real.date())
+        try:
+            pulled = await asyncio.to_thread(
+                lambda: feeds.pull(now=real_utc, big=big, hours=hours))
+        except Exception:
+            log.exception("[news-cycle] %s %s: the pull raised; the cycle is partial",
+                          marker, slot)
+            outcome["partial"] = True
+            return await _finish("the pull raised")
+        outcome["pull"] = pulled
+        if pulled.get("partial"):
+            outcome["partial"] = True
+
+        # ---- 4: score what was SEEN since the window opened -------------------
+        since_utc = feeds.utc_iso(real_utc - timedelta(hours=hours))
+        until_utc = feeds.utc_iso(real_utc)
+        cutoff = news.cutoff_iso(today)
+
+        def unposted(rows: list) -> list:
+            return [r for r in rows if not self.db.news_story_seen(
+                r.get("url_key") or "", r.get("headline_key") or "", since_iso=cutoff)]
+
+        seen = await asyncio.to_thread(
+            lambda: unposted(ledger.news_feed_seen_after(since_utc, until_utc)))
+        scored = await self._score_feed(seen, today=today, mode=news.MODE_CYCLE)
+        if scored is None:
+            # THE SCORER COULD NOT RUN (budget, a failed call). The items stay
+            # unscored, this cycle's breaking check is skipped, and the cycle
+            # ends `unscored` — not `done` — so the next one's window reaches
+            # back over it and scores them.
+            outcome["unscored"] = True
+            log.info("[news-cycle] %s %s: the scoring could not run; no breaking "
+                     "check this cycle — the next one scores them", marker, slot)
+            return await _finish("the scoring could not run")
+        outcome["scored"] = True
+
+        # ---- 5: the breaking check --------------------------------------------
+        if not force:
+            # THE KILL SWITCH governs every proactive post, and a test run owns
+            # the channel while it lasts. Either way the cycle has read, stored
+            # and scored; it posts nothing and records nothing.
+            if not config.digest_enabled():
+                outcome["silent"] = "the kill switch is off"
+            elif self._live_loop_held("breaking news"):
+                outcome["silent"] = "a test run holds the live loop"
+        if outcome["silent"]:
+            log.info("[news-cycle] %s %s: %s — stored and scored, nothing posted, "
+                     "nothing recorded", marker, slot, outcome["silent"])
+            return await _finish(outcome["silent"])
+
+        age = max(1, int(config.NEWS_BREAKING_MAX_AGE_HOURS))
+        # Read back as far as this cycle's window, not only the last `age`
+        # hours: a story that reached a breaking score too late to be sent is
+        # then SAID to be going to the daily post instead of passing in silence.
+        recent_from = feeds.utc_iso(real_utc - timedelta(hours=max(age, hours)))
+
+        def choose() -> dict:
+            rows = ledger.news_feed_seen_after(recent_from, until_utc)
+            stories = [news.story_from_feed(r) for r in rows
+                       if int(r.get("importance") or 0) > 0]
+            return news.choose_breaking(
+                stories, today=today, db=self.db, now=real_utc, max_age_hours=age,
+                ours_min=config.NEWS_POC_BREAKING_MIN,
+                industry_min=config.NEWS_BREAKING_MIN_IMPORTANCE,
+                cap=config.NEWS_BREAKING_MAX_PER_CYCLE)
+
+        picked = await asyncio.to_thread(choose)
+        keep = picked["keep"]
+        outcome.update(kept=keep, held=picked["held"], skipped=picked["skipped"])
+        for line in picked["skipped"]:
+            log.info("[news-cycle] %s %s: %s", marker, slot, line)
         if not keep:
-            why = ("the check could not run (search or token budget)"
-                   if not result.get("ok")
-                   else "nothing new worth a 3" if not stories
-                   else f"{len(stories)} found, none new at importance >= "
-                        f"{config.NEWS_BREAKING_MIN_IMPORTANCE}")
-            log.info("[news-check] %s %s (last %dh): nothing important — %s; no post",
-                     marker, slot, since_hours, why)
-            await _finish(0)
-            return outcome
-
-        valve = int(config.NEWS_BREAKING_MAX_PER_DAY)
-        sent_today = await asyncio.to_thread(
-            self.db.news_breaking_messages_today, marker)
-        if valve < 99 and sent_today >= valve:
-            outcome["held"] = True
-            log.info("[news-check] %s %s: %d important story/stories held for the "
-                     "next main post — %d breaking message(s) already sent today "
-                     "(NEWS_BREAKING_MAX_PER_DAY=%d); nothing stored: %s",
-                     marker, slot, len(keep), sent_today, valve,
-                     "; ".join(s["headline"] for s in keep))
-            await _finish(0)
-            return outcome
+            log.info("[news-cycle] %s %s: nothing breaking — %d new item(s), %d about "
+                     "us; no post", marker, slot, int(pulled.get("new") or 0),
+                     int(pulled.get("flagged") or 0))
+            return await _finish()
 
         if channel is None:
             channel_id = (config.test_channel_id() if config.SALES_TEST_MODE
                           else config.digest_channel_id())
             channel = self.get_channel(channel_id) if channel_id else None
             if channel is None:
-                log.warning("[news-check] no reachable sales channel (%s); %d "
-                            "story/stories not posted and not stored",
-                            channel_id, len(keep))
-                await _finish(0)
-                return outcome
+                log.warning("[news-cycle] no reachable sales channel (%s); %d breaking "
+                            "story/stories not posted and not recorded — still unsent "
+                            "for the next cycle", channel_id, len(keep))
+                return await _finish("no reachable sales channel")
 
-        # AT MOST FIVE IN A BREAKING POST, like every news message. What is
-        # past that is not recorded, so the next daily post still has it.
-        if len(keep) > news.MAX_PER_MESSAGE:
-            log.info("[news-check] %s %s: %d important stories; the %d highest-"
-                     "scored go now and the rest wait for the daily post", marker,
-                     slot, len(keep), news.MAX_PER_MESSAGE)
-            keep = sorted(keep, key=lambda s: -int(s.get("importance") or 3)
-                          )[:news.MAX_PER_MESSAGE]
-            outcome["kept"] = keep
         tagged = config.SALES_TEST_MODE or self._test_run_active()
         room = len(config.SIMULATION_PREFIX) + 1 if tagged else 0
         parts = news.split_message(
-            news.render(keep, mode=news.MODE_BREAKING, day=today), limit=2000 - room)
+            news.render(keep, mode=news.MODE_BREAKING, day=today, tags=drip.news_tags()),
+            limit=2000 - room)
         body = chr(10).join(self._tag_test(part) for part in parts)
         sent = None
         for i, part in enumerate(parts):
             got = await guardrails.send(
                 channel, self._tag_test(part),
-                reason=f"breaking AI news, hourly check {slot}"
+                reason=f"breaking news, cycle {slot}"
                        + (f" (part {i + 1}/{len(parts)})" if len(parts) > 1 else ""),
                 kind="news-breaking",
             )
@@ -13333,20 +13336,23 @@ class SalesBot(discord.Client):
             if got is None:
                 break
         if sent is None:
-            log.warning("[news-check] %s %s: the post was refused or failed; nothing "
-                        "stored", marker, slot)
-            await _finish(0)
-            return outcome
+            log.warning("[news-cycle] %s %s: the post was refused or failed; nothing "
+                        "recorded", marker, slot)
+            return await _finish("the post was refused or failed")
 
         await asyncio.to_thread(
             lambda: self.db.record_news_stories(
                 keep, on_date=marker, rule_id="R1", kind=news.MODE_BREAKING))
-        await _finish(len(keep))
         outcome.update(posted=len(keep), body=body)
-        log.info("[news-check] %s %s: posted %d breaking story/stories in one "
-                 "message (outside the drip and the daily cap)", marker, slot,
-                 len(keep))
-        return outcome
+        state.audit("news_breaking", reason="breaking news, posted in the cycle that "
+                    "found it", date=marker, slot=slot, stories=len(keep),
+                    about_us=sum(1 for s in keep if news.is_ours(s)),
+                    held=len(picked["held"]))
+        log.info("[news-cycle] %s %s: posted %d breaking story/stories in one message "
+                 "(outside the drip and the daily cap)%s", marker, slot, len(keep),
+                 f"; {len(picked['held'])} more wait for the next cycle"
+                 if picked["held"] else "")
+        return await _finish()
 
     async def _search_available(self, *, feed_first: bool = False) -> tuple:
         """(ok, why). The reasons research cannot happen, said plainly: search
@@ -14197,13 +14203,9 @@ class SalesBot(discord.Client):
 
     # The fields the research writes onto an item besides research, sources and
     # the note. A cache hit restores them too, or a hit would differ from a miss.
-    # `news_overflow` is R1's: the stories that did not fit the main post. It
-    # has to come back with the cached post, or a second pass over the same day
-    # (a restart between the sweep and the send, a test day run twice) would
-    # post the news and silently drop "More AI News".
     _RESEARCH_PAYLOAD_FIELDS = (
         "text", "web_pending", "event_proposals", "deadline_proposals",
-        "news_overflow", "email_checked", "email_found", "email_source",
+        "email_checked", "email_found", "email_source",
         "emails_found",
     )
 
@@ -15069,9 +15071,9 @@ class SalesBot(discord.Client):
                         log.exception("[test-day] slot %s failed to send",
                                       msg.get("slot"))
 
-            # ONE HOURLY NEWS CHECK, at the afternoon stop. Exactly the live
-            # path — same prompt, same gates, same valve — and silent unless it
-            # finds something major, like the real one.
+            # ONE NEWS CYCLE, at the afternoon stop. Exactly the live path —
+            # same pull, same prompt, same gates — and silent unless it finds
+            # something breaking, like the real one.
             await self._test_news_check(channel, at=stop_at)
         finally:
             # THE STOP WAS TEMPORARY. The clock goes back to pretend date + the
@@ -15126,27 +15128,30 @@ class SalesBot(discord.Client):
         return len(stale)
 
     async def _test_news_check(self, channel, *, at=None) -> Optional[dict]:
-        """The test run's one forced hourly news check. Never raises, never
-        speaks — a post goes out only when something is major, as live.
+        """The test run's one forced news cycle. Never raises, never speaks —
+        a post goes out only when something is breaking, as live.
+
+        "RUN ONE NEWS CHECK NOW" ON A TEST DAY forces ONE CYCLE — read, store,
+        flag, score, check — into the tester's channel (`_news_cycle`,
+        force=True). The live cycles stand down while a test runs.
 
         ONCE AN HOUR PER PRETEND DATE. A second "test monday", or a "simulate
-        monday" straight after one, would otherwise pay for the same search
-        again; within an hour (real time) of the last forced check for that
-        date it is skipped, silently. Lean, at most
-        NEWS_CHECK_MAX_USES searches (see `_maybe_breaking_news`).
+        monday" straight after one, would otherwise read every feed and pay
+        for the same scoring call again; within an hour (real time) of the
+        last forced cycle for that date it is skipped, silently.
         """
         now = at or dl.now_ist()
         marker = dl.iso(now.date())
         last = self._forced_news_at.get(marker)
         if last is not None and _monotonic() - last < 3600:
-            log.info("[news-check] %s: a forced check ran %d min ago; skipped",
+            log.info("[news-cycle] %s: a forced cycle ran %d min ago; skipped",
                      marker, int((_monotonic() - last) // 60))
             return None
         self._forced_news_at[marker] = _monotonic()
         try:
-            return await self._maybe_breaking_news(force=True, channel=channel, at=at)
+            return await self._news_cycle(force=True, channel=channel, at=at)
         except Exception:
-            log.exception("[test-day] the hourly news check failed")
+            log.exception("[test-day] the forced news cycle failed")
             return None
 
     async def _answer_why_quiet(self, message) -> None:

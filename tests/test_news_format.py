@@ -1,4 +1,4 @@
-"""The 8 Oct news template and news answer (docs/plans/NEWS-OCT8.md), under pytest.
+"""The news templates (NFT2-1087) and the news answer (docs/plans/NEWS-OCT8.md), under pytest.
 
 The checks themselves live in tests/news_checks.py and are shared with
 verify_news_format.py and the 8 Oct section of verify_replay_oct6.py; here
@@ -33,7 +33,7 @@ def _run(fn) -> None:
     assert not failed, "\n".join(failed)
 
 
-def test_the_template_in_every_mode_the_cap_and_one_message():
+def test_the_templates_the_one_line_shape_the_cap_and_one_message():
     _run(news_checks.pure)
 
 
@@ -41,7 +41,7 @@ def test_answers_in_the_channel():
     _run(news_checks.answers)
 
 
-def test_the_daily_post_and_its_follow_up_skip_what_an_answer_gave():
+def test_the_daily_post_is_one_message_and_skips_what_an_answer_gave():
     _run(news_checks.daily)
 
 
