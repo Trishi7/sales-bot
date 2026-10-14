@@ -2063,22 +2063,32 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 # alternate Wednesdays the rule ran on, and the rule now runs on all of them
 # (EVENTS_WINDOW_DAYS decides what is close enough to mention).
 
-# -- R1 NEWS: A DAILY AI INDUSTRY FEED ON A FIXED TOPIC LIST -----------------
+# -- R1 NEWS: THE HOURLY CYCLE, OUR NAMES FIRST (NFT2-1087) -------------------
 #
-# THE DECISION FROM THE 24 AND 29 SEP CALLS. R1 is no longer about our people:
-# nothing is searched for from the Outreach PoCs, the researcher mapping, the
-# Master Pipeline or the departures list. It is an AI industry feed, in two
-# shapes:
+# THE NEWS IS READ ONCE AN HOUR, NOT EVERY 15 MINUTES, AND NOT BEFORE 14:00.
+# Nothing is read between midnight and NEWS_PULL_FIRST. At NEWS_PULL_FIRST the
+# BIG PULL collects the whole day so far (Google News queries carry `when:1d`);
+# from then until NEWS_PULL_UNTIL a SMALL PULL runs every hour (`when:2h`,
+# NEWS_PULL_WINDOW_HOURS). Every pull is ONE CYCLE of five steps — read, store,
+# flag, score, check — so the breaking check is not a clock of its own
+# (`bot._news_cycle`). Cycles run SEVEN days a week.
 #
-#   ONE MAIN POST every weekday, covering everything since the previous one. It
-#   is R1's drip post, in R1's place in the day's order (`daily_order` in
-#   bot_rules.yaml), and it counts toward the day's cap like any rule.
+# TWO NUMBERS FOR EVERY STORY. `flag` (is it about us?) is set BY RULE when the
+# item is stored: its title or summary names a company or a person on Master
+# Pipeline or Outreach PoCs, a name on NEWS_WATCH_NAMES, or one of our
+# researchers. No model is asked. `importance` (1-5) is the light model's, one
+# call a cycle. The flag decides whether the team MUST see a story; the score
+# decides WHEN:
 #
-#   HOURLY SILENT CHECKS at NEWS_CHECK_TIMES that post ONLY when something is
-#   genuinely important (importance >= NEWS_BREAKING_MIN_IMPORTANCE). A check
-#   post goes straight to the sales channel — never through drip_sends, never
-#   against DAILY_MESSAGE_CAP — and at most NEWS_BREAKING_MAX_PER_DAY of them a
-#   day. Checks run every day, weekends included; the main post is weekdays.
+#   about us, 4 or 5 (NEWS_POC_BREAKING_MIN)       breaking, within the hour
+#   industry, 5 (NEWS_BREAKING_MIN_IMPORTANCE)     breaking, within the hour
+#   about us, 1-3      the daily post, FIRST; carried when it does not fit
+#   industry, 3-4      the daily post, after ours, if there is room
+#
+# THE DAILY POST is R1's drip post, one a weekday, in R1's place in the day's
+# order (`daily_order` in bot_rules.yaml), at most NEWS_MAX_ITEMS stories. A
+# BREAKING POST goes straight to the sales channel — never through drip_sends,
+# never against DAILY_MESSAGE_CAP — any day, with no daily limit.
 #
 # These settings take precedence over the R1 row on the Bot Rules tab.
 
@@ -2088,21 +2098,33 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 # Thursday (16:00), and earlier when a rule ahead of it has nothing to post.
 # Nothing reads the name any more; a value left in .env is inert.
 
-# The hourly check slots, HH:MM, IST. 14:00 is absent because the main post
-# used to go then; the 15:00 check looks back to 13:00, so nothing is missed.
-NEWS_CHECK_TIMES = _str_list(
-    "NEWS_CHECK_TIMES",
-    "11:00,12:00,13:00,15:00,16:00,17:00,18:00,19:00,20:00,21:00,22:00,23:00",
-)
+# WHEN THE FEEDS ARE READ, HH:MM IST. The first cycle of the day is the big
+# pull; one cycle an hour follows, the last at NEWS_PULL_UNTIL. With the
+# defaults that is ten pulls a day. An unreadable time falls back to the
+# default with a warning (`news.pull_slots`).
+NEWS_PULL_FIRST = (os.getenv("NEWS_PULL_FIRST", "14:00") or "").strip()
+NEWS_PULL_UNTIL = (os.getenv("NEWS_PULL_UNTIL", "23:00") or "").strip()
+# How far back a small pull's Google News queries reach, in hours. Two, for an
+# hourly pull, so two cycles overlap: the store drops what it already has. A
+# cycle that follows a missed or partial one reaches back to the last cycle
+# that completed instead — never less than this, never more than 24.
+NEWS_PULL_WINDOW_HOURS = _int("NEWS_PULL_WINDOW_HOURS", 2)
 
 # THE TOPIC LIST, seeded from the "Sample Keywords" column of the Bot Rules tab
 # minus the four words too broad to steer anything (AI, ML, models, research).
 # SEEDS, NOT LIMITS: the prompt says important news off the list is welcome.
+# NFT2-1087 took out "leadership", "robot" and "robotics" (they filled the
+# scoring call with stories nobody here sells into) and added what the team
+# sells and where: data labeling, evals, Indic speech, India and the UK.
 _NEWS_TOPICS_DEFAULT = (
-    "artificial intelligence,machine learning,leadership,robot,robotics,"
-    "human reinforcement,RLHF,human data,multimodal,voice agent,STT,TTS,"
-    "AI regulation,responsible AI,AI safety,AI trust,evals,post-training,"
-    "red-teaming"
+    "artificial intelligence,machine learning,human reinforcement,RLHF,"
+    "human data,multimodal,voice agent,STT,TTS,AI regulation,responsible AI,"
+    "AI safety,AI trust,evals,post-training,red-teaming,data labeling,"
+    "data annotation,human-in-the-loop,preference data,AI training data,"
+    "synthetic data,LLM evaluation,AI benchmark,Hinglish,Indic language AI,"
+    "Indian language model,speech dataset,voice dataset,AI startup India,"
+    "AI funding India,Bengaluru AI,UK AI startup,London AI,AI layoffs,"
+    "AI acquisition,head of AI appointed,AI data partnership"
 )
 
 # NEWS_KEYWORDS IS THE OLD NAME, kept as an alias so nobody's .env breaks: it is
@@ -2114,21 +2136,51 @@ NEWS_TOPICS = (
     or [t.strip() for t in _NEWS_TOPICS_DEFAULT.split(",") if t.strip()]
 )
 
-# The most stories the main post carries.
+# The most stories the daily post carries: ours first, then the industry.
 NEWS_MAX_ITEMS = _int("NEWS_MAX_ITEMS", 5)
 
-# TWO KINDS OF NEWS (S2). Every story is `industry` — the outlets' feeds and the
-# topic queries — or `poc`: news about a person on an active Outreach PoCs row,
-# or a company on Master Pipeline or Outreach PoCs.
+# THE NAME LIST (`news_names`, rebuilt at every big pull): every company on
+# Master Pipeline, every company AND every person on Outreach PoCs — active
+# row or not — and the names below. Nobody on the mapping's departures list.
 #
-# HOW MANY PoC NAMES ARE LOOKED UP A DAY. One Google News RSS query per name
-# ("<company>", or "<person>" "<company>"), polled with the other feeds: plain
-# HTTP, free, no search API. The names take turns, least recently checked
-# first (the `news_targets` table), so 382 names at 40 a day come round every
-# 10 days (it was 15 a day until 12 Oct 2026: a 25-day cycle against a 7-day
-# lookback, an 18-day blind spot for each company). Nobody on the mapping's departures list is ever looked up. 0 turns
-# PoC news off.
-NEWS_POC_TARGETS_PER_DAY = _int("NEWS_POC_TARGETS_PER_DAY", 40)
+# HOW MANY NAMES GO IN ONE GOOGLE NEWS SEARCH: "Sarvam AI" OR "PolyAI" OR ...
+# Every item that comes back is checked in code for each name (whole phrase,
+# word boundaries), so Google's own reading of OR is never relied on.
+NEWS_NAME_BATCH_SIZE = _int("NEWS_NAME_BATCH_SIZE", 15)
+
+# NAMES THAT ARE ALSO ORDINARY WORDS OR GIANTS. Each gets a search of its own
+# (never in a batch), counts only when it is in the TITLE, and flags the story
+# only when one of our people at that name is on it too — or the scorer later
+# gives it a 4 or more. Without this every story that says "Google" is ours.
+NEWS_GENERIC_NAMES = _str_list(
+    "NEWS_GENERIC_NAMES",
+    "Google,Meta,Microsoft,NVIDIA,Apple,OpenAI,Amazon,Arcade,Multiple,Cleo")
+
+# NAMES WATCHED THAT ARE NOT ON A SHEET: the competitors. Flagged like our own
+# companies and breaking at NEWS_POC_BREAKING_MIN. A name that is also on a
+# sheet is one entry, in the sheet's spelling.
+NEWS_WATCH_NAMES = _str_list(
+    "NEWS_WATCH_NAMES",
+    "Scale AI,Surge AI,Mercor,Toloka,Appen,Labelbox,Prolific,Handshake AI,"
+    "Invisible Technologies")
+
+# WHO IS A RESEARCHER: a person whose Company/Uni cell contains one of these
+# (whole words, any case), or whose Research Paper Link cell is filled. A
+# researcher is looked up on arXiv and in a Google News search of their own,
+# once a day at the big pull; the institution is never searched as a company.
+NEWS_INSTITUTION_WORDS = _str_list(
+    "NEWS_INSTITUTION_WORDS", "university,institute of,college,school of,IIT,IISc")
+
+# STAYING UNBLOCKED. Google News requests go one at a time with this many
+# seconds between two of them. On an HTTP 429 the pull stops at once, what is
+# stored stays, the cycle is marked partial and nothing is retried before the
+# next cycle.
+NEWS_REQUEST_GAP_SECONDS = _float("NEWS_REQUEST_GAP_SECONDS", 1.5)
+
+# arXiv (arxiv.py): our researchers as authors, once a day at the big pull.
+# ARXIV_BATCH_SIZE authors per query, three seconds between two queries.
+ARXIV_ENABLED = _bool("ARXIV_ENABLED", default=True)
+ARXIV_BATCH_SIZE = _int("ARXIV_BATCH_SIZE", 20)
 
 # R2 (the news-company screen): a company proposed and not answered comes back
 # in the next message until it is this many days old; then it is dropped. A
@@ -2141,65 +2193,47 @@ NEWS_SCREEN_STALE_DAYS = _int("NEWS_SCREEN_STALE_DAYS", 14)
 # last post and never reaches back past the previous scheduled R2 day.
 NEWS_SCREEN_FIRST_RUN_DAYS = _int("NEWS_SCREEN_FIRST_RUN_DAYS", 7)
 
-# How far back a PoC query looks, in days. Wider than the topic queries' two
-# days because a name is only looked up every few weeks: a round announced on
-# Tuesday is still news to the team when the name's turn comes on Friday.
-NEWS_POC_LOOKBACK_DAYS = _int("NEWS_POC_LOOKBACK_DAYS", 7)
-
-# THE MAIN POST'S FIRST SLOTS GO TO OUR PoCs: the top this-many PoC stories by
-# importance lead the post (fewer when fewer exist), and the remaining slots go
-# to the best of everything left, PoC or industry. Ties: PoC first, then newest.
-NEWS_POC_SLOTS = _int("NEWS_POC_SLOTS", 2)
-
 # AN OFF-TOPIC STORY THAT MATTERS GETS IN. An industry story the scorer tagged
 # OTHER at or above this importance skips the per-topic and per-week limits
 # below — the topic list is seeds, not limits. (Importance 5 still interrupts
 # as breaking: NEWS_BREAKING_MIN_IMPORTANCE.)
 NEWS_OFFTOPIC_BYPASS_IMPORTANCE = _int("NEWS_OFFTOPIC_BYPASS_IMPORTANCE", 4)
 
-# THE FOLLOW-UP CARRIES ONLY WHAT IS MAJOR (8 Oct). A story that qualified —
-# at or above NEWS_OVERFLOW_MIN_IMPORTANCE and not already sent — but did not
-# fit the main post goes out right after it as ONE message, "More AI News",
-# PoC first, at most NEWS_OVERFLOW_MAX_ITEMS. The bar is 5 ("scored above 4"):
-# it used to be 3, and the follow-up was a second, longer post of middling
-# stories every day. What scores 3 or 4 and did not fit is not lost — it is
-# still unsent, so anybody who asks for the news is given it. No news message
-# of any kind carries more than 5 stories (news.MAX_PER_MESSAGE), whatever
-# this is set to. Outside the daily cap, not a breaking message (the valve
-# does not count it); each story is recorded in news_stories with
-# kind=overflow so it never repeats.
-NEWS_OVERFLOW_ENABLED = _bool("NEWS_OVERFLOW_ENABLED", default=True)
-NEWS_OVERFLOW_MIN_IMPORTANCE = _int("NEWS_OVERFLOW_MIN_IMPORTANCE", 5)
-NEWS_OVERFLOW_MAX_ITEMS = _int("NEWS_OVERFLOW_MAX_ITEMS", 5)
+# A STORY ABOUT US THAT DID NOT FIT TODAY'S POST IS CARRIED to the next daily
+# post, ahead of that day's industry news — for at most this many daily posts
+# (posts, not calendar days: Friday to Monday is one). Then it is dropped, and
+# the log says so. Industry news that does not fit is dropped the same day.
+NEWS_CARRY_MAX_DAYS = _int("NEWS_CARRY_MAX_DAYS", 3)
 
-# How many INDUSTRY stories on one topic may go in the main post in one day, and
-# how many distinct topics in one ISO week. Both are bypassed by a story at or
-# above NEWS_BREAKING_MIN_IMPORTANCE (a spread rule must never hide the big
-# one), by an OTHER story at or above NEWS_OFFTOPIC_BYPASS_IMPORTANCE, and by
-# every PoC story — news about our own people is not a topic to be rationed.
-# A story these limits keep out of the main post is not lost: it goes in "More
-# AI news today".
+# How many INDUSTRY stories on one topic may go in the daily post in one day,
+# and how many distinct topics in one ISO week. Both are bypassed by a story at
+# or above NEWS_BREAKING_MIN_IMPORTANCE (a spread rule must never hide the big
+# one) and by an OTHER story at or above NEWS_OFFTOPIC_BYPASS_IMPORTANCE. They
+# never apply to a story about us — news about our own people is not a topic
+# to be rationed.
 NEWS_PER_TOPIC_PER_DAY = _int("NEWS_PER_TOPIC_PER_DAY", 2)
 NEWS_TOPICS_PER_WEEK = _int("NEWS_TOPICS_PER_WEEK", 6)
 
-# THE IMPORTANCE SCALE, 1-5, is defined in the prompt: 5 = the whole industry is
-# talking about it today; 4 = a sales team must know this week; 3 = useful;
-# 2-1 = filler. At or above this, a check posts and the spread gates yield.
+# THE IMPORTANCE SCALE, 1-5, is defined in the scoring prompt, which carries
+# the table of what makes a story breaking word for word. An INDUSTRY story at
+# or above this is breaking news, and the spread gates yield to it.
 NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 5)
+# A story ABOUT US is breaking news at or above this.
+NEWS_POC_BREAKING_MIN = _int("NEWS_POC_BREAKING_MIN", 4)
+# THE FLOOD GUARD. One cycle posts at most this many breaking stories, in ONE
+# message: the highest-scored, then the higher source, then the newest. The
+# rest are not recorded, so the next cycle can send them. There is no daily
+# limit (NEWS_BREAKING_MAX_PER_DAY is retired).
+NEWS_BREAKING_MAX_PER_CYCLE = _int("NEWS_BREAKING_MAX_PER_CYCLE", 3)
+# BREAKING MEANS NEW. A story is sent as breaking only while it was FIRST SEEN
+# within this many hours; older than that it goes to the daily post. A story
+# that reaches a breaking score late is never sent as stale breaking news.
+NEWS_BREAKING_MAX_AGE_HOURS = _int("NEWS_BREAKING_MAX_AGE_HOURS", 3)
 
-# Breaking MESSAGES per day (one message may carry several stories). 99
-# disables the valve.
-NEWS_BREAKING_MAX_PER_DAY = _int("NEWS_BREAKING_MAX_PER_DAY", 2)
-
-# Searches one hourly check may spend — ONLY under SEARCH_BACKEND=anthropic.
-# Under every other backend the check reads the feeds and searches nothing.
-NEWS_CHECK_MAX_USES = _int("NEWS_CHECK_MAX_USES", 2)
-
-# THE FEEDS (feeds.py). Polled every NEWS_FEED_POLL_MINUTES from the sweep
-# loop; a poll is plain HTTP GETs and makes ZERO API calls. Each entry in
-# NEWS_TOPICS also gets one Google News RSS query. New items land in
-# news_feed_items, deduplicated on the same url and headline keys the posted
-# stories use.
+# THE OUTLETS' OWN FEEDS (feeds.py), read after the Google News queries: plain
+# HTTP GETs, ZERO API calls. New items land in news_feed_items, deduplicated on
+# the same url and headline keys the posted stories use; the first copy of a
+# story is the one kept, so Google's wins.
 _NEWS_RSS_DEFAULT = (
     "https://techcrunch.com/category/artificial-intelligence/feed/,"
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml,"
@@ -2207,16 +2241,25 @@ _NEWS_RSS_DEFAULT = (
     # VentureBeat's own /category/ai/feed/ answers 429 to anything that is not
     # a browser; its FeedBurner feed is the public one for readers.
     "https://feeds.feedburner.com/venturebeat/SZYF,"
-    "https://www.technologyreview.com/topic/artificial-intelligence/feed"
+    "https://www.technologyreview.com/topic/artificial-intelligence/feed,"
+    # India and the UK (NFT2-1087): where the team sells.
+    "https://inc42.com/feed/,"
+    "https://yourstory.com/feed,"
+    "https://economictimes.indiatimes.com/tech/rssfeeds/13357270.cms,"
+    "https://analyticsindiamag.com/feed/,"
+    "https://www.moneycontrol.com/rss/technology.xml,"
+    "https://sifted.eu/feed,"
+    "https://www.uktech.news/feed,"
+    "https://tech.eu/feed/,"
+    "https://news.crunchbase.com/feed/"
 )
 NEWS_RSS_FEEDS = _str_list("NEWS_RSS_FEEDS", _NEWS_RSS_DEFAULT)
-NEWS_FEED_POLL_MINUTES = _int("NEWS_FEED_POLL_MINUTES", 15)
 # One feed's fetch timeout, in seconds.
 NEWS_FEED_TIMEOUT_SECONDS = _int("NEWS_FEED_TIMEOUT_SECONDS", 10)
 # The most feed items ONE scoring call is shown (titles + summaries only).
-# 40 items is about 3k tokens on the light model.
+# 40 items is about 3k tokens on the light model. Items about us go first.
 NEWS_SCORE_MAX_ITEMS = _int("NEWS_SCORE_MAX_ITEMS", 40)
-# How long a feed item is kept, in days, before a poll prunes it.
+# How long a feed item is kept, in days, before a pull prunes it.
 NEWS_FEED_KEEP_DAYS = _int("NEWS_FEED_KEEP_DAYS", 14)
 
 # PREFERRED SITES, comma-separated bare domains. A PREFERENCE LINE IN THE PROMPT
@@ -2233,14 +2276,23 @@ NEWS_PREFERRED_DOMAINS = _str_list("NEWS_PREFERRED_DOMAINS")
 NEWS_BLOCKED_DOMAINS = _str_list(
     "NEWS_BLOCKED_DOMAINS", "theneuron.ai,aiagentsdirectory.com")
 
-# While a test day or a simulation runs, the LIVE hourly news check stands down
-# (the live sweep follows the pretend clock, so it would otherwise run the
-# pretend day's checks too). It stays down this many seconds afterwards.
+# While a test day or a simulation runs, the LIVE breaking post stands down
+# (the cycle still reads and stores: it runs on the real clock whatever date a
+# tester is standing on). It stays down this many seconds afterwards.
 NEWS_HOLD_AFTER_TEST_SECONDS = _int("NEWS_HOLD_AFTER_TEST_SECONDS", 300)
 
-# How long a posted story stays remembered, so it is not posted twice — main
+# How long a posted story stays remembered, so it is not posted twice — daily
 # or breaking. Matched on the normalised URL OR the headline key.
 NEWS_REPEAT_DAYS = _int("NEWS_REPEAT_DAYS", 30)
+
+# RETIRED WITH NFT2-1087 — nothing reads these names any more, and a value
+# left in .env is ignored, never a crash: NEWS_FEED_POLL_MINUTES and
+# NEWS_CHECK_TIMES (the hourly cycle replaced the 15-minute poll and the check
+# slots), NEWS_CHECK_MAX_USES, NEWS_BREAKING_MAX_PER_DAY (no daily limit; the
+# flood guard is per cycle), NEWS_POC_TARGETS_PER_DAY, NEWS_POC_SLOTS and
+# NEWS_POC_LOOKBACK_DAYS (every name is watched every hour, in batches),
+# NEWS_OVERFLOW_ENABLED, NEWS_OVERFLOW_MIN_IMPORTANCE and
+# NEWS_OVERFLOW_MAX_ITEMS ("More AI News" is removed).
 
 
 # -- R3 EVENTS: DISCOVERY AND DEADLINE BACKFILL -------------------------------
@@ -4141,13 +4193,13 @@ def validate() -> list[str]:
             "[config] web search ON, OUTSIDE the model: backend=%s%s, fallbacks=%s, "
             "%d request(s) a day, results cached %dh; company news reads Google "
             "News RSS first (no request). R1's news comes from %d RSS feed(s) + %d "
-            "topic queries, polled every %d min. MODEL_LIGHT=%s reads the snippets. "
+            "topic queries, read hourly from %s IST. MODEL_LIGHT=%s reads the snippets. "
             "Token budget %s input tokens a day.",
             SEARCH_BACKEND,
             f" at {SEARXNG_URL}" if SEARCH_BACKEND == "searxng" else "",
             ",".join(SEARCH_FALLBACKS) or "(none)",
             SEARCH_DAILY_BUDGET, SEARCH_CACHE_HOURS,
-            len(NEWS_RSS_FEEDS), len(NEWS_TOPICS), NEWS_FEED_POLL_MINUTES,
+            len(NEWS_RSS_FEEDS), len(NEWS_TOPICS), NEWS_PULL_FIRST,
             MODEL_LIGHT, f"{TOKEN_DAILY_BUDGET:,}" if TOKEN_DAILY_BUDGET else "no",
         )
         if SEARCH_BACKEND == "ddg":

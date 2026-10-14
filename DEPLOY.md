@@ -1832,3 +1832,78 @@ writable; composing carries on.
 third → a 👍. Reply "show the prompt for that" (as an approver) to any Saley reply → the prompt behind it.
 
 `python verify_voice_book.py` checks all of it offline and prints the T1-T66 table.
+## Upgrading to NFT2-1087 (the AI news flow: one hourly cycle, our names first)
+
+What changes for the team: the feeds are read once an hour from 14:00 IST instead of every 15 minutes; news that
+names a company or a person on Master Pipeline or Outreach PoCs (or a competitor on the watch list, or one of our
+researchers) is flagged by rule and goes first; the daily post is ONE message of at most 5 stories with the tags
+on its heading line, and there is no "More AI News"; breaking news goes out within the hour, any day, with no daily
+limit (at most 3 stories a cycle); a day with nothing to send posts nothing. Described in the README under "AI news
+(R1): the hourly cycle, our names first (NFT2-1087)".
+
+**No deploy step changes.** `git pull`, edit `.env`, `pm2 restart sales-bot`. The database migrates itself on boot:
+five columns on `news_feed_items` (`names`, `flag`, `source_rank`, `carried_from`, `carry_count`) and two new tables
+(`news_names`, `news_cycles`). `news_targets` and `news_checks` are left in place and no longer read. No new Python
+package: arXiv is read with `feedparser`, which is already installed.
+
+**In `.env`, on the laptop AND on the server (`/opt/sales-bot/.env`).**
+
+```
+# CHANGE these two if the line is present (a line that is present overrides the new default):
+NEWS_TOPICS=...        # copy the whole line from .env.example (38 topics; leadership, robot, robotics removed)
+NEWS_RSS_FEEDS=...     # copy the whole line from .env.example (the five AI desks plus nine Indian and UK feeds)
+
+# CHECK this one: the ticket's bar for INDUSTRY breaking news is 5
+NEWS_BREAKING_MIN_IMPORTANCE=5
+
+# OPTIONAL, the defaults are what was specified; add a line only to change it:
+# NEWS_PULL_FIRST=14:00
+# NEWS_PULL_UNTIL=23:00
+# NEWS_PULL_WINDOW_HOURS=2
+# NEWS_NAME_BATCH_SIZE=15
+# NEWS_GENERIC_NAMES=Google,Meta,Microsoft,NVIDIA,Apple,OpenAI,Amazon,Arcade,Multiple,Cleo
+# NEWS_WATCH_NAMES=Scale AI,Surge AI,Mercor,Toloka,Appen,Labelbox,Prolific,Handshake AI,Invisible Technologies
+# NEWS_INSTITUTION_WORDS=university,institute of,college,school of,IIT,IISc
+# NEWS_REQUEST_GAP_SECONDS=1.5
+# NEWS_BREAKING_MAX_PER_CYCLE=3
+# NEWS_POC_BREAKING_MIN=4
+# NEWS_CARRY_MAX_DAYS=3
+# NEWS_BREAKING_MAX_AGE_HOURS=3
+# ARXIV_ENABLED=true
+# ARXIV_BATCH_SIZE=20
+
+# DELETE these lines if present (retired, no longer read; leaving one in is harmless):
+#   NEWS_FEED_POLL_MINUTES  NEWS_CHECK_TIMES  NEWS_CHECK_MAX_USES  NEWS_BREAKING_MAX_PER_DAY
+#   NEWS_POC_TARGETS_PER_DAY  NEWS_POC_SLOTS  NEWS_POC_LOOKBACK_DAYS
+#   NEWS_OVERFLOW_ENABLED  NEWS_OVERFLOW_MIN_IMPORTANCE  NEWS_OVERFLOW_MAX_ITEMS
+```
+
+`SALES_ALWAYS_TAG_IDS` is who the news heading tags. The templates show two people (Vaishnavi and Sid); if the line
+holds one id, the heading tags one person.
+
+**What to look for in the log after the first 14:00.**
+
+```
+[news-cycle] 2026-10-14 14:00: BIG pull, the last 24h
+[news] name list rebuilt: N name(s) — ... compan(y/ies), 9 watch, ... person/people, ...
+[feeds] big pull (when:1d): N Google request(s) for N name(s) and 38 topic(s), 14 outlet feed(s), N arXiv paper(s) — ...
+[news] cycle: scored N of N unscored item(s) in one <model> call (N about us, shown first) — ...
+[news-cycle] 2026-10-14 14:00: nothing breaking — ...        (or: posted N breaking story/stories in one message)
+```
+
+and then, every hour until 23:00, `[news-cycle] ... small pull, the last 2h`. Lines that need a person:
+
+```
+[news] name list: the mapping's departures list is not loaded, so NO PERSON is listed — companies only. ...
+[news] name list: the sheets could not be read; keeping the list built on <date>
+[feeds] Google News answered 429 on request N of M ...; the pull stops here ...
+```
+
+The first means no person on Outreach PoCs is watched until the mapping sheet is shared. The third, once, is
+harmless (the next cycle reaches back over it); every hour, raise `NEWS_REQUEST_GAP_SECONDS` or lower
+`NEWS_NAME_BATCH_SIZE`.
+
+**The Bot Rules tab, by hand.** Rule 1's "What the Bot Shares / Checks" wording still describes the old flow; nothing
+in the code reads it, but it should be brought in line with the README section above.
+
+`python verify_news_v2.py` checks all of it offline and prints the T1-T83 table.

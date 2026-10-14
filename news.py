@@ -1,53 +1,58 @@
-"""R1 AND R2 — a daily AI industry feed on a fixed topic list.
+"""R1 AND R2 — the AI news: what is about us first, then the industry.
 
-THE DECISION FROM THE 24 AND 29 SEP CALLS. R1 is no longer about our people.
-It searched the Outreach PoCs, the researcher mapping and the Master Pipeline
-by name, and most days nothing is written about eight particular mid-market AI
-people — so the post was either empty or a fallback that announced itself. The
-team asked for the other thing: what moved in AI, on the topics they care
-about, once a day, and a tap on the shoulder when something big happens.
+THE FLOW (NFT2-1087). The feeds are read once an hour from 14:00 IST
+(feeds.py: Google News for our names, our researchers and our topics, then the
+outlets, then arXiv). Every stored story has TWO NUMBERS:
 
-So R1 is now two shapes of ONE search:
+    flag        is it ABOUT US — a company or a person on Master Pipeline or
+                Outreach PoCs, a name on the watch list, one of our
+                researchers? Set BY RULE when the item is stored. No model.
+    importance  1-5, the light model's, one call a cycle.
 
-    MAIN   every weekday, in R1's place in the day's order, everything since
-           the previous main post, up to NEWS_MAX_ITEMS stories. It is R1's
-           drip post, so it counts toward the day's cap.
+The flag decides whether the team MUST see a story; the score decides WHEN:
 
-    CHECK  hourly at NEWS_CHECK_TIMES, silent unless something is MAJOR
-           (importance >= NEWS_BREAKING_MIN_IMPORTANCE). A check that finds
-           something posts ONE grouped "Worth knowing now:" message straight to
-           the channel — never through drip_sends, never against the cap — and
-           at most NEWS_BREAKING_MAX_PER_DAY of them a day.
+    BREAKING   about us at 4 or 5, industry at 5 — posted in the cycle that
+               finds it, any day, with no daily limit, straight to the
+               channel: never through drip_sends, never against the cap.
+               At most NEWS_BREAKING_MAX_PER_CYCLE stories a cycle, and only
+               while the story is new (NEWS_BREAKING_MAX_AGE_HOURS).
 
-NOTHING IS SEARCHED FOR FROM OUR SHEETS. No PoCs, no mapping, no pipeline, no
-departures list. The topics come from config (NEWS_TOPICS), and they are SEEDS,
-NOT LIMITS: important news off the list is welcome, tagged OTHER.
+    DAILY      every weekday, in R1's place in the day's order: at most
+               NEWS_MAX_ITEMS stories, ours first, then the industry. A story
+               about us that does not fit is CARRIED to the next daily post;
+               industry news that does not fit is dropped. There is no second
+               message, and a day with nothing to send posts nothing.
+
+ONE LINE SHAPE, EVERYWHERE (`story_line`): `- Headline ([Outlet](<url>))`. No
+bold, no "— what" clause, no sheet tag. The messages are the team's templates
+(`render`), fixed text and never written by a model.
+
+THE TOPICS ARE SEEDS, NOT LIMITS (NEWS_TOPICS): important news off the list is
+welcome, tagged OTHER.
 
 ONE STORY IS POSTED ONCE. `news_stories` remembers every story that went out,
-main or breaking, by normalised URL AND by headline key — four outlets give one
-funding round four URLs, and the headline key is what catches the second one.
-It is also what keeps a story that broke at 16:00 out of the next day's main
-post: `choose` skips it and says so.
+daily or breaking, by normalised URL AND by headline key — four outlets give
+one funding round four URLs, and the headline key is what catches the second
+one. It is also what keeps a story that broke at 16:00 out of the daily post.
 
-THE SPREAD RULES YIELD TO IMPORTANCE. At most NEWS_PER_TOPIC_PER_DAY stories on
-one topic a day and NEWS_TOPICS_PER_WEEK distinct topics a week, so a feed does
-not become "evals, evals, evals" — but a story at or above the breaking bar
-walks past both, because a spread rule that hid the day's biggest story would
-be the wrong rule.
+THE SPREAD RULES ARE FOR THE INDUSTRY PART, AND YIELD TO IMPORTANCE. At most
+NEWS_PER_TOPIC_PER_DAY stories on one topic a day and NEWS_TOPICS_PER_WEEK
+distinct topics a week, so a feed does not become "evals, evals, evals" — but
+a story at or above the breaking bar walks past both, and a story about us is
+never rationed at all.
 
-R2 READS WHAT R1 POSTED. The news-company screen wants companies in today's
-news that are NOT in the Master Pipeline. It reads today's rows from
-`news_stories` rather than searching again, and asks before anything is added
-to a sheet. It never writes.
+R2 READS WHAT R1 COLLECTED. The news-company screen wants companies in the
+news that are NOT in the Master Pipeline. It never searches again, and it asks
+before anything is added to a sheet. It never writes.
 
-NOTHING HERE OPENS A SOCKET. This module builds prompts, parses and chooses; the
-one search call is `llm.web_research(lean=True)`, made by the caller in bot.py,
-which also banks the budget. Keeping the I/O out means everything here can be
-tested without a network or an API key — see `_self_test`.
+NOTHING HERE OPENS A SOCKET OR CALLS A MODEL. This module builds prompts,
+parses, chooses and renders; the pull is feeds.py's and the one scoring call is
+bot.py's. Keeping the I/O out means everything here can be tested without a
+network or an API key — see `_self_test`.
 """
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -59,9 +64,9 @@ log = logging.getLogger(__name__)
 # The modes. MAIN and CHECK are the two prompts; BREAKING is how a check's post
 # renders and what it is recorded as.
 MODE_MAIN = "main"
-MODE_CHECK = "check"
+MODE_CHECK = "check"            # SEARCH_BACKEND=anthropic only: the old search prompt
+MODE_CYCLE = "cycle"            # the hourly cycle's scoring call
 MODE_BREAKING = "breaking"
-MODE_OVERFLOW = "overflow"      # "More AI News", right after the main post
 MODE_ANSWER = "answer"          # the list given to somebody who asked
 
 # The tag for a story that is not on the topic list. Welcome — the list is
@@ -583,120 +588,133 @@ def choose(stories: list, *, today: date, db, cap: int, per_topic: int,
     return keep, skipped
 
 
-# -- the main post: our PoCs first, and nothing useful lost -------------------
+# -- the daily post: ours first, then the industry (NFT2-1087) ----------------
 
 KIND_INDUSTRY = "industry"
 KIND_POC = "poc"
+KIND_RESEARCHER = "researcher"
 
-# ONE NAME DOES NOT TAKE OVER THE POST. The PoC slots go to DIFFERENT names, and
-# no single name has more than this many stories in the main post — the rest
-# go to "More AI News". Without it, the first live run's post was five
-# stories about one company on the sheet and nothing about anybody else.
-POC_PER_NAME_IN_POST = 2
+# Where a stored item came from, 1 the highest (feeds.py reads them in this
+# order). A row stored before the column existed is 9.
+SOURCE_RANK_UNKNOWN = 9
 
-# ...AND DOES NOT TAKE OVER THE SCORING CALL: at most this many items per name
-# are shown to the scorer in one call, and PoC items together get at most this
-# share of it. What is not shown stays unscored and is seen by the next sweep.
-POC_SCORE_PER_NAME = 3
-POC_SCORE_SHARE = 0.4
+# AN INDUSTRY STORY NEEDS A 3 TO BE POSTED. The scorer writes a line only for
+# what is AI news worth 3 or more; everything it leaves out — a recipe on an
+# outlet's feed, a discount, a listicle — is recorded as 1 so it is never paid
+# for twice. "If there is room" therefore means room for a story the scorer
+# kept, never for one it threw out. A story ABOUT US has no such floor: the
+# flag wins, and a flagged story at 1 is still shown.
+INDUSTRY_MIN_IMPORTANCE = 3
 
 
-def is_poc(story: dict) -> bool:
-    return str((story or {}).get("kind") or "") == KIND_POC
+def is_ours(story: dict) -> bool:
+    """Is this story ABOUT US — a company or a person on our sheets, a name on
+    the watch list, one of our researchers? Decided by rule when the item was
+    stored (`flag`); never by a model."""
+    try:
+        return bool(int((story or {}).get("flag") or 0))
+    except (TypeError, ValueError):
+        return False
+
+
+# The old name, kept for the callers that still ask it (R10, the checks).
+is_poc = is_ours
+
+
+def is_carried(story: dict) -> bool:
+    """Was this story left out of an earlier daily post for want of room?"""
+    return bool(str((story or {}).get("carried_from") or "").strip()) \
+        and int((story or {}).get("carry_count") or 0) > 0
 
 
 def _rank(stories: list) -> list:
-    """Most important first; at the same importance a PoC story leads, and
-    after that the newest. Two stable sorts, so the order is the same every
-    time the same stories are ranked."""
+    """THE ONE ORDER (section 6): higher score, then a carried story before a
+    new one, then the higher source rank, then the newest. Stable sorts, so
+    the order is the same every time the same stories are ranked."""
     newest = sorted(stories or [], key=lambda s: str(s.get("published_at") or ""),
                     reverse=True)
-    return sorted(newest, key=lambda s: (-int(s.get("importance") or 3),
-                                         0 if is_poc(s) else 1))
+    return sorted(newest, key=lambda s: (
+        -int(s.get("importance") or 3), 0 if is_carried(s) else 1,
+        int(s.get("source_rank") or SOURCE_RANK_UNKNOWN)))
 
 
-def choose_main(stories: list, *, today: date, db, cap: int, poc_slots: int,
-                per_topic: int, topics_per_week: int, min_importance: int,
-                offtopic_bypass: int, overflow_min: int, overflow_max: int) -> dict:
-    """THE MAIN POST, and what did not fit it.
-
-    Returns {"keep": [...], "overflow": [...], "skipped": [...], "dropped": [...]}.
-    `keep` is the main post in the order it is posted; `overflow` is "More AI
-    news today"; `skipped` is a sentence per story that is in neither or that
-    moved to the overflow, for the log; `dropped` is what even the overflow
-    had no room for.
-
-    WHO QUALIFIES: a story not already posted (by link or by headline, inside
-    NEWS_REPEAT_DAYS) and not a second copy of one in this batch.
-
-    HOW THE POST IS FILLED:
-      1. the top `poc_slots` PoC stories by importance — fewer when fewer exist
-         — each about a DIFFERENT name on the sheet;
-      2. the remaining slots, up to `cap`, with the best of everything left,
-         PoC or industry, by importance. Ties: PoC first, then newest.
-    No one name gets more than POC_PER_NAME_IN_POST stories in the post.
-
-    THE SPREAD LIMITS APPLY TO INDUSTRY NEWS IN STEP 2 ONLY — at most
-    `per_topic` stories on a topic a day and `topics_per_week` topics a week —
-    and three kinds of story walk past them: importance at or above
-    `min_importance` (the big one is never hidden), an OTHER story at or above
-    `offtopic_bypass` (the topic list is seeds, not limits), and every PoC
-    story.
-
-    NOTHING USEFUL IS LOST. Whatever qualified and did not get in — the post
-    was full, or a spread limit kept it out — goes to `overflow` when it is
-    worth `overflow_min` or more: PoC first, then by importance, at most
-    `overflow_max`.
-    """
+def _qualify(stories: list, *, db, today: date, why) -> list:
+    """The ranked stories that have not been posted (by link or by headline,
+    inside NEWS_REPEAT_DAYS) and are not a second copy of one in this batch."""
     since = cutoff_iso(today)
-    marker = dl.iso(today)
-    bar = int(min_importance)
-    cap = max(0, int(cap))
-
-    skipped: list = []
-
-    def _why(s, why):
-        skipped.append(f"{s.get('headline', '?')!r} — {why}")
-
-    # ---- who qualifies ------------------------------------------------------
     pool: list = []
     batch_urls: set = set()
     batch_heads: set = set()
     for s in _rank(stories):
         ukey, hkey = s.get("url_key") or "", s.get("headline_key") or ""
         if (ukey and ukey in batch_urls) or (hkey and hkey in batch_heads):
-            _why(s, "the same story is already in this batch")
+            why(s, "the same story is already in this batch")
             continue
         seen = db.news_story_seen(ukey, hkey, since_iso=since)
         if seen:
             how = "the same link" if seen.get("url_key") == ukey and ukey else \
                 "the same headline"
-            _why(s, f"already posted on {seen.get('posted_on', '?')} "
-                    f"({seen.get('kind') or 'main'} post) — {how}, within "
-                    f"{config.NEWS_REPEAT_DAYS} days")
+            why(s, f"already posted on {seen.get('posted_on', '?')} "
+                   f"({seen.get('kind') or 'main'} post) — {how}, within "
+                   f"{config.NEWS_REPEAT_DAYS} days")
             continue
         if ukey:
             batch_urls.add(ukey)
         if hkey:
             batch_heads.add(hkey)
         pool.append(s)
+    return pool
 
-    # ---- 1. our PoCs first --------------------------------------------------
-    keep: list = []
-    per_name: dict = {}                    # sheet_ref -> stories in the post
 
-    def _name(s) -> str:
-        return str(s.get("sheet_ref") or "").strip().lower()
+def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
+                topics_per_week: int, min_importance: int,
+                offtopic_bypass: int) -> dict:
+    """THE DAILY POST: at most `cap` stories, OURS FIRST, then the industry.
 
-    for s in pool:
-        if len(keep) >= max(0, min(int(poc_slots), cap)):
-            break
-        if is_poc(s) and not per_name.get(_name(s)):
-            keep.append(s)
-            per_name[_name(s)] = 1
-    taken = {id(s) for s in keep}
+    Returns {"keep", "ours", "industry", "carry", "dropped", "skipped"}.
+    `keep` is the post in the order it is posted (`ours` then `industry`);
+    `carry` is every story about us that qualified and did not fit — the
+    caller carries it to the next daily post (`db.news_feed_carry`); `dropped`
+    is the industry news that did not fit, which is not carried; `skipped` is
+    a sentence per story that is not in the post, for the log.
 
-    # ---- 2. the best of everything left -------------------------------------
+    WHO QUALIFIES: a story not already posted (by link or by headline, inside
+    NEWS_REPEAT_DAYS — which is what keeps a story sent as breaking out of the
+    daily post) and not a second copy of one in this batch.
+
+    1. OURS — every story with the flag, whatever its score (a flagged story
+       the scorer left out is a 1, and the flag wins), in the one order: score,
+       then a carried story before a new one, then source rank, then newest.
+       They take the first slots, up to `cap`. No spread limit ever applies.
+    2. THE INDUSTRY — what is left of `cap`, from the stories scored
+       INDUSTRY_MIN_IMPORTANCE or more, in the same order. THE SPREAD LIMITS
+       APPLY HERE ONLY — at most `per_topic` stories on a topic a day and
+       `topics_per_week` topics a week — and two kinds of story walk past
+       them: importance at or above `min_importance` (the big one is never
+       hidden) and an OTHER story at or above `offtopic_bypass` (the topic
+       list is seeds, not limits).
+
+    THERE IS NO SECOND MESSAGE. "More AI News" is gone: what does not fit is
+    carried if it is about us and dropped if it is not.
+    """
+    marker = dl.iso(today)
+    bar = int(min_importance)
+    cap = max(0, min(int(cap), MAX_PER_MESSAGE))
+    skipped: list = []
+
+    def _why(s, why):
+        skipped.append(f"{s.get('headline', '?')!r} — {why}")
+
+    pool = _qualify(stories, db=db, today=today, why=_why)
+
+    # ---- 1. ours first ------------------------------------------------------
+    mine = [s for s in pool if is_ours(s)]
+    ours, carry = mine[:cap], mine[cap:]
+    for s in carry:
+        _why(s, f"about us, and the post is full (cap {cap}) — carried to the "
+                "next daily post")
+
+    # ---- 2. the industry, in what is left -----------------------------------
     try:
         week_topics = set(db.news_topics_this_week(iso_week(today)))
     except Exception:
@@ -704,7 +722,6 @@ def choose_main(stories: list, *, today: date, db, cap: int, poc_slots: int,
                       "as full so only the important breaks through")
         week_topics = None
     topic_counts: dict = {}
-    left_out: list = []                    # (story, why) — qualified, did not fit
 
     def _count(topic) -> int:
         if topic not in topic_counts:
@@ -714,58 +731,98 @@ def choose_main(stories: list, *, today: date, db, cap: int, poc_slots: int,
                 topic_counts[topic] = int(per_topic)
         return topic_counts[topic]
 
+    industry: list = []
+    dropped: list = []
     for s in pool:
-        if id(s) in taken:
+        if is_ours(s):
             continue
         imp = int(s.get("importance") or 3)
         topic = s.get("topic") or TOPIC_OTHER
-        if len(keep) >= cap:
-            left_out.append((s, f"the post is full (cap {cap})"))
+        if imp < INDUSTRY_MIN_IMPORTANCE:
+            _why(s, f"industry news at importance {imp}: below the {INDUSTRY_MIN_IMPORTANCE} "
+                    "a story needs to be posted")
             continue
-        if is_poc(s) and per_name.get(_name(s), 0) >= POC_PER_NAME_IN_POST:
-            left_out.append((s, f"the post already has {per_name[_name(s)]} stories "
-                                f"about {s.get('sheet_ref') or 'that name'}"))
+        if len(ours) + len(industry) >= cap:
+            dropped.append(s)
+            _why(s, f"the post is full (cap {cap}) — industry news is not carried")
             continue
-        free = (is_poc(s) or imp >= bar
-                or (topic == TOPIC_OTHER and imp >= int(offtopic_bypass)))
+        free = imp >= bar or (topic == TOPIC_OTHER and imp >= int(offtopic_bypass))
         if not free:
             if _count(topic) >= int(per_topic):
-                left_out.append((s, f"{topic} already has {topic_counts[topic]} "
-                                    f"story/stories today "
-                                    f"(NEWS_PER_TOPIC_PER_DAY={per_topic})"))
+                dropped.append(s)
+                _why(s, f"{topic} already has {topic_counts[topic]} story/stories "
+                        f"today (NEWS_PER_TOPIC_PER_DAY={per_topic})")
                 continue
             if week_topics is None or (topic not in week_topics
                                        and len(week_topics) >= int(topics_per_week)):
-                left_out.append((s, f"{topic} would be topic number "
-                                    f"{len(week_topics or ()) + 1} this week "
-                                    f"(NEWS_TOPICS_PER_WEEK={topics_per_week})"))
+                dropped.append(s)
+                _why(s, f"{topic} would be topic number "
+                        f"{len(week_topics or ()) + 1} this week "
+                        f"(NEWS_TOPICS_PER_WEEK={topics_per_week})")
                 continue
-        keep.append(s)
-        taken.add(id(s))
-        if is_poc(s):
-            per_name[_name(s)] = per_name.get(_name(s), 0) + 1
-        if not is_poc(s):
-            topic_counts[topic] = _count(topic) + 1
-            if week_topics is not None:
-                week_topics.add(topic)
+        industry.append(s)
+        topic_counts[topic] = _count(topic) + 1
+        if week_topics is not None:
+            week_topics.add(topic)
+    return {"keep": ours + industry, "ours": ours, "industry": industry,
+            "carry": carry, "dropped": dropped, "skipped": skipped}
 
-    # ---- what did not fit ---------------------------------------------------
-    eligible = [(s, why) for s, why in left_out
-                if int(s.get("importance") or 3) >= int(overflow_min)]
-    for s, why in left_out:
-        if int(s.get("importance") or 3) < int(overflow_min):
-            _why(s, f"{why}; importance {int(s.get('importance') or 3)} is below "
-                    f"NEWS_OVERFLOW_MIN_IMPORTANCE={overflow_min}")
-    eligible.sort(key=lambda p: 0 if is_poc(p[0]) else 1)       # stable: rank kept
-    room = max(0, int(overflow_max))
-    overflow = [s for s, _why_ in eligible[:room]]
-    dropped = [s for s, _why_ in eligible[room:]]
-    for s, why in eligible[:room]:
-        _why(s, f"{why} — goes in \"More AI News\"")
-    for s, why in eligible[room:]:
-        _why(s, f"{why}; \"More AI News\" is full too "
-                f"(NEWS_OVERFLOW_MAX_ITEMS={overflow_max})")
-    return {"keep": keep, "overflow": overflow, "skipped": skipped, "dropped": dropped}
+
+def is_breaking(story: dict, *, ours_min: int, industry_min: int) -> bool:
+    """Does this story's SCORE make it breaking news? About us: `ours_min`
+    (4) or more. Industry: `industry_min` (5)."""
+    imp = int((story or {}).get("importance") or 0)
+    return imp >= (int(ours_min) if is_ours(story) else int(industry_min))
+
+
+def choose_breaking(stories: list, *, today: date, db, now: datetime,
+                    max_age_hours: int, ours_min: int, industry_min: int,
+                    cap: int) -> dict:
+    """WHAT ONE CYCLE SENDS AS BREAKING NEWS. {"keep", "held", "skipped"}.
+
+    THE GATES, IN ORDER:
+      1. the score — about us 4 or 5, industry 5 (`is_breaking`);
+      2. NEW — first SEEN within `max_age_hours` of `now`. A story that only
+         reaches a breaking score hours later is not sent as stale breaking
+         news: it is in the next daily post instead. A CARRIED story is never
+         breaking — being carried does not make it new;
+      3. not already posted, by link or by headline — a second outlet's copy
+         of a story that already went out is the same story;
+      4. THE FLOOD GUARD — the top `cap` in the one order (score, source rank,
+         newest) go now, in ONE message. The rest are `held`: the caller does
+         not record them, so the next cycle can send them.
+    """
+    skipped: list = []
+
+    def _why(s, why):
+        skipped.append(f"{s.get('headline', '?')!r} — {why}")
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    oldest = (now.astimezone(timezone.utc)
+              - timedelta(hours=max(1, int(max_age_hours)))).isoformat(timespec="seconds")
+    fresh: list = []
+    for s in stories or []:
+        if not is_breaking(s, ours_min=ours_min, industry_min=industry_min):
+            continue
+        if is_carried(s) or int(s.get("carry_count") or 0) < 0:
+            _why(s, "carried from an earlier daily post; a carried story is never "
+                    "breaking")
+            continue
+        seen_at = str(s.get("seen_at") or "")
+        if seen_at and seen_at < oldest:
+            _why(s, f"first seen more than {int(max_age_hours)}h ago "
+                    "(NEWS_BREAKING_MAX_AGE_HOURS) — it goes in the daily post")
+            continue
+        fresh.append(s)
+    pool = _qualify(fresh, db=db, today=today, why=_why)
+    room = max(0, min(int(cap), MAX_PER_MESSAGE))
+    keep, held = pool[:room], pool[room:]
+    for s in held:
+        _why(s, f"{room} breaking stories already go out this cycle "
+                "(NEWS_BREAKING_MAX_PER_CYCLE) — not recorded; the next cycle "
+                "can send it")
+    return {"keep": keep, "held": held, "skipped": skipped}
 
 
 # -- what the message says ----------------------------------------------------
@@ -783,8 +840,11 @@ def _topic_label(topic: str) -> str:
     return "Other" if (topic or TOPIC_OTHER) == TOPIC_OTHER else topic
 
 
-# What a quiet main sweep posts under its heading. A quiet hourly check posts
-# nothing at all.
+# What somebody who ASKS for the news is told when there is none to give.
+#
+# RETIRED FOR THE DAILY POST (NFT2-1087): a day with nothing to send posts
+# NOTHING — no heading over one line saying so. An answer is different:
+# somebody asked, and silence is not a reply.
 #
 # THREE LINES, IN ROTATION BY DATE (`quiet_line`): three quiet days in a row
 # read as three different sentences, and the same day always gets the same one,
@@ -796,22 +856,25 @@ QUIET_LINES = (
     "Checked the news: nothing you need to see today.",
 )
 QUIET_MAIN = QUIET_LINES[0]
-# ONE TEMPLATE FOR EVERY NEWS MESSAGE (8 Oct): a bold heading with the day, a
-# blank line, then one bullet per story with a blank line between bullets. The
-# labels live here; the day is added by `heading`. The daily post's heading is
-# put on by the drip sender (drip.HEADINGS["R1"]) and reads the same.
+# THE TEMPLATES (NFT2-1087, section 16). The heading is the ONLY bold line of a
+# news message. The daily post's and an answer's carry the day; a breaking
+# post's does not ("**Breaking news**"). The daily post's heading is put on by
+# the drip sender (drip.HEADINGS["R1"]) and reads the same.
 HEADING_LABELS = {
     MODE_MAIN: "AI News",
     MODE_ANSWER: "AI News",
-    MODE_OVERFLOW: "More AI News",
-    MODE_BREAKING: "Breaking AI News",
+    MODE_BREAKING: "Breaking news",
 }
-# Kept as names other modules and checks read: the bold label, without the day.
-BREAKING_HEADING = "**Breaking AI News**"
-OVERFLOW_HEADING = "**More AI News**"
+# Kept as a name other modules and checks read: the bold label.
+BREAKING_HEADING = "**Breaking news**"
+# THE FIXED TEXT OF THE DAILY POST. No model writes any of these.
+OPENER = "Hey here's today's round-up:"
+LABEL_OURS = "Our PoCs are in the news:"
+LABEL_INDUSTRY = "Elsewhere in AI"
+CLOSER = "Let me know if you want me to dig into any of these"
 # NO NEWS MESSAGE OF ANY KIND CARRIES MORE THAN THIS MANY STORIES — the daily
-# post, the follow-up, a breaking post, an answer. A hard ceiling under every
-# setting: NEWS_MAX_ITEMS and NEWS_OVERFLOW_MAX_ITEMS can lower it, not raise it.
+# post, a breaking post, an answer. A hard ceiling under every setting:
+# NEWS_MAX_ITEMS and NEWS_BREAKING_MAX_PER_CYCLE can lower it, not raise it.
 MAX_PER_MESSAGE = 5
 # A story whose line could not fit one Discord message even alone (a tracking
 # link two thousand characters long) is left out and logged: a link is never
@@ -825,9 +888,15 @@ def day_label(day: date) -> str:
     return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
 
 
-def heading(mode: str, day: date) -> str:
-    """`**AI News, Thu 8 Oct**` — the bold first line of a news message."""
-    return f"**{HEADING_LABELS.get(mode, HEADING_LABELS[MODE_MAIN])}, {day_label(day)}**"
+def heading(mode: str, day: Optional[date] = None, *, tags: str = "") -> str:
+    """The first line of a news message: `**AI News, Thu 8 Oct**`, or
+    `**Breaking news**` (no date). `tags` — who the message is for — go on the
+    SAME line, after the bold: `**AI News, Tue 13 Oct** <@1> <@2>`."""
+    label = HEADING_LABELS.get(mode, HEADING_LABELS[MODE_MAIN])
+    bold = f"**{label}**" if mode == MODE_BREAKING \
+        else f"**{label}, {day_label(day or dl.today_ist())}**"
+    tags = " ".join(str(tags or "").split())
+    return f"{bold} {tags}" if tags else bold
 
 
 def quiet_line(day: date) -> str:
@@ -896,7 +965,7 @@ def clean_headline(story: dict) -> str:
       with one, and the outlet is named in the link beside it);
     - a trailing full stop and stray whitespace come off;
     - mention tokens are removed (`_no_pings`) and asterisks with them, so feed
-      text can neither ping anybody nor break the bold;
+      text can neither ping anybody nor make itself bold;
     - NEVER CUT. A headline is shown to its last word or not at all.
     """
     text = " ".join(_no_pings((story or {}).get("headline")
@@ -942,29 +1011,20 @@ def outlet(story: dict) -> str:
 
 
 def story_line(story: dict) -> str:
-    """One story as one bullet.
+    """One story as one bullet. THE ONLY SHAPE THERE IS (NFT2-1087, section 9):
 
-    INDUSTRY NEWS IS A HEADLINE AND A LINK, NOTHING ELSE (the team's template,
-    8 Oct): `- **Headline** ([Outlet](<url>))`. No "— what happened" clause:
-    the headline is shown once and the story is one click away.
+        - 'Brutal session' for chip stocks shows AI trade is turning ([Reuters](<url>))
 
-    A PoC STORY KEEPS ITS OWN LINE, word for word: `Headline — what. (Company
-    — on Master Pipeline) [site](<url>)`. Whose story it is is the whole
-    reason it is in the post. It only takes the same "- " marker, so a post
-    that carries both kinds reads as one list.
+    A headline and its outlet, nothing else, for every story in every news
+    message — the daily post, a breaking post, an answer in the channel. NO
+    BOLD: only a message's heading is bold. No "— what happened" clause: the
+    headline is shown once and the story is one click away. NO SHEET TAG: a
+    story about us used to have a line of its own ("Headline — what. (Company
+    — on Master Pipeline) [site](<url>)"); what says it is ours now is the
+    label it stands under, "Our PoCs are in the news:".
     """
-    import links
-
-    if is_poc(story):
-        head = _no_pings(story.get("headline") or "").strip()
-        what = _no_pings(story.get("what") or "").strip().rstrip(".")
-        body = f"{head} — {what}." if what else head
-        ref = _no_pings(story.get("sheet_ref") or "").strip()
-        if ref:
-            body = f"{body} ({ref})"
-        return f"- {body} {links.link(_link_label(story), story['url'])}"
     url = str(story["url"]).strip().strip("<>")
-    return f"- **{clean_headline(story)}** ([{outlet(story)}](<{url}>))"
+    return f"- {clean_headline(story)} ([{outlet(story)}](<{url}>))"
 
 
 def unique(stories: list) -> list:
@@ -994,29 +1054,27 @@ def unique(stories: list) -> list:
     return out
 
 
-def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None) -> str:
-    """One news message: the stories as bullets, a blank line between them.
+def _is_item(line: str) -> bool:
+    return str(line or "").startswith("- ")
 
-        **AI News, Thu 8 Oct**
 
-        - **Headline** ([Outlet](<url>))
+def _join(lines: list) -> str:
+    """The lines of a news message with its spacing set: ONE blank line
+    between two stories, and none anywhere else — not under the heading, not
+    under the opener or a label, not above the closer (the templates of
+    NFT2-1087, section 16)."""
+    out: list = []
+    for ln in lines:
+        if out and _is_item(out[-1]) and _is_item(ln):
+            out.append("")
+        out.append(ln)
+    return "\n".join(out)
 
-        - **Headline** ([Outlet](<url>))
 
-    THE SAME SHAPE EVERYWHERE — the daily post, "More AI News", a breaking
-    post and an answer in the channel — because it is rendered here and
-    nowhere else. Never written by a model.
-
-    THE HEADING: a breaking post, the follow-up and an answer carry their own,
-    with the day (`heading`). The DAILY post's is put on by the drip sender,
-    above the line that tags people, so MODE_MAIN returns the bullets alone
-    and `layout` sets the blank line once the heading is on.
-
-    AT MOST MAX_PER_MESSAGE STORIES, each once (`unique`), whatever was handed
-    in. NO TOPIC TAG AND NO CLOSING LINE — news never needs an action, so
-    nothing after the bullets asks for one.
-    """
-    picked = []
+def _picked(stories: list, cap: int) -> list:
+    """The stories a message carries: each once (`unique`), with a link, at
+    most `cap`, and none whose line cannot fit a Discord message."""
+    picked: list = []
     for s in unique([s for s in (stories or []) if s.get("url")]):
         if len(story_line(s)) > MAX_LINE_CHARS:
             log.warning("[news] left out of the message: its line is %d characters "
@@ -1024,42 +1082,75 @@ def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None) 
                         len(story_line(s)), str(s.get("headline") or "")[:80])
             continue
         picked.append(s)
-        if len(picked) >= MAX_PER_MESSAGE:
+        if len(picked) >= cap:
             break
+    return picked
+
+
+def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
+           tags: str = "") -> str:
+    """One news message, in one of the team's templates (NFT2-1087, s.16).
+    Never written by a model: the opener, the two labels and the closer are
+    fixed text, and every story is `story_line`.
+
+    THE DAILY POST (MODE_MAIN) — everything UNDER its heading, which the drip
+    sender puts on with the tags (`heading`). Three shapes:
+
+        Hey here's today's round-up:        both kinds of story
+        Our PoCs are in the news:
+        - ours
+        Elsewhere in AI
+        - industry
+        Let me know if you want me to dig into any of these
+
+      only ours      the first label and its stories; no "Elsewhere in AI"
+      only industry  no label at all
+
+    A BREAKING POST (MODE_BREAKING) — `**Breaking news** <tags>` and the
+    stories: no date, no opener, no closer. AN ANSWER (MODE_ANSWER) — `**AI
+    News, <day>**` and the stories: no tags, no opener, no closer, no labels.
+
+    AT MOST MAX_PER_MESSAGE STORIES, each once (`unique`), whatever was handed
+    in; ours (`is_ours`) before the industry, the order inside each kept as
+    given. No stories: "" — there is no quiet line; nothing to send is no post.
+    """
+    picked = _picked(stories, MAX_PER_MESSAGE)
     if not picked:
         return ""
-    body = "\n\n".join(story_line(s) for s in picked)
-    if mode == MODE_MAIN:
-        return body
-    return f"{heading(mode, day or dl.today_ist())}\n\n{body}"
+    if mode != MODE_MAIN:
+        head = heading(mode, day or dl.today_ist(),
+                       tags=tags if mode == MODE_BREAKING else "")
+        return _join([head] + [story_line(s) for s in picked])
+    ours = [s for s in picked if is_ours(s)]
+    industry = [s for s in picked if not is_ours(s)]
+    lines = [OPENER]
+    if ours:
+        lines.append(LABEL_OURS)
+        lines += [story_line(s) for s in ours]
+        if industry:
+            lines.append(LABEL_INDUSTRY)
+    lines += [story_line(s) for s in industry]
+    lines.append(CLOSER)
+    return _join(lines)
 
 
-def _is_item(line: str) -> bool:
-    return str(line or "").startswith("- ")
+def daily_message(stories: list, *, day: date, tags: str = "") -> str:
+    """The whole daily post as it is sent: the heading with the tags on its
+    line, then `render`. "" when there is nothing to send. The drip sender
+    builds the same text from the same two functions."""
+    body = render(stories, mode=MODE_MAIN, day=day)
+    return f"{heading(MODE_MAIN, day, tags=tags)}\n{body}" if body else ""
 
 
 def layout(text: str) -> str:
-    """A news message with its spacing set: whatever stands above the first
-    bullet (the heading, the line that tags people), ONE blank line, then the
-    bullets with ONE blank line between them.
+    """A news message with its spacing set (`_join`): one blank line between
+    two stories and none anywhere else. Idempotent, so the sender can put the
+    heading on a rendered body and run the whole message through it."""
+    lines = [ln.rstrip() for ln in str(text or "").split("\n") if ln.strip()]
+    return _join(lines)
 
-    FOR THE DAILY POST, whose heading and tags line are put on by the drip
-    sender after `render`. A message with no bullets (a quiet day's one line)
-    comes back as it was.
-    """
-    lines = [ln.rstrip() for ln in str(text or "").split("\n")]
-    head: list = []
-    rest: list = []
-    for ln in lines:
-        if not ln.strip():
-            continue
-        if rest or _is_item(ln):
-            rest.append(ln)
-        else:
-            head.append(ln)
-    if not rest:
-        return str(text or "").strip()
-    return ("\n".join(head) + "\n\n" if head else "") + "\n\n".join(rest)
+
+_BOLD_HEAD_RE = re.compile(r"^(\*\*.+?\*\*)")
 
 
 def split_message(text: str, *, limit: int = 2000) -> list:
@@ -1067,36 +1158,44 @@ def split_message(text: str, *, limit: int = 2000) -> list:
 
     A NEWS MESSAGE IS ONE MESSAGE. It is split only when it is past `limit`
     characters (five stories with long tracking links can be), and then only
-    BETWEEN stories, and every later part opens with the heading again,
-    marked "(continued)". A daily post once arrived as two messages, the
-    second a bare list with no heading; this is what makes that impossible.
+    BETWEEN stories. Every later part opens with the bold heading again,
+    marked "(continued)" — `**AI News, Tue 13 Oct (continued)**` — and carries
+    STORIES ONLY: no tags, no opener, no label, no closer. A daily post once
+    arrived as two messages, the second a bare list with no heading; this is
+    what makes that impossible.
     """
     body = str(text or "")
     limit = max(200, int(limit))
     if len(body) <= limit:
         return [body]
     lines = [ln for ln in body.split("\n") if ln.strip()]
-    head = []
-    while lines and not _is_item(lines[0]):
-        head.append(lines.pop(0))
-    if not lines:
+    if not any(_is_item(ln) for ln in lines):
         # No bullets at all: nothing of ours to keep together.
         return [body[i:i + limit] for i in range(0, len(body), limit)]
-    title = next((ln for ln in head if ln.startswith("**") and ln.endswith("**")), "")
-    again = f"{title[:-2]} {CONTINUED}**" if title else ""
+    found = _BOLD_HEAD_RE.match(lines[0])
+    again = f"{found.group(1)[:-2]} {CONTINUED}**" if found else ""
     parts: list = []
-    current = "\n".join(head)
-    has_item = False
+    current: list = []
+    first = True
     for ln in lines:
-        candidate = f"{current}\n\n{ln}" if current else ln
-        if len(candidate) > limit and has_item:
-            parts.append(current)
-            current = f"{again}\n\n{ln}" if again else ln
+        if not first and not _is_item(ln):
+            continue                        # a later part is stories only
+        has_item = any(_is_item(x) for x in current)
+        if has_item and len(_join(current + [ln])) > limit:
+            # A label left hanging at the foot of a part belongs to the
+            # stories that moved on; it goes rather than stand over nothing.
+            while current and not _is_item(current[-1]):
+                current.pop()
+            parts.append(_join(current))
+            first = False
+            if not _is_item(ln):
+                current = []
+                continue
+            current = ([again] if again else []) + [ln]
         else:
-            current = candidate
-        has_item = True
-    if current:
-        parts.append(current)
+            current.append(ln)
+    if any(_is_item(x) for x in current):
+        parts.append(_join(current))
     return parts
 
 
@@ -1160,22 +1259,12 @@ def plain_question(text: str) -> bool:
     return all(w in _PLAIN_NEWS_WORDS or w.isdigit() for w in words)
 
 
-def _link_label(story: dict) -> str:
-    """The masked link's name. "" (the site name) for an outlet's own link; the
-    OUTLET for a Google News link, whose host would otherwise read
-    "news.google.com" under every story it carried."""
-    host = (urlsplit(str(story.get("url") or "")).hostname or "").lower()
-    if host.endswith("news.google.com"):
-        return _no_pings(story.get("source") or "").strip()
-    return ""
-
-
 # -- R1 from the feeds: choosing what the scorer sees, and reading its verdicts --
 #
-# THE NEWS IS NOT SEARCHED FOR ANY MORE. `feeds.poll()` stores what the outlets
-# published; the light model is shown TITLES AND SUMMARIES ONLY — about 3k
-# tokens for forty items — and gives each a topic and an importance. Nothing
-# here opens a socket or calls a model; bot.py does both.
+# THE NEWS IS NOT SEARCHED FOR. A cycle (`feeds.pull`) stores what Google News
+# and the outlets published; the light model is shown TITLES AND SUMMARIES
+# ONLY — about 3k tokens for forty items — and gives each a topic and an
+# importance. Nothing here opens a socket or calls a model; bot.py does both.
 
 SCORE_TITLE_CHARS = 140
 SCORE_SUMMARY_CHARS = 120
@@ -1191,19 +1280,19 @@ def future_note(day: date) -> str:
 def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
     """The feed items worth showing the scorer, at most `cap`, newest first.
 
-    THE OUTLETS' OWN FEEDS GO FIRST (no `topic_hint`): they are AI desks and
-    nearly everything on them is in scope — but they get at most 60% of the
-    call, so a busy day on five desks cannot crowd out the topic queries, which
-    are where a story off those desks (a regulator, an Indian outlet) arrives.
-    The Google News queries fill the rest, at most `per_hint` per topic, so one
-    busy topic ("robot") cannot spend the whole call; any room still left goes
-    back to the outlets. Two rows with one headline key count once.
+    ITEMS ABOUT US GO BEFORE ALL OF IT, EVERY ONE OF THEM (NFT2-1087). The
+    flag was set by rule when the item was stored, and a flagged story is one
+    the team must see; the score only decides when. There is no per-name
+    share any more: every name is read every hour in a batch, and the batch
+    returns what is new in the window, not a week of one company.
 
-    PoC ITEMS GO BEFORE ALL OF IT — each is the reason a whole query was made,
-    and a busy news day must not push them out of the call — BUT WITHIN LIMITS:
-    at most POC_SCORE_PER_NAME per name and POC_SCORE_SHARE of the call
-    together, so a company that is in the news forty times a week (or shares
-    its name with a footballer) cannot push the industry out instead.
+    THEN THE OUTLETS' OWN FEEDS (no `topic_hint`): they are AI desks and
+    nearly everything on them is in scope — but they get at most 60% of what
+    is left, so a busy day on the desks cannot crowd out the topic queries,
+    which are where a story off those desks (a regulator, an Indian outlet)
+    arrives. The Google News queries fill the rest, at most `per_hint` per
+    topic; any room still left goes back to the outlets. Two rows with one
+    headline key count once.
     """
     cap = max(1, int(cap))
     ordered = sorted(items or [], key=lambda r: str(r.get("published_at") or ""),
@@ -1220,21 +1309,16 @@ def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
         out.append(row)
         return True
 
-    poc_room = max(1, int(cap * POC_SCORE_SHARE))
     for row in ordered:
-        if not is_poc(row):
-            continue
-        name = str(row.get("sheet_ref") or "").strip().lower()
-        if per.get(("poc", name), 0) >= POC_SCORE_PER_NAME:
-            continue
-        if take(row, poc_room):
-            per[("poc", name)] = per.get(("poc", name), 0) + 1
-    ordered = [r for r in ordered if not is_poc(r)]
+        if is_ours(row):
+            take(row, cap)
+    ordered = [r for r in ordered if not is_ours(r)]
     outlets = [r for r in ordered if not (r.get("topic_hint") or "").strip()]
     queries = [r for r in ordered if (r.get("topic_hint") or "").strip()]
-    share = cap if not queries else max(1, int(cap * 0.6))
+    room = cap - len(out)
+    share = cap if not queries else len(out) + max(1, int(room * 0.6))
     for row in outlets:
-        take(row, share)
+        take(row, min(cap, share))
     for row in queries:
         hint = row["topic_hint"].strip()
         if per.get(hint, 0) >= int(per_hint):
@@ -1246,52 +1330,92 @@ def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
     return out
 
 
+# WHAT MAKES A STORY BREAKING — the team's table (NFT2-1087, section 8), carried
+# in the scoring prompt WORD FOR WORD. A row is (about us, industry).
+BREAKING_TABLE = (
+    ("About us (score 4 or 5)", "Industry (score 5 only)"),
+    ("A funding round, an acquisition, or a merger.",
+     "A new frontier model from a top lab."),
+    ("A shutdown, or layoffs.",
+     "A law or a rule that changes how AI companies buy data or run evals."),
+    ("A new CEO, CTO, or head of AI.",
+     "A big move by a competitor on the watch list."),
+    ("A product launch in data, evals, voice, or annotation.",
+     "A market event that changes AI spending for a quarter or more."),
+    ("A regulatory action against them.",
+     "News that changes the India or UK AI market."),
+    ("One of our people changes job or company.", "—"),
+    ("One of our researchers publishes a paper in our field.", "—"),
+)
+
+# WHO THE SCORE IS FOR: three lines about Membrane, so "important" means
+# important to this team and not to the industry at large.
+MEMBRANE_LINES = (
+    "Membrane sells student-panel human data in Bangalore.",
+    "Its work: evals and preference data, Hinglish and Indic speech, voice AI data.",
+    "It also does RLHF and red-teaming.",
+)
+
+
+def breaking_table() -> str:
+    """The table as the prompt carries it: one `| left | right |` line a row."""
+    return "\n".join(f"| {a} | {b} |" for a, b in BREAKING_TABLE)
+
+
 def score_prompt(items: list, topics: list, *, today: date, mode: str) -> str:
     """ONE scoring call for a batch of feed items: titles and summaries only.
 
     The model does not search and is given no page text. It returns one SCORE
     line per item worth a 3 or more; everything it leaves out is recorded as
     filler (1) by the caller, so no item is ever paid for twice.
+
+    THE MODEL DOES NOT DECIDE WHAT IS ABOUT US. That was decided by rule when
+    the item was stored, and the item says so: `[ABOUT US: names]`. What the
+    model decides is how much the story matters, against the team's own table
+    of what is breaking (`BREAKING_TABLE`) and three lines on what Membrane
+    sells. `mode` is kept for the caller's log line; the prompt is the same
+    for a cycle, the daily post and a question.
     """
     seeds = [str(t).strip() for t in (topics or []) if str(t).strip()]
     lines = [
         "Below are news items from RSS feeds — a title and sometimes a summary "
-        f"each. Today is {dl.iso(today)}. Score them for a sales team at an "
-        "AI-data company (human data, evals, RLHF, voice and speech data, "
-        "red-teaming).",
+        f"each. Today is {dl.iso(today)}. Score them for the sales team at "
+        "Membrane.",
+        "",
+        "ABOUT MEMBRANE:",
+    ]
+    lines += [f"  {line}" for line in MEMBRANE_LINES]
+    lines += [
         "",
         "TOPICS — these are SEEDS, NOT LIMITS. The team's sheet says 'not limited "
         "to these', so important news off this list is welcome; tag it OTHER:",
         "  " + ", ".join(seeds),
         "",
         "IMPORTANCE, 1-5:",
-        "  5 = the whole industry is talking about it today",
+        "  5 = breaking: the whole industry is talking about it today",
         "  4 = a sales team must know this week",
         "  3 = useful",
         "  2-1 = filler",
+        "",
+        "WHAT MAKES A STORY BREAKING:",
+        breaking_table(),
+        "",
+        "AN ITEM MARKED [ABOUT US: …] names a company or a person this team sells "
+        "to, one of its researchers, or a competitor it watches. Score it 4 or 5 "
+        "ONLY for something in the left column; anything else about them is a 3 at "
+        "most, and a passing mention is filler. An item NOT marked is industry "
+        "news: score it 5 ONLY for something in the right column. Everything not "
+        "in the table is a 4 at most.",
+        "",
+        "ITEMS:",
     ]
-    if any(is_poc(it) for it in items):
-        lines += [
-            "",
-            "AN ITEM MARKED [ABOUT OUR CONTACT: …] came from looking up a company or "
-            "person this team is selling to. Score it for what it means to that "
-            "relationship: a funding round, a launch, an acquisition, a senior hire "
-            "or departure, layoffs or a partnership there is a 4 even if the wider "
-            "industry would not notice; a passing mention is filler. If the item is "
-            "not really about them, leave it out.",
-        ]
-    if mode == MODE_CHECK:
-        lines.append("BE STRICT WITH 4 AND 5: this is an hourly check for MAJOR news "
-                     "only — a big launch, a large round, a regulation, a leadership "
-                     "move the whole industry is discussing.")
-    lines += ["", "ITEMS:"]
     for i, it in enumerate(items, 1):
         title = " ".join(str(it.get("title") or "").split())[:SCORE_TITLE_CHARS]
         summary = " ".join(str(it.get("summary") or "").split())[:SCORE_SUMMARY_CHARS]
         source = " ".join(str(it.get("source") or "").split())[:30]
-        about = " ".join(str(it.get("sheet_ref") or "").split())[:80] if is_poc(it) else ""
+        about = " ".join(str(it.get("names") or "").split())[:120] if is_ours(it) else ""
         lines.append(f"{i} | {source} | {title}" + (f" — {summary}" if summary else "")
-                     + (f" [ABOUT OUR CONTACT: {about}]" if about else ""))
+                     + (f" [ABOUT US: {about}]" if about else ""))
     lines += [
         "",
         "FOR EACH ITEM THAT IS AI NEWS WORTH 3 OR MORE, one line in exactly this "
@@ -1312,8 +1436,21 @@ def score_prompt(items: list, topics: list, *, today: date, mode: str) -> str:
 _SCORE_RE = re.compile(r"^\s*[-*•]?\s*SCORE\s*\|", re.IGNORECASE)
 
 
-def story_from_feed(row: dict, *, topics: Optional[list] = None) -> dict:
-    """A stored, scored feed row as the story dict `choose` and `render` use."""
+def story_from_feed(row: dict, *, topics: Optional[list] = None,
+                    default_importance: int = 3) -> dict:
+    """A stored feed row as the story dict `choose_main` and `render` use.
+
+    BOTH NUMBERS RIDE ON IT: `flag` (about us, by rule) with the `names` it
+    carries, and `importance` (the model's). An unscored row takes
+    `default_importance` — a flagged story the scorer never reached goes into
+    the daily post at 3.
+    """
+    flag = 1 if is_ours(row) else 0
+    kind = str(row.get("kind") or "")
+    if not flag:
+        kind = KIND_INDUSTRY
+    elif kind in ("", KIND_INDUSTRY):
+        kind = KIND_POC
     return {
         "topic": _canonical_topic(row.get("topic") or "", topics),
         "headline": str(row.get("title") or "").strip(),
@@ -1321,12 +1458,20 @@ def story_from_feed(row: dict, *, topics: Optional[list] = None) -> dict:
         "url": str(row.get("url") or "").strip(),
         "url_key": str(row.get("url_key") or ""),
         "headline_key": str(row.get("headline_key") or ""),
-        "importance": max(1, min(5, int(row.get("importance") or 3))),
+        "importance": max(1, min(5, int(row.get("importance")
+                                        or default_importance))),
         "source": str(row.get("source") or "").strip(),
-        # industry | poc, and for a PoC story the sheet row it is about.
-        "kind": KIND_POC if is_poc(row) else KIND_INDUSTRY,
-        "sheet_ref": str(row.get("sheet_ref") or "").strip() if is_poc(row) else "",
+        # industry | poc | researcher, and for a story about a sheet company
+        # the row it is about (R10 reads `sheet_ref`; no post shows it).
+        "kind": kind,
+        "flag": flag,
+        "names": str(row.get("names") or "").strip() if flag else "",
+        "sheet_ref": str(row.get("sheet_ref") or "").strip() if flag else "",
+        "source_rank": int(row.get("source_rank") or SOURCE_RANK_UNKNOWN),
+        "carried_from": str(row.get("carried_from") or ""),
+        "carry_count": int(row.get("carry_count") or 0),
         "published_at": str(row.get("published_at") or ""),
+        "seen_at": str(row.get("seen_at") or ""),
     }
 
 
@@ -1385,7 +1530,16 @@ def render_screen(rows: list, *, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
-# -- the hourly check's clock -------------------------------------------------
+# -- the cycle's clock --------------------------------------------------------
+#
+# THE FEEDS ARE READ ONCE AN HOUR FROM NEWS_PULL_FIRST TO NEWS_PULL_UNTIL
+# (NFT2-1087), not every 15 minutes and not at a list of check slots. Nothing
+# here reads a clock: the caller hands in the REAL time, because a cycle runs
+# on the real clock whatever date a tester is standing on.
+
+PULL_FIRST_DEFAULT = "14:00"
+PULL_UNTIL_DEFAULT = "23:00"
+MAX_WINDOW_HOURS = 24
 
 
 def _minutes(hhmm: str) -> Optional[int]:
@@ -1398,50 +1552,52 @@ def _minutes(hhmm: str) -> Optional[int]:
     return h * 60 + mi
 
 
-def check_slots(times: Optional[list] = None) -> list:
-    """NEWS_CHECK_TIMES as sorted, de-duplicated "HH:MM" strings."""
-    out = {}
-    for t in (times if times is not None else config.NEWS_CHECK_TIMES) or []:
-        m = _minutes(t)
-        if m is None:
-            log.warning("[news-check] NEWS_CHECK_TIMES entry %r is not HH:MM; ignored", t)
-            continue
-        out[m] = f"{m // 60:02d}:{m % 60:02d}"
-    return [out[k] for k in sorted(out)]
+_BAD_TIMES_LOGGED: set = set()
 
 
-def latest_slot(now: datetime, times: Optional[list] = None) -> Optional[str]:
-    """The latest check slot at or before `now`, or None before the first."""
+def _pull_time(name: str, default: str) -> int:
+    raw = getattr(config, name, default)
+    at = _minutes(raw)
+    if at is None:
+        if (name, raw) not in _BAD_TIMES_LOGGED:
+            _BAD_TIMES_LOGGED.add((name, raw))
+            log.warning("[news-cycle] %s=%r is not a time like 14:00; using %s", name,
+                        raw, default)
+        at = _minutes(default)
+    return at
+
+
+def pull_slots() -> list:
+    """The day's cycles as "HH:MM" strings: NEWS_PULL_FIRST, then one an hour,
+    the last at or before NEWS_PULL_UNTIL. Ten with the defaults."""
+    first = _pull_time("NEWS_PULL_FIRST", PULL_FIRST_DEFAULT)
+    until = max(first, _pull_time("NEWS_PULL_UNTIL", PULL_UNTIL_DEFAULT))
+    return [f"{m // 60:02d}:{m % 60:02d}" for m in range(first, until + 1, 60)]
+
+
+def cycle_slot(now: datetime) -> Optional[str]:
+    """The cycle `now` belongs to: the latest slot at or before it, or None
+    before the first one of the day. After the last slot it is still the last
+    one, so a bot started at 23:40 runs the 23:00 cycle rather than none."""
     at = now.hour * 60 + now.minute
     best = None
-    for s in check_slots(times):
+    for s in pull_slots():
         if _minutes(s) <= at:
             best = s
     return best
 
 
-def hours_since_previous(slot: str, *, times: Optional[list] = None) -> int:
-    """Hours between `slot` and the check slot before it, wrapping to yesterday
-    for the first one. Never below 1.
-
-    THE MAIN POST IS NOT A MARK ANY MORE. It had a fixed time (NEWS_MAIN_TIME,
-    retired 8 Oct) that stood in for the missing 14:00 check; it now moves with
-    the day's order, so a check looks back to the check before it and nothing
-    else. With the default slots the 15:00 check therefore covers from 13:00.
-    """
-    at = _minutes(slot)
-    if at is None:
-        return 1
-    marks = {_minutes(s) for s in check_slots(times)}
-    marks.discard(None)
-    earlier = [m for m in marks if m < at]
-    if earlier:
-        gap = at - max(earlier)
-    elif marks:
-        gap = at + 24 * 60 - max(marks)
-    else:
-        gap = 60
-    return max(1, round(gap / 60))
+def window_hours(last_done: Optional[datetime], now: datetime) -> int:
+    """How many hours back a cycle reads: from the last cycle that COMPLETED,
+    rounded up — never less than NEWS_PULL_WINDOW_HOURS (so two hourly pulls
+    overlap and nothing falls between them), never more than 24. With no
+    completed cycle to measure from, the full 24."""
+    floor = max(1, min(MAX_WINDOW_HOURS, int(config.NEWS_PULL_WINDOW_HOURS)))
+    if last_done is None:
+        return MAX_WINDOW_HOURS
+    seconds = (now - last_done).total_seconds()
+    hours = int(-(-seconds // 3600)) if seconds > 0 else 0
+    return max(floor, min(MAX_WINDOW_HOURS, hours))
 
 
 def _self_test() -> int:
@@ -1502,20 +1658,23 @@ def _self_test() -> int:
           sweep_prompt(topics, today=today, since_hours=24, mode=MODE_MAIN,
                        already=already).count("\n  - h"), 25)
 
-    print("\nthe main post: our PoCs first, nothing useful lost (S2)")
+    print("\nthe daily post: ours first, then the industry (NFT2-1087)")
 
-    def st(n, imp, kind="industry", topic="evals", ref="", when="2026-09-29T08:00:00+00:00"):
+    def st(n, imp, flag=0, topic="evals", when="2026-09-29T08:00:00+00:00", rank=3,
+           carried=0):
         return {"headline": f"story {n}", "what": "it happened", "url": f"https://x.com/{n}",
                 "url_key": f"x.com/{n}", "headline_key": f"story {n}", "topic": topic,
-                "importance": imp, "kind": kind, "sheet_ref": ref, "source": "X",
-                "published_at": when}
+                "importance": imp, "flag": flag, "kind": "poc" if flag else "industry",
+                "names": "Acme" if flag else "", "source": "X", "published_at": when,
+                "seen_at": when, "source_rank": rank,
+                "carried_from": "2026-09-28" if carried else "", "carry_count": carried}
 
     class Posted:
         def __init__(self, seen=(), week=(), today_counts=None):
             self.seen, self.week, self.counts = set(seen), list(week), today_counts or {}
 
         def news_story_seen(self, ukey, hkey, *, since_iso):
-            return {"url_key": ukey, "posted_on": "2026-09-28", "kind": "main"} \
+            return {"url_key": ukey, "posted_on": "2026-09-28", "kind": "breaking"} \
                 if ukey in self.seen else None
 
         def news_topic_count_today(self, topic, on_date):
@@ -1525,122 +1684,134 @@ def _self_test() -> int:
             return list(self.week)
 
     def main(stories, db=None, **kw):
-        args = dict(today=today, db=db or Posted(), cap=5, poc_slots=2, per_topic=2,
-                    topics_per_week=6, min_importance=5, offtopic_bypass=4,
-                    overflow_min=3, overflow_max=8)
+        args = dict(today=today, db=db or Posted(), cap=5, per_topic=2,
+                    topics_per_week=6, min_importance=5, offtopic_bypass=4)
         args.update(kw)
         return choose_main(stories, **args)
 
     def names(rows):
         return [s["headline"] for s in rows]
 
-    six = [st("i5", 5, topic="RLHF"), st("i4", 4, topic="evals"),
-           st("i3", 3, topic="voice agent"),
-           st("p4", 4, "poc", ref="Acme — on Master Pipeline"),
-           st("p3a", 3, "poc", ref="Borealis — on Outreach PoCs"),
-           st("p3b", 3, "poc", ref="Cinder — on Master Pipeline",
-              when="2026-09-28T08:00:00+00:00")]
-    got = main(six)
-    check("3 PoC + 3 industry: the top 2 PoC lead, then the best 3 of the rest",
-          names(got["keep"]), ["story p4", "story p3a", "story i5", "story i4",
-                               "story p3b"])
-    check("...and the sixth is in the overflow", names(got["overflow"]), ["story i3"])
-    check("a tie goes to the PoC story, then to the newest",
-          names(_rank([st("a", 3), st("b", 3, "poc", when="2026-09-27T00:00:00+00:00"),
-                       st("c", 3, "poc")])), ["story c", "story b", "story a"])
-    check("fewer PoC stories than slots: the slots go to the rest",
-          names(main([st("p", 3, "poc"), st("a", 4), st("b", 4, topic="RLHF")])["keep"]),
-          ["story p", "story a", "story b"])
-    check("no PoC stories at all: an ordinary post",
+    nine = [st("o3", 3, 1), st("o2", 2, 1), st("o1", 1, 1),
+            st("i4a", 4, topic="RLHF"), st("i4b", 4, topic="evals"),
+            st("i3a", 3, topic="voice agent"), st("i3b", 3, topic="TTS"),
+            st("i2a", 2, topic="STT"), st("i2b", 2, topic="AI trust")]
+    got = main(nine)
+    check("3 ours (3,2,1) + 6 industry: the 3 of ours first, then the two 4s",
+          names(got["keep"]), ["story o3", "story o2", "story o1", "story i4a",
+                               "story i4b"])
+    check("...industry news that did not fit is dropped, never carried",
+          (names(got["dropped"]), got["carry"]), (["story i3a", "story i3b"], []))
+    check("...and an industry story below 3 is not padding",
+          any("story i2a" in line and "below the 3" in line for line in got["skipped"]),
+          True)
+    seven_ours = [st(f"m{i}", 3, 1, when=f"2026-09-29T0{9 - i}:00:00+00:00")
+                  for i in range(7)]
+    got = main(seven_ours)
+    check("7 about us, 5 slots: five go and two are carried",
+          (len(got["keep"]), names(got["carry"])), (5, ["story m5", "story m6"]))
+    got = main([st("new", 3, 1), st("c1", 3, 1, carried=1, when="2026-09-27T08:00:00+00:00"),
+                st("c2", 3, 1, carried=1, when="2026-09-26T08:00:00+00:00")]
+               + [st(f"i{i}", 4, topic=f"t{i}") for i in range(10)], topics_per_week=99)
+    check("a carried story goes before a new one at the same score",
+          names(got["keep"])[:3], ["story c1", "story c2", "story new"])
+    check("...and the industry takes what is left", len(got["industry"]), 2)
+    check("a tie in score goes to the higher source rank, then to the newest",
+          names(_rank([st("a", 3, rank=4), st("b", 3, rank=1,
+                                                when="2026-09-27T00:00:00+00:00"),
+                       st("c", 3, rank=1)])), ["story c", "story b", "story a"])
+    check("only ours", (names(main([st("p", 2, 1)])["ours"]),
+                        main([st("p", 2, 1)])["industry"]), (["story p"], []))
+    check("no stories about us at all: an ordinary post",
           names(main([st("a", 4), st("b", 3, topic="RLHF")])["keep"]),
           ["story a", "story b"])
 
     full = Posted(today_counts={"evals": 2, "OTHER": 2})
     got = main([st("e", 4, topic="evals"), st("o4", 4, topic="OTHER"),
-                st("o3", 3, topic="OTHER"), st("p", 3, "poc", topic="evals")], db=full)
+                st("o3", 3, topic="OTHER"), st("p", 3, 1, topic="evals")], db=full)
     check("an OTHER story at importance 4 gets in past a full topic cap",
           "story o4" in names(got["keep"]), True)
     check("...an OTHER story at 3 does not, and neither does an on-topic 4",
-          sorted(names(got["overflow"])), ["story e", "story o3"])
-    check("...and a PoC story is never held by a topic cap",
-          "story p" in names(got["keep"]), True)
+          sorted(names(got["dropped"])), ["story e", "story o3"])
+    check("...and a story about us is never held by a topic cap",
+          "story p" in names(got["ours"]), True)
+    three = main([st(f"t{i}", 3, topic="evals", when=f"2026-09-29T0{i}:00:00+00:00")
+                  for i in range(3)])
+    check("three industry stories on one topic at 3: only two are posted",
+          len(three["keep"]), 2)
     week = Posted(week=["a", "b", "c", "d", "e", "f"])
     got = main([st("n", 4, topic="new topic"), st("o", 4, topic="OTHER")], db=week)
     check("the per-week limit: OTHER at 4 walks past it, a seventh topic does not",
-          (names(got["keep"]), names(got["overflow"])), (["story o"], ["story n"]))
+          (names(got["keep"]), names(got["dropped"])), (["story o"], ["story n"]))
     check("importance 5 walks past every spread limit",
           names(main([st("big", 5, topic="evals")], db=full)["keep"]), ["story big"])
+    check("a story already sent as breaking is not in the daily post",
+          names(main([st("old", 5, 1)], db=Posted(seen={"x.com/old"}))["keep"]), [])
 
-    many = [st(f"m{i}", 3, topic=f"t{i}") for i in range(16)]
-    got = main(many, topics_per_week=99)
-    check("the overflow carries at most NEWS_OVERFLOW_MAX_ITEMS",
-          (len(got["keep"]), len(got["overflow"]), len(got["dropped"])), (5, 8, 3))
-    got = main([st("i", 4), st("j", 4, topic="RLHF"), st("k", 4, topic="a"),
-                st("l", 4, topic="b"), st("m", 4, topic="c"), st("n", 4, topic="d"),
-                st("lp", 3, "poc")], poc_slots=0)
-    check("in the overflow, PoC goes first whatever its importance",
-          names(got["overflow"]), ["story lp", "story n"])
-    check("a story already posted does not qualify for either",
-          (names(main([st("old", 5)], db=Posted(seen={"x.com/old"}))["keep"]),
-           names(main([st("old", 5)], db=Posted(seen={"x.com/old"}))["overflow"])),
-          ([], []))
-    check("below NEWS_OVERFLOW_MIN_IMPORTANCE it is not carried over",
-          names(main([st(f"q{i}", 3, topic=f"t{i}") for i in range(7)],
-                     topics_per_week=99, overflow_min=4)["overflow"]), [])
+    print("\nbreaking: the score, new, and the flood guard")
+    now = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
 
-    one = [st(f"a{i}", 4, "poc", ref="Anthropic — on Outreach PoCs") for i in range(6)]
-    got1 = main(one + [st("b", 3, "poc", ref="Borealis — on Master Pipeline"),
-                       st("ind", 3)])
-    check("the PoC slots go to two DIFFERENT names",
-          names(got1["keep"])[:2], ["story a0", "story b"])
-    check("...and one name has at most 2 stories in the post",
-          (sum(1 for s in got1["keep"] if s["sheet_ref"].startswith("Anthropic")),
-           "story ind" in names(got1["keep"])), (2, True))
-    check("...the rest of that name's news is in the overflow, not lost",
-          names(got1["overflow"]), ["story a2", "story a3", "story a4", "story a5"])
+    def brk(stories, db=None, **kw):
+        args = dict(today=today, db=db or Posted(), now=now, max_age_hours=3,
+                    ours_min=4, industry_min=5, cap=3)
+        args.update(kw)
+        return choose_breaking(stories, **args)
 
-    print("\nrendering a PoC story")
-    line = render([six[3]], mode=MODE_MAIN)
-    print("   " + line)
-    check("the sheet row is in the post, in brackets, before the link",
-          "(Acme — on Master Pipeline) [" in line, True)
-    check("a PoC story keeps its own line; only the marker is the list's",
-          line.startswith("- ") and " — " in line and "**" not in line, True)
-    check("an industry story names no sheet row",
-          "(" in render([six[0]], mode=MODE_MAIN).split(" ([")[0], False)
-    over = render(got["overflow"], mode=MODE_OVERFLOW, day=date(2026, 10, 8))
-    check("the follow-up has its heading, with the day", over.splitlines()[0],
-          "**More AI News, Thu 8 Oct**")
-    check("...then a blank line, then the list", over.splitlines()[1:3][0], "")
+    got = brk([st("ours4", 4, 1), st("ours3", 3, 1), st("ind5", 5), st("ind4", 4)])
+    check("about us at 4 and industry at 5 are breaking; ours at 3 and industry at 4 "
+          "are not", sorted(names(got["keep"])), ["story ind5", "story ours4"])
+    got = brk([st("late", 5, 1, when="2026-09-29T04:00:00+00:00")])
+    check("first seen five hours ago: not breaking, however high the score",
+          (got["keep"], "NEWS_BREAKING_MAX_AGE_HOURS" in got["skipped"][0]), ([], True))
+    check("a carried story is never breaking",
+          brk([st("c", 5, 1, carried=1)])["keep"], [])
+    five = [st(f"b{i}", 5 if i < 2 else 4, 1, rank=1 + i,
+               when="2026-09-29T08:30:00+00:00") for i in range(5)]
+    got = brk(five)
+    check("five in one cycle: the top three go, by score then source rank",
+          names(got["keep"]), ["story b0", "story b1", "story b2"])
+    check("...and two are held, for the next cycle", names(got["held"]),
+          ["story b3", "story b4"])
+    check("a story already posted is not sent again",
+          brk([st("old", 5)], db=Posted(seen={"x.com/old"}))["keep"], [])
 
-    print("\nscoring: a PoC item is marked, and shown first")
+    print("\nscoring: what is about us is marked, and shown first")
     feed = [{"title": "Robots walk", "summary": "", "source": "A", "url_key": "a",
              "headline_key": "robots walk", "topic_hint": "", "published_at": "2",
-             "kind": "industry", "sheet_ref": ""},
+             "kind": "industry", "flag": 0, "names": ""},
             {"title": "Acme raises $40M", "summary": "", "source": "B", "url_key": "b",
              "headline_key": "acme raises", "topic_hint": "", "published_at": "1",
-             "kind": "poc", "sheet_ref": "Acme — on Master Pipeline"}]
-    check("a PoC item is never squeezed out of the scoring call",
+             "kind": "poc", "flag": 1, "names": "Acme, Jo Roe",
+             "sheet_ref": "Acme — on Master Pipeline"}]
+    check("a flagged item is never squeezed out of the scoring call",
           [r["url_key"] for r in preselect(feed, cap=1)], ["b"])
     flood = [{"title": f"Andi story {i}", "url_key": f"p{i}", "headline_key": f"andi {i}",
               "topic_hint": "", "published_at": f"2026-09-29T{i:02d}", "kind": "poc",
-              "sheet_ref": "Andi — on Master Pipeline"} for i in range(20)] + \
+              "flag": 1, "names": "Andi"} for i in range(8)] + \
             [{"title": f"Outlet story {i}", "url_key": f"o{i}", "headline_key": f"out {i}",
               "topic_hint": "", "published_at": f"2026-09-28T{i:02d}", "kind": "industry",
-              "sheet_ref": ""} for i in range(20)]
+              "flag": 0, "names": ""} for i in range(20)]
     shown = preselect(flood, cap=10)
-    check("...and one name's flood does not squeeze the industry out either: "
-          "3 of its 20, then the outlets",
-          (sum(1 for r in shown if r["kind"] == "poc"),
-           sum(1 for r in shown if r["kind"] == "industry")), (3, 7))
-    sp = score_prompt(feed, topics, today=today, mode=MODE_MAIN)
-    check("the prompt says who a PoC item is about",
-          "[ABOUT OUR CONTACT: Acme — on Master Pipeline]" in sp, True)
-    check("...and how to score one", "ABOUT OUR CONTACT" in sp.split("ITEMS:")[0], True)
+    check("every flagged item is shown, with no per-name limit, then the rest",
+          (sum(1 for r in shown if r["flag"]), sum(1 for r in shown if not r["flag"])),
+          (8, 2))
+    sp = score_prompt(feed, topics, today=today, mode=MODE_CYCLE)
+    check("the prompt says who a flagged item names",
+          "[ABOUT US: Acme, Jo Roe]" in sp, True)
+    check("...and an industry item carries no marker",
+          "Robots walk [ABOUT US" in sp, False)
+    check("the breaking table is in the prompt, word for word",
+          all(f"| {a} | {b} |" in sp for a, b in BREAKING_TABLE), True)
+    check("...with the three lines about Membrane",
+          all(line in sp for line in MEMBRANE_LINES)
+          and "student-panel human data in Bangalore" in sp
+          and "Hinglish and Indic speech" in sp and "RLHF and red-teaming" in sp, True)
+    check("...and what is not in the table is a 4 at most",
+          "Everything not in the table is a 4 at most." in sp, True)
     scored = parse_scores("SCORE | 2 | OTHER | 4 | Acme raised a round", feed)
-    check("a scored PoC item keeps its kind and its sheet row",
-          [(s["kind"], s["sheet_ref"]) for s in scored],
-          [("poc", "Acme — on Master Pipeline")])
+    check("a scored flagged item keeps its flag and its names",
+          [(s["flag"], s["names"], s["kind"]) for s in scored],
+          [(1, "Acme, Jo Roe", "poc")])
 
     print("\nthe check prompt")
     c = sweep_prompt(topics, today=today, since_hours=1, mode=MODE_CHECK)
@@ -1747,30 +1918,33 @@ def _self_test() -> int:
 
     print("\nrendering")
     body = render([S("evals", "Lab ships", 4), S(TOPIC_OTHER, "Thing <@123> @everyone")])
-    first = body.splitlines()[0]
-    check("one bullet per story", body.count("- **"), 2)
+    rows = body.splitlines()
+    check("the opener is the first line under the heading", rows[0], OPENER)
+    check("only industry stories: no label at all",
+          LABEL_OURS in body or LABEL_INDUSTRY in body, False)
+    check("a story is its headline and its outlet, nothing else", rows[1],
+          "- Lab ships ([n.com](<https://n.com/lab-ships>))")
+    check("...no bold anywhere under the heading", "**" in body, False)
+    check("...with no '— what happened' clause", " — " in rows[1], False)
+    check("no blank line under the opener, one between two stories",
+          (rows[1].startswith("- "), rows[2], rows[3].startswith("- ")), (True, "", True))
     check("no topic tag", "[evals]" in body or "[Other]" in body, False)
-    check("an industry story is a bold headline and its outlet, nothing else",
-          first, "- **Lab ships** ([a.com](<https://a.com/lab-ships>))"
-          if "a.com/lab-ships" in first else first)
-    check("...with no '— what happened' clause", " — " in first, False)
-    check("a blank line between the stories", body.splitlines()[1], "")
     check("no bare url", "<http" in body.replace("(<http", ""), False)
     check("no pings survive", "<@123>" in body or "@everyone" in body, False)
-    check("no closing line", body.splitlines()[-1].startswith("- **"), True)
+    check("the closer is the last line", rows[-1], CLOSER)
     b = render([S("evals", "Alpha lab ships", 5), S("RLHF", "Beta raises funds", 4)],
-               mode=MODE_BREAKING,
-               day=date(2026, 10, 8))
-    check("breaking opens with its heading, with the day", b.splitlines()[0],
-          "**Breaking AI News, Thu 8 Oct**")
-    check("...and carries every story as a bullet", b.count("- **"), 2)
+               mode=MODE_BREAKING, day=date(2026, 10, 8), tags="<@1> <@2>")
+    check("breaking opens with its heading: no date, the tags on its line",
+          b.splitlines()[0], "**Breaking news** <@1> <@2>")
+    check("...and carries every story as a bullet, right under it",
+          (b.count("\n- "), b.splitlines()[1].startswith("- ")), (2, True))
     seven = [S("evals", f"The {w} lab ships", 5, f"https://a.com/{w}")
              for w in ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf")]
     check("no news message carries more than five stories",
-          render(seven, mode=MODE_BREAKING, day=date(2026, 10, 8)).count("- **"), 5)
-    check("no stories, no text", render([]), "")
+          render(seven, mode=MODE_BREAKING, day=date(2026, 10, 8)).count("\n- "), 5)
+    check("no stories, no text — and no quiet line", render([]), "")
 
-    print("\nthe 8 Oct template: headline, outlet, one message")
+    print("\nthe templates (NFT2-1087, section 16)")
     G = "https://news.google.com/rss/articles/CBMi?oc=5"
     gn = {"headline": "State AGs launch investigations into OpenAI AI safety - Reuters",
           "source": "Reuters", "url": G, "url_key": "g1", "headline_key": "state ags",
@@ -1798,31 +1972,65 @@ def _self_test() -> int:
     check("a strapline source is cut back to the name",
           outlet({"source": "ABC News - Breaking News, Latest News and Videos", "url": G}),
           "ABC News")
-    check("the line", story_line(gn),
-          f"- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<{G}>))")
+    check("a mention token and asterisks in a feed title are removed",
+          clean_headline({"headline": "**Lab** ships <@123> evals", "url": G}),
+          "Lab ships evals")
+    check("the line — the only shape", story_line(gn),
+          f"- State AGs launch investigations into OpenAI AI safety ([Reuters](<{G}>))")
+    mine = dict(gn, url=G + "m", url_key="m1", headline_key="sarvam raises",
+                headline="Sarvam AI raises $90M - Economic Times", source="Economic Times",
+                flag=1, names="Sarvam AI", kind=KIND_POC,
+                sheet_ref="Sarvam AI — on Master Pipeline", what="a round")
+    check("a story about us has the same line: no sheet tag, no clause, no bold",
+          story_line(mine), f"- Sarvam AI raises $90M ([Economic Times](<{G}m>))")
     twin = dict(gn, url="https://other.com/a", url_key="g2", headline_key="other key",
                 source="Other Wire",
                 headline="State AGs launch investigations into OpenAI AI safety | "
                          "Other Wire")
     check("the same headline from two outlets is one story",
           len(unique([gn, twin, direct])), 2)
-    post = layout("**AI News, Thu 8 Oct**\n<@1> <@2>\n" + render([gn, direct]))
-    check("the daily post: heading, tags, a blank line, the stories",
-          post.split("\n")[:4], ["**AI News, Thu 8 Oct**", "<@1> <@2>", "",
-                                 story_line(gn)])
-    check("a quiet day's line is left as it is",
-          layout("**AI News, Thu 8 Oct**\nQuiet day."), "**AI News, Thu 8 Oct**\nQuiet day.")
+    day = date(2026, 10, 13)
+    check("template A: both kinds — both labels, ours first",
+          daily_message([gn, mine, direct], day=day, tags="@V @S"),
+          "**AI News, Tue 13 Oct** @V @S\n" + OPENER + "\n" + LABEL_OURS + "\n"
+          + story_line(mine) + "\n" + LABEL_INDUSTRY + "\n" + story_line(gn) + "\n\n"
+          + story_line(direct) + "\n" + CLOSER)
+    check("template B: only ours — no 'Elsewhere in AI'",
+          daily_message([mine], day=day, tags="@V @S"),
+          "**AI News, Tue 13 Oct** @V @S\n" + OPENER + "\n" + LABEL_OURS + "\n"
+          + story_line(mine) + "\n" + CLOSER)
+    check("template C: only industry — no label",
+          daily_message([gn, direct], day=day, tags="@V @S"),
+          "**AI News, Tue 13 Oct** @V @S\n" + OPENER + "\n" + story_line(gn) + "\n\n"
+          + story_line(direct) + "\n" + CLOSER)
+    check("template D: nothing to send is no message", daily_message([], day=day), "")
+    check("template G: an answer — heading, stories, nothing else",
+          render([mine, gn], mode=MODE_ANSWER, day=day, tags="@V"),
+          "**AI News, Tue 13 Oct**\n" + story_line(mine) + "\n\n" + story_line(gn))
+    post = daily_message([gn, mine, direct], day=day, tags="<@1> <@2>")
+    check("layout leaves a rendered message as it is", layout(post), post)
+    check("...and takes a stray blank line out",
+          layout(post.replace(OPENER + "\n", OPENER + "\n\n")), post)
     check("a message that fits is one message", len(split_message(post)), 1)
     long = [dict(gn, url=G + "x" * 500 + str(i), url_key=f"L{i}", headline_key=f"L{i}",
-                 headline=f"Long link story number {i}") for i in range(5)]
-    parts = split_message(render(long, mode=MODE_ANSWER, day=date(2026, 10, 8)))
+                 headline=f"Long link story number {i}", flag=1 if i < 2 else 0)
+            for i in range(5)]
+    parts = split_message(daily_message(long, day=day, tags="<@1> <@2>"))
     check("past 2,000 characters it is split, between stories",
           (len(parts) > 1, all(len(x) <= 2000 for x in parts)), (True, True))
-    check("...and every later part carries the heading again",
+    check("...and every later part carries the heading again, with no tags",
           [x.split("\n")[0] for x in parts[1:]],
-          ["**AI News, Thu 8 Oct (continued)**"] * (len(parts) - 1))
+          ["**AI News, Tue 13 Oct (continued)**"] * (len(parts) - 1))
+    check("...and no opener, no label and no closer",
+          any(w in x for x in parts[1:] for w in (OPENER, LABEL_OURS, LABEL_INDUSTRY,
+                                                  CLOSER)), False)
     check("...with every story still there, once",
-          sum(x.count("- **") for x in parts), 5)
+          sum(x.count("\n- ") for x in parts), 5)
+    check("no part ends on a label with nothing under it",
+          any(x.split("\n")[-1] in (LABEL_OURS, LABEL_INDUSTRY) for x in parts), False)
+    parts = split_message(render(long, mode=MODE_BREAKING, tags="<@1>"))
+    check("a breaking post splits the same way",
+          parts[1].split("\n")[0], "**Breaking news (continued)**")
 
     print("\nwhat somebody who asks is given")
 
@@ -1858,20 +2066,31 @@ def _self_test() -> int:
                 "where are we with Acme?", "AI news this week on evals"):
         check(f"not plain: {ask!r}", plain_question(ask), False)
 
-    print("\nthe check clock")
-    slots = ["11:00", "12:00", "13:00", "15:00", "16:00"]
+    print("\nthe cycle's clock")
+    saved_pull = (config.NEWS_PULL_FIRST, config.NEWS_PULL_UNTIL,
+                  config.NEWS_PULL_WINDOW_HOURS)
+    config.NEWS_PULL_FIRST, config.NEWS_PULL_UNTIL = "14:00", "23:00"
+    config.NEWS_PULL_WINDOW_HOURS = 2
+    check("ten pulls a day, 14:00 to 23:00",
+          (len(pull_slots()), pull_slots()[0], pull_slots()[-1]), (10, "14:00", "23:00"))
     check("the latest slot at or before now",
-          latest_slot(datetime(2026, 9, 29, 15, 20), slots), "15:00")
-    check("nothing before the first", latest_slot(datetime(2026, 9, 29, 9, 0), slots),
-          None)
-    check("15:00 looks back to the 13:00 check (there is no 14:00 slot, and "
-          "the main post is no longer a mark)",
-          hours_since_previous("15:00", times=slots), 2)
-    check("16:00 looks back one hour",
-          hours_since_previous("16:00", times=slots), 1)
-    check("11:00 looks back to last night's last slot",
-          hours_since_previous("11:00", times=slots), 19)
-    check("bad entries are ignored", check_slots(["25:00", "9:05", "x"]), ["09:05"])
+          cycle_slot(datetime(2026, 9, 29, 16, 30)), "16:00")
+    check("nothing before the first", cycle_slot(datetime(2026, 9, 29, 13, 59)), None)
+    check("after the last slot it is still the last",
+          cycle_slot(datetime(2026, 9, 29, 23, 40)), "23:00")
+    at = datetime(2026, 9, 29, 12, 30, tzinfo=timezone.utc)
+    check("an hourly pull reads two hours back, so two pulls overlap",
+          window_hours(at - timedelta(hours=1), at), 2)
+    check("three hours down: the window reaches back to the last cycle",
+          window_hours(at - timedelta(hours=3), at), 3)
+    check("never more than 24", window_hours(at - timedelta(days=3), at), 24)
+    check("no completed cycle to measure from: 24", window_hours(None, at), 24)
+    config.NEWS_PULL_FIRST = "13:00"
+    check("NEWS_PULL_FIRST moves the first pull", pull_slots()[0], "13:00")
+    config.NEWS_PULL_FIRST = "2pm"
+    check("an unreadable time falls back to 14:00", pull_slots()[0], "14:00")
+    (config.NEWS_PULL_FIRST, config.NEWS_PULL_UNTIL,
+     config.NEWS_PULL_WINDOW_HOURS) = saved_pull
 
     print("\nthe strategy section")
     doc = "# T\n\n## 1. Who\nx\n\n## 2. What we sell\n| A | B |\n### sub\ny\n## 3. Goals\nz"
@@ -1944,9 +2163,8 @@ def _self_test() -> int:
     check("it carries no url", "http" in sp, False)
     check("it asks for SCORE lines", "SCORE | <item number> |" in sp, True)
     check("seeds, not limits", "SEEDS, NOT LIMITS" in sp, True)
-    check("the check is strict",
-          "BE STRICT WITH 4 AND 5" in score_prompt(picked[:2], topics, today=today,
-                                                   mode=MODE_CHECK), True)
+    check("an unflagged batch still carries the breaking table",
+          "WHAT MAKES A STORY BREAKING:" in sp, True)
     scored = parse_scores(
         "SCORE | 2 | RLHF | 5 | raised $700m for inference capacity\n"
         "SCORE | 1 | evals | 4 | a public benchmark for agents\n"

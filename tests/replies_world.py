@@ -602,8 +602,7 @@ class World:
             return [], ""
         bot._convert_if_already_done = nothing
         bot._sweep_proposals = nothing
-        bot._maybe_breaking_news = nothing
-        bot._maybe_poll_feeds = nothing
+        bot._news_cycle = nothing            # the hourly pull: no feed is read in a test world
         bot._discover_events = no_new_events
         bot._backfill_deadlines = no_missing_deadlines
         bot._split_active = lambda rows, why: (list(rows), [])

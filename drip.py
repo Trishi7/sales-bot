@@ -1249,9 +1249,11 @@ def _fill(template: str, *, name: str = "", companies: list = (), days: int = 0,
 # Sep". No dash-separated fields, no "week of" stamp.
 HEADINGS = {
     # THE NEWS HEADINGS READ THE SAME EVERYWHERE (news.HEADING_LABELS): the
-    # daily post, the follow-up, a breaking post and an answer in the channel.
+    # daily post and an answer in the channel carry the day; a breaking post's
+    # does not (NFT2-1087). For R1 the tags go ON this line, not under it
+    # (`news_tags`, `bot._send_drip_message`).
     "R1": "AI News, {day}",
-    "R1_breaking": "Breaking AI News, {day}",
+    "R1_breaking": "Breaking news",
     "R2": "New companies in the news",
     "R3": "AI events & summits",
     # "Deliverables to chase" since 12 Oct 2026 (it was "This week's
@@ -1334,6 +1336,18 @@ TAGS_IN_BLOCK_TYPES = frozenset({nextaction.R_RECONNECT})
 
 def tags_in_block(message: dict) -> bool:
     return message.get("type") in TAGS_IN_BLOCK_TYPES
+
+
+def news_tags() -> str:
+    """Who a news message is for: the always-tag ids (Vaishnavi and Sid), as
+    "<@id> <@id>" — on the SAME line as the bold heading, for the daily post
+    and a breaking post alike (NFT2-1087, section 16). Every token is
+    `guardrails.mention_for`'s, so an id off the roster is a plain name. ""
+    when nothing is configured: the heading then stands alone."""
+    import guardrails
+
+    tokens = [guardrails.mention_for(uid) for uid in config.always_tag_ids()]
+    return " ".join(t for t in dict.fromkeys(tokens) if t)
 
 
 def greeting_tags() -> str:
@@ -2073,6 +2087,12 @@ def nothing_to_say(message: dict) -> bool:
         # tracked is a good outcome, not news, so nothing is posted: no "nothing
         # new today", no placeholder.
         return not research_of(message)
+    if message.get("type") == nextaction.R_AI_NEWS:
+        # R1: NOTHING TO SEND IS NO POST (NFT2-1087). The quiet line is
+        # retired: a day with no story left to show posts nothing at all, not
+        # a heading over "nothing new". A note that the news could NOT be
+        # checked is still said — that is not a quiet day.
+        return not research_of(message) and not note_of(message)
     if message.get("type") != nextaction.R_EVENTS:
         return False
     # R3 HAS SOMETHING TO SAY when it has a line, when the search ran and found

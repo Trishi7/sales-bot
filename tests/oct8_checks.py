@@ -71,7 +71,7 @@ async def _acks_under(test_mode, parent_kind):
             elif parent_kind == "interim, web":
                 parent = w.bot_says(wording.INTERIM_WEB[0])
             elif parent_kind == "the answer":
-                parent = w.bot_says("**AI News, Thu 8 Oct**\n\n- **A headline** ([Reuters](<https://x.example/a>))")
+                parent = w.bot_says("**AI News, Thu 8 Oct**\n- A headline ([Reuters](<https://x.example/a>))")
                 w.bot._remember_said(parent, kind="answer", question=QUESTION)
             else:                                   # a quiet line
                 parent = w.bot_says(wording.NOTHING_TODAY)
