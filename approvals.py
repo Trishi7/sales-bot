@@ -4,7 +4,7 @@ THE GLOBAL RULE FROM THE WORKBOOK: the bot never writes a cell straight from a
 reply. It says exactly what it proposes to change, in the sheet's own column
 names, and waits for a yes from an approver.
 
-    "Shall I set Meeting Date for Sahaj (Wispr Flow) to 24 Sep? Reply yes."
+    "Shall I set Meeting Date for Sahaj (Wispr Flow) to 24 Sep?"
 
 WHAT THIS COSTS, AND WHY IT IS WORTH IT. The old loop was one message: somebody
 said "met Sahaj today" and the cell was written by the time they read the echo.
@@ -46,11 +46,20 @@ log = logging.getLogger(__name__)
 _YES_WORDS = (
     "yes", "y", "yep", "yeah", "yup", "ok", "okay", "sure", "go ahead",
     "do it", "please do", "confirmed", "approved", "correct", "right",
+    # NFT2-1090: what people say when they are asked a question rather than
+    # for a vote — "sounds good", "go for it", "add them".
+    "please", "yes please", "sounds good", "do that", "add them", "add it",
+    "ok go", "go for it", "lets do it", "fine by me",
 )
 _NO_WORDS = (
     "no", "n", "nope", "nah", "do not", "don't", "dont", "stop", "cancel",
     "wrong", "incorrect", "leave it", "hold off", "not yet", "wait",
+    "not now", "skip that", "skip it", "no thanks", "leave them",
 )
+# NOT AN ANSWER YET (NFT2-1090): "maybe", "let me think". Nothing is decided,
+# the question stays open, and Saley says "Of course, take your time."
+_UNDECIDED_WORDS = ("maybe", "let me think", "not sure", "im not sure", "need to think",
+                    "let me check", "will think", "thinking")
 
 VOTE_YES = "yes"
 VOTE_NO = "no"
@@ -60,6 +69,20 @@ VOTE_NONE = ""
 APPLY = "apply"
 DECLINE = "decline"
 WAIT = "wait"
+
+
+def undecided(text: str) -> bool:
+    """"maybe", "let me think", "not sure": a person who has not decided.
+    Whole words, and only when the message carries no yes or no of its own."""
+    raw = str(text or "").lower().replace("'", "").replace(chr(0x2019), "")
+    low = f" {re.sub(r'[^a-z0-9 ]+', ' ', raw)} "
+    low = re.sub(r"\s+", " ", low)
+    if not any(f" {w} " in low for w in _UNDECIDED_WORDS):
+        return False
+    stripped = low
+    for w in _UNDECIDED_WORDS:
+        stripped = stripped.replace(f" {w} ", " ")
+    return read_vote(stripped) == VOTE_NONE
 
 
 def read_vote(text: str) -> str:
@@ -143,20 +166,23 @@ def proposal_text(*, company: str, poc: str, applied: list, kind: str = "cell_up
     not really an approval.
     """
     who = f"{poc} ({company})" if poc and company else (poc or company or "that row")
+    # A QUESTION A PERSON WOULD ASK (NFT2-1090): no "Reply yes." on the end.
+    # A sheet write still needs an approver's yes; Saley just asks for it the
+    # way a teammate would.
     if kind == "row_add":
         return (
             f"Shall I add a new row for {who}"
             + (f" to {tab}" if tab else "")
-            + "? Reply yes."
+            + "?"
         )
     if not applied:
-        return f"Shall I update {who}? Reply yes."
+        return f"Shall I update {who}?"
     changes = " and ".join(
         f"{a.get('label') or a.get('role')} to {a.get('new')}"
         + (f" (currently {a.get('old')})" if a.get("old") else "")
         for a in applied
     )
-    return f"Shall I set {changes} for {who}? Reply yes."
+    return f"Shall I set {changes} for {who}?"
 
 
 # THE ADD OFFER, word for word. The ONE place its wording lives — the engine
@@ -323,28 +349,29 @@ def pending_text(proposals: list) -> str:
 #
 # (several, one) pairs: the head for a list, and for a single proposal.
 PENDING_HEADS = (
-    ("A few things still waiting for a yes:", "One thing still waiting for a yes:"),
-    ("These are still waiting on a yes from you:",
-     "This one's still waiting on a yes from you:"),
+    ("Did you get a chance to look at these?", "Did you get a chance to look at this one?"),
+    ("A few things I asked about earlier:", "One thing I asked about earlier:"),
     ("Still open, whenever you get a minute:",
      "One still open, whenever you get a minute:"),
 )
+# QUESTIONS, NOT VOTES (NFT2-1090): what Saley would like to know, and that
+# nothing happens on its own — never "reply yes".
 PENDING_CLOSES = (
-    "Reply yes to any of them and I'll apply it. If one's wrong, say no and I'll "
-    "drop it — otherwise I'll let them go after tomorrow.",
-    "A yes on any of them and I'll make the change. Say no if one's wrong and "
-    "it's gone — I'll let the rest go after tomorrow either way.",
-    "Say yes to the ones you want and I'll apply them, or no and I'll drop them. "
+    "Let me know what you'd like me to do with any of them. If one's wrong, tell me "
+    "and I'll drop it — otherwise I'll let them go after tomorrow.",
+    "Shall I go ahead with any of them? If one's not right, let me know and it's "
+    "gone — I'll let the rest go after tomorrow either way.",
+    "Which of these do you want me to go ahead with? All of them is fine too. "
     "Anything left goes after tomorrow.",
 )
-# {what} is the proposal's own text, which ends in its own full stop.
+# {what} is the proposal's own text, which ends in its own question mark.
 NUDGE_LINES = (
-    "Still holding this one: {what} If it's not right, just say no and I'll drop "
-    "it — otherwise I'll let it go after today.",
-    "This one's still open: {what} A yes and I'll apply it; a no and it's gone. "
-    "I'll let it go after today either way.",
-    "Last ask on this: {what} Say no if it's wrong and I'll drop it — otherwise "
-    "it goes after today.",
+    "Did you get a chance to look at this? {what} Let me know what you'd like me to "
+    "do — otherwise I'll let it go after today.",
+    "This one's still open: {what} Let me know what you'd like me to do. I'll let it "
+    "go after today either way.",
+    "Last ask on this: {what} If it's not right, tell me and I'll drop it — "
+    "otherwise it goes after today.",
 )
 DROPPED_LINES = (
     "Dropping this one, nobody got to it: {what} Nothing has changed in the "
@@ -430,7 +457,17 @@ def _self_test() -> int:
     check("names the column", "Meeting Date" in text, True)
     check("names the value", "24 Sep" in text, True)
     check("names the person and company", "Sahaj (Wispr Flow)" in text, True)
-    check("asks for a yes", "Reply yes." in text, True)
+    check("asks a question a person would ask, no vote", (text.endswith("?"),
+                                                           "Reply yes" in text), (True, False))
+    import wording
+
+    lines = [text, withold if False else text, *(h for pair in PENDING_HEADS for h in pair),
+             *PENDING_CLOSES, *NUDGE_LINES, *DROPPED_LINES, ROW_ADD_OFFER]
+    check("R-f: no approval line asks for a vote or a number",
+          [l for l in lines if any(w in l.lower() for w in wording.VOTE_WORDS)], [])
+    check("sure, add them is a yes", read_vote("sure, add them"), VOTE_YES)
+    check("not now is a no", read_vote("not now"), VOTE_NO)
+    check("maybe is undecided", (undecided("maybe"), read_vote("maybe")), (True, VOTE_NONE))
     print(f"    -> {text}")
     withold = proposal_text(
         company="Acme", poc="Ann",

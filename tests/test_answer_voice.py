@@ -405,9 +405,12 @@ class TestPromptWhatMustStay:
         import persona
 
         p = persona.COS_PERSONA
+        # NFT2-1090: the character card replaced the VOICE section and the
+        # "NO EMOJIS" line went with it (one emoji at most, on good news).
         for must in ("ANSWER FIRST", "LENGTH FOLLOWS THE QUESTION", "no tool you were given this turn can do it",
-                     "CITE THE MEETING", "NO EMOJIS", "HONESTY"):
+                     "CITE THE MEETING", "THE CHARACTER CARD", "HONESTY", persona.CARD_ONE_LINE):
             assert must in p, must
+        assert "NO EMOJIS" not in p
         # each banned opener appears, inside a "never" sentence
         m = re.search(r"never\s+open\s+with\s+(.*?)\.", re.sub(r"\s+", " ", p), re.I | re.S)
         assert m, "the persona has no 'never open with' sentence"
@@ -417,7 +420,7 @@ class TestPromptWhatMustStay:
     def test_the_persona_has_the_voice_before_the_honesty(self):
         import persona
 
-        assert persona.COS_PERSONA.index("VOICE") < persona.COS_PERSONA.index("HONESTY")
+        assert persona.COS_PERSONA.index("THE CHARACTER CARD") < persona.COS_PERSONA.index("HONESTY")
 
     def test_the_persona_forbids_narration_and_keeps_the_gap_line(self):
         import persona
@@ -547,6 +550,9 @@ def profile(db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_LEARN_FROM_IDS", [])
     monkeypatch.setattr(config, "VOICE_ENABLED", True)
     monkeypatch.setattr(config, "VOICE_EXEMPLARS", 12)
+    # THE LEARNED PROFILE IS THE VOICE_SOURCE=channel PATH since NFT2-1090 (the
+    # default is the voice book); these tests are about that path.
+    monkeypatch.setenv("VOICE_SOURCE", "channel")
     base = datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc)
     msgs = [{"author_id": 100 + (i % 3), "text": t, "timestamp": base + timedelta(hours=i)} for i, t in enumerate(_TEXTS)]
     got = voice.assemble(msgs, companies=["Wispr Flow"], people=["Tanay Kothari"])
@@ -617,6 +623,8 @@ class TestVoiceRidesInTheCachedPrefix:
         import persona
         import voice
 
+        monkeypatch.setenv("VOICE_SOURCE", "channel")
+
         voice.bind(lambda: db)
         voice.invalidate()
         try:
@@ -669,7 +677,8 @@ class TestVoiceRidesInTheCachedPrefix:
         _day(monkeypatch, date(2026, 10, 7))
         block = persona.reply_style_block()
         assert voice.WRAPPER in block and END_LINE in block
-        assert "outranks" in block and "no emojis" in block.lower()
+        # NFT2-1090: the wrapper no longer forbids emoji (one is allowed, on good news).
+        assert "outranks" in block and "no emojis" not in block.lower()
         voice.bind(None)
         voice.invalidate()
         assert persona.reply_style_block() == ""
@@ -737,7 +746,10 @@ R_A = re.compile(r"\b(I will(?! not)|I have not|I am\b|I could not|I cannot|I di
 BANNED_START = re.compile(r"^\s*(Here is|Here's|Here are|Based on|Great question|Good question|Sure|Certainly|Of course|Absolutely)\b",
                           re.I)
 # a fixed line that is allowed to break a lint rule, with the reason; empty until a case is argued
-LINT_EXCEPTIONS = {}
+# TAKE_YOUR_TIME is the ticket's own words (NFT2-1090: "Of course, take your
+# time."), so it opens with "Of course" by choice; wording.REGISTER_EXEMPT
+# says the same.
+LINT_EXCEPTIONS = {"TAKE_YOUR_TIME", "REGISTER_EXEMPT"}
 
 
 def _strings(obj):
@@ -861,9 +873,10 @@ class TestPlanTextsExact:
     def test_rewritten_lines(self, wording):
         assert wording.model_failure("X") == ("Something's down on my side (X), so I couldn't answer that. "
                                               "Your message was fine. Try me again in a minute.")
-        assert wording.greeting("Hi Vaishnavi") == "Hi Vaishnavi, what do you need?"
-        assert wording.not_followed("Hi Vaishnavi") == ("Hi Vaishnavi, I couldn't work out what you need there. "
-                                                        "Give me a company, a person or a date and I'll look.")
+        # NFT2-1090: a hello with no task in it, and one clarifying question.
+        assert wording.greeting("Hi Vaishnavi", "morning") == "Hi Vaishnavi, good morning. How's it going?"
+        assert wording.not_followed("Hi Vaishnavi") == ("Umm, I'm not sure I follow, Vaishnavi. Which company, "
+                                                        "person or date did you mean?")
         assert wording.TRUNCATED == "…that's as much as fits here. Ask for a narrower slice and I'll send the rest."
         assert wording.BRIEF_FAILED == ("I couldn't write the brief just now. Something failed on my side, and what I "
                                         "gathered is fine. Try again in a moment.")

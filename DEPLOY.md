@@ -1788,6 +1788,50 @@ The first two are fixed in `.env` (and by inviting the bot). The third means no 
 
 `python verify_reconnect.py` checks all of it offline and prints a table of the 35 cases.
 
+## Upgrading to NFT2-1090 (Voice v2: the character card, the voice book, context, empathy)
+
+What changes for the team: Saley greets like a teammate ("Hi Sid, good morning. How's it going?"), answers
+small talk in one line, says "we", asks rather than orders, notices how somebody is doing (once), and asks
+questions instead of asking for a vote. The tone examples come from `voice_book.md`, which Trishi edits — no
+restart needed after an edit. **The fourteen daily post templates are unchanged.** Described in the README
+under "Voice v2".
+
+**No deploy step changes.** `git pull`, add the lines below to `.env`, `pm2 restart sales-bot`. The database
+migrates itself on boot (three new tables: `person_state`, `prompt_log`, `company_facts`). `voice_book.md`
+ships in the repo; keep it next to `bot.py` or point `VOICE_BOOK_PATH` at it.
+
+**The prompt log.** With `SALEY_PROMPT_LOG=true` every model call is written to `state/prompts/<date>/` on the
+machine running the bot (`state/prompts/test/` during a test day). The folder is gitignored and pruned after
+`SALEY_PROMPT_LOG_DAYS`; it holds the strategy, sheet rows and channel text the prompts carry, so treat it like
+the database. Set `SALEY_PROMPT_LOG=false` to stop writing it.
+
+**In `.env`, on the laptop AND on the server (`/opt/sales-bot/.env`)** — all optional, the defaults are what
+was specified; add a line only to change it:
+
+```
+VOICE_SOURCE=book
+VOICE_BOOK_PATH=./voice_book.md
+SALEY_SMALL_TALK=react
+SALEY_FILLERS=unsure
+EMPATHY_ENABLED=true
+EMPATHY_STATE_HOURS=48
+CONTEXT_MESSAGES=10
+SALEY_PROMPT_LOG=true
+SALEY_PROMPT_LOG_DAYS=14
+```
+
+No default changed and nothing is retired. With `VOICE_SOURCE=book` the weekly voice rebuild stops (no channel
+read, no voice-note model call); `VOICE_SOURCE=channel` brings the learned profile back exactly as before.
+
+**What to look for in the log.** `[voice] the voice book ./voice_book.md is missing` means the book was not
+found (Saley then writes from the card alone). `[voice] voice book entry skipped — it reads like an
+instruction` names an entry to fix. `[prompt-log] cannot write under …` (once) means the state folder is not
+writable; composing carries on.
+
+**Try it in the test channel.** "hi" → a one-line hello. "how's it going?" twice → two different lines, a
+third → a 👍. Reply "show the prompt for that" (as an approver) to any Saley reply → the prompt behind it.
+
+`python verify_voice_book.py` checks all of it offline and prints the T1-T66 table.
 ## Upgrading to NFT2-1087 (the AI news flow: one hourly cycle, our names first)
 
 What changes for the team: the feeds are read once an hour from 14:00 IST instead of every 15 minutes; news that

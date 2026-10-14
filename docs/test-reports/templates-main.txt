@@ -1,0 +1,1749 @@
+[ai_news]
+- Synthflow raises $20M Series A — what happened. (Synthflow AI — on Master Pipeline) [example.org](<https://example.org/synthflow-raises-20m-series-a>)
+
+- **Papa raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/papa-raises-a-billion-dollar-round?oc=5>))
+
+- **Oscar raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
+
+- **November raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
+
+- **Mike raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/mike-raises-a-billion-dollar-round?oc=5>))
+==============================================================================
+[closure_support]
+No closure support this week — Closure Prob% has empty values in the GTM sheet.
+==============================================================================
+[closure_support]
+No closure support this week — Prospect Status and Closure Prob% have empty values in the GTM sheet.
+==============================================================================
+[closure_support]
+No closure support this week — Prospect Status has empty values in the GTM sheet.
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [ACME-AI ships](<https://news.example/acme-ai-ships>), 13 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+   In the news: [Borealis grows](<https://news.example/borealis-grows>), 13 Oct
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI hires an evals lead](<https://news.example/acme-ai-hires-an-evals-lead>), 8 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI opens in Berlin](<https://news.example/acme-ai-opens-in-berlin>), 2 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 12 Oct
+2. Alan Turing (Acme AI) — 60% at Demo
+   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 12 Oct
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 12 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI raises forty million dollars…](<https://news.example/acme-ai-raises-forty-million-dollars-in-a-new-round>), 13 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+2. Alan Turing (Acme AI) — 60% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+2. Bo Chen (Borealis) — 65% at Demo
+   In the news: [Borealis signs a telco](<https://news.example/borealis-signs-a-telco>), 4 Oct
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+2. Bo Chen (Borealis) — 65% at Demo
+3. Nia Shah (Nudge Security) — 55% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ann Day (Co) — 70% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ann Day (Co) — 70% at Quote
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Fraction (Co E) — 95% at Demo
+2. Ninety (Co B) — 90% at Quote
+3. Seventy (Co D) — 70% at Proposal
+4. Sixty A (Co A) — 60% at Demo
+5. Sixty B (Co C) — 60% at Deal
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. New Nia (Nimbus Labs) — 80% at Demo
+   In the news: [Nimbus Labs raises a seed round](<https://news.example/nimbus-labs-raises-a-seed-round>), 12 Oct
+2. Ada Lovelace (Acme AI) — 70% at Quote
+3. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Person L (Company L) — 62% at Demo
+2. Person K (Company K) — 61% at Demo
+3. Person J (Company J) — 60% at Demo
+4. Person I (Company I) — 59% at Demo
+5. Person H (Company H) — 58% at Demo
+6. Person G (Company G) — 57% at Demo
+7. Person F (Company F) — 56% at Demo
+8. Person E (Company E) — 55% at Demo
+9. Person D (Company D) — 54% at Demo
+10. Person C (Company C) — 53% at Demo
+11. Person B (Company B) — 52% at Demo
+12. Person A (Company A) — 51% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[deliverables]
+1 open:
+1. Only one
+   Team: Sales
+   Due: Tue 20 Oct
+==============================================================================
+[deliverables]
+1 open:
+1. Still open
+   Team: Sales
+   Due: Tue 20 Oct
+==============================================================================
+[deliverables]
+11 open:
+1. New Hinglish STT Demo/Sales Package
+   Team: Sales
+   Due: Mon 14 Sep
+2. Pricing page copy
+   Team: Marketing
+   Due: Wed 30 Sep
+3. Sales deck v3
+   Team: Sales
+   Due: Mon 12 Oct
+4. Third item on the tab, whose title runs to one hundred and eighty-one characters so that it is the first one the trim touches: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…
+   Team: Engineering
+   Due: Tue 20 Oct
+5. Demo environment
+   Team: Vaishnavi
+   Due: Tue 20 Oct
+6. Q4 pipeline review
+   Team: Sales
+   Due: Mon 26 Oct
+7. Evals benchmark write-up
+   Team: Research
+   Due: Mon 2 Nov
+8. Support runbook
+   Team: Ops
+   Due: Tue 15 Dec
+9. Security questionnaire
+   Team: Legal
+   Due: Thu 31 Dec
+10. Onboarding checklist
+   Team: Ops
+   There's no deadline for this
+11. Customer reference list
+   Team: Sales
+   There's no deadline for this
+==============================================================================
+[deliverables]
+2 open:
+1. A year late
+   Team: Sales
+   Due: Fri 10 Oct
+2. Late last week
+   Team: Sales
+   Due: Mon 5 Oct
+==============================================================================
+[deliverables]
+2 open:
+1. Has a doc
+   Team: Sales
+   Due: Tue 20 Oct
+2. Has a tracker
+   Team: Sales
+   Due: Wed 21 Oct
+==============================================================================
+[deliverables]
+2 open:
+1. Overview doc
+   Team: Sales
+   Due: Tue 20 Oct
+2. Pricing page
+   Team: Sales
+   Due: Wed 21 Oct
+==============================================================================
+[deliverables]
+20 open:
+1. Deliverable number 01
+   Team: Sales
+   Due: Sun 1 Nov
+2. Deliverable number 02
+   Team: Sales
+   Due: Mon 2 Nov
+3. Deliverable number 03
+   Team: Sales
+   Due: Tue 3 Nov
+4. Deliverable number 04
+   Team: Sales
+   Due: Wed 4 Nov
+5. Deliverable number 05
+   Team: Sales
+   Due: Thu 5 Nov
+6. Deliverable number 06
+   Team: Sales
+   Due: Fri 6 Nov
+7. Deliverable number 07
+   Team: Sales
+   Due: Sat 7 Nov
+8. Deliverable number 08
+   Team: Sales
+   Due: Sun 8 Nov
+9. Deliverable number 09
+   Team: Sales
+   Due: Mon 9 Nov
+10. Deliverable number 10
+   Team: Sales
+   Due: Tue 10 Nov
+11. Deliverable number 11
+   Team: Sales
+   Due: Wed 11 Nov
+12. Deliverable number 12
+   Team: Sales
+   Due: Thu 12 Nov
+13. Deliverable number 13
+   Team: Sales
+   Due: Fri 13 Nov
+14. Deliverable number 14
+   Team: Sales
+   Due: Sat 14 Nov
+15. Deliverable number 15
+   Team: Sales
+   Due: Sun 15 Nov
+16. Deliverable number 16
+   Team: Sales
+   Due: Mon 16 Nov
+17. Deliverable number 17
+   Team: Sales
+   Due: Tue 17 Nov
+18. Deliverable number 18
+   Team: Sales
+   Due: Wed 18 Nov
+19. Deliverable number 19
+   Team: Sales
+   Due: Thu 19 Nov
+20. Deliverable number 20
+   Team: Sales
+   Due: Fri 20 Nov
+==============================================================================
+[deliverables]
+23 open:
+1. Deliverable number 01
+   Team: Sales
+   Due: Sun 1 Nov
+2. Deliverable number 02
+   Team: Sales
+   Due: Mon 2 Nov
+3. Deliverable number 03
+   Team: Sales
+   Due: Tue 3 Nov
+4. Deliverable number 04
+   Team: Sales
+   Due: Wed 4 Nov
+5. Deliverable number 05
+   Team: Sales
+   Due: Thu 5 Nov
+6. Deliverable number 06
+   Team: Sales
+   Due: Fri 6 Nov
+7. Deliverable number 07
+   Team: Sales
+   Due: Sat 7 Nov
+8. Deliverable number 08
+   Team: Sales
+   Due: Sun 8 Nov
+9. Deliverable number 09
+   Team: Sales
+   Due: Mon 9 Nov
+10. Deliverable number 10
+   Team: Sales
+   Due: Tue 10 Nov
+11. Deliverable number 11
+   Team: Sales
+   Due: Wed 11 Nov
+12. Deliverable number 12
+   Team: Sales
+   Due: Thu 12 Nov
+13. Deliverable number 13
+   Team: Sales
+   Due: Fri 13 Nov
+14. Deliverable number 14
+   Team: Sales
+   Due: Sat 14 Nov
+15. Deliverable number 15
+   Team: Sales
+   Due: Sun 15 Nov
+16. Deliverable number 16
+   Team: Sales
+   Due: Mon 16 Nov
+17. Deliverable number 17
+   Team: Sales
+   Due: Tue 17 Nov
+18. Deliverable number 18
+   Team: Sales
+   Due: Wed 18 Nov
+19. Deliverable number 19
+   Team: Sales
+   Due: Thu 19 Nov
+20. Deliverable number 20
+   Team: Sales
+   Due: Fri 20 Nov
+(+3 more — the rest are on the Deliverables Checklist.)
+==============================================================================
+[deliverables]
+3 open:
+1. New Hinglish STT Demo/Sales Package
+   Team: Sales
+   Due: Mon 14 Sep
+2. MSA template
+   Team: Legal
+   There's no deadline for this
+3. Pricing pge copy (typo and all)
+   Team: Vaishnavi
+   There's no deadline for this
+==============================================================================
+[deliverables]
+3 open:
+1. Tiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
+   Team: Sales
+   Due: Tue 20 Oct
+2. Tiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
+   Team: Sales
+   Due: Wed 21 Oct
+3. Tiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii…
+   Team: Sales
+   Due: Thu 22 Oct
+==============================================================================
+[deliverables]
+40 open:
+1. Deliverable 28 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Sun 1 Nov
+2. Deliverable 01 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Mon 2 Nov
+3. Deliverable 29 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Mon 2 Nov
+4. Deliverable 02 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Tue 3 Nov
+5. Deliverable 30 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Tue 3 Nov
+6. Deliverable 03 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Wed 4 Nov
+7. Deliverable 31 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Wed 4 Nov
+8. Deliverable 04 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Thu 5 Nov
+9. Deliverable 32 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Thu 5 Nov
+10. Deliverable 05 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Fri 6 Nov
+11. Deliverable 33 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Fri 6 Nov
+12. Deliverable 06 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Sat 7 Nov
+13. Deliverable 34 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Sat 7 Nov
+14. Deliverable 07 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Sun 8 Nov
+15. Deliverable 35 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Sun 8 Nov
+16. Deliverable 08 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Mon 9 Nov
+17. Deliverable 36 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Mon 9 Nov
+18. Deliverable 09 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Tue 10 Nov
+19. Deliverable 37 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Tue 10 Nov
+20. Deliverable 10 with a long descriptive title about the thing to ship with a long descriptive title about the thing to ship
+   Team: Engineering
+   Due: Wed 11 Nov
+(+20 more — the rest are on the Deliverables Checklist.)
+==============================================================================
+[deliverables]
+40 open:
+1. Deliverable 28 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Sun 1 Nov
+2. Deliverable 01 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Mon 2 Nov
+3. Deliverable 29 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Mon 2 Nov
+4. Deliverable 02 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Tue 3 Nov
+5. Deliverable 30 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Tue 3 Nov
+6. Deliverable 03 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Wed 4 Nov
+7. Deliverable 31 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Wed 4 Nov
+8. Deliverable 04 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Thu 5 Nov
+9. Deliverable 32 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Thu 5 Nov
+10. Deliverable 05 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Fri 6 Nov
+11. Deliverable 33 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Fri 6 Nov
+12. Deliverable 06 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Sat 7 Nov
+13. Deliverable 34 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Sat 7 Nov
+14. Deliverable 07 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Sun 8 Nov
+15. Deliverable 35 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Sun 8 Nov
+16. Deliverable 08 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Mon 9 Nov
+17. Deliverable 36 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Mon 9 Nov
+18. Deliverable 09 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Tue 10 Nov
+19. Deliverable 37 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Tue 10 Nov
+20. Deliverable 10 with a long descriptive title with a long descriptive title with a long descriptive title with a long descriptive title
+   Team: Sales
+   Due: Wed 11 Nov
+(+20 more — the rest are on the Deliverables Checklist.)
+==============================================================================
+[dm_no_meeting]
+1. Ann Day (Co)
+
+We sent them a DM more than 10 days ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. Ann Day (Co)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. Ann Day (Co) — 24 Oct
+
+This meeting is set for more than 2 weeks after the DM went out.
+==============================================================================
+[dm_no_meeting]
+1. Ariya Rastrow (Wisprlow.ai)
+2. Prof. Karim Ouazzane (London Metropolitan University)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+
+3. Eleonore Lumer (PolyAI) — 24 Oct
+
+This meeting is set for more than a week after the DM went out.
+==============================================================================
+[dm_no_meeting]
+1. Ariya Rastrow (Wisprlow.ai)
+2. Prof. Karim Ouazzane (London Metropolitan University)
+3. Dr. Nabeela Berardinelli (University of East London)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. Eleonore Lumer (PolyAI) — 24 Oct
+
+This meeting is set for more than a week after the DM went out.
+==============================================================================
+[dm_no_meeting]
+1. None One (Co)
+2. None Two (Co)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+
+3. Late One (Co) — 24 Oct
+
+This meeting is set for more than a week after the DM went out.
+==============================================================================
+[dm_no_meeting]
+1. P1 (Co 1)
+2. P2 (Co 2)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. P1 (Co 1)
+2. P2 (Co 2)
+3. P3 (Co 3)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. P1 (Co 1)
+2. P2 (Co 2)
+3. P7 (Co 7)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. P4 (Co 4)
+2. P5 (Co 5)
+3. P6 (Co 6)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[dm_no_meeting]
+1. P7 (Co 7)
+2. P1 (Co 1)
+3. P2 (Co 2)
+
+We sent them a DM more than 3 weeks ago and don't have a meeting set up with them.
+==============================================================================
+[events]
+No events on the tab for the next 14 days, and nothing new worth suggesting.
+==============================================================================
+[events]
+No events on the tab for the next 14 days. A few worth a look that we could still register for:
+1. [Cypher 2026](<https://events.example/cypher-2026>) — Thu 5 Nov, Bengaluru
+2. [London AI Forum](<https://events.example/london-ai-forum>) — Thu 12 Nov, London
+3. [Karnataka Data Day](<https://events.example/karnataka-data-day>) — Thu 19 Nov, Mysuru
+
+Want me to add any of these to the GTM Playbook? And shall I remind you again on Monday?
+==============================================================================
+[events]
+No events on the tab for the next 14 days. A few worth a look that we could still register for:
+1. [Good Summit](<https://events.example/good-summit>) — Wed 4 Nov, London
+
+Want me to add any of these to the GTM Playbook? And shall I remind you again on Monday?
+==============================================================================
+[events]
+No events on the tab for the next 21 days, and nothing new worth suggesting.
+==============================================================================
+[events]
+Registration closes soon for these events:
+1. Epsilon Summit (London) — Sat 24 Oct, closes Tue 20 Oct
+
+Shall I remind you again on Monday?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Alpha Forum (Bengaluru) — Sat 17 Oct
+
+Registration closes soon for these events:
+2. Delta Summit (London) — Tue 3 Nov, closes Fri 16 Oct
+3. Epsilon Summit (London) — Sat 24 Oct, closes Tue 20 Oct
+
+Shall I remind you again tomorrow?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Alpha Forum (Bengaluru) — Sat 17 Oct
+2. Beta Forum (Bengaluru) — Thu 22 Oct
+3. Gamma Forum (Bengaluru) — Mon 26 Oct
+
+Shall I remind you again tomorrow?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Beta Forum (Bengaluru) — Thu 22 Oct
+
+(the search is switched off)
+
+Shall I remind you again on Monday?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Beta Forum (Bengaluru) — Thu 22 Oct
+
+Events not in the sheet, but worth looking at:
+2. [Cypher 2026](<https://events.example/cypher-2026>) — Thu 5 Nov, Bengaluru
+3. [London AI Forum](<https://events.example/london-ai-forum>) — Thu 12 Nov, London
+
+Want me to add any of these to the GTM Playbook? And shall I remind you again on Monday?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Beta Forum (Bengaluru) — Thu 22 Oct
+
+Registration closes soon for these events:
+2. Epsilon Summit (London) — Sat 24 Oct, closes Tue 20 Oct
+
+Events not in the sheet, but worth looking at:
+3. [Cypher 2026](<https://events.example/cypher-2026>) — Thu 5 Nov, Bengaluru
+
+Want me to add any of these to the GTM Playbook? And shall I remind you again on Monday?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Friday Forum (Bengaluru) — Fri 16 Oct
+
+Shall I remind you again tomorrow?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Later Forum (Bengaluru) — Sat 24 Oct
+
+Events not in the sheet, but worth looking at:
+2. [Weekend Meetup](<https://events.example/weekend-meetup>) — Sat 17 Oct, London
+
+Want me to add any of these to the GTM Playbook? And shall I remind you again tomorrow?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Later Forum (Bengaluru) — Sat 24 Oct
+
+Shall I remind you again on Monday?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Near Forum (Bengaluru) — Mon 19 Oct
+
+Shall I remind you again on Monday?
+==============================================================================
+[events]
+We have registered for these events and they are coming up soon:
+1. Starts In Three (Bengaluru) — Sat 17 Oct
+
+Registration closes soon for these events:
+2. Closes In Two (London) — Fri 13 Nov, closes Fri 16 Oct
+
+Shall I remind you again tomorrow?
+==============================================================================
+[li_no_dm]
+1. Angus Addlesee (PolyAI)
+==============================================================================
+[li_no_dm]
+1. Daisy Leigh (PolyAI)
+2. Ioana Mocanu (Agoda)
+==============================================================================
+[li_no_dm]
+1. Daisy Leigh (PolyAI)
+2. Ioana Mocanu (Agoda)
+
+Found missing or alternate emails:
+3. Joel Georgie J. (ARTPARK) — joel@artpark.in
+4. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai
+
+These domains can't receive mail:
+5. Angus Addlesee (PolyAI) — addleseehq.co.uk
+
+Couldn't find an email for:
+6. Ishan Mishra (AI Security Institute)
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+==============================================================================
+[li_no_dm]
+1. Daisy Leigh (PolyAI)
+2. Ioana Mocanu (Agoda)
+
+Found missing or alternate emails:
+3. Joel Georgie J. (ARTPARK) — joel@artpark.in
+4. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai
+5. Tara Two (Twin Labs) — tara@twinlabs.ai, tara.two@gmail.com
+
+These domains can't receive mail:
+6. Angus Addlesee (PolyAI) — addleseehq.co.uk
+
+Couldn't find an email for:
+7. Ishan Mishra (AI Security Institute)
+==============================================================================
+[li_no_dm]
+1. Daisy Leigh (PolyAI)
+2. Ioana Mocanu (Agoda)
+
+Found missing or alternate emails:
+3. Joel Georgie J. (ARTPARK) — joel@artpark.in
+4. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai
+5. Tara Two (Twin Labs) — tara@twinlabs.ai, tara.two@gmail.com
+
+These domains can't receive mail:
+6. Angus Addlesee (PolyAI) — addleseehq.co.uk
+
+Couldn't find an email for:
+7. Ishan Mishra (AI Security Institute)
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+==============================================================================
+[li_no_dm]
+1. Dee Dupe (Dupe Co)
+==============================================================================
+[li_no_dm]
+1. Fine 01 (Fine Co)
+2. Fine 02 (Fine Co)
+3. Fine 03 (Fine Co)
+4. Fine 04 (Fine Co)
+5. Fine 05 (Fine Co)
+
+Couldn't find an email for:
+6. News 01 (News Co)
+7. News 02 (News Co)
+==============================================================================
+[li_no_dm]
+1. Fine 01 (Fine Co)
+2. Fine 02 (Fine Co)
+3. Fine 03 (Fine Co)
+4. Fine 04 (Fine Co)
+5. Fine 05 (Fine Co)
+
+Found missing or alternate emails:
+6. News 01 (News Co) — news1@news.co
+7. News 02 (News Co) — news2@news.co
+8. News 03 (News Co) — news3@news.co
+
+Couldn't find an email for:
+9. News 04 (News Co)
+10. News 05 (News Co)
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+==============================================================================
+[li_no_dm]
+1. Gina Neff (Multiple)
+==============================================================================
+[li_no_dm]
+1. Ioana Mocanu (Agoda)
+
+Found missing or alternate emails:
+2. Joel Georgie J. (ARTPARK) — joel@artpark.in
+3. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai
+
+These domains can't receive mail:
+4. Angus Addlesee (PolyAI) — addleseehq.co.uk
+
+Couldn't find an email for:
+5. Ishan Mishra (AI Security Institute)
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+==============================================================================
+[li_no_dm]
+1. Mina Mismatch (Acme Robotics)
+==============================================================================
+[li_no_dm]
+1. Ollie Old (Old Co)
+==============================================================================
+[li_no_dm]
+1. Percy Personal (PolyAI)
+==============================================================================
+[li_no_dm]
+1. Una Unknown (Co)
+==============================================================================
+[li_no_dm]
+All clear, nobody is waiting on a DM.
+==============================================================================
+[li_no_dm]
+Couldn't find an email for:
+1. Ishan Mishra (AI Security Institute)
+==============================================================================
+[li_no_dm]
+Found missing or alternate emails:
+1. Sam Same (Same Co) — sam@same.co
+
+Couldn't find an email for:
+2. Nina None (None Co)
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+==============================================================================
+[li_no_dm]
+Found missing or alternate emails:
+1. Tara Two (Twin Labs) — tara@twinlabs.ai, tara.two@gmail.com
+
+Would you like me to add these emails to the Outreach PoCs sheet?
+==============================================================================
+[li_no_dm]
+These domains can't receive mail:
+1. Angus Addlesee (PolyAI) — addleseehq.co.uk
+==============================================================================
+[meeting_prep]
+1. Ada Lovelace (Acme AI) — I couldn't read the Meeting Date on the sheet. Could you put the day in?
+==============================================================================
+[meeting_prep]
+we have 30 meetings today with:
+1. Person Number 01 (A Rather Long Company Name For A Research Institute Limited 01)
+2. Person Number 02 (A Rather Long Company Name For A Research Institute Limited 02)
+3. Person Number 03 (A Rather Long Company Name For A Research Institute Limited 03)
+4. Person Number 04 (A Rather Long Company Name For A Research Institute Limited 04)
+5. Person Number 05 (A Rather Long Company Name For A Research Institute Limited 05)
+6. Person Number 06 (A Rather Long Company Name For A Research Institute Limited 06)
+7. Person Number 07 (A Rather Long Company Name For A Research Institute Limited 07)
+8. Person Number 08 (A Rather Long Company Name For A Research Institute Limited 08)
+9. Person Number 09 (A Rather Long Company Name For A Research Institute Limited 09)
+10. Person Number 10 (A Rather Long Company Name For A Research Institute Limited 10)
+11. Person Number 11 (A Rather Long Company Name For A Research Institute Limited 11)
+12. Person Number 12 (A Rather Long Company Name For A Research Institute Limited 12)
+13. Person Number 13 (A Rather Long Company Name For A Research Institute Limited 13)
+14. Person Number 14 (A Rather Long Company Name For A Research Institute Limited 14)
+15. Person Number 15 (A Rather Long Company Name For A Research Institute Limited 15)
+16. Person Number 16 (A Rather Long Company Name For A Research Institute Limited 16)
+17. Person Number 17 (A Rather Long Company Name For A Research Institute Limited 17)
+18. Person Number 18 (A Rather Long Company Name For A Research Institute Limited 18)
+19. Person Number 19 (A Rather Long Company Name For A Research Institute Limited 19)
+20. Person Number 20 (A Rather Long Company Name For A Research Institute Limited 20)
+21. Person Number 21 (A Rather Long Company Name For A Research Institute Limited 21)
+22. Person Number 22 (A Rather Long Company Name For A Research Institute Limited 22)
+23. Person Number 23 (A Rather Long Company Name For A Research Institute Limited 23)
+24. Person Number 24 (A Rather Long Company Name For A Research Institute Limited 24)
+25. Person Number 25 (A Rather Long Company Name For A Research Institute Limited 25)
+26. Person Number 26 (A Rather Long Company Name For A Research Institute Limited 26)
+27. Person Number 27 (A Rather Long Company Name For A Research Institute Limited 27)
+28. Person Number 28 (A Rather Long Company Name For A Research Institute Limited 28)
+29. Person Number 29 (A Rather Long Company Name For A Research Institute Limited 29)
+30. Person Number 30 (A Rather Long Company Name For A Research Institute Limited 30)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+==============================================================================
+[meeting_prep]
+we have a meeting in 2 days with:
+1. Ada Lovelace (Acme AI) — Wed 14 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Ada Lovelace (Acme AI) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Ada Lovelace (Acme AI) — Sat 17 Oct
+   They've been in the news recently — worth a skim before the call:
+   [Acme AI announces a very long and winding headline about its new platform announces a very long and…](<https://news.example/acme-ai-announces-a-very-long-and-winding-headline-about-its-new-platform-announces-a-very-long-and-winding-headline-about-its-new-platform-announces-a-very-long-and-winding-headline-about-its-new-platform>)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Ada Lovelace (Acme AI) — Sat 17 Oct
+   They've been in the news recently — worth a skim before the call:
+   [Acme AI is acquired](<https://news.example/acme-ai-is-acquired>)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Ada Lovelace (Acme AI) — Sat 17 Oct
+   They've been in the news recently — worth a skim before the call:
+   [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Ada Lovelace (Acme AI) — Sat 17 Oct
+   They've been in the news recently — worth a skim before the call:
+   [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
+
+and a meeting in 5 days with:
+2. Sam Lee (Acme AI) — Mon 19 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Dr. David Gamez (Middlesex University London) — Thu 15 Oct
+
+2. Ada Lovelace (Acme AI) — I couldn't read the Meeting Date on the sheet. Could you put the day in?
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Dr. David Gamez (Middlesex University London) — Thu 15 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Dr. David Gamez (Middlesex University London) — Thu 15 Oct
+
+and a meeting in 5 days with:
+2. Sujith P (ARTPARK) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Dr. David Gamez (Middlesex University London) — Thu 15 Oct
+
+and two meetings in 5 days with:
+2. Sujith P (ARTPARK) — Sat 17 Oct
+3. Bo Chen (Borealis) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Late Three (Tardy Co) — Thu 15 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Nia Day (Nudge) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 3 days with:
+1. Sujith P (ARTPARK) — Wed 21 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 5 days with:
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
+   They've been in the news recently — worth a skim before the call:
+   [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
+
+Good time to start on the deck, the package and the demo. Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting in 5 days with:
+1. Sujith P (ARTPARK) — Sat 17 Oct
+
+Good time to start on the deck, the package and the demo. Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have a meeting today with:
+1. Ada Lovelace (Acme AI)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+==============================================================================
+[meeting_prep]
+we have a meeting today with:
+1. Ada Lovelace (Acme AI)
+   They've been in the news recently — worth a skim before you go in:
+   [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+==============================================================================
+[meeting_prep]
+we have a meeting today with:
+1. Late Today (Tardy Co)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+==============================================================================
+[meeting_prep]
+we have three meetings in 3 days with:
+1. Ada Lovelace (Acme AI) — Sat 17 Oct
+2. Sam Lee (Acme AI) — Sat 17 Oct
+   They've been in the news recently — worth a skim before the call:
+   [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
+3. Dr. David Gamez (Middlesex University London) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have three meetings in 3 days with:
+1. Dr. David Gamez (Middlesex University London) — Thu 15 Oct
+2. Cy Dee (Cinder) — Thu 15 Oct
+3. Eve Fay (Echo) — Thu 15 Oct
+
+and two meetings in 5 days with:
+4. Sujith P (ARTPARK) — Sat 17 Oct
+5. Bo Chen (Borealis) — Sat 17 Oct
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
+==============================================================================
+[meeting_prep]
+we have two meetings today with:
+1. Ada Lovelace (Acme AI)
+2. Sujith P (ARTPARK)
+
+Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like another nudge before it starts.
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Blank Co
+2. Fullhouse Labs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Company 01
+2. Company 02
+3. Company 03
+4. Company 04
+5. Company 05
+6. Company 06
+7. Company 07
+8. Company 08
+9. Company 09
+10. Company 10
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Email Only Co — already on Outreach PoCs, missing some fields
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Fullhouse Labs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Limbic AI — already on Outreach PoCs, missing some fields
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Nobody Labs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Oogam AI
+2. Limbic AI — already on Outreach PoCs, missing some fields
+3. Underdog AI — already on Outreach PoCs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Oogam AI
+2. Underdog AI — already on Outreach PoCs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Optional Co — already on Outreach PoCs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Underdog AI (Conway Research) — already on Outreach PoCs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[new_pipeline_company]
+New companies in the Master Pipeline — since Wed 7 Oct
+
+1. Underdog AI — already on Outreach PoCs
+
+Would you like me to look these up and suggest prospective PoCs we could contact?
+==============================================================================
+[news.render]
+**AI News, Thu 8 Oct**
+
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+
+- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
+
+- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+==============================================================================
+[news.render]
+**AI News, Thu 8 Oct**
+
+- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
+
+- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
+
+- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
+
+- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
+
+- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+==============================================================================
+[news.render]
+**AI News, Wed 14 Oct**
+
+- **Frontier lab ships a new eval suite** ([example.org](<https://example.org/frontier-lab-ships-a-new-eval-suite>))
+
+- **Voice startup closes a Series A** ([example.org](<https://example.org/voice-startup-closes-a-series-a>))
+
+- **Regulator publishes AI data rules** ([example.org](<https://example.org/regulator-publishes-ai-data-rules>))
+
+- **Open model tops the speech benchmark** ([example.org](<https://example.org/open-model-tops-the-speech-benchmark>))
+
+- **Chip maker unveils an inference part** ([example.org](<https://example.org/chip-maker-unveils-an-inference-part>))
+==============================================================================
+[news.render]
+**AI News, Wed 7 Oct**
+
+- **Consortium drafts an agent safety standard** ([Reuters](<https://news.google.com/rss/articles/consortium-drafts-an-agent-safety-standard?oc=5>))
+
+- **University publishes an RLHF study** ([Reuters](<https://news.google.com/rss/articles/university-publishes-an-rlhf-study?oc=5>))
+
+- **Chipmaker unveils an inference accelerator** ([Reuters](<https://news.google.com/rss/articles/chipmaker-unveils-an-inference-accelerator?oc=5>))
+
+- **Regulator opens an inquiry into model evals** ([Reuters](<https://news.google.com/rss/articles/regulator-opens-an-inquiry-into-model-evals?oc=5>))
+==============================================================================
+[news.render]
+**AI News, Wed 7 Oct**
+
+- **Echo lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/echo-lab-announces-a-frontier-model?oc=5>))
+
+- **Delta lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/delta-lab-announces-a-frontier-model?oc=5>))
+
+- **Charlie lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/charlie-lab-announces-a-frontier-model?oc=5>))
+
+- **Bravo lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/bravo-lab-announces-a-frontier-model?oc=5>))
+
+- **Alpha lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/alpha-lab-announces-a-frontier-model?oc=5>))
+==============================================================================
+[news.render]
+**AI News, Wed 7 Oct**
+
+- **ElevenLabs launches a Hindi voice agent** ([Reuters](<https://news.google.com/rss/articles/elevenlabs-launches-a-hindi-voice-agent?oc=5>))
+==============================================================================
+[news.render]
+**AI News, Wed 7 Oct**
+
+- **ElevenLabs launches a Hindi voice agent** ([Reuters](<https://news.google.com/rss/articles/elevenlabs-launches-a-hindi-voice-agent?oc=5>))
+
+- **Voice startup closes a round** ([Reuters](<https://news.google.com/rss/articles/voice-startup-closes-a-round?oc=5>))
+==============================================================================
+[news.render]
+**AI News, Wed 7 Oct**
+
+- **Open weights model tops a coding benchmark** ([Reuters](<https://news.google.com/rss/articles/open-weights-model-tops-a-coding-benchmark?oc=5>))
+
+- **Search engine adds an agent mode** ([Reuters](<https://news.google.com/rss/articles/search-engine-adds-an-agent-mode?oc=5>))
+
+- **Startup releases an open speech dataset** ([Reuters](<https://news.google.com/rss/articles/startup-releases-an-open-speech-dataset?oc=5>))
+
+- **Cloud provider cuts inference prices** ([Reuters](<https://news.google.com/rss/articles/cloud-provider-cuts-inference-prices?oc=5>))
+
+- **Frontier lab ships a reasoning model** ([Reuters](<https://news.google.com/rss/articles/frontier-lab-ships-a-reasoning-model?oc=5>))
+==============================================================================
+[news.render]
+**AI News, Wed 7 Oct**
+
+- **Romeo opens a regional office** ([Reuters](<https://news.google.com/rss/articles/romeo-opens-a-regional-office?oc=5>))
+
+- **Quebec publishes a tooling guide** ([Reuters](<https://news.google.com/rss/articles/quebec-publishes-a-tooling-guide?oc=5>))
+
+- **Golf raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/golf-raises-a-billion-dollar-round?oc=5>))
+
+- **Foxtrot raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/foxtrot-raises-a-billion-dollar-round?oc=5>))
+==============================================================================
+[news.render]
+**Breaking AI News, Thu 8 Oct**
+
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+
+- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
+
+- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+==============================================================================
+[news.render]
+**Breaking AI News, Thu 8 Oct**
+
+- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
+
+- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
+
+- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
+
+- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
+
+- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+==============================================================================
+[news.render]
+**More AI News, Thu 8 Oct**
+
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+
+- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
+
+- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+==============================================================================
+[news.render]
+**More AI News, Thu 8 Oct**
+
+- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
+
+- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
+
+- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
+
+- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
+
+- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+==============================================================================
+[news.render]
+**More AI News, Wed 7 Oct**
+
+- **Lima raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/lima-raises-a-billion-dollar-round?oc=5>))
+
+- **Kilo raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/kilo-raises-a-billion-dollar-round?oc=5>))
+
+- **Juliet raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/juliet-raises-a-billion-dollar-round?oc=5>))
+
+- **India raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/india-raises-a-billion-dollar-round?oc=5>))
+
+- **Hotel raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/hotel-raises-a-billion-dollar-round?oc=5>))
+==============================================================================
+[news.render]
+- **Lab ships @​everyone a model** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+==============================================================================
+[news.render]
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+==============================================================================
+[news.render]
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+==============================================================================
+[news.render]
+- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+
+- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
+
+- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+==============================================================================
+[news.render]
+- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
+
+- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
+
+- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
+
+- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
+
+- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+==============================================================================
+[news.render]
+- **The first story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy0>))
+
+- **The second story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy1>))
+
+- **The third story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy2>))
+
+- **The fourth story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy3>))
+
+- **The fifth story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy4>))
+==============================================================================
+[news.render]
+- Synthflow raises $20M Series A — what happened. (Synthflow AI — on Master Pipeline) [example.org](<https://example.org/synthflow-raises-20m-series-a>)
+
+- **Papa raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/papa-raises-a-billion-dollar-round?oc=5>))
+
+- **Oscar raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
+
+- **November raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
+
+- **Mike raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/mike-raises-a-billion-dollar-round?oc=5>))
+==============================================================================
+[news_company_screen]
+Two companies in today's news aren't on the Master Pipeline yet:
+
+- **[Mirage Labs](<https://news.example/mirage-labs-launches-an-indic-speech-model>)** — launched an Indic speech model. **Good fit:** Phase 1 voice focus, and evals are close to Pulse.
+
+- **[Nudge Security](<https://news.example/nudge-security-raises-25m-to-secure-saas-sprawl>)** — raised $25M. **Weak fit:** sells to enterprise security teams, not AI teams.
+
+Would you like me to add either of them to the Master Pipeline?
+
+Vapi.ai isn't on the Master Pipeline, but it is on Outreach PoCs. Shall I add a pipeline row?
+==============================================================================
+[next_step_followups]
+No reply after the calls. These look unresponsive:
+- Cal Ladder (Ladder Co)
+==============================================================================
+[next_step_followups]
+The people below have replied to us! We need to set up a meeting with them:
+- Ariya Rastrow (Wisprflow.ai)
+
+We need to call these PoCs:
+- Angelos Perivolaropoulos (ElevenLabs)
+
+We sent the first email to these people over a week ago — time for the second:
+- Ioana Mocanu (Agoda)
+
+We need to send out the first email to these people:
+- Arjun Aryaa (Gnani.ai)
+- Oliver Shoulson (PolyAI)
+==============================================================================
+[next_step_followups]
+The people below have replied to us! We need to set up a meeting with them:
+- Rae Received (Co)
+==============================================================================
+[next_step_followups]
+We need to call these PoCs:
+- Cal Ladder (Ladder Co)
+==============================================================================
+[next_step_followups]
+We need to call these PoCs:
+- Dee Nodate (Nodate Co)
+==============================================================================
+[next_step_followups]
+We need to send out the first email to these people:
+- Arjun Aryaa (Gnani.ai)
+- Oliver Shoulson (PolyAI)
+- Priya Rao (Acme Labs)
+- Dev Shah (Borealis)
+
+We need to send out the second email to these people:
+- Ariya Rastrow (Wisprflow.ai)
+==============================================================================
+[next_step_followups]
+We need to send out the first email to these people:
+- P01 (Co 01)
+- P02 (Co 02)
+- P03 (Co 03)
+- P04 (Co 04)
+- P05 (Co 05)
+==============================================================================
+[next_step_followups]
+We need to send out the first email to these people:
+- P04 (Co 04)
+- P05 (Co 05)
+- P06 (Co 06)
+- P07 (Co 07)
+- P08 (Co 08)
+==============================================================================
+[next_step_followups]
+We need to send out the first email to these people:
+- P06 (Co 06)
+- P07 (Co 07)
+- P08 (Co 08)
+- P09 (Co 09)
+- P10 (Co 10)
+==============================================================================
+[next_step_followups]
+We need to send out the first email to these people:
+- P11 (Co 11)
+- P12 (Co 12)
+- P01 (Co 01)
+- P02 (Co 02)
+- P03 (Co 03)
+==============================================================================
+[next_step_followups]
+We need to send out the first email to these people:
+- Sol Solo (Solo Co)
+==============================================================================
+[next_step_followups]
+We need to send out the second email to these people:
+- Sol Solo (Solo Co)
+- Other 0 (Other Co 0)
+- Other 1 (Other Co 1)
+- Other 2 (Other Co 2)
+- Other 3 (Other Co 3)
+==============================================================================
+[next_step_followups]
+We're connected with these people — next thing is to research them:
+- Contact 1 (Middlesex University London)
+- Contact 2 (London Metropolitan University)
+- Contact 3 (University of East London)
+- Contact 4 (Telekinesis AI)
+==============================================================================
+[prospects]
+**PoCs to contact — Cartesia.ai**
+
+1. Cartesia Person 04 (Founder)
+2. Cartesia Person 01 (Engineer)
+3. Cartesia Person 02 (Engineer)
+4. Cartesia Person 03 (Engineer)
+5. Cartesia Person 05 (Engineer)
+
+We've already reached 2 from Cartesia.ai, there are 10 people left to contact.
+Would you like me to list the rest?
+
+Rime.ai is next on our list, let me know if you'd like to move on to Rime.ai
+==============================================================================
+[prospects]
+**PoCs to contact — Cartesia.ai**
+
+1. Cartesia Person 04 (Founder)
+2. Cartesia Person 01 (Engineer)
+3. Cartesia Person 02 (Engineer)
+4. Cartesia Person 03 (Engineer)
+5. Cartesia Person 05 (Engineer)
+
+We've already reached 2 from Cartesia.ai, there are 10 people left to contact.
+Would you like me to list the rest?
+
+Rime.ai is next on our list, let me know if you'd like to move on to Rime.ai
+
+Wisprlow.ai and Cartesia.ai haven't moved — 27 people still to contact between them.
+They're blocking other PoCs to contact.
+==============================================================================
+[prospects]
+**PoCs to contact — Co**
+
+1. Bo Break
+2. Cy Fine (CTO)
+3. Ada Long
+==============================================================================
+[prospects]
+**PoCs to contact — Rime.ai**
+
+1. Rime Person 1 (Engineer)
+2. Rime Person 2 (Engineer)
+3. Rime Person 3 (Engineer)
+
+Plainco is next on our list, let me know if you'd like to move on to Plainco
+
+Wisprlow.ai, Cartesia.ai and Rime.ai haven't moved — 30 people still to contact between them.
+They're blocking other PoCs to contact.
+==============================================================================
+[prospects]
+**PoCs to contact — Sierra AI**
+
+1. Sierra AI person 01 (Engineer)
+2. Sierra AI person 02 (Engineer)
+3. Sierra AI person 03 (Engineer)
+4. Sierra AI person 04 (Engineer)
+5. Sierra AI person 05 (Engineer)
+
+We've already reached 3 from Sierra AI.
+
+ElevenLabs is next on our list, let me know if you'd like to move on to ElevenLabs
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Ray (Ruizhe) Huang (Member of Technical Staff)
+3. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+4. Nathan Klapoetke (Computational Neuroscientist)
+5. Dev Malhotra (Machine Learning Engineer)
+
+We've already reached 2 from Wisprlow.ai, there are 7 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Ray (Ruizhe) Huang (Member of Technical Staff)
+3. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+4. Nathan Klapoetke (Computational Neuroscientist)
+5. Dev Malhotra (Machine Learning Engineer)
+
+We've already reached 3 from Wisprlow.ai, there are 6 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Ray (Ruizhe) Huang (Member of Technical Staff)
+3. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+4. Nathan Klapoetke (Computational Neuroscientist)
+5. Dev Malhotra (Machine Learning Engineer)
+
+We've already reached 3 from Wisprlow.ai, there are 6 people left to contact.
+Would you like me to list the rest?
+
+Rime.ai is next on our list, let me know if you'd like to move on to Rime.ai
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Sahaj Garg (Co-Founder/CTO)
+3. Ray (Ruizhe) Huang (Member of Technical Staff)
+4. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+5. Nathan Klapoetke (Computational Neuroscientist)
+
+We've already reached 2 from Wisprlow.ai, there are 7 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Sahaj Garg (Co-Founder/CTO)
+3. Ray (Ruizhe) Huang (Member of Technical Staff)
+4. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+5. Nathan Klapoetke (Computational Neuroscientist)
+
+We've already reached 2 from Wisprlow.ai, there are 7 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+
+Wisprlow.ai hasn't moved this month — 12 people still to contact there.
+It's blocking other PoCs to contact.
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Sahaj Garg (Co-Founder/CTO)
+3. Ray (Ruizhe) Huang (Member of Technical Staff)
+4. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+5. Nathan Klapoetke (Computational Neuroscientist)
+
+We've already reached 3 from Wisprlow.ai, there are 6 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+==============================================================================
+[prospects]
+**PoCs to contact — Wisprlow.ai**
+
+1. Tanay Kothari (Co-Founder / CEO)
+2. Sahaj Garg (Co-Founder/CTO)
+3. Ray (Ruizhe) Huang (Member of Technical Staff)
+4. Allegra Molinaro (Computational Linguist & Data Annotation Lead)
+5. Nathan Klapoetke (Computational Neuroscientist)
+
+We've already reached 3 from Wisprlow.ai, there are 6 people left to contact.
+Would you like me to list the rest?
+
+Cartesia.ai is next on our list, let me know if you'd like to move on to Cartesia.ai
+
+Wisprlow.ai hasn't moved this month — 11 people still to contact there.
+It's blocking other PoCs to contact.
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Person 01** (Co 01)
+2. **Person 02** (Co 02)
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Person 01** (Co 01)
+2. **Person 02** (Co 02)
+3. **Person 03** (Co 03)
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Person 01** (Co 01)
+2. **Person 02** (Co 02)
+3. **Person 03** (Co 03)
+4. **Person 04** (Co 04)
+5. **Person 05** (Co 05)
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Person 01** (Co 01)
+2. **Person 02** (Co 02)
+3. **Person 03** (Co 03)
+4. **Person 04** (Co 04)
+5. **Person 05** (Co 05)
+
+there are 2 more — would you like to look at the rest?
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Person 01** (Co 01)
+2. **Person 02** (Co 02)
+3. **Person 03** (Co 03)
+4. **Person 04** (Co 04)
+5. **Person 05** (Co 05)
+
+there is 1 more — would you like to look at them too?
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Prof. Alexandra Montgomery-Whitfield 15** (Northern Institute of Advanced Computing 15)
+2. **Prof. Alexandra Montgomery-Whitfield 16** (Northern Institute of Advanced Computing 16)
+3. **Prof. Alexandra Montgomery-Whitfield 17** (Northern Institute of Advanced Computing 17)
+4. **Prof. Alexandra Montgomery-Whitfield 18** (Northern Institute of Advanced Computing 18)
+5. **Prof. Alexandra Montgomery-Whitfield 19** (Northern Institute of Advanced Computing 19)
+
+there are 36 more — would you like to look at the rest?
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with this PoC, do get in touch when you can:
+
+1. **Ann** (Acme)
+==============================================================================
+[reconnect]
+Hey <@111>, <@222> — it's been a while since we last connected with this PoC, do get in touch when you can:
+
+1. **Person 01** (Co 01)
+==============================================================================
+[reconnect]
+Hey Vaishnavi, Sid — it's been a while since we last connected with these PoCs, do get in touch when you can:
+
+1. **Ann** (Acme) (reconnect date unclear)
+2. **Bob** (Borealis) (reconnect date unclear)
+==============================================================================
+[reconnect]
+Hey Vaishnavi, Sid — it's been a while since we last connected with this PoC, do get in touch when you can:
+
+1. **Bob** (Borealis)
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. DPO Pack
+2. Evals_Vibe-check
+3. Voice Agents Bench
+4. Safety Red Team
+5. Tamil TTS
+Could you let me know roughly when each might be ready?
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. Evals_Vibe-check
+2. Voice Agents Bench
+3. Safety Red Team
+4. Tamil TTS
+Could you let me know roughly when each might be ready?
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. First
+2. Second
+Could you let me know roughly when each might be ready?
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. Only One
+Could you let me know roughly when each might be ready?
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. Package A
+2. Package B
+3. Package C
+4. Package D
+5. Package E
+(+1 more next Thursday.)
+Could you let me know roughly when each might be ready?
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. Package A
+2. Package B
+3. Package C
+4. Package D
+5. Package E
+(+2 more next Thursday.)
+Could you let me know roughly when each might be ready?
+==============================================================================
+[sales_packages]
+these Sales Packages aren't ready yet:
+1. [Linked Pack](<https://docs.example/linked-pack>)
+2. Plain Pack
+3. Words Pack
+Could you let me know roughly when each might be ready?

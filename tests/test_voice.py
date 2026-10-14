@@ -79,9 +79,12 @@ def roster(monkeypatch):
 
 
 @pytest.fixture
-def built(db, roster):
-    """A profile built from `_msgs()` and stored, with voice bound to `db`."""
+def built(db, roster, monkeypatch):
+    """A profile built from `_msgs()` and stored, with voice bound to `db`.
+    The learned profile is the VOICE_SOURCE=channel path since NFT2-1090."""
     import voice
+
+    monkeypatch.setenv("VOICE_SOURCE", "channel")
 
     got = voice.assemble(_msgs(), companies=COMPANIES, people=PEOPLE)
     db.save_voice_profile(

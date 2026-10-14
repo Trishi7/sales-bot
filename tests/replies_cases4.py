@@ -37,7 +37,7 @@ async def d26_a_nudge_that_listed_three(check, test_mode):
         m = Mark(w)
         await w.say("yes", reply_to=nudge)
         text = "\n".join(m.said)
-        check("D26: three listed: which_proposal, numbered 1-3, 0 votes", (text.startswith("Which one do you mean?"), "3. " in text, applied, m.d("votes")), (True, True, [], 0))
+        check("D26: three listed: which_proposal, numbered 1-3, 0 votes", (text.startswith("Which one did you mean?"), "3. " in text, applied, m.d("votes")), (True, True, [], 0))
         which = w.posted[-1]
         await w.say("2", reply_to=which)
         check("D26: '2' applies exactly the second one shown", (len(applied), sorted(w.proposals().values())), (1, ["applied", "open", "open"]))

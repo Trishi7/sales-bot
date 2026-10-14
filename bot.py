@@ -84,6 +84,9 @@ import meeting_prep
 import leave
 import news
 import news_screen
+import context as saley_context
+import empathy
+import promptlog
 import nextaction
 import packages as packages_mod
 import reconnect as reconnect_mod
@@ -257,6 +260,12 @@ _VOICE_SHOW_RE = re.compile(
     r"^\s*(?:how\s+do\s+you\s+sound|what(?:'?s|\s+is)\s+your\s+voice"
     r"(?:\s+profile)?|show\s+(?:me\s+)?(?:your|the)\s+voice(?:\s+profile)?)"
     r"\s*[?.!]?\s*$", re.IGNORECASE)
+# "SHOW THE PROMPT FOR THAT" (NFT2-1090), replied to a message in the test
+# channel by an approver: the prompt-log file behind it.
+_SHOW_PROMPT_RE = re.compile(
+    r"^\s*(?:please\s+)?show\s+(?:me\s+)?(?:the|your)\s+prompt"
+    r"(?:\s+(?:for|behind|of)\s+(?:that|this|it)(?:\s+(?:one|message|post))?)?\s*[?.!]?\s*$",
+    re.IGNORECASE)
 _VOICE_FORGET_RE = re.compile(
     r"^\s*(?:please\s+)?forget\s+my\s+messages\s*[.!]?\s*$", re.IGNORECASE)
 
@@ -522,6 +531,20 @@ class SalesBot(discord.Client):
         # after), and whenever the pretend clock is set. The test run owns the
         # day. >0 = running; else a real-clock monotonic deadline.
         self._news_hold_depth: int = 0
+        # VOICE v2 (NFT2-1090). Small talk said today, per (person, date): the
+        # second "how's it going" gets a different line, the third only a 👍.
+        self._smalltalk: dict = {}
+        # A greeting clause to put in front of the answer to "hi, where's Acme?".
+        self._greet_prefix: dict = {}
+        # The person's last reply to one of Saley's posts, with the post — what
+        # the composer is shown so a nudge can follow on from it.
+        self._last_reply_pair: dict = {}
+        # The ids of every part of the last reply sent, for the prompt log.
+        self._last_sent_ids: list = []
+        self._prompts_pruned_on: str = ""
+        # A TEST DAY OR A SIMULATION writes its prompts under state/prompts/test/.
+        promptlog.bind(lambda: bool(config.SALES_TEST_MODE or self._news_hold_depth > 0
+                                    or simulation.in_simulation()))
         self._news_hold_until: float = 0.0
         self._hold_logged: str = ""
         # The last test run's plan, for "why was it quiet": {date, planned,
@@ -1689,6 +1712,17 @@ class SalesBot(discord.Client):
             # "typing…" followed by nothing would be its own small lie.
             ctx = await self._reply_context(message)
             self._reply_ctx[message.id] = ctx
+            # A NEW MESSAGE, A NEW PROMPT LOG: nothing logged for an earlier
+            # message in this task may be mapped to this one's reply.
+            promptlog.reset()
+            # "SHOW THE PROMPT FOR THAT" (NFT2-1090) — test channel, approver,
+            # a reply to a message. Before everything else reads it.
+            if _SHOW_PROMPT_RE.match(text or ""):
+                return await self._show_prompt(message, ctx)
+            # THEIR LAST REPLY TO A POST OF OURS, for the composer's context.
+            if ctx.get("direct_is_bot") and ctx.get("parent_text") and (text or "").strip():
+                self._last_reply_pair[self._person_key(message.author)] = {
+                    "post": ctx["parent_text"], "reply": text}
             # A QUESTION TYPED UNDER "GIVE ME A MOMENT" IS ITS OWN QUESTION.
             # "take ur time, also any news on ElevenLabs?" is answered for the
             # part after the politeness, with the interim line dropped from
@@ -1746,6 +1780,7 @@ class SalesBot(discord.Client):
             self._qstate.pop(message.id, None)
             self._reply_ctx.pop(message.id, None)
             self._parents.pop(message.id, None)
+            self._greet_prefix.pop(message.id, None)
             await self._record_latency(message, timing, loop.time())
 
     @contextlib.asynccontextmanager
@@ -1802,6 +1837,28 @@ class SalesBot(discord.Client):
             self._mark_route(message, "social")
             await self._send_social(message, "greeting", text="")
             return True
+
+        # SMALL TALK AND A PLAIN HELLO ARE RECOGNISED IN CODE (NFT2-1090),
+        # before the extractor and the router: "how's it going?" gets one line
+        # back, "hi" a hello. "hi, where's Acme?" is a QUESTION — the hello is
+        # one clause in front of the answer, and the question is answered.
+        if replies.is_small_talk(text):
+            log.info("[query] msg=%s → small talk (matched directly)", message.id)
+            self._mark_route(message, "social")
+            await self._send_small_talk(message, text)
+            return True
+        if replies.is_greeting_only(text):
+            log.info("[query] msg=%s → greeting (matched directly)", message.id)
+            self._mark_route(message, "social")
+            await self._send_social(message, "greeting", text=text)
+            return True
+        lead, rest = replies.split_greeting(text)
+        if lead and rest:
+            hi, part = self._hello(message.author)
+            self._greet_prefix[message.id] = f"{hi}, good {part}."
+            log.info("[query] msg=%s a greeting in front of a question: answered as the "
+                     "question, the hello said first", message.id)
+            text = rest
 
         # THE WRITE PATH, TRIED FIRST. Only two things reach it — a reply to one
         # of the bot's own messages, or an explicit @-mention command — and it
@@ -2709,6 +2766,19 @@ class SalesBot(discord.Client):
         # they reply to when there is one.
         engine_question = (replies.with_parent(q, ctx["chain"], bot_name=config.COS_NAME)
                            if ctx["parent_id"] else q)
+        # WHAT HAPPENED LATELY AND HOW THEY ARE (NFT2-1090), as data above the
+        # question. Never raises: without it the question is asked as before.
+        try:
+            vc = await self._voice_context(
+                person_key=self._person_key(message.author),
+                name=self._first_name(message.author), last_message=text)
+            extra = "\n".join(x for x in (vc["block"], vc["guidance"] and
+                                          ("HOW TO SAY IT: " + vc["guidance"])) if x)
+            if extra:
+                engine_question = extra + "\n\n" + engine_question
+        except Exception:
+            log.info("[context] could not build the context for the engine", exc_info=True)
+        promptlog.begin_group()
         log.info("[engine] msg=%s tools=%d (%s) routed by %s", message.id, len(tools),
                  ", ".join(groups) or "full set", routed_by)
         task = None
@@ -2837,6 +2907,24 @@ class SalesBot(discord.Client):
         # something was added or proposed (only `_offer_poc_add` may ask, and
         # it does so in its own message), then — on a profile turn — any link
         # no tool returned.
+        promptlog.end_group()
+        # THE VOICE CHECKS ON AN ANSWER (NFT2-1090): a cliché, a pushy word or
+        # shape, a filler where none belongs. ONE retry with the complaint;
+        # if that fails too, the first answer goes, through the reply guard.
+        issue = empathy.voice_problem(reply or "", proactive=False) if (reply or "").strip() \
+            else None
+        if issue and self.llm is not None and hasattr(self.llm, "revise_reply"):
+            log.info("[voice] msg=%s answer soft failure (%s); one retry", message.id,
+                     issue["reason"])
+            try:
+                again = await self.llm.revise_reply(text=reply, fix=issue["fix"], question=q)
+            except Exception:
+                again = ""
+            if again and not empathy.voice_problem(again, proactive=False):
+                reply = again
+            else:
+                log.info("[voice] msg=%s the retry did not fix it; the first answer goes "
+                         "through the guard", message.id)
         reply = self._strip_unbacked_offer(reply)
         if profile_turn:
             allowed = list(outcome.get("result_urls") or [])
@@ -2887,6 +2975,7 @@ class SalesBot(discord.Client):
                 reason="answered a question in the sales channel",
                 keep_rule_ids="cadence_preview" in (outcome.get("tools_used") or []),
             )
+            await self._map_prompt(sent, site="answer")
             if sent is not None and news_block:
                 await self._record_news_answer(news_got)
             # WHAT THIS MESSAGE ANSWERED, so a reply to it is routed with it.
@@ -3323,7 +3412,11 @@ class SalesBot(discord.Client):
 
         `interim` marks the "one moment" line, which is not the ANSWER: the
         latency clock stops on the answer's first chunk, not on it."""
+        prefix = "" if interim else self._greet_prefix.pop(getattr(message, "id", None), "")
+        if prefix and (body or "").strip():
+            body = f"{prefix} {body.lstrip()}"
         chunks = _split_for_discord(body or "…")
+        self._last_sent_ids = []
 
         if len(chunks) > config.QUERY_REPLY_MAX_MESSAGES:
             log.info(
@@ -3353,24 +3446,292 @@ class SalesBot(discord.Client):
                 return first
             if i == 0:
                 first = sent
+            self._last_sent_ids.append(str(getattr(sent, "id", "")))
             if i == 0 and not interim:
                 timing = self._qstate.get(getattr(message, "id", None))
                 if timing is not None and timing["first_reply"] is None:
                     timing["first_reply"] = asyncio.get_running_loop().time()
         return first
 
+    # -- VOICE v2: who, when, what happened lately, how they are --------------
+
+    @staticmethod
+    def _first_name(user) -> str:
+        """The first name the roster knows for this person, or "" (NFT2-1090:
+        a person not on the roster is "Hi there", never a guessed name)."""
+        uid = str(getattr(user, "id", "") or "")
+        name = str((config.ROSTER_DISPLAY_NAMES or {}).get(uid) or "").strip()
+        return name.split()[0] if name else ""
+
+    def _hello(self, user) -> tuple:
+        """("Hi Sid" or "Hi there", "morning" / "afternoon" / "evening") — the
+        time of day in IST, on the bot's own clock."""
+        name = self._first_name(user)
+        return (f"Hi {name}" if name else "Hi there"), wording.part_of_day(dl.now_ist().hour)
+
+    @staticmethod
+    def _person_key(user_or_name) -> str:
+        if isinstance(user_or_name, str):
+            return gtm_sheet.normalise_header(user_or_name) or "someone"
+        uid = getattr(user_or_name, "id", None)
+        return f"id:{uid}" if uid else "someone"
+
+    async def _recent_channel_messages(self) -> Optional[list]:
+        """The last CONTEXT_MESSAGES messages in the sales channels, oldest
+        first, as {author, text, is_bot} — Saley's own included and marked.
+        None when the read failed (the caller composes without the block, edge
+        23). The same channels query.py reads (`guardrails.readable_channel_ids`)."""
+        n = empathy.context_messages()
+        if not n:
+            return []
+        me = getattr(self.user, "id", None)
+        got: list = []
+        try:
+            for cid in guardrails.readable_channel_ids():
+                channel = self.get_channel(int(cid))
+                if channel is None:
+                    continue
+                async for m in channel.history(limit=n):
+                    text = str(getattr(m, "content", "") or "").strip()
+                    if not text:
+                        continue
+                    author = getattr(m, "author", None)
+                    got.append({"at": getattr(m, "created_at", None) or datetime.min,
+                                "author": _display(author) if author else "Someone",
+                                "text": text,
+                                "is_bot": bool(me and getattr(author, "id", None) == me)})
+        except Exception:
+            log.info("[context] the channel read failed; composing without the "
+                     "WHAT HAPPENED LATELY block", exc_info=True)
+            return None
+        got.sort(key=lambda m: str(m["at"]))
+        return got[-n:]
+
+    async def _voice_context(self, *, person_key: str, name: str, last_message: str = "",
+                             away: bool = False, away_why: str = "", changes=None,
+                             company: str = "", last_pair=None, chain=None,
+                             label: bool = True) -> dict:
+        """THE CONTEXT AND THE STATE FOR ONE PROMPT (NFT2-1090).
+
+        {"block", "label", "evidence", "guidance"}: the WHAT HAPPENED LATELY
+        block (data), the person's label (empathy.py: the rule, then the light
+        model, merged), and the one line of guidance — "" when there is
+        nothing to say OR when that state was already mentioned inside
+        EMPATHY_STATE_HOURS (said once, never twice). "I'm fine now" clears it.
+        `label=False` skips the label (the unclear-message path has none).
+        """
+        msgs = await self._recent_channel_messages()
+        if msgs is None:
+            msgs = []
+        n = empathy.context_messages()
+        msgs = list(msgs)[-n:] if n else []
+        db = self.db
+        state_label, evidence, guidance = empathy.NEUTRAL, "", ""
+        if last_message and empathy.clears_state(last_message):
+            await asyncio.to_thread(lambda: db.person_state_clear(person_key))
+            log.info("[empathy] %s said they are fine now; the state is cleared", person_key)
+        elif label:
+            rule = empathy.rule_label(away=away, away_why=away_why, changes=changes,
+                                      last_message=last_message)
+            model = None
+            # THE MODEL IS ASKED ONLY WHEN IT HAS SOMETHING TO READ that the rule
+            # has not: the channel's recent messages or a change on the sheet.
+            # With neither, it would see the same one message the rule just read.
+            if empathy.enabled() and self.llm is not None and (msgs or changes):
+                try:
+                    model = await self.llm.empathy_label(
+                        person=name, changes=list(changes or []), rule=rule,
+                        messages="\n".join(f"{m['author']}: {m['text'][:300]}" for m in msgs))
+                except Exception:
+                    log.info("[empathy] the label call failed; the rule label stands",
+                             exc_info=True)
+                    model = None
+                if not (model is None or (isinstance(model, tuple) and len(model) == 2)):
+                    model = None
+            state_label, evidence = empathy.merge(rule, model)
+            if state_label != empathy.NEUTRAL:
+                stored = await asyncio.to_thread(lambda: db.person_state_get(person_key))
+                fresh = False
+                if stored and stored.get("label") == state_label:
+                    try:
+                        set_at = datetime.fromisoformat(str(stored.get("set_at") or ""))
+                        now = dl.real_now_ist()
+                        if set_at.tzinfo is None:
+                            now = now.replace(tzinfo=None)
+                        fresh = (now - set_at).total_seconds() < empathy.state_hours() * 3600
+                    except ValueError:
+                        fresh = False
+                if fresh:
+                    log.info("[empathy] %s is still %s — already mentioned, not said again",
+                             person_key, state_label)
+                else:
+                    await asyncio.to_thread(lambda: db.person_state_set(
+                        person_key, label=state_label, evidence=evidence,
+                        set_at=dl.real_now_ist().isoformat(timespec="seconds")))
+                    guidance = empathy.guidance(state_label, evidence)
+        block = saley_context.block(
+            messages=msgs, chain=chain, last_pair=last_pair,
+            state=(state_label, evidence) if guidance else None,
+            changes=changes, company=company, bot_name=config.COS_NAME)
+        return {"block": block, "label": state_label, "evidence": evidence,
+                "guidance": guidance}
+
+    async def _social_call(self, **kw) -> str:
+        """`llm.social_reply` with the NFT2-1090 arguments, or — for a stand-in
+        model written before them — without."""
+        try:
+            return await self.llm.social_reply(**kw)
+        except TypeError:
+            return await self.llm.social_reply(kind=kw["kind"], text=kw["text"],
+                                               requester=kw["requester"])
+
+    async def _map_prompt(self, sent, *, site: str) -> None:
+        """Map every part of a message a model wrote to its prompt-log file."""
+        path = promptlog.current()
+        ids = [i for i in (self._last_sent_ids or []) if i] or \
+            ([str(getattr(sent, "id", ""))] if sent is not None else [])
+        if not path or sent is None or not ids:
+            return
+        try:
+            await asyncio.to_thread(lambda: self.db.record_prompt_log(
+                ids, path=path, site=site,
+                at=dl.real_now_ist().isoformat(timespec="seconds")))
+        except Exception:
+            log.debug("[prompt-log] could not map the message to its prompt", exc_info=True)
+
     async def _send_social(self, message: discord.Message, kind: str, text: str = "") -> None:
-        """A non-answer reply — greeting or "I couldn't follow that" — in the
-        bot's own voice, so these paths sound like the same colleague as a real
-        answer. Looks nothing up."""
+        """A non-answer reply — a hello, or one clarifying question — in the
+        voice of the teammate on the card (NFT2-1090). Looks nothing up.
+
+        A GREETING is like meeting your boss on the way in: "Hi Sid, good
+        morning. How's it going?" The name comes from the roster ("Hi there"
+        when it is not known), the time of day from the IST clock, and the
+        line carries no task, no list and no offer — checked in code, with a
+        deterministic hello when the model cannot manage it.
+
+        AN UNCLEAR MESSAGE gets the reply chain and the last channel messages,
+        and ONE question back naming the two readings: "Umm, do you mean the
+        Acme meeting or the Acme deliverable?"
+        """
         said = text or self._strip_self_mention(message.content)
-        reply = await self.llm.social_reply(
-            kind=kind,
-            text=said,
-            requester=_display(message.author),
-        )
-        await self._reply(message, self._voiced(message, reply, said),
-                          reason=f"{kind} reply")
+        hi, part = self._hello(message.author)
+        name = self._first_name(message.author)
+        ctx = self._reply_ctx.get(getattr(message, "id", None)) or {}
+        vc = await self._voice_context(
+            person_key=self._person_key(message.author), name=name, last_message=said,
+            chain=ctx.get("chain"), label=(kind != "unclear"))
+        if kind == "greeting":
+            fallback = wording.greeting(hi, part)
+            monday = dl.now_ist().weekday() == 0 and part == "morning"
+            hint = (f"Greet them: {hi}, good {part}. "
+                    + ("It is Monday morning: ask how the weekend was. " if monday else "")
+                    + "ONE line — hello and a question about them. No task, no list, no "
+                      "offer, nothing about the sheet.")
+        else:
+            fallback = wording.not_followed(hi)
+            hint = ("Start with \"Umm\" and ask ONE clarifying question that names the "
+                    "two readings you can see (use the context above).")
+        if vc["guidance"]:
+            hint += "\n" + vc["guidance"]
+        promptlog.reset()
+        reply = await self._social_call(kind=kind, text=said,
+                                        requester=_display(message.author),
+                                        context=vc["block"], hint=hint, fallback=fallback)
+        sent = await self._reply(message, self._voiced(message, reply, said),
+                                 reason=f"{kind} reply")
+        await self._map_prompt(sent, site=f"social_{kind}")
+
+    async def _send_small_talk(self, message, text: str) -> None:
+        """"How's it going?" — Saley reacts, never starts (NFT2-1090).
+
+        ONE LINE BACK, no work in it, nothing about the sheet. The same
+        question a second time that day gets a DIFFERENT line; the third time,
+        a 👍 and no text. SALEY_SMALL_TALK=off: a 👍 and no text, always."""
+        if empathy.small_talk() == "off":
+            await self._react(message, reason="small talk, SALEY_SMALL_TALK=off")
+            return
+        key = (getattr(message.author, "id", 0), dl.iso(dl.today_ist()))
+        said = self._smalltalk.setdefault(key, [])
+        if len(said) >= 2:
+            await self._react(message, reason="small talk, the third time today")
+            return
+        hi, part = self._hello(message.author)
+        name = self._first_name(message.author)
+        vc = await self._voice_context(person_key=self._person_key(message.author),
+                                       name=name, last_message=text)
+        fallback = next((l for l in wording.SMALLTALK_LINES if l not in said),
+                        wording.SMALLTALK_LINES[-1])
+        hint = ("Answer in ONE line, then nothing more. No work in it, nothing about the "
+                "sheet." + (f' You already said today: "{said[-1]}". Say something '
+                            "different." if said else ""))
+        if vc["guidance"]:
+            hint += "\n" + vc["guidance"]
+        promptlog.reset()
+        reply = await self._social_call(kind="smalltalk", text=text,
+                                        requester=_display(message.author),
+                                        context=vc["block"], hint=hint, fallback=fallback)
+        if not (reply or "").strip() or any(reply.strip() == s.strip() for s in said):
+            reply = fallback
+        sent = await self._reply(message, self._voiced(message, reply, text),
+                                 reason="small talk")
+        said.append(reply)
+        await self._map_prompt(sent, site="social_smalltalk")
+
+    async def _show_prompt(self, message, ctx: dict) -> bool:
+        """"show the prompt for that" (NFT2-1090). True: always handled.
+
+        ONLY IN THE TEST CHANNEL, ONLY FOR AN APPROVER; anywhere else it is
+        ignored, silently. Replied to a Saley message a model wrote: its
+        prompt-log file, split at 2,000 characters between lines. Replied to a
+        fixed post: "That post is a template. No prompt was sent." and the
+        text as rendered. Replied to a person's message: "That one isn't mine."
+        """
+        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        if channel_id != config.test_channel_id() or \
+                not config.is_approver(getattr(message.author, "id", 0)):
+            log.info("[prompt-log] 'show the prompt' outside the test channel or from a "
+                     "non-approver — ignored")
+            return True
+        chain = list(ctx.get("chain") or [])
+        if not ctx.get("is_reply"):
+            await self._reply(message, "Reply to one of my messages with that and I'll "
+                              "show what I was told.", reason="show the prompt: no message")
+            return True
+        if not ctx.get("direct_is_bot") or not chain or not chain[0].get("is_bot"):
+            await self._reply(message, wording.PROMPT_NOT_MINE,
+                              reason="show the prompt: a person's message")
+            return True
+        parent_id = ctx.get("parent_id") or ""
+        row = await asyncio.to_thread(lambda: self.db.prompt_log_for(parent_id)) \
+            if parent_id else None
+        if row is None and ctx.get("root_id"):
+            row = await asyncio.to_thread(lambda: self.db.prompt_log_for(ctx["root_id"]))
+        if row is None:
+            rendered = replies.strip_tag(chain[0].get("text") or "")
+            body = wording.PROMPT_TEMPLATE + ("\n\n" + rendered if rendered else "")
+        else:
+            body = await asyncio.to_thread(promptlog.read, row["path"]) or \
+                wording.PROMPT_MISSING
+        # BETWEEN LINES, like a news message; a line longer than a message
+        # (a system prompt has some) is cut where it has to be.
+        lines: list = []
+        for line in body.split(chr(10)):
+            while len(line) > 1900:
+                lines.append(line[:1900])
+                line = line[1900:]
+            lines.append(line)
+        parts = drip.split_on_lines(chr(10).join(lines), limit=1990) or [body[:1990]]
+        for i, part in enumerate(parts):
+            sent = await guardrails.send(
+                message.channel, part, reason="showed the prompt behind a message",
+                kind="reply", reply_to=message if i == 0 else None,
+                extra={"part": i + 1, "parts": len(parts)},
+                # THE PROMPT AS IT WAS SENT: rule ids are not translated, which
+                # would also push a part past Discord's 2,000 characters.
+                keep_rule_ids=True)
+            if sent is None:
+                break
+        return True
 
     async def _send_capability(self, message: discord.Message, text: str) -> None:
         """"What can you do?" — answered from the policy and the LIVE source
@@ -7065,6 +7426,16 @@ class SalesBot(discord.Client):
             await self._maybe_send_drip()
         except Exception:
             log.exception("[drip] tick raised; continuing")
+
+        # THE PROMPT LOG IS PRUNED ONCE A DAY (NFT2-1090): files older than
+        # SALEY_PROMPT_LOG_DAYS go.
+        today_marker = dl.iso(dl.real_today_ist())
+        if self._prompts_pruned_on != today_marker:
+            self._prompts_pruned_on = today_marker
+            try:
+                await asyncio.to_thread(promptlog.prune)
+            except Exception:
+                log.debug("[prompt-log] the daily prune failed", exc_info=True)
         # THE WEEKLY VOICE REBUILD. A date comparison on every tick; a channel
         # read and one light-model call when the profile is VOICE_REFRESH_DAYS
         # old. Posts nothing.
@@ -7088,6 +7459,8 @@ class SalesBot(discord.Client):
         """
         if not config.VOICE_ENABLED or simulation.in_simulation():
             return False
+        if voice.source() == "book":
+            return False            # the voice book: no channel read, no weekly rebuild
         if self._voice_task is not None and not self._voice_task.done():
             return False
         due, why = voice.needs_rebuild(self.db)
@@ -7146,6 +7519,13 @@ class SalesBot(discord.Client):
         one was handled. Deterministic replies; the only model call is the one
         light note call inside a rebuild."""
         uid = getattr(message.author, "id", 0)
+        if voice.source() == "book" and (_VOICE_REFRESH_RE.match(text)
+                                         or _VOICE_FORGET_RE.match(text)):
+            # THE VOICE COMES FROM THE BOOK (NFT2-1090): nothing is learned from
+            # the channel, so there is nothing to refresh or forget.
+            self._mark_route(message, "capability")
+            await self._reply(message, voice.BOOK_NOW, reason="voice command, book mode")
+            return True
         if _VOICE_SHOW_RE.match(text):
             self._mark_route(message, "capability")
             await self._reply(message, await asyncio.to_thread(voice.describe, self.db),
@@ -7433,6 +7813,12 @@ class SalesBot(discord.Client):
             # contains "right", and used to count as a yes.
             if "?" in (text or ""):
                 return False
+            # NOT DECIDED YET (NFT2-1090): "maybe", "let me think". No vote, one
+            # kind line, and the question stays open.
+            if approvals.undecided(text):
+                await self._reply(message, wording.TAKE_YOUR_TIME,
+                                  reason="an undecided answer to a proposal")
+                return True
             vote = approvals.read_vote(text)
             if not vote:
                 return False
@@ -7563,6 +7949,19 @@ class SalesBot(discord.Client):
             return False
         vote, key = "", ""
         pick = replies.pick_numbered(text, len(keys))
+        if not pick and len(keys) > 1:
+            # A NAME IS FINE (NFT2-1090): "the Acme one", "Daisy". Two that
+            # match get one question naming both — never a pick between them.
+            props = [await asyncio.to_thread(self.db.proposal, k) for k in keys]
+            labels = [self._proposal_label(p or {}) for p in props]
+            picks, candidates = replies.pick_phrase(text, len(keys), labels)
+            if picks and len(picks) == 1:
+                pick = picks[0]
+            elif len(candidates) >= 2:
+                await self._reply(message, wording.two_matches(
+                    text, [labels[i - 1] for i in candidates]),
+                    reason="a name that matches two proposals")
+                return True
         if pick:
             vote, key = approvals.VOTE_YES, keys[pick - 1]
         elif len(keys) == 1:
@@ -10875,6 +11274,70 @@ class SalesBot(discord.Client):
                 return hit
         return None
 
+    async def _rows_for(self, message: dict) -> dict:
+        """{company_key: row} for the companies a message is about, from the
+        Outreach PoCs tab AS ALREADY READ (the sheet cache the rule just
+        filled). Nothing new is read for this; a tab that cannot be had is {}."""
+        try:
+            tab, _src = await asyncio.to_thread(gtm_sheet.SHEETS.cadence_tab)
+        except Exception:
+            return {}
+        rows = list(getattr(tab, "rows", None) or [])
+        wanted = {gtm_sheet.normalise_header(c): c for c in (message.get("companies") or [])
+                  if str(c).strip()}
+        out: dict = {}
+        for row in rows:
+            key = gtm_sheet.normalise_header(str(row.get("company") or ""))
+            if key in wanted and key not in out:
+                out[key] = row
+        return out
+
+    async def _compose_context(self, message: dict) -> tuple:
+        """(extra prompt text, label) for one composed post (NFT2-1090): the WHAT
+        HAPPENED LATELY block — the channel, their last reply to us with the
+        post it answered, how they are, what changed on the sheet since the
+        last post about the company — and the one guidance line. Never
+        raises; ("", "") when nothing could be built."""
+        try:
+            owner = str(message.get("owner") or "")
+            company = next((str(c) for c in (message.get("companies") or [])
+                            if str(c).strip()), "")
+            changes: list = []
+            if company:
+                rows = await self._rows_for(message)
+                key = gtm_sheet.normalise_header(company)
+                before = await asyncio.to_thread(lambda: self.db.company_facts_get(key))
+                if rows.get(key) is not None and before is not None:
+                    changes = saley_context.sheet_diff(before, rows[key],
+                                                       today=dl.today_ist())
+            away, away_why = False, ""
+            if message.get("covering_for"):
+                away, away_why = True, f"{message['covering_for']} is away"
+            vc = await self._voice_context(
+                person_key=self._person_key(owner) if owner else "team", name=owner,
+                away=away, away_why=away_why, changes=changes, company=company,
+                last_pair=self._last_reply_pair.get(self._person_key(owner)) if owner else None)
+            extra = ""
+            if vc["block"]:
+                extra += "\n\n" + vc["block"]
+            if vc["guidance"]:
+                extra += "\n\nHOW TO SAY IT: " + vc["guidance"]
+            return extra, vc["label"]
+        except Exception:
+            log.info("[context] could not build the composer's context; composing "
+                     "without it", exc_info=True)
+            return "", ""
+
+    async def _store_company_facts(self, message: dict) -> None:
+        """The rows of the companies this post was about, as they stood when it
+        went out — what the next post's sheet diff compares against."""
+        rows = await self._rows_for(message)
+        stamp = dl.real_now_ist().isoformat(timespec="seconds")
+        for key, row in rows.items():
+            facts = saley_context.facts_of(row)
+            await asyncio.to_thread(lambda: self.db.company_facts_set(key, facts,
+                                                                      posted_at=stamp))
+
     async def _send_drip_message(self, channel, message: dict, *, marker: str,
                                  channel_id: int) -> None:
         """Compose ONE message and send it. The only proactive send in this bot.
@@ -11040,8 +11503,13 @@ class SalesBot(discord.Client):
                 fallback_reason = "no model configured"
             else:
                 try:
+                    # WHAT HAPPENED LATELY, WHAT CHANGED ON THE SHEET, HOW THE
+                    # PERSON IS (NFT2-1090) — data and one line of guidance.
+                    extra, state_label = await self._compose_context(message)
+                    promptlog.reset()
                     body, used_model = await self.llm.proactive_message(
-                        prompt=drip.compose_prompt(message, address=address),
+                        label=state_label,
+                        prompt=drip.compose_prompt(message, address=address) + extra,
                         fallback=fallback,
                         recent_openers=openers,
                         facts=drip.fact_count(message),
@@ -11277,6 +11745,17 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[approvals] could not open this post's offer; the message "
                           "went out but a yes will not find it")
+        # THE PROMPT BEHIND A COMPOSED POST, mapped to every part of it, and
+        # THE ROW AS IT STOOD, for the next post's "what changed" (NFT2-1090).
+        try:
+            how = getattr(self.llm, "last_proactive", None) or {}
+            if used_model and how.get("path"):
+                await asyncio.to_thread(lambda: self.db.record_prompt_log(
+                    part_ids, path=how["path"], site="proactive_message",
+                    at=dl.real_now_ist().isoformat(timespec="seconds")))
+            await self._store_company_facts(message)
+        except Exception:
+            log.debug("[context] could not record the prompt or the facts", exc_info=True)
         # R9 CLIMBS ONE RUNG PER FOLLOW-UP THAT ACTUALLY WENT OUT. After the
         # send, like every other ledger here: a rung spent on a message that was
         # refused would escalate somebody who was never asked.

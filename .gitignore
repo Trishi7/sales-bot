@@ -30,6 +30,10 @@ notes/
 # tracked via .gitkeep, its contents never are.
 state/*
 !state/.gitkeep
+# The prompt log (SALEY_PROMPT_LOG, NFT2-1090): every model call's system
+# prompt, user prompt and reply. Covered by state/* already; named so a later
+# change to the line above cannot start committing it.
+state/prompts/
 
 # Logs (PM2 writes here; see DEPLOY.md)
 logs/

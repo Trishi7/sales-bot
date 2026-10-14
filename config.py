@@ -3365,6 +3365,42 @@ VOICE_EXEMPLARS = _int("VOICE_EXEMPLARS", 12)
 # is none, and on "refresh voice").
 VOICE_REFRESH_DAYS = _int("VOICE_REFRESH_DAYS", 7)
 
+# -- VOICE v2 (NFT2-1090): the card, the voice book, context, empathy ----------
+#
+# WHERE THE VOICE COMES FROM. `book` (the default): voice_book.md, written and
+# edited by the team — no channel is read, no voice-note model call is made,
+# nothing is rebuilt weekly, and nothing learns from reactions. `channel`: the
+# learned profile above, exactly as before (VOICE_LOOKBACK_DAYS,
+# VOICE_MAX_MESSAGES, VOICE_EXEMPLARS and VOICE_REFRESH_DAYS apply only then).
+VOICE_SOURCE = (os.getenv("VOICE_SOURCE", "book") or "book").strip().lower()
+# The voice book. Re-read on every compose when it changes (mtime+size).
+VOICE_BOOK_PATH = (os.getenv("VOICE_BOOK_PATH", "./voice_book.md")
+                   or "./voice_book.md").strip()
+
+# These four are READ FRESH ON EVERY COMPOSE (os.environ, in empathy.py), like
+# the tone dials: a change is in force on the next message with no restart.
+# The values here are only what the boot log shows.
+#   SALEY_SMALL_TALK  react | off — off: pure small talk gets a 👍 and no text
+#   SALEY_FILLERS     unsure | off — "Umm"/"Hmm" as the first word of a reply
+#                     when Saley is unsure; off: never
+#   EMPATHY_ENABLED   the light-model label of how a person is doing (the rule
+#                     signals always run)
+#   EMPATHY_STATE_HOURS  how long a noticed state is remembered, so it is
+#                     mentioned once
+#   CONTEXT_MESSAGES  how many recent channel messages ride in a prompt
+SALEY_SMALL_TALK = (os.getenv("SALEY_SMALL_TALK", "react") or "react").strip().lower()
+SALEY_FILLERS = (os.getenv("SALEY_FILLERS", "unsure") or "unsure").strip().lower()
+EMPATHY_ENABLED = _bool("EMPATHY_ENABLED", default=True)
+EMPATHY_STATE_HOURS = _int("EMPATHY_STATE_HOURS", 48)
+CONTEXT_MESSAGES = _int("CONTEXT_MESSAGES", 10)
+
+# SEEING THE PROMPT: every model call written to state/prompts/<date>/ (a test
+# day or simulation: state/prompts/test/), kept SALEY_PROMPT_LOG_DAYS days.
+# "show the prompt for that" in the test channel posts the file behind a
+# message. No redaction: prompts hold no secrets. The folder is gitignored.
+SALEY_PROMPT_LOG = _bool("SALEY_PROMPT_LOG", default=True)
+SALEY_PROMPT_LOG_DAYS = _int("SALEY_PROMPT_LOG_DAYS", 14)
+
 
 def voice_learn_from_ids() -> list:
     """The ids whose messages the voice profile may learn from, in a stable

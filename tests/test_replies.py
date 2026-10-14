@@ -72,10 +72,12 @@ def test_ack_emoji_is_the_thumbs_up():
 
 BARE_YES = ["yes", "Yes.", "YES", "yep", "yeah", "yup", "y", "ok", "okay", "sure", "go ahead", "do it", "please do",
             "confirmed", "approved", "right", "correct", "yes please", "yes, please.", "yes thanks", "yes saley",
-            "<@999> yes", "please yes"]
+            "<@999> yes", "please yes",
+            # NFT2-1090: "add them" is a yes of its own, and an ack plus a vote is a yes (T59).
+            "yes, add them", "sure, add them"]
 BARE_NO = ["no", "No.", "nope", "nah", "n", "do not", "don't", "dont", "stop", "cancel", "wrong", "leave it",
            "hold off", "not yet", "wait", "no thanks", "no saley"]
-NOT_BARE = ["what's the right contact at Acme?", "is there no news today?", "yes, add them", "yes for Janajit",
+NOT_BARE = ["what's the right contact at Acme?", "is there no news today?", "yes for Janajit",
             "yesterday we met", "no news today", "ok, and what about Globex?", "right, so who owns Acme?", "",
             "is that right?", "don't forget Globex", "yes and no", "nothing came back", "who said no?"]
 
@@ -294,8 +296,8 @@ def test_new_lines_are_registered_and_pass_the_register_check():
                   wording.EVENTS_REMIND_PAST, wording.POC_LOOKUP_EMPTY, wording.OFFER_NEEDS_DETAIL):
         assert const in lines, f"not in all_lines(): {const!r}"
     # the parameterised ones are registered with stand-in values: one line of each family
-    for family, sample in (("Which one do you mean?", wording.which_proposal(["a", "b"])),
-                           ("Is that a yes to", wording.confirm_proposal("the update to Acme")),
+    for family, sample in (("Which one did you mean?", wording.which_proposal(["a", "b"])),
+                           ("did you mean", wording.confirm_proposal("the update to Acme")),
                            ("I'll post the AI events list again on", wording.events_remind_set("Mon 12 Oct at 2 PM")),
                            ("Noted.", wording.holding("the update to Acme")),
                            ("There was nothing left on", wording.nothing_left("the update to Acme")),
@@ -315,10 +317,11 @@ def test_exact_texts():
     assert wording.today_unread(["my own posts for today"]) == (
         "I couldn't read my own posts for today just now, so that part is missing.")
     assert wording.OBJECTIVES_UNREADABLE == "I couldn't read what's gone out today, so I can't list it. Try me again in a minute."
-    assert wording.which_proposal(["A", "B"]) == ("Which one do you mean?\n1. A\n2. B\n"
-                                                  "Reply to that message with yes, or give me the number.")
+    # NFT2-1090, QUESTIONS NOT VOTES (R-f): never "reply with yes" or "give me the number".
+    assert wording.which_proposal(["A", "B"]) == ("Which one did you mean? A name is fine.\n"
+                                                  "1. A\n2. B")
     assert wording.confirm_proposal("the update to Acme") == (
-        "Is that a yes to the update to Acme? Say yes in a reply to this and I'll go ahead.")
+        "Just to be sure — did you mean the update to Acme? Let me know and I'll go ahead.")
     assert wording.events_remind_set("Mon 12 Oct at 2 PM") == "I'll post the AI events list again on Mon 12 Oct at 2 PM."
     assert wording.EVENTS_REMIND_EMPTY == "The AI events reminder had no events left on it, so I haven't set one."
     assert wording.EVENTS_REMIND_PAST == ("The day for the AI events reminder has already come, so I haven't set one. "

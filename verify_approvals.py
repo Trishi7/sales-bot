@@ -104,7 +104,9 @@ proposed = approvals.proposal_text(company="Wispr Flow", poc="Sahaj",
 print(f"  bot posts      {proposed}")
 check("names the column", "Meeting Date" in proposed, True)
 check("names the row", "Sahaj (Wispr Flow)" in proposed, True)
-check("asks for a yes", "Reply yes." in proposed, True)
+# NFT2-1090: a question a person would ask, never a vote ("Reply yes." retired).
+check("asks a question, not for a vote", (proposed.endswith("?"), "Reply yes" in proposed),
+      (True, False))
 
 d.open_proposal(proposal_key="pA", kind="cell_update", tab=tab.title, sheet_row=2,
                 row_key="wispr flow|sahaj", company="Wispr Flow", poc="Sahaj",

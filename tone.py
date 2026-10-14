@@ -116,32 +116,33 @@ def settings() -> dict:
 # means nothing to a composer; "open by using their first name" does.
 _WARMTH_TEXT = {
     "low": (
-        "WARMTH: LOW. Be courteous and brief. Skip the pleasantries — no thanks "
-        "unless something was actually done, no acknowledgement of how busy "
-        "anyone is. Get to the thing."
+        "WARMTH: LOW. A teammate who is brief: courteous, \"we\", a question "
+        "rather than an order, and no pleasantries beyond that. Get to the thing."
     ),
     "medium": (
-        "WARMTH: MEDIUM. Sound like a colleague, not a notification. A short "
-        "acknowledgement is fine where it is earned; do not manufacture one."
+        "WARMTH: MEDIUM. A teammate, not a notification. Say \"we\", ask rather "
+        "than order. A short acknowledgement where it is earned; never a "
+        "manufactured one."
     ),
     "high": (
-        "WARMTH: HIGH. Sound like somebody on the team who noticed and cared "
-        "enough to mention it. Use their first name. Thank them where a thank "
-        "you is earned, notice good news when there is some, and make the ask "
-        "feel like a favour between colleagues rather than a task assignment. "
-        "Warmth is not padding: it is one clause, not an extra sentence."
+        "WARMTH: HIGH. The teammate on the card: warm, welcoming, on our side. "
+        "Use their first name. Say \"we\" and \"us\" — the pipeline is ours. "
+        "Thank them where a thank you is earned, cheer good news, ask rather than "
+        "order, say why it helps us, and offer to do the work (\"Do you want me to "
+        "draft it?\"). Warmth is one clause, not an extra sentence."
     ),
 }
 
 _FORMALITY_TEXT = {
     "casual": (
-        "FORMALITY: CASUAL. Contractions, everyday words, the way people "
-        "actually type in a team channel. \"Worth a look when you get a "
-        "window\" rather than \"please review at your earliest convenience\"."
+        "FORMALITY: CASUAL. Contractions, everyday words, the way a teammate "
+        "types in the channel. \"Could you look at it when you can?\" rather "
+        "than \"please review at your earliest convenience\"."
     ),
     "balanced": (
-        "FORMALITY: BALANCED. Professional but not stiff. Contractions are "
-        "fine. No corporate register, no \"kindly\", no \"please be advised\"."
+        "FORMALITY: BALANCED. A polite teammate: contractions are fine, first "
+        "names, \"could you\" and \"when you can\". No corporate register, no "
+        "\"kindly\", no \"please be advised\", never an order."
     ),
     "formal": (
         "FORMALITY: FORMAL. Full words rather than contractions, complete "
@@ -183,8 +184,9 @@ _HUMOUR_TEXT = {
         "same as funny, and a joke in a nudge somebody is behind on reads badly."
     ),
     "light": (
-        "HUMOUR: LIGHT. A dry aside is allowed where it is genuinely warm and "
-        "never at anybody's expense. If you are not sure it lands, leave it out."
+        "HUMOUR: LIGHT. Sometimes witty: one warm aside at most, when it lands. "
+        "Never about a person, never after bad news. If you are not sure it "
+        "lands, leave it out."
     ),
 }
 
@@ -199,6 +201,13 @@ PLAIN_WORDS_RULE = (
 )
 
 HUMAN_TOUCHES = """HUMAN TOUCHES (these apply at every tone setting):
+
+- SAY "WE". The pipeline is ours and the win is ours.
+- ASK, NEVER ORDER, AND NEVER ASSUME. "Could you … when you can? It would help us
+  a lot." "Do you want me to stop their reminders?" — never "I've stopped them".
+- OFFER TO DO THE WORK. "I can draft it — could you give it a final approval?"
+- NEVER HOLD A TASK BACK, NEVER MOVE IT TO TOMORROW. Late in the day, share it
+  anyway, "so it's ready whenever you look".
 
 - USE FIRST NAMES. "Vaishnavi — ..." not "Hi team" and not "@Vaishnavi, please".
 - VARY THE OPENING. The openers used in the last few messages are listed below;
@@ -313,7 +322,7 @@ def count_sentences(text: str) -> int:
     return max(1, ends)
 
 
-def check_detail(text: str, *, facts: int = 0) -> Optional[dict]:
+def check_detail(text: str, *, facts: int = 0, reply: bool = False) -> Optional[dict]:
     """{"reason", "fix"} for the first enforced setting this message breaks,
     or None. `reason` is the log line; `fix` is what the composer is told on
     its one retry, in the plainest words there are: "that was 7 sentences;
@@ -330,7 +339,17 @@ def check_detail(text: str, *, facts: int = 0) -> Optional[dict]:
 
     THE SENTENCE CAP COUNTS PROSE ONLY — the point lines are facts, and "1. "
     is not a sentence end.
+
+    FILLERS (NFT2-1090, the Umm rule, kind "filler"): a proactive post with
+    "Umm"/"Hmm" fails; a REPLY (`reply=True`) may open with one, once; two, or
+    one anywhere but the start, fails; SALEY_FILLERS=off fails any. Checked
+    first, because a filler is wrong whatever the length.
     """
+    import empathy
+
+    filler = empathy.filler_problem(text, proactive=not reply)
+    if filler:
+        return {"kind": "filler", "reason": filler["reason"], "fix": filler["fix"]}
     if int(facts or 0) >= 3 and not any(
             is_point_line(l) for l in str(text or "").splitlines()):
         return {
@@ -359,10 +378,10 @@ def check_detail(text: str, *, facts: int = 0) -> Optional[dict]:
     return None
 
 
-def check(text: str, *, facts: int = 0) -> str:
+def check(text: str, *, facts: int = 0, reply: bool = False) -> str:
     """Why this message breaks the ENFORCED tone settings, or "". The reason
     alone — see `check_detail` for the words the retry uses."""
-    detail = check_detail(text, facts=facts)
+    detail = check_detail(text, facts=facts, reply=reply)
     return detail["reason"] if detail else ""
 
 

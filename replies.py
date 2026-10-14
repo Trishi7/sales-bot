@@ -380,6 +380,129 @@ def pick_numbered(text: str, n: int) -> Optional[int]:
     return picks[0] if 1 <= picks[0] <= int(n or 0) else None
 
 
+# -- greetings and small talk (NFT2-1090) ---------------------------------------
+#
+# RECOGNISED IN CODE, before the extractor and the router: "hi" is a hello,
+# "how's it going?" is small talk, and "hi, where's Acme?" is a question with a
+# greeting clause in front of it — answered as the question, the hello said in
+# one clause first.
+
+_GREETING_RE = re.compile(
+    r"^\s*(?:hi+|hey+|hello+|hiya|heya|yo|namaste|good\s+(?:morning|afternoon|evening)|"
+    r"(?:gm|morning|evening|afternoon))(?![A-Za-z])"
+    r"(?:\s+(?:there|team|all|everyone|saley|again)(?![A-Za-z]))*\s*[!.,:;~-]*\s*", re.IGNORECASE)
+_SMALL_TALK_RE = re.compile(
+    r"^\s*(?:(?:hi|hey|hello)[\s,!]+)?(?:saley[\s,!]+)?"
+    r"(?:how(?:'?s|\s+is)\s+it\s+going|how\s+are\s+(?:you|u|things)(?:\s+doing)?(?:\s+today)?|"
+    r"how\s+r\s+u|how(?:'?s|\s+is|\s+was)\s+(?:your|ur)\s+(?:day|week|weekend|morning)(?:\s+going)?|"
+    r"how(?:'?s|\s+are)\s+things|how\s+have\s+you\s+been|what'?s\s+up|wassup|sup)"
+    r"(?:\s+(?:saley|today|mate|buddy))?\s*[?!.]*\s*$", re.IGNORECASE)
+
+
+def is_small_talk(text: str) -> bool:
+    """"how's it going?", "how are you", "how was your weekend?" — and nothing
+    about work in it."""
+    return bool(_SMALL_TALK_RE.match(_MENTION_RE.sub(" ", str(text or "")).strip()))
+
+
+def split_greeting(text: str) -> tuple:
+    """(the greeting clause, the rest) — ("", text) when it does not open with
+    a greeting. "hi, where's Acme?" -> ("hi,", "where's Acme?")."""
+    body = _MENTION_RE.sub(" ", str(text or "")).strip()
+    m = _GREETING_RE.match(body)
+    if not m or not m.group(0).strip():
+        return "", body
+    return m.group(0).strip(), body[m.end():].strip()
+
+
+def is_greeting_only(text: str) -> bool:
+    """A hello and nothing else: "hi", "good morning Saley!", "hey there"."""
+    lead, rest = split_greeting(text)
+    return bool(lead) and not rest
+
+
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+                "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def _one_pick(word: str) -> Optional[int]:
+    if word.isdigit():
+        return int(word)
+    return _ORDINALS.get(word)
+
+
+def _named(text: str, items) -> list:
+    """The 1-based items whose text contains `text` as a whole word or phrase."""
+    want = " ".join(_words(text))
+    if not want or len(want) < 2:
+        return []
+    out = []
+    for i, item in enumerate(items or (), 1):
+        if re.search(r"(?<![a-z0-9])" + re.escape(want) + r"(?![a-z0-9])",
+                     " ".join(_words(item))):
+            out.append(i)
+    return out
+
+
+def pick_phrase(text: str, n: int, items=()) -> tuple:
+    """WHICH OF A LIST SOMEBODY MEANT, READ THE WAY A PERSON SAYS IT (NFT2-1090).
+    Returns (picks, candidates):
+
+        "the first two"          -> ([1, 2], [])
+        "all" / "all of them"    -> ([1 .. n], [])
+        "all but Acme"           -> (every item except Acme's, [])
+        "only the second"        -> ([2], [])
+        "2 and 3"                -> ([2, 3], [])
+        "Acme"                   -> ([the item naming Acme], [])
+        "Daisy" (two Daisys)     -> (None, [i, j]) — the caller asks which
+        anything else            -> (None, [])
+
+    Nothing out of range is rounded to the nearest item, and a name that
+    matches two items is never guessed between."""
+    body = str(text or "").strip()
+    n = max(0, int(n or 0))
+    if not body or not n or "?" in body:
+        return None, []
+    words = [w for w in _words(body) if w not in ("the", "please", "thanks", "just", "ones",
+                                                  "of", "them", "these", "those")]
+    if not words:
+        return None, []
+    everything = list(range(1, n + 1))
+    if words in (["all"], ["both"], ["every", "one"], ["everyone"], ["all", "one"]):
+        return everything, []
+    if words[0] == "all" and len(words) > 2 and words[1] in ("but", "except", "apart"):
+        rest = [w for w in words[2:] if w != "from"]
+        drop: list = []
+        for w in rest:
+            got = _one_pick(w)
+            if got:
+                drop.append(got)
+        if not drop:
+            named = _named(" ".join(rest), items)
+            if len(named) != 1:
+                return (None, named) if named else (None, [])
+            drop = named
+        return [i for i in everything if i not in drop], []
+    if words[0] in ("first", "last") and len(words) == 2 and (
+            words[1] in _COUNT_WORDS or words[1].isdigit()):
+        k = _COUNT_WORDS.get(words[1]) or int(words[1])
+        if not 1 <= k <= n:
+            return None, []
+        return (everything[:k] if words[0] == "first" else everything[-k:]), []
+    if words[0] == "only":
+        words = words[1:]
+    nums = [w for w in words if w not in ("and", "one", "number", "no")]
+    picks = [_one_pick(w) for w in nums]
+    if nums and all(picks):
+        if all(1 <= p <= n for p in picks):
+            return list(dict.fromkeys(picks)), []
+        return None, []
+    named = _named(body, items)
+    if len(named) == 1:
+        return named, []
+    return None, named
+
+
 # (THE READER FOR A REPLY TO THE NEXT-STEPS POST WAS HERE until 12 Oct 2026:
 # next_step_done / _all / _shorts / _named / _candidates. That post is now a
 # reminder and replies to it are not read, so they were removed with their
@@ -494,7 +617,9 @@ def _self_test() -> int:
         ("no", "no"), ("No.", "no"), ("nope", "no"), ("don't", "no"),
         ("not yet", "no"), ("no thanks", "no"), ("no, wait", "no"),
         ("what's the right contact at Acme?", ""), ("is there no news today?", ""),
-        ("yes, add them", ""), ("yes for Janajit", ""), ("ok wait", ""),
+        # "add them" is a yes of its own since NFT2-1090 (an ack plus a vote
+        # is a yes: "sure, add them").
+        ("yes, add them", "yes"), ("yes for Janajit", ""), ("ok wait", ""),
         ("thanks", ""), ("please", ""), ("", ""), ("yesterday", ""),
         ("the right one", ""), ("yes?", ""),
     ]:

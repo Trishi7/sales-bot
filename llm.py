@@ -49,7 +49,9 @@ from typing import Optional
 from anthropic import Anthropic
 
 import config
+import empathy
 import persona
+import promptlog
 import usage
 import wording
 from persona import (
@@ -203,10 +205,49 @@ def proactive_verdict(text: str, *, facts: int = 0, required_lines=(),
                 "reason": f"uses the banned phrase {phrase.group(1).lower()!r}",
                 "fix": (f"that said \"{phrase.group(1)}\"; say it the way a teammate "
                         "would in a group chat, without that phrase")}
+    # THE VOICE CHECKS (NFT2-1090): a cliché, a pushy word or shape, a
+    # deferral, an assumption. Saley's own words only — quoted data is not
+    # checked. The filler rule is in `tone.check_detail` above.
+    voice_issue = empathy.voice_problem(text, proactive=True, checks=("cliche", "pushy"))
+    if voice_issue:
+        return {"hard": False, "reason": voice_issue["reason"], "fix": voice_issue["fix"]}
     if len(_tone.prose_of(text)) > 1200:
         return {"hard": False,
                 "reason": f"far too long ({len(text)} chars) — the model has malfunctioned",
                 "fix": f"that was {len(text)} characters; make it two or three sentences"}
+    return None
+
+
+# A greeting is one friendly line: no list, no task, no offer (NFT2-1090).
+_GREETING_OFFER_RE = re.compile(
+    r"\b(?:i can|i could|want me to|do you want|look into|let me know if|shall i|"
+    r"anything i can|how can i help|what can i)\b", re.IGNORECASE)
+
+
+def social_problem(kind: str, text: str) -> Optional[dict]:
+    """The first thing wrong with a greeting, small talk or an unclear-message
+    reply, or None. Soft: the caller retries once."""
+    body = str(text or "").strip()
+    if not body:
+        return {"reason": "empty", "fix": "that came back empty"}
+    if kind == "unclear":
+        got = empathy.voice_problem(body, proactive=False, checks=("filler",))
+    else:
+        got = empathy.voice_problem(body, proactive=False)
+    if got:
+        return got
+    if kind == "greeting":
+        import tone as _tone
+
+        if any(_tone.is_point_line(l) for l in body.splitlines()):
+            return {"reason": "a greeting with a list", "fix": "no list in a greeting"}
+        if _GREETING_OFFER_RE.search(empathy.own_words(body)):
+            return {"reason": "a greeting with an offer or a task",
+                    "fix": "no offer and no task in a greeting — hello and a question "
+                           "about them, nothing else"}
+    if kind in ("greeting", "smalltalk") and len([l for l in body.splitlines()
+                                                   if l.strip()]) > 2:
+        return {"reason": "more than one line", "fix": "one line only"}
     return None
 
 
@@ -306,10 +347,12 @@ class LLM:
         # What the last `proactive_message` did: {"retries", "reason",
         # "first_reason"}. Read by the caller straight after the await.
         self.last_proactive: dict = {}
+        # The prompt-log file of the last call (promptlog.py), or None.
+        self.last_prompt_path: Optional[str] = None
 
     async def _create(self, *, system, prompt: str, max_tokens: int,
                       site: str = "?", include_strategy: bool = True,
-                      light: bool = False):
+                      light: bool = False, log_path: Optional[str] = None):
         """One model call, with the STRATEGY DOC in front of the system prompt.
 
         `light=True` runs it on MODEL_LIGHT — the routers, the extractors and
@@ -362,6 +405,13 @@ class LLM:
         await asyncio.to_thread(lambda: usage.record(
             site=site, model=model, response=resp,
             seconds=time.monotonic() - t0))
+        # SEEING THE PROMPT (NFT2-1090): one file per call — or, with
+        # `log_path`, the retry appended to the first attempt's file.
+        # `promptlog.current()` then names it for whoever sends the message.
+        self.last_prompt_path = await asyncio.to_thread(
+            lambda: promptlog.write(site=site, system=system, prompt=prompt,
+                                    reply=_text_of(resp), model=model, path=log_path))
+        promptlog.set_current(self.last_prompt_path)
         return resp
 
     # -- routing ------------------------------------------------------------
@@ -437,61 +487,132 @@ class LLM:
     # -- speaking paths ------------------------------------------------------
 
     async def social_reply(
-        self, *, kind: str, text: str = "", requester: Optional[str] = None
+        self, *, kind: str, text: str = "", requester: Optional[str] = None,
+        context: str = "", hint: str = "", fallback: str = "",
     ) -> str:
-        """The voice on a non-answer path. Always returns something sendable: on
-        any failure it falls back to `persona.fallback_social_reply`, which is
-        still first-person, still direct, still emoji-free."""
+        """The voice on a non-answer path: a greeting, small talk, or one
+        clarifying question. Always returns something sendable.
+
+        `context` is the WHAT HAPPENED LATELY block (data). `hint` is what code
+        already knows and the model must use: the first name and the time of
+        day for a greeting, the line already said today for small talk, the
+        state guidance from empathy.py.
+
+        CHECKED, THEN ONE RETRY (NFT2-1090). A greeting or small talk with a
+        cliché, a pushy word or a filler where none belongs, or a greeting that
+        carries a list, a task or an offer, goes back once with the complaint.
+        If the retry fails too: a greeting gets `fallback` (the deterministic
+        hello — a greeting must never carry a task); anything else is sent as
+        the FIRST attempt, through the reply guard.
+
+        A RAISED CALL IS NEVER "I'm not sure what you're after"
+        (`persona.model_failure_reply`)."""
         kind = (kind or "unclear").strip().lower()
-        if kind not in ("greeting", "unclear"):
+        if kind not in ("greeting", "unclear", "smalltalk"):
             kind = "unclear"
         log.info("[llm.social] kind=%s requester=%r", kind, requester)
 
         prompt = (
-            f"Message kind: {kind}\n"
-            f"Who is speaking to you: {requester or '(unknown)'}\n\n"
-            f'Their message:\n"""\n{text}\n"""\n\n'
-            "Reply to them now, in your own voice, per the rules above."
+            (context + "\n\n" if context else "")
+            + f"Message kind: {kind}\n"
+            f"Who is speaking to you: {requester or '(unknown)'}\n"
+            + (f"{hint}\n" if hint else "")
+            + f'\nTheir message:\n"""\n{text}\n"""\n\n'
+            "Reply to them now, as the teammate on the card, per the rules above."
         )
-        try:
+        log_file: dict = {"path": None}
+
+        async def attempt(ask: str, site: str) -> str:
             # The preamble probes the sources live (Sheets among them): built
             # on a thread so it cannot freeze the event loop.
-            # THE TEAM'S OWN TONE rides in the cached policy block (data,
-            # never instructions — `persona.reply_style_block`); it is not
-            # there at all when no profile exists.
             def _blocks():
                 return persona.system_blocks(tail=SOCIAL_REPLY_PROMPT, voice=True)
 
             blocks = await asyncio.to_thread(_blocks)
-            resp = await self._create(
-                system=blocks,
-                prompt=prompt,
-                max_tokens=250,
-                site="social_reply",
-            )
+            resp = await self._create(system=blocks, prompt=ask, max_tokens=250,
+                                      site=site, log_path=log_file["path"])
+            if log_file["path"] is None:
+                log_file["path"] = self.last_prompt_path
+            return (_text_of(resp) or "").strip()
+
+        try:
+            reply = await attempt(prompt, "social_reply")
         except Exception as e:
-            # A RAISED CALL IS NEVER "I'm not sure what you're after". That line
-            # tells the person their message was unclear; the truth is that the
-            # bot never read it. See `persona.model_failure_reply`.
             log.error(
                 "[llm.social] the model call raised %s: %s. Replying that the "
                 "service is down rather than blaming the question.",
                 type(e).__name__, str(e)[:300], exc_info=True,
             )
             return model_failure_reply(type(e).__name__)
-
-        reply = _text_of(resp)
         if not reply:
-            # The call SUCCEEDED and produced nothing, which is the one case
-            # the "not sure" line is honest for.
             log.warning("[llm.social] empty reply; using deterministic fallback")
-            return fallback_social_reply(kind, requester or "")
-        return reply
+            return fallback or fallback_social_reply(kind, requester or "")
+        problem = social_problem(kind, reply)
+        promptlog.append(log_file["path"], "VERDICT",
+                         "accepted" if problem is None else f"soft: {problem['reason']}")
+        if problem is None:
+            return reply
+        log.warning("[llm.social] soft failure (%s); retry 1 of 1. Got: %r",
+                    problem["reason"], reply[:160])
+        first = reply
+        try:
+            again = await attempt(
+                f"{prompt}\n\nYOUR FIRST ATTEMPT WAS:\n<<<\n{first}\n>>>\n"
+                f"IT CANNOT BE SENT: {problem['fix']}. Write it again with only that "
+                "fixed. The reply and nothing else.", "social_reply_retry")
+        except Exception:
+            log.exception("[llm.social] the retry raised")
+            again = ""
+        second = social_problem(kind, again) if again else {"reason": "empty"}
+        promptlog.append(log_file["path"], "VERDICT (RETRY)",
+                         "accepted" if second is None else f"soft: {second['reason']}")
+        if second is None:
+            return again
+        if kind == "greeting":
+            return fallback or fallback_social_reply(kind, requester or "")
+        return first
+
+    async def empathy_label(self, *, person: str, messages: str, changes: list,
+                            rule: tuple) -> Optional[tuple]:
+        """THE LIGHT MODEL'S READ OF HOW A TEAMMATE IS DOING (NFT2-1090): one
+        MODEL_LIGHT call, (label, evidence) or None when it failed or answered
+        something that is not a label — the caller then keeps the rule's label
+        alone (`empathy.merge`). Behind EMPATHY_ENABLED."""
+        if not empathy.enabled():
+            return None
+        try:
+            resp = await self._create(
+                system=empathy.LABEL_PROMPT,
+                prompt=empathy.label_request(person=person, messages=messages,
+                                             changes=changes, rule=rule),
+                max_tokens=80, site="empathy_label", include_strategy=False, light=True)
+        except Exception:
+            log.exception("[llm.empathy] the label call raised; the rule label stands")
+            return None
+        return empathy.parse_label(_text_of(resp))
+
+    async def revise_reply(self, *, text: str, fix: str, question: str = "") -> str:
+        """ONE RETRY FOR AN ANSWER THAT BROKE A VOICE CHECK (NFT2-1090): the
+        answer and the complaint, rewritten with only that fixed — same facts,
+        nothing added. "" when the call failed (the caller then sends the first
+        attempt through the reply guard)."""
+        try:
+            resp = await self._create(
+                system=persona.COS_PERSONA,
+                prompt=(f"A teammate asked: {question}\n\nYOUR ANSWER WAS:\n<<<\n{text}\n>>>\n"
+                        f"IT CANNOT BE SENT AS IT IS: {fix}. Write it again with only that "
+                        "fixed — the same facts, the same links, nothing added. The answer "
+                        "and nothing else."),
+                max_tokens=900, site="answer_retry", include_strategy=False)
+        except Exception:
+            log.exception("[llm.revise] the retry raised; the first answer goes")
+            return ""
+        return (_text_of(resp) or "").strip()
 
     async def proactive_message(self, *, prompt: str, fallback: str,
                                 recent_openers=None, facts: int = 0,
                                 required_lines=(),
-                                voice_seed: int = 0) -> tuple[str, bool]:
+                                voice_seed: int = 0, label: str = "") -> tuple[str, bool]:
         """Compose ONE proactive message in the warm-sales-head voice.
 
         Returns (text, used_model). `fallback` is a complete, sendable sentence
@@ -530,22 +651,32 @@ class LLM:
             self.last_proactive["reason"] = "DRIP_LLM_COMPOSE is off"
             return fallback, False
 
+        log_file: dict = {"path": None}
+
         async def attempt(ask: str, site: str) -> str:
             resp = await self._create(
                 # TONE IS READ HERE, AT COMPOSE TIME, not at import. A change to
                 # SALEY_WARMTH is in force on the very next message with no
                 # restart — which is the point of the setting existing.
                 system=persona.proactive_voice_blocks(
-                    recent_openers=recent_openers, voice_seed=voice_seed),
+                    recent_openers=recent_openers, voice_seed=voice_seed, label=label),
                 prompt=ask,
                 max_tokens=320,
                 site=site,
+                log_path=log_file["path"],
             )
+            if log_file["path"] is None:
+                log_file["path"] = self.last_prompt_path
+            self.last_proactive["path"] = log_file["path"]
             return (_text_of(resp) or "").strip().strip('"').strip()
 
         def judge(candidate: str):
-            return proactive_verdict(candidate, facts=facts,
-                                     required_lines=required_lines, prompt=prompt)
+            verdict = proactive_verdict(candidate, facts=facts,
+                                        required_lines=required_lines, prompt=prompt)
+            promptlog.append(log_file["path"], "VERDICT",
+                             "accepted" if verdict is None else
+                             f"{'HARD' if verdict['hard'] else 'soft'}: {verdict['reason']}")
+            return verdict
 
         try:
             text = await attempt(prompt, "proactive_message")
