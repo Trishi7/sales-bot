@@ -32,14 +32,15 @@ HEADING = "**AI News, Wed 7 Oct**"
 BANNED = ("2 PM", "already", "scheduled", "since", "ran")
 
 
-# THE SHIPPED DEFAULTS (.env.example), pinned: the laptop's own .env has the
-# follow-up switched off and a different bar, and a test must not inherit that.
+# THE SHIPPED DEFAULTS (.env.example), pinned: the laptop's own .env differs
+# from them, and a test must not inherit that. (The follow-up message and its
+# NEWS_OVERFLOW_* / NEWS_POC_SLOTS settings are retired - NFT2-1087.)
 NEWS_PINS = {
-    "NEWS_MAX_ITEMS": 5, "NEWS_POC_SLOTS": 2, "NEWS_REPEAT_DAYS": 30,
+    "NEWS_MAX_ITEMS": 5, "NEWS_REPEAT_DAYS": 30, "NEWS_CARRY_MAX_DAYS": 3,
+    "NEWS_BREAKING_MAX_AGE_HOURS": 3, "NEWS_POC_BREAKING_MIN": 4,
     "NEWS_FEED_KEEP_DAYS": 14, "NEWS_PER_TOPIC_PER_DAY": 2, "NEWS_TOPICS_PER_WEEK": 6,
     "NEWS_BREAKING_MIN_IMPORTANCE": 5, "NEWS_OFFTOPIC_BYPASS_IMPORTANCE": 4,
-    "NEWS_OVERFLOW_ENABLED": True, "NEWS_OVERFLOW_MIN_IMPORTANCE": 5,
-    "NEWS_OVERFLOW_MAX_ITEMS": 5, "NEWS_SCORE_MAX_ITEMS": 40,
+    "NEWS_SCORE_MAX_ITEMS": 40,
     "TOKEN_DAILY_BUDGET": 0,
 }
 
@@ -55,9 +56,10 @@ def at(hh: int, mm: int = 0) -> datetime:
 
 
 def item(title: str, when: datetime, *, ref: str = "", source: str = "Reuters",
-         google: bool = True, summary: str = "") -> dict:
+         google: bool = True, summary: str = "", names: str = "") -> dict:
     """One feed item as `feeds.parse` stores it. A Google News link by default,
-    so the outlet shown is the item's `source`, not its host."""
+    so the outlet shown is the item's `source`, not its host. `ref` (or
+    `names`) makes it a story ABOUT US: flag=1, as the store-time rule sets it."""
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
     url = ("https://news.google.com/rss/articles/" + slug + "?oc=5") if google \
         else ("https://example.org/" + slug)
@@ -66,7 +68,10 @@ def item(title: str, when: datetime, *, ref: str = "", source: str = "Reuters",
             "summary": summary, "source": source,
             "published_at": feeds.utc_iso(when), "topic_hint": "",
             "seen_at": feeds.utc_iso(when),
-            "kind": feeds.KIND_POC if ref else feeds.KIND_INDUSTRY, "sheet_ref": ref}
+            "kind": feeds.KIND_POC if (ref or names) else feeds.KIND_INDUSTRY,
+            "sheet_ref": ref, "flag": 1 if (ref or names) else 0,
+            "names": names or (ref.split(" — ")[0] if ref else ""),
+            "source_rank": 1 if (ref or names) else 4}
 
 
 def seed(world, rows: list) -> list:
@@ -91,11 +96,11 @@ def bullets(text: str) -> list:
 
 
 def headlines(text: str) -> list:
-    """The headline of each bullet, industry (bold) or PoC (plain, to the dash)."""
+    """The headline of each bullet - ONE shape now: `- Headline ([Outlet](<url>))`."""
     out = []
     for ln in bullets(text):
-        m = re.match(r"^- \*\*(.+?)\*\* \(\[", ln)
-        out.append(m.group(1) if m else ln[2:].split(" — ")[0])
+        m = re.match(r"^- (.+?) \(\[", ln)
+        out.append(m.group(1) if m else ln[2:])
     return out
 
 
@@ -204,6 +209,9 @@ MAJOR = [f"{w} raises a billion dollar round" for w in (
 MIDDLING = ["Quebec publishes a tooling guide", "Romeo opens a regional office"]
 POC = "Synthflow raises $20M Series A"
 POC_REF = "Synthflow AI — on Master Pipeline"
+# A second story about us, scored LOW by the model: the flag wins, so it is
+# still in the post, under the same label (NFT2-1087 section 5).
+POC2 = "Dr. David Gamez on machine consciousness at the Royal Institution"
 
 
 def daily_items() -> list:
@@ -213,14 +221,16 @@ def daily_items() -> list:
     for n, title in enumerate(MIDDLING):
         rows.append((item(title, at(9, 30) + timedelta(minutes=5 * n)), 4))
     rows.append((item(POC, at(10), ref=POC_REF, source="Inc42", google=False), 4))
+    rows.append((item(POC2, at(10, 30), names="David Gamez", source="The Guardian"), 1))
     for n, title in enumerate(ASKED):                       # the newest five 5s
         rows.append((item(title, at(12) + timedelta(minutes=5 * n)), 5))
     return rows
 
 
 async def answer_then_daily_post(test_mode: bool) -> dict:
-    """Somebody asks at 13:55; the 14:00 post and its follow-up must not carry
-    what that answer gave."""
+    """Somebody asks at 13:55; the daily post must not carry what that answer
+    gave. It is ONE message (no follow-up: "More AI News" is retired), ours
+    first and the industry after."""
     with rw.World(test_mode=test_mode, pins=NEWS_PINS, pretend=(DAY, 13, 55), rules={"R1"}) as w:
         real_news(w)
         seed(w, daily_items())

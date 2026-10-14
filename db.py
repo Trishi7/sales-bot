@@ -907,6 +907,49 @@ CREATE TABLE IF NOT EXISTS news_checks (
     PRIMARY KEY (on_date, slot_hhmm)
 );
 
+-- R1: THE HOURLY NEWS CYCLES (NFT2-1087), which replaced the check slots above
+-- (that table is left in place and no longer read).
+--
+-- ONE ROW PER (real IST date, slot), claimed BEFORE the pull, so an hour runs
+-- once even across restarts. NO `done` ROW FOR TODAY MEANS THE NEXT CYCLE IS
+-- THE BIG PULL — which is how a bot started at 16:30 still reads the whole
+-- day. A cycle Google cut short (429) ends `partial`, and one whose scoring
+-- could not run ends `unscored`: neither is `done`, so the next cycle's window
+-- reaches back over it. A row left `running` by a crash is not `done` either.
+CREATE TABLE IF NOT EXISTS news_cycles (
+    on_date      TEXT NOT NULL,              -- ISO date, real IST
+    hour         TEXT NOT NULL,              -- "14:00"; "test 14:00" from a test day
+    started_at   TEXT NOT NULL,              -- ISO datetime, real UTC
+    finished_at  TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'running',   -- running | done | partial | unscored
+    big          INTEGER NOT NULL DEFAULT 0, -- 1 = the day's big pull
+    window_hours INTEGER NOT NULL DEFAULT 0,
+    fetched      INTEGER NOT NULL DEFAULT 0,
+    new_items    INTEGER NOT NULL DEFAULT 0,
+    flagged      INTEGER NOT NULL DEFAULT 0,
+    posted       INTEGER NOT NULL DEFAULT 0, -- breaking stories that went out
+    note         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (on_date, hour)
+);
+
+-- R1: THE NAME LIST (NFT2-1087), which replaced the rotation in news_targets
+-- (left in place and no longer read). Rebuilt from the two tabs at every big
+-- pull and KEPT, so a sheet that cannot be read at 14:00 leaves yesterday's
+-- list in use. `kind` is company | person | researcher | watch.
+CREATE TABLE IF NOT EXISTS news_names (
+    name_key    TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    name        TEXT NOT NULL,              -- as the sheet spells it
+    aliases     TEXT NOT NULL DEFAULT '[]', -- other spellings (JSON list)
+    company     TEXT NOT NULL DEFAULT '',   -- a person's company or institution
+    institution TEXT NOT NULL DEFAULT '',   -- a filter word, never searched
+    researcher  INTEGER NOT NULL DEFAULT 0, -- 1 = also in the researcher lane
+    warm        INTEGER NOT NULL DEFAULT 0, -- 1 = connected, DM'd or met
+    generic     INTEGER NOT NULL DEFAULT 0, -- 1 = on NEWS_GENERIC_NAMES
+    source      TEXT NOT NULL DEFAULT '',   -- the tab(s) it is on
+    built_on    TEXT NOT NULL DEFAULT ''    -- ISO date the list was built
+);
+
 -- R3: EVENTS THE BOT HAS PROPOSED ADDING.
 --
 -- COUNTED SO THE PROPOSALS STAY RARE — EVENTS_DISCOVERY_MAX_PER_RUN and
@@ -1189,7 +1232,7 @@ CREATE TABLE IF NOT EXISTS voice_profile (
 # messages" list, which a test reset must never undo.
 KEPT_ON_RESET = ("research_cache", "search_cache", "news_feed_items", "llm_calls",
                  "web_search_usage", "search_quota_usage", "voice_profile",
-                 "news_targets")
+                 "news_targets", "news_names")
 
 
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` won't
@@ -1259,6 +1302,16 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("news_feed_items", "sheet_ref", "TEXT NOT NULL DEFAULT ''"),
     ("news_stories", "news_kind", "TEXT NOT NULL DEFAULT 'industry'"),
     ("news_stories", "sheet_ref", "TEXT NOT NULL DEFAULT ''"),
+    # NFT2-1087: the two numbers of a story. `flag` (about us?) is set by rule
+    # when the item is stored, with the `names` it carries; `source_rank` is
+    # where it came from (1 Google News our names ... 5 arXiv; 9 = stored
+    # before the column existed). `carried_from` / `carry_count` are the carry
+    # queue of the daily post: a story about us that did not fit.
+    ("news_feed_items", "names", "TEXT NOT NULL DEFAULT ''"),
+    ("news_feed_items", "flag", "INTEGER NOT NULL DEFAULT 0"),
+    ("news_feed_items", "source_rank", "INTEGER NOT NULL DEFAULT 9"),
+    ("news_feed_items", "carried_from", "TEXT NOT NULL DEFAULT ''"),
+    ("news_feed_items", "carry_count", "INTEGER NOT NULL DEFAULT 0"),
     # ONE-OFF REMINDERS FIRE WHERE THEY WERE ASKED, TAGGING WHO ASKED. Rows from
     # before this carry '' for both: they fire in the posting channel and name
     # the asker in plain text.
@@ -3601,14 +3654,14 @@ class DB:
 
         NEW MEANS NEITHER KEY IS KNOWN: the same link (url_key) or the same
         headline from another outlet (headline_key) is the same story and is
-        not stored twice.
+        not stored twice. THE FIRST COPY IS THE ONE KEPT — its link, its
+        outlet and its `source_rank` — and the sources are read in priority
+        order (Google News for our names first), so Google's copy wins.
 
-        A STORY ALREADY STORED AS INDUSTRY NEWS THAT A PoC QUERY ALSO RETURNS
-        BECOMES A PoC STORY. The outlets' feeds are read first, so a funding
-        round at a pipeline company usually arrives from TechCrunch before the
-        company's own query finds it; without this it would stay "industry" and
-        lose both its sheet row and its place in the PoC slots. Its score is
-        kept — it is the same story.
+        A SECOND COPY THAT NAMES US MARKS THE STORED ROW (NFT2-1087). Two
+        outlets carry one story and only one of them names the company: the
+        row's `flag` is set if EITHER copy named us, and its `names` are the
+        union of both. Its score is kept — it is the same story.
         """
         added = 0
         with self.conn() as c:
@@ -3617,26 +3670,47 @@ class DB:
                 hkey = str(it.get("headline_key") or "").strip()
                 if not ukey:
                     continue
-                kind = "poc" if str(it.get("kind") or "") == "poc" else "industry"
+                flag = 1 if int(it.get("flag") or 0) else 0
+                names = [n.strip() for n in str(it.get("names") or "").split(",")
+                         if n.strip()]
+                kind = str(it.get("kind") or "")
+                if kind not in ("poc", "researcher"):
+                    kind = "poc" if flag else "industry"
                 ref = str(it.get("sheet_ref") or "")[:200]
+                try:
+                    rank = int(it.get("source_rank") or 9)
+                except (TypeError, ValueError):
+                    rank = 9
                 seen = c.execute(
-                    "SELECT url_key, kind FROM news_feed_items WHERE url_key = ? "
-                    "OR (? <> '' AND headline_key = ?) LIMIT 1", (ukey, hkey, hkey),
+                    "SELECT url_key, kind, names, flag, sheet_ref FROM news_feed_items "
+                    "WHERE url_key = ? OR (? <> '' AND headline_key = ?) LIMIT 1",
+                    (ukey, hkey, hkey),
                 ).fetchone()
                 if seen is not None:
-                    if kind == "poc" and str(seen["kind"] or "") != "poc":
+                    have = [n.strip() for n in str(seen["names"] or "").split(",")
+                            if n.strip()]
+                    low = {n.lower() for n in have}
+                    merged = have + [n for n in names if n.lower() not in low]
+                    if merged != have or (flag and not int(seen["flag"] or 0)):
+                        was = str(seen["kind"] or "")
                         c.execute(
-                            "UPDATE news_feed_items SET kind = 'poc', sheet_ref = ? "
-                            "WHERE url_key = ?", (ref, seen["url_key"]))
+                            "UPDATE news_feed_items SET names = ?, flag = ?, kind = ?, "
+                            "sheet_ref = ? WHERE url_key = ?",
+                            (", ".join(merged)[:500],
+                             1 if (flag or int(seen["flag"] or 0)) else 0,
+                             kind if (flag and was in ("", "industry")) else was,
+                             str(seen["sheet_ref"] or "") or ref, seen["url_key"]))
                     continue
                 c.execute(
                     "INSERT INTO news_feed_items (url_key, headline_key, url, title, "
                     "summary, source, published_at, topic_hint, seen_at, kind, "
-                    "sheet_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "sheet_ref, names, flag, source_rank) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (ukey, hkey, str(it.get("url") or ""), str(it.get("title") or "")[:300],
                      str(it.get("summary") or "")[:300], str(it.get("source") or "")[:120],
                      str(it.get("published_at") or ""), str(it.get("topic_hint") or ""),
-                     str(it.get("seen_at") or ""), kind, ref),
+                     str(it.get("seen_at") or ""), kind, ref,
+                     ", ".join(names)[:500], flag, rank),
                 )
                 added += 1
         return added
@@ -3644,17 +3718,17 @@ class DB:
     def news_feed_between(self, since_utc: str, until_utc: str) -> list[dict]:
         """Every stored item that belongs to [since, until], newest first.
 
-        PUBLISHED in the window — or, for a PoC item, FIRST SEEN in it. A name
-        is looked up every few weeks and its query reaches back
-        NEWS_POC_LOOKBACK_DAYS, so a PoC story is often a few days old on the
-        day the bot first learns of it; by its publication date alone it would
-        belong to a window that closed before anybody had looked.
+        PUBLISHED in the window — or, for an item ABOUT US, FIRST SEEN in it.
+        A warm person's search and arXiv both return things a few days old, so
+        a story about us is often not new on the day the bot first learns of
+        it; by its publication date alone it would belong to a window that
+        closed before anybody had looked.
         """
         with self.conn() as c:
             rows = c.execute(
                 "SELECT * FROM news_feed_items WHERE "
                 "(published_at >= ? AND published_at <= ?) "
-                "OR (kind = 'poc' AND seen_at >= ? AND seen_at <= ?) "
+                "OR ((flag = 1 OR kind = 'poc') AND seen_at >= ? AND seen_at <= ?) "
                 "ORDER BY published_at DESC",
                 (str(since_utc), str(until_utc), str(since_utc), str(until_utc)),
             ).fetchall()
@@ -3666,18 +3740,19 @@ class DB:
         both ends included, most important first and then newest; at most
         `limit`.
 
-        BY `seen_at`, NOT `published_at`. The feeds are polled every 15
-        minutes, so a story published just before the last post and picked up
-        just after it would belong, by its publication time, to a window that
-        has already closed, and nobody would ever look at it.
+        BY `seen_at`, NOT `published_at`. The feeds are read once an hour, so
+        a story published just before the last post and picked up just after
+        it would belong, by its publication time, to a window that has already
+        closed, and nobody would ever look at it.
 
-        PoC items are left out: each was found by searching for a company that
-        is on our sheets, so it is about a tracked company by construction.
+        Items about us are left out (kind `poc` or `researcher`): each names a
+        company or a person already on our sheets or our watch list, so it is
+        not a NEW company to screen.
         """
         with self.conn() as c:
             rows = c.execute(
                 "SELECT * FROM news_feed_items WHERE seen_at >= ? AND seen_at <= ? "
-                "AND importance > 0 AND COALESCE(kind, '') != 'poc' "
+                "AND importance > 0 AND COALESCE(kind, '') NOT IN ('poc', 'researcher') "
                 "ORDER BY importance DESC, published_at DESC LIMIT ?",
                 (str(since_utc), str(until_utc), max(1, int(limit))),
             ).fetchall()
@@ -3811,7 +3886,8 @@ class DB:
                     (str(status), str(at), key)).rowcount or 0)
         return n
 
-    def news_feed_set_scores(self, scored: list, *, scored_at: str) -> int:
+    def news_feed_set_scores(self, scored: list, *, scored_at: str,
+                             generic_flag_min: int = 4) -> int:
         """Write the light model's verdicts back: [{url_key, importance, topic,
         what}]. An item scored once is never paid for again."""
         rows = [(max(1, min(5, int(s.get("importance") or 1))),
@@ -3824,6 +3900,13 @@ class DB:
             c.executemany(
                 "UPDATE news_feed_items SET importance = ?, topic = ?, what = ?, "
                 "scored_at = ? WHERE url_key = ?", rows)
+            # A GENERIC NAME'S ITEM (NEWS_GENERIC_NAMES: named in the title, no
+            # person of ours on it) carries the name but not the flag. The
+            # score is what settles it: at 4 or more it is about us after all.
+            c.executemany(
+                "UPDATE news_feed_items SET flag = 1, kind = 'poc' WHERE url_key = ? "
+                "AND flag = 0 AND names <> '' AND importance >= ?",
+                [(r[4], max(1, int(generic_flag_min))) for r in rows])
         return len(rows)
 
     def news_feed_prune(self, before_utc: str) -> int:
@@ -3836,6 +3919,188 @@ class DB:
         with self.conn() as c:
             return int(c.execute(
                 "SELECT COUNT(*) AS n FROM news_feed_items").fetchone()["n"] or 0)
+
+    def news_feed_get(self, url_keys: list) -> list[dict]:
+        """The stored rows for these url keys, as they are now."""
+        keys = [str(k) for k in (url_keys or []) if str(k or "").strip()]
+        if not keys:
+            return []
+        out: list = []
+        with self.conn() as c:
+            for i in range(0, len(keys), 400):
+                part = keys[i:i + 400]
+                out.extend(dict(r) for r in c.execute(
+                    "SELECT * FROM news_feed_items WHERE url_key IN (%s)"
+                    % ",".join("?" * len(part)), part).fetchall())
+        return out
+
+    # -- R1: the carry queue of the daily post (NFT2-1087) -------------------
+
+    def news_feed_carried(self) -> list[dict]:
+        """Every story about us still waiting for a daily post that has room,
+        oldest carry first. A dropped one (carry_count < 0) is not waiting."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_feed_items WHERE carried_from <> '' "
+                "AND carry_count > 0 ORDER BY carried_from ASC, published_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def news_feed_carry(self, url_keys: list, *, on_date: str, max_posts: int) -> dict:
+        """A daily post had no room for these stories about us: carry each to
+        the next one, or drop it. {"carried": [url_key], "dropped": [url_key]}.
+
+        COUNTED IN DAILY POSTS, NOT DAYS. `carry_count` goes up once per daily
+        post the story did not fit, so Friday to Monday is one carry. A story
+        that has already been carried `max_posts` times and still has no room
+        is DROPPED (carry_count = -1) and never offered again; `carried_from`
+        keeps the day it was first left out. Its score is not touched.
+        """
+        carried: list = []
+        dropped: list = []
+        limit = max(0, int(max_posts))
+        with self.conn() as c:
+            for key in url_keys or []:
+                row = c.execute(
+                    "SELECT carry_count FROM news_feed_items WHERE url_key = ?",
+                    (str(key),)).fetchone()
+                if row is None:
+                    continue
+                count = int(row["carry_count"] or 0)
+                if count < 0:
+                    continue
+                if count >= limit:
+                    c.execute("UPDATE news_feed_items SET carry_count = -1, "
+                              "carried_from = CASE WHEN carried_from = '' THEN ? "
+                              "ELSE carried_from END WHERE url_key = ?",
+                              (str(on_date), str(key)))
+                    dropped.append(str(key))
+                else:
+                    c.execute("UPDATE news_feed_items SET carry_count = ?, "
+                              "carried_from = CASE WHEN carried_from = '' THEN ? "
+                              "ELSE carried_from END WHERE url_key = ?",
+                              (count + 1, str(on_date), str(key)))
+                    carried.append(str(key))
+        return {"carried": carried, "dropped": dropped}
+
+    # -- R1: the name list (NFT2-1087) ---------------------------------------
+
+    def news_names_replace(self, entries: list, *, built_on: str) -> int:
+        """Replace the whole name list with today's build. How many names.
+
+        ALL OR NOTHING, in one transaction: the caller only gets here with a
+        list it read off the sheets, so a failed read never empties the table
+        (`bot._rebuild_news_names` keeps yesterday's instead)."""
+        rows = []
+        for e in entries or []:
+            key = str(e.get("key") or "").strip()
+            name = str(e.get("name") or "").strip()
+            if not key or not name:
+                continue
+            rows.append((key, str(e.get("kind") or "company"), name,
+                         json.dumps(list(e.get("aliases") or []), ensure_ascii=False),
+                         str(e.get("company") or ""), str(e.get("institution") or ""),
+                         1 if e.get("researcher") else 0, 1 if e.get("warm") else 0,
+                         1 if e.get("generic") else 0, str(e.get("source") or ""),
+                         str(built_on)))
+        with self.conn() as c:
+            c.execute("DELETE FROM news_names")
+            c.executemany(
+                "INSERT OR REPLACE INTO news_names (name_key, kind, name, aliases, "
+                "company, institution, researcher, warm, generic, source, built_on) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+
+    def news_names_all(self) -> list[dict]:
+        """The stored name list, in a stable order (companies and watch names,
+        then people), as the entries `feeds.build_names` makes."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_names ORDER BY CASE kind WHEN 'company' THEN 0 "
+                "WHEN 'watch' THEN 1 WHEN 'person' THEN 2 ELSE 3 END, name_key"
+            ).fetchall()
+        out: list = []
+        for r in rows:
+            e = dict(r)
+            e["key"] = e.pop("name_key")
+            try:
+                e["aliases"] = [str(a) for a in json.loads(e.get("aliases") or "[]")]
+            except (TypeError, ValueError):
+                e["aliases"] = []
+            for field in ("researcher", "warm", "generic"):
+                e[field] = bool(e.get(field))
+            out.append(e)
+        return out
+
+    def news_names_built_on(self) -> str:
+        """The ISO date the stored list was built, or "" when there is none."""
+        with self.conn() as c:
+            row = c.execute("SELECT MAX(built_on) AS d FROM news_names").fetchone()
+        return str((row["d"] if row is not None else "") or "")
+
+    # -- R1: the hourly cycles (NFT2-1087) -----------------------------------
+
+    def news_cycle_claim(self, on_date: str, hour: str, *, started_at: str,
+                         big: bool = False, window_hours: int = 0) -> bool:
+        """Claim a cycle BEFORE the pull. False when it was already taken, so
+        two ticks — or a restart mid-pull — cannot run one hour twice."""
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO news_cycles (on_date, hour, started_at, big, "
+                "window_hours) VALUES (?,?,?,?,?)",
+                (str(on_date), str(hour), str(started_at), 1 if big else 0,
+                 int(window_hours)))
+            return cur.rowcount > 0
+
+    def news_cycle_claimed(self, on_date: str, hour: str) -> bool:
+        """Has this cycle been claimed? FAILS CLOSED — an unreadable table says
+        yes, and the hour is skipped rather than pulled twice."""
+        try:
+            with self.conn() as c:
+                return c.execute(
+                    "SELECT 1 FROM news_cycles WHERE on_date = ? AND hour = ?",
+                    (str(on_date), str(hour))).fetchone() is not None
+        except Exception:
+            log.exception("[news-cycle] could not read news_cycles; skipping the hour")
+            return True
+
+    def news_cycle_finish(self, on_date: str, hour: str, *, status: str,
+                          finished_at: str, fetched: int = 0, new_items: int = 0,
+                          flagged: int = 0, posted: int = 0, note: str = "") -> None:
+        with self.conn() as c:
+            c.execute(
+                "UPDATE news_cycles SET status = ?, finished_at = ?, fetched = ?, "
+                "new_items = ?, flagged = ?, posted = ?, note = ? "
+                "WHERE on_date = ? AND hour = ?",
+                (str(status), str(finished_at), int(fetched), int(new_items),
+                 int(flagged), int(posted), str(note)[:300], str(on_date), str(hour)))
+
+    def news_cycle_last_done(self) -> Optional[dict]:
+        """The most recent LIVE cycle that completed, or None. A test day's
+        forced cycle is not one: it must not move the live window."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM news_cycles WHERE status = 'done' "
+                "AND hour NOT LIKE 'test%' ORDER BY started_at DESC LIMIT 1").fetchone()
+        return dict(row) if row is not None else None
+
+    def news_cycle_done_on(self, on_date: str) -> bool:
+        """Has a live cycle READ EVERYTHING on this date? No: the next is the
+        big pull. A cycle whose pull completed and whose scoring could not run
+        (`unscored`) counts: the day's reading is done, and repeating the
+        once-a-day lanes every hour the model is unreachable would help nobody."""
+        with self.conn() as c:
+            return c.execute(
+                "SELECT 1 FROM news_cycles WHERE on_date = ? "
+                "AND status IN ('done', 'unscored') "
+                "AND hour NOT LIKE 'test%' LIMIT 1", (str(on_date),)).fetchone() is not None
+
+    def news_cycles_on(self, on_date: str) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_cycles WHERE on_date = ? ORDER BY started_at, hour",
+                (str(on_date),)).fetchall()
+        return [dict(r) for r in rows]
 
     # -- "reset test state" / "start over" ----------------------------------
 
@@ -4370,7 +4635,10 @@ class DB:
              str(s.get("what") or s.get("about") or "")[:300], str(rule_id),
              str(kind), str(on_date), str(s.get("topic") or ""),
              str(s.get("headline_key") or ""), int(s.get("importance") or 3), str(kind),
-             "poc" if str(s.get("kind") or "") == "poc" else "industry",
+             # A STORY ABOUT US (flag) is recorded as `poc`, which is what
+             # keeps it out of the industry's per-topic and per-week counts.
+             "poc" if (int(s.get("flag") or 0)
+                       or str(s.get("kind") or "") == "poc") else "industry",
              str(s.get("sheet_ref") or "")[:200])
             for s in (stories or []) if str(s.get("url_key") or "").strip()
         ]
@@ -4513,6 +4781,11 @@ class DB:
                               (str(on_date),)).rowcount
             checks = c.execute("DELETE FROM news_checks WHERE on_date = ?",
                                (str(on_date),)).rowcount
+            # A test day's FORCED news cycle is keyed "test HH:MM" on the
+            # pretend date; the live cycles of a real date are never touched.
+            checks = int(checks or 0) + int(c.execute(
+                "DELETE FROM news_cycles WHERE on_date = ? AND hour LIKE 'test%'",
+                (str(on_date),)).rowcount or 0)
         return {"drip_sends": int(sends or 0), "news_checks": int(checks or 0)}
 
     def news_breaking_messages_today(self, on_date: str) -> int:

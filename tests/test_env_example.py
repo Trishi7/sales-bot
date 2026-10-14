@@ -54,7 +54,7 @@ HELPERS = {
 NOT_SETTINGS = {"PYTHONPATH", "PYTEST_CURRENT_TEST", "TZ"}
 
 # RETIRED, BUT STILL READ ON ONE PATH. Web search moved out of the model
-# (search_backend.py), and these ten shape Anthropic's server-side tool, which
+# (search_backend.py), and these nine shape Anthropic's server-side tool, which
 # is now reached only under SEARCH_BACKEND=anthropic — kept for comparison.
 # Under every other backend they do nothing, so they belong in the RETIRED
 # block; the code still reads them, so they are the one exception to "a
@@ -64,8 +64,10 @@ ANTHROPIC_BACKEND_ONLY = {
     "WEB_SEARCH_MAX_USES", "WEB_SEARCH_RESPONSE_INCLUSION",
     "WEB_SEARCH_ALLOWED_CALLERS", "WEB_SEARCH_ALLOWED_DOMAINS",
     "WEB_SEARCH_BLOCKED_DOMAINS", "WEB_SEARCH_CITY", "WEB_SEARCH_REGION",
-    "WEB_SEARCH_COUNTRY", "WEB_SEARCH_TIMEZONE", "NEWS_CHECK_MAX_USES",
+    "WEB_SEARCH_COUNTRY", "WEB_SEARCH_TIMEZONE",
 }
+# NEWS_CHECK_MAX_USES was the tenth until NFT2-1087: the hourly check it capped
+# is gone under every backend, nothing reads it, and it is plainly retired.
 
 _VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 # A live line: KEY=..., no leading "#", indentation tolerated.
@@ -208,7 +210,7 @@ class TestRetiredVariablesStayRetired:
         )
 
     def test_the_server_side_search_settings_are_retired_and_say_why(self):
-        """The ten settings of Anthropic's server-side tool live in RETIRED —
+        """The nine settings of Anthropic's server-side tool live in RETIRED —
         commented, never live — and the block says when they ARE read."""
         retired = retired_keys()
         missing = sorted(ANTHROPIC_BACKEND_ONLY - retired)

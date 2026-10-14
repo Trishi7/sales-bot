@@ -15,10 +15,11 @@ counts how often it was asked.
   (a) routing: a news question gets the "news" group, and select() hands the
       engine todays_news;
   (b) the 5 highest-scored stories NOT sent before, listed newest first, in
-      the one template (bold headline, outlet link, a blank line between
-      stories); a PoC story keeps its own line; fewer than 5 unsent gives
-      those; nothing unsent gives the top 5 again; an answer's stories are
-      recorded as sent;
+      the one template (NFT2-1087 template G: "**AI News, <day>**", no blank
+      line under it, "- Headline ([Outlet](<url>))" for EVERY story - a story
+      about us too, no bold, no sheet tag - and a blank line between two
+      stories); fewer than 5 unsent gives those; nothing unsent gives the top
+      5 again; an answer's stories are recorded as sent;
   (c) topic="ElevenLabs" gives only the stories that name it;
   (d) unrated rows cost exactly one scoring call, rated rows none, and past
       the token budget there is no call and nothing is guessed at;
@@ -122,7 +123,7 @@ class ScoreTable:
             m = re.match(r"\s*(\d+) \|[^|]*\| (.+)", line)
             if not m:
                 continue
-            verdict = VERDICTS.get(m.group(2).split(" [ABOUT OUR CONTACT")[0].strip())
+            verdict = VERDICTS.get(m.group(2).split(" [ABOUT US")[0].strip())
             if verdict:
                 lines.append(f"SCORE | {m.group(1)} | {verdict[0]} | {verdict[1]} "
                              f"| {verdict[2]}")
@@ -140,7 +141,9 @@ def item(title: str, when: datetime, *, ref: str = "", source: str = "TechCrunch
             "headline_key": news.headline_key(title), "title": title,
             "summary": summary, "source": source, "published_at": feeds.utc_iso(when),
             "topic_hint": "", "seen_at": feeds.utc_iso(when),
-            "kind": feeds.KIND_POC if ref else feeds.KIND_INDUSTRY, "sheet_ref": ref}
+            "kind": feeds.KIND_POC if ref else feeds.KIND_INDUSTRY, "sheet_ref": ref,
+            "flag": 1 if ref else 0, "names": ref.split(" - ")[0].split(" \u2014 ")[0] if ref else "",
+            "source_rank": 1 if ref else 4}
 
 
 def scored(it: dict, importance: int, topic: str = "evals", what: str = "what happened"):
@@ -161,10 +164,10 @@ def new_bot(items: list, scores: list = ()) -> SalesBot:
     bot.llm = llm_mod.LLM("sk-fake-not-used", config.MODEL)
     bot.llm._client = SimpleNamespace(messages=ScoreTable())
 
-    async def no_poll(*_a, **_k):
+    async def no_cycle(*_a, **_k):
         return None
 
-    bot._maybe_poll_feeds = no_poll      # the store is filled here, not fetched
+    bot._news_cycle = no_cycle           # the store is filled here, not fetched
     return bot
 
 
@@ -244,13 +247,18 @@ async def main():
     lines = [ln for ln in result["block"].split("\n") if ln.startswith("- ")]
     check("the heading is bold, with the day", result["block"].split("\n")[0],
           news.heading(news.MODE_ANSWER, TODAY[0]))
-    check("then a blank line", result["block"].split("\n")[1], "")
-    check("a blank line between the stories", "\n\n- " in result["block"], True)
-    check("an industry story is a bold headline and its outlet",
-          lines[0], f"- **{fours[0]['title']}** ([example.org](<{fours[0]['url']}>))")
-    check("the PoC story keeps its own line and its sheet row",
-          lines[3], f"- {poc['title']} — what happened. (Synthflow AI — on Master "
-                    f"Pipeline) [example.org](<{poc['url']}>)")
+    check("NO blank line under the heading", result["block"].split("\n")[1].startswith("- "),
+          True)
+    check("a blank line between two stories, and only there",
+          (result["block"].count("\n\n"), result["block"].count("\n\n- ")), (4, 4))
+    check("an industry story is its headline and its outlet, no bold",
+          lines[0], f"- {fours[0]['title']} ([example.org](<{fours[0]['url']}>))")
+    check("a story about us is the SAME shape: no '- what' clause, no sheet tag",
+          lines[3], f"- {poc['title']} ([example.org](<{poc['url']}>))")
+    check("only the heading is bold; no tags, opener, closer or label in an answer",
+          (result["block"].count("**"), any(x in result["block"] for x in (
+              news.OPENER, news.CLOSER, news.LABEL_OURS, news.LABEL_INDUSTRY, "<@"))),
+          (2, False))
     check("it is not a repeat", result["repeat"], False)
     check("nothing in it about when anything is posted",
           [w for w in BANNED if w.lower() in result["block"].lower()], [])
@@ -300,7 +308,8 @@ async def main():
     check("one new story arrives: it alone is given, however low it scored",
           (titles(result), result["repeat"]), ([newcomer["title"]], False))
     empty = await ask(new_bot([]))
-    check("nothing collected at all: no list, and the quiet line",
+    check("nothing collected at all: an ANSWER still gets the quiet line (only the daily "
+          "post dropped it)",
           (empty["block"], empty["quiet"]), ("", news.quiet_line(TODAY[0])))
 
     # ------------------------------------------------------------------ (c)
