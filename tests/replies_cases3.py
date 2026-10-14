@@ -14,8 +14,8 @@ answer gets a reaction or a question, never an action.
   X6  the objectives answer pings nobody, even when a post that went out carried a mention
   X7  a post sent before the text was kept is left out of the answer, never guessed
   X8  the named constants the open decisions hang on
-  X9  the "Is that a yes to ...?" question: a yes to it applies the one proposal; the proposal answered meanwhile says so
-  X10 a reply to "Which one do you mean?" that picks none gets a reaction; a real question is answered normally
+  X9  the "Just to be sure — did you mean ...?" question: a yes to it applies the one proposal; the proposal answered meanwhile says so
+  X10 a reply to "Which one did you mean?" that picks none gets a reaction; a real question is answered normally
 """
 import re
 from datetime import date
@@ -65,7 +65,7 @@ async def x1_the_waiting_for_your_yes_post(check, test_mode):
         await w.say("yes", reply_to=nudge)
         text = "\n".join(m.said)
         check("X1: 'yes' to a nudge that listed TWO asks which, naming both, and applies neither",
-              (text.startswith("Which one do you mean?"), applied, m.d("votes")), (True, [], 0))
+              (text.startswith("Which one did you mean?"), applied, m.d("votes")), (True, [], 0))
         which = w.posted[-1]
         m = Mark(w)
         await w.say("1", reply_to=which)
@@ -236,7 +236,7 @@ async def x9_a_yes_to_the_confirmation_question(check, test_mode):
         key = w.open_remind(post.id, age_minutes=45)
         await w.say("yes", mention=True)
         question = w.posted[-1]
-        check("X9 setup: asked, applied nothing", (question.content.startswith("Is that a yes to"), applied), (True, []))
+        check("X9 setup: asked, applied nothing", (question.content.startswith("Just to be sure — did you mean"), applied), (True, []))
         m = Mark(w)
         await w.say("yes", reply_to=question)
         check("X9: a yes replied to the question applies that one proposal", (applied, w.proposals()[key]), ([key], "applied"))

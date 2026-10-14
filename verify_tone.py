@@ -210,8 +210,19 @@ async def main() -> int:
           "worth a look at" in p_casual, True)
     check("the prompt carries the human touches",
           "ALWAYS OFFER AN EASY OUT" in p_casual, True)
-    check("the exemplars are the new per-rule ones",
-          "R7 — DM sent, no meeting" in p_casual, True)
+    # NFT2-1090: with VOICE_SOURCE=book (the default) the examples come from
+    # voice_book.md, wrapped as examples and never templates; the policy's
+    # per-rule exemplars are what VOICE_SOURCE=channel falls back to.
+    import voice
+
+    check("the examples are the voice book's, wrapped as examples not templates",
+          (voice.BOOK_WRAPPER in p_casual, "R7 — DM sent, no meeting" in p_casual),
+          (True, False))
+    os.environ["VOICE_SOURCE"] = "channel"
+    p_channel = persona.proactive_voice_prompt(recent_openers=["worth a look at"])
+    os.environ.pop("VOICE_SOURCE", None)
+    check("...and VOICE_SOURCE=channel with no profile keeps the per-rule exemplars",
+          "R7 — DM sent, no meeting" in p_channel, True)
 
     print()
     print("  " + ("ALL PASSED" if not failures else f"{failures} FAILED"))

@@ -1248,7 +1248,7 @@ async def t11_to_t18():
     check("T13 two open: neither is applied, both stay open", sorted(p["status"] for p in proposals(r["bot"])),
           ["open", "open"])
     check("T13 two open: it asks which, numbered, naming both",
-          (lambda t: ("Which one do you mean?" in t, "1. " in t, "2. " in t))(
+          (lambda t: ("Which one did you mean?" in t, "1. " in t, "2. " in t))(
               r["ch"].sent[-1] if r["ch"].sent else ""), (True, True, True))
     check("T13 two open: nothing was written", r["sh"].appends, [])
 

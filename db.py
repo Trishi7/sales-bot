@@ -1166,6 +1166,38 @@ CREATE INDEX IF NOT EXISTS ix_news_screen_message ON news_screen_ledger(message_
 --
 -- A simulation runs on a COPY of this database, so it reads the same row the
 -- real day and the test day read.
+-- VOICE v2 (NFT2-1090).
+--
+-- HOW A TEAMMATE IS DOING, so it is said ONCE. The last label empathy.py gave a
+-- person (away / setback / under pressure / good news), with its evidence and
+-- when it was first mentioned. Kept for EMPATHY_STATE_HOURS only to stop the
+-- next message saying it again; "I'm fine now" clears it.
+CREATE TABLE IF NOT EXISTS person_state (
+    person_key TEXT PRIMARY KEY,           -- normalised first name or Discord id
+    label      TEXT NOT NULL DEFAULT '',
+    evidence   TEXT NOT NULL DEFAULT '',
+    set_at     TEXT NOT NULL DEFAULT ''    -- ISO datetime, real IST
+);
+
+-- WHICH PROMPT IS BEHIND WHICH MESSAGE. Every part of a sent message that a
+-- model wrote, mapped to its prompt-log file (promptlog.py), so "show the
+-- prompt for that" can find it.
+CREATE TABLE IF NOT EXISTS prompt_log (
+    message_id TEXT PRIMARY KEY,
+    path       TEXT NOT NULL,
+    site       TEXT NOT NULL DEFAULT '',
+    at         TEXT NOT NULL DEFAULT ''
+);
+
+-- WHAT A ROW SAID WHEN THE LAST POST ABOUT ITS COMPANY WENT OUT, so the next
+-- compose can be told what changed since (context.sheet_diff). Written after
+-- a send from the row the rule had already read; nothing new is read.
+CREATE TABLE IF NOT EXISTS company_facts (
+    company_key TEXT PRIMARY KEY,
+    facts       TEXT NOT NULL DEFAULT '{}',   -- JSON {role: value}
+    posted_at   TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS voice_profile (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
     built_at      TEXT NOT NULL DEFAULT '',     -- ISO datetime, REAL UTC; '' = none
@@ -4800,6 +4832,63 @@ class DB:
                  json.dumps(list(exemplars or []), ensure_ascii=False),
                  str(note or ""), str(note_source or "")),
             )
+
+    # -- VOICE v2 (NFT2-1090) ---------------------------------------------------
+
+    def person_state_get(self, person_key: str) -> Optional[dict]:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM person_state WHERE person_key = ?",
+                            (str(person_key),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def person_state_set(self, person_key: str, *, label: str, evidence: str,
+                         set_at: str) -> None:
+        with self.conn() as c:
+            c.execute("INSERT INTO person_state (person_key, label, evidence, set_at) "
+                      "VALUES (?,?,?,?) ON CONFLICT(person_key) DO UPDATE SET "
+                      "label = excluded.label, evidence = excluded.evidence, "
+                      "set_at = excluded.set_at",
+                      (str(person_key), str(label), str(evidence)[:300], str(set_at)))
+
+    def person_state_clear(self, person_key: str) -> int:
+        with self.conn() as c:
+            return int(c.execute("DELETE FROM person_state WHERE person_key = ?",
+                                 (str(person_key),)).rowcount or 0)
+
+    def record_prompt_log(self, message_ids, *, path: str, site: str = "",
+                          at: str = "") -> int:
+        rows = [(str(m), str(path), str(site), str(at)) for m in (message_ids or []) if m]
+        if not rows or not path:
+            return 0
+        with self.conn() as c:
+            c.executemany("INSERT OR REPLACE INTO prompt_log (message_id, path, site, at) "
+                          "VALUES (?,?,?,?)", rows)
+        return len(rows)
+
+    def prompt_log_for(self, message_id) -> Optional[dict]:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM prompt_log WHERE message_id = ?",
+                            (str(message_id),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def company_facts_get(self, company_key: str) -> Optional[dict]:
+        with self.conn() as c:
+            row = c.execute("SELECT facts FROM company_facts WHERE company_key = ?",
+                            (str(company_key),)).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["facts"] or "{}")
+        except (TypeError, ValueError):
+            return {}
+
+    def company_facts_set(self, company_key: str, facts: dict, *, posted_at: str) -> None:
+        with self.conn() as c:
+            c.execute("INSERT INTO company_facts (company_key, facts, posted_at) VALUES "
+                      "(?,?,?) ON CONFLICT(company_key) DO UPDATE SET facts = excluded.facts, "
+                      "posted_at = excluded.posted_at",
+                      (str(company_key), json.dumps(facts or {}, ensure_ascii=False),
+                       str(posted_at)))
 
     def clear_voice_profile(self) -> None:
         """Forget what was learned; keep who opted out."""

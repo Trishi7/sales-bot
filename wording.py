@@ -17,6 +17,9 @@ THE REGISTER, for every fixed line a teammate reads:
        names belong in operator lines: the cost report, the test commands, the
        sheet status, "Web search: OFF right now (…)".
   R-d  No banned opener (replyguard: "Sure!", "Here's …", "Based on …").
+  R-f  No line asks for a vote or a number (NFT2-1090): never "reply with
+       yes", "say yes", "yes or no", "choose 1", "give me the number" or
+       "vote". Saley asks a question and reads the answer like a person.
   R-e  A fixed line never claims a check, a source or a search the code did
        not just do. "I'm going through the sheet and the notes" was sent on
        questions routed to neither.
@@ -100,18 +103,63 @@ BRIEF_EMPTY = ("I gathered the material but nothing came back when I tried to wr
 # -- when there is nothing to say --------------------------------------------
 
 
-def greeting(hi: str) -> str:
-    """The fallback hello. It offers nothing it would have to look up: the
-    notes may not be connected, and this path checks no source (R-e)."""
-    return f"{hi}, what do you need?"
+def part_of_day(hour: int) -> str:
+    """"morning" before 12:00 IST, "afternoon" 12:00-17:00, "evening" after —
+    and 00:00-04:00 is still the evening before (NFT2-1090, edge 4)."""
+    hour = int(hour) % 24
+    if 4 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    return "evening"
+
+
+def greeting(hi: str, part: str = "") -> str:
+    """The fallback hello, like meeting your boss on the way in (NFT2-1090):
+    "Hi Sid, good morning. How's it going?" No task, no list, no offer — and
+    it offers nothing it would have to look up (R-e)."""
+    return f"{hi}, good {part}. How's it going?" if part else f"{hi}! How's it going?"
 
 
 def not_followed(hi: str) -> str:
-    """The fallback for a message the bot could not place. This path looked
-    NOTHING up, so it does not say "I checked …" (R-e); it asks for the one
-    thing that would let it look."""
-    return (f"{hi}, I couldn't work out what you need there. Give me a company, "
-            "a person or a date and I'll look.")
+    """The fallback for a message the bot could not place: one question, no
+    blame. This path looked NOTHING up, so it does not say "I checked …" (R-e)."""
+    return (f"Umm, I'm not sure I follow, {hi[3:].strip() or 'there'}. Which company, "
+            "person or date did you mean?") if hi.lower().startswith("hi") else \
+        "Umm, I'm not sure I follow. Which company, person or date did you mean?"
+
+
+# SMALL TALK, when the model gives nothing usable (NFT2-1090). Saley reacts,
+# one line, no work, nothing about the sheet; the second "how's it going" of a
+# day gets a different line, and the third only a reaction.
+SMALLTALK_LINES = (
+    "Good, thanks. Busy week for me, which is the right kind of busy.",
+    "All good here, thanks for asking!",
+    "Doing well, thanks. Nice to hear from you.",
+)
+
+# A reply that is neither a yes nor a no — "maybe", "let me think", "not
+# sure". Nothing is decided and the question stays open. THE TICKET'S OWN
+# WORDS, so this one line opens with "Of course" (exempt from R-d below).
+TAKE_YOUR_TIME = "Of course, take your time."
+
+# "show the prompt for that" (NFT2-1090), replied to a message in the test
+# channel.
+PROMPT_TEMPLATE = "That post is a template. No prompt was sent."
+PROMPT_NOT_MINE = "That one isn't mine."
+PROMPT_MISSING = "I don't have the prompt for that one any more."
+
+
+def two_matches(name: str, options) -> str:
+    """A name that matches two rows: one question naming both, never a pick.
+    ("Two Daisys on the sheet. Daisy at Acme or Daisy at Globex?")"""
+    opts = [str(o) for o in (options or ()) if str(o).strip()]
+    first = str(name or "").strip().split()[0] if str(name or "").strip() else "of them"
+    many = f"{first}s" if not first.endswith("s") else first
+    asked = (", ".join(opts[:-1]) + " or " + opts[-1]) if len(opts) > 1 else \
+        (opts[0] if opts else "")
+    return f"Two {many} on the sheet. {asked}?" if len(opts) == 2 else \
+        f"More than one {first} on the sheet. {asked}?"
 
 
 # The engine DID look (tools ran, nothing came back worth saying), so "I
@@ -353,19 +401,18 @@ def proposal_label(kind: str, *, company: str = "", poc: str = "", names=(),
 
 
 def which_proposal(labels) -> str:
-    """A bare "yes" with more than one thing open. It names each one, numbered,
-    and records nothing: guessing which was meant is how a yes lands on the
-    wrong proposal."""
+    """A bare "yes" with more than one thing open. ONE QUESTION NAMING THEM,
+    and nothing recorded: guessing which was meant is how a yes lands on the
+    wrong proposal. It never asks for a vote or a number (R-f); the list stays
+    numbered so "2" still picks the second, and a name is read too."""
     rows = [f"{i}. {label}" for i, label in enumerate(labels or (), 1)]
-    return "\n".join(["Which one do you mean?", *rows,
-                      "Reply to that message with yes, or give me the number."])
+    return "\n".join(["Which one did you mean? A name is fine.", *rows])
 
 
 def confirm_proposal(label: str) -> str:
     """A bare "yes" with ONE thing open that was asked too long ago to be sure
-    the yes is about it. It asks, and a yes replied to THIS line is the answer."""
-    return (f"Is that a yes to {label}? Say yes in a reply to this and I'll go "
-            "ahead.")
+    the yes is about it. It asks, and the answer to THIS line decides."""
+    return f"Just to be sure — did you mean {label}? Let me know and I'll go ahead."
 
 
 def events_add_which(numbers) -> str:
@@ -1482,7 +1529,11 @@ def all_lines() -> list:
     return [
         *INTERIM_WEB, *INTERIM_ENGINE,
         model_failure("APIConnectionError"), BRIEF_FAILED, BRIEF_EMPTY,
-        greeting("Hi Vaishnavi"), not_followed("Hi"), FOUND_NOTHING, TRUNCATED,
+        greeting("Hi Vaishnavi", "morning"), not_followed("Hi"), FOUND_NOTHING, TRUNCATED,
+        *SMALLTALK_LINES, PROMPT_TEMPLATE, PROMPT_NOT_MINE, PROMPT_MISSING,
+        two_matches("Daisy", ["Daisy at Acme", "Daisy at Globex"]),
+        which_proposal(["the update to Acme", "the AI events reminder"]),
+        confirm_proposal("the update to Acme"),
         SOURCES_HEADING, time_now("14:05 IST on Wednesday 7 Oct"),
         capability_intro("Saley"), CONNECTED, GOING_STALE, WAITING_ON, UNTIL_THEN,
         POLICY_MISSING, SHEET_UNREADABLE, NO_POCS_TAB, COMPANY_UNCLEAR,
@@ -1517,12 +1568,26 @@ _BANNED_START = (
 )
 
 
+# R-f: what a line may never ask for (NFT2-1090).
+VOTE_WORDS = ("reply with yes", "say yes", "yes or no", "choose 1", "give me the number",
+              "vote")
+# Lines whose words the team chose, kept exactly as written even where a rule
+# would object: TAKE_YOUR_TIME opens with "Of course" by the ticket's choice.
+REGISTER_EXEMPT = (TAKE_YOUR_TIME,)
+
+
 def register_problems(line: str) -> list:
-    """What is wrong with one fixed line under R-a, R-b and R-d: a list of
+    """What is wrong with one fixed line under R-a, R-b, R-d and R-f: a list of
     short reasons, empty when it is fine."""
     import re
 
     problems = []
+    if line in REGISTER_EXEMPT:
+        return problems
+    low = line.lower()
+    for word in VOTE_WORDS:
+        if re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z])", low):
+            problems.append(f"R-f asks for a vote: {word!r}")
     for pattern in _UNCONTRACTED:
         if re.search(pattern, line, re.IGNORECASE):
             problems.append("R-a uncontracted: " + pattern)
@@ -1593,11 +1658,22 @@ def _self_test() -> int:
          "the PoC search for Shunya Labs and Acme"),
     ]:
         check(f"label: {kind} {sorted(kwargs)}", proposal_label(kind, **kwargs), want)
-    check("which one, naming each",
+    check("which one, naming each, as a question",
           which_proposal(["the update to Acme", "the AI events reminder for Mon 12 Oct"]),
-          "Which one do you mean?\n1. the update to Acme\n"
-          "2. the AI events reminder for Mon 12 Oct\n"
-          "Reply to that message with yes, or give me the number.")
+          "Which one did you mean? A name is fine.\n1. the update to Acme\n"
+          "2. the AI events reminder for Mon 12 Oct")
+    check("R-f: no line asks for a vote or a number",
+          [l for l in all_lines() + [TAKE_YOUR_TIME] if any(
+              w in l.lower() for w in VOTE_WORDS)], [])
+    check("R-f catches one", bool(register_problems("Reply with yes or give me the number.")),
+          True)
+    check("the time of day", [part_of_day(h) for h in (0, 3, 4, 11, 12, 16, 17, 23)],
+          ["evening", "evening", "morning", "morning", "afternoon", "afternoon",
+           "evening", "evening"])
+    check("the greeting has no task", greeting("Hi Sid", "morning"),
+          "Hi Sid, good morning. How's it going?")
+    check("two Daisys", two_matches("Daisy", ["Daisy at Acme", "Daisy at Globex"]),
+          "Two Daisys on the sheet. Daisy at Acme or Daisy at Globex?")
     check("holding names what stays open", holding("the update to Acme"),
           "Noted. The update to Acme stays open until someone who can approve it "
           "says yes.")

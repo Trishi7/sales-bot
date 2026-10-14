@@ -298,10 +298,14 @@ async def forced_tone_failure():
               "template)")
     msg = r6_message(date(2026, 9, 29))
     fallback = drip.compose_fallback(msg, address="Vaishnavi")
+    # THE POINT LINES ARE KEPT (R6's post has carried numbered people since its
+    # 12 Oct rebuild, and dropping one is a HARD failure that skips the retry),
+    # so what this scenario forces is the SOFT one it is about: the length.
+    points = chr(10) + chr(10).join(drip.required_lines(msg))
     seven = ("Vaishnavi, quick one. PolyAI connected. Agoda connected too. Nobody has "
-             "sent a DM. It has been two days. Want to send one? Say skip if not.")
+             "sent a DM. It has been two days. Want to send one? Say skip if not." + points)
     good = ("Vaishnavi, PolyAI and Agoda are connected but nobody's sent a DM yet. "
-            "Worth one this week? Say skip if not.")
+            "Could you look at one this week? Let me know if not." + points)
     config.DRIP_LLM_COMPOSE = True
     for label, script, want_model in (
             ("too long, then fine", [seven, good], True),

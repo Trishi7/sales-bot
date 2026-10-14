@@ -42,6 +42,7 @@ from typing import Optional
 from anthropic import Anthropic
 
 import config
+import promptlog
 import deadlines
 import persona
 import usage
@@ -562,6 +563,15 @@ class QueryEngine:
         await asyncio.to_thread(lambda: usage.record(
             site=site, model=self._model, response=resp,
             seconds=time.monotonic() - t0))
+        # SEEING THE PROMPT (NFT2-1090): every turn of the tool loop into the
+        # answer's one file (`promptlog.begin_group`, opened by the bot).
+        logged = await asyncio.to_thread(lambda: promptlog.write(
+            site=site, system=system, model=self._model,
+            prompt=json.dumps(messages, default=str, ensure_ascii=False, indent=1)[:60000],
+            reply=json.dumps([getattr(b, "text", None) or getattr(b, "name", "")
+                              for b in (getattr(resp, "content", None) or [])],
+                             default=str, ensure_ascii=False)))
+        promptlog.set_current(logged)
         return resp
 
     async def answer(
