@@ -1370,7 +1370,7 @@ latest readable one wins.
 **Reading is unaffected.** Ask about an inactive row by name and you get the
 whole row, including *"we have no record of contacting them"*. The rule governs
 what the bot brings up on its own initiative, not what it is allowed to know.
-`lookup_company` and `query_tracker` read the tab unfiltered.
+`lookup_company`, `query_tracker`, `sheet_columns` and `sheet_query` read the tab unfiltered.
 
 **Rejection is a second, narrower gate.** Activation asks *"has this ever
 started"*; `CADENCE_REJECTED_MARKERS` asks *"was it deliberately stopped"*. They
@@ -1438,6 +1438,93 @@ disagree with it, and then neither one can be trusted.
 The same facts are logged at boot under `[gtm.schema]`, `[gtm.roles]` and
 `[sheet.world]`, so they are visible on the first restart rather than a week
 later.
+
+### Asking the sheet anything: `sheet_columns` and `sheet_query` (NFT2-1095)
+
+**The bug.** On 15 Oct someone asked for the PoCs whose Next Steps is "research
+the poc" and who are based in the UK or the USA, as Name / Company/Uni /
+Designation bullets. The sheet holds the answer (20 rows with Research the PoC,
+8 of them in the UK or the USA). Saley said it could not filter by that value
+and asked which column held the dropdown. It had eight fixed questions
+(`query_tracker`'s filters), no way to filter by a column value or by Based,
+and the rows it saw were keyed by code role names: `next_steps` is the
+Notes/Remarks column and `outreach_step` is the Next Steps dropdown.
+
+**Two read-only tools.** Pure logic in `sheetquery.py` (`python -m sheetquery`);
+the handlers are in `bot._sheet_tools`.
+
+- **`sheet_columns(tab)`** — the tab's headers as the sheet shows them, in
+  column order, each with its letter and its role, and for any column with 30
+  or fewer distinct values (a dropdown) the top 20 values with counts. A role
+  that maps to no column today is listed under `roles_not_found`, never guessed.
+- **`sheet_query(tab, where, columns, limit)`** — the rows of one tab that meet
+  every condition. A condition is `{column, op, value}`; `column` is the sheet
+  header (or the role); the ops are `equals`, `contains`, `contains_any` (a
+  list), `starts_with`, `empty`, `not_empty`, `in` (a list), `before` / `after`
+  (dates, read day-first by R14's reader `reconnect.read_date`) and `greater` /
+  `less` (numbers). `columns` defaults to Name, Company/Uni and Designation on
+  Outreach PoCs, and to Company plus the next three mapped roles elsewhere.
+  `limit` is 50 by default and capped at 200; the result carries
+  `match_count`, `returned`, `truncated` and `unreadable_dates`.
+
+`tab` is a title or a kind: Outreach PoCs (the default), Master Pipeline,
+Deliverables, AI Events, Sales Packages, or any tab the bot reads. **Matching
+ignores case, accents, spaces and punctuation** ("research the poc" is
+"Research the PoC"). A word of three letters or fewer (UK, USA, US) must match
+a whole word, so "UK" never finds "Ukraine"; a longer one may sit anywhere.
+
+**It never guesses.** A name that fits two columns ("Next Steps" on a tab that
+also has "Next Steps/Notes") comes back as a question naming both. A value that
+matches nothing comes back with the closest values ("Did you mean Research the
+PoC?"). A column that does not exist comes back with the tab's real columns. A
+tab the bot does not read gives the same error as before, naming the tab. A date
+cell nobody can read is skipped and counted. Headers are read by their text at
+call time, so a column the team moved is still found.
+
+**Read-only.** Neither tool has a write path; an input that looks like a write
+(`set`, `values`, `update`, an `update` op) is refused by name with "a change goes
+through an approval proposal". The role-based column locks are untouched.
+
+**One row shape for every sheet tool.** `sheet_query` (full rows),
+`lookup_company`, `query_tracker`, `prospect_priority` and `positioning_matrix`
+all key a row by the sheet header with the role in brackets, and list the blank
+cells under `empty`:
+
+```
+{"sheet_row": 621,
+ "Company/Uni (company)": "AI Security Institute (UK Govt.)",
+ "Next Steps (outreach_step)": "Research the PoC",
+ "About PoC": "...",
+ "empty": ["Notes/Remarks (next_steps)", "Meeting Date (meeting_date)", ...]}
+```
+
+A column with no role is keyed by its header alone. `sheet_query` with
+`columns` returns exactly those columns and nothing else. `query_tracker` keeps
+its eight filters and returns the same rows as before; its description now says
+that `no_next_step` means the Notes/Remarks cell is blank, not the dropdown.
+
+**The prompt rule** (`query_engine.SHEET_QUESTIONS_RULE`, sent only when
+`sheet_query` is offered): for any question about rows, call `sheet_columns`
+when the column or the value is not certain, then `sheet_query`; never answer
+"I can't slice by that" (name the columns that do exist, or ask the question
+the tool gives back); join two tabs by company name and say so; give the match
+count first, then one bullet per row in the shape asked for. Long answers are
+split for Discord as every other answer is (`QUERY_REPLY_CHUNK`). Both tools are
+in the `sheet` routing group.
+
+**Checking it:** `python verify_sheet_query.py` runs T1 to T17 and the ten edge
+cases offline and prints a PASS/FAIL table for each (`--table` for the tables
+only; `--full` adds `verify_profile_lookup.py`, `verify_poc_lookup.py`, which
+makes real model calls and web searches, and `pytest -q tests/`). It runs on
+`tests/fixture_outreach_2026_10_13.py`: the Outreach PoCs tab as it stood on 13
+Oct 2026, with no emails or phone numbers, and the real Master Pipeline tab. The
+same checks run under pytest as `tests/test_sheet_query.py`. **The real Master
+Pipeline tab has no Priority column** (its seven headers are Sr no., Company,
+Industry, Geography, Approx. Funding, Outreach Line - Researchers, Dates), so
+"Priority equals P1" there answers with those columns; the P1 case is checked on
+a made-up Master Pipeline that has one.
+
+No new `.env` variables.
 
 ### Reads, and what happens when the API is down
 
@@ -5169,8 +5256,9 @@ Sonnet writes). The token log records the model per call:
   NFT2-1065): a question routed to the sheet tools used to get no web tool,
   and the bot then said it had no web search. A `profile` route ("LinkedIn",
   "LI", "profile", "links", "url", "website", "scholar", "X handle") adds
-  `lookup_company` and `propose_poc_add`. Usually under ten routed tools (the
-  web pair is on top), each with a one-sentence description, and the engine prompt's notes / mapping /
+  `lookup_company` and `propose_poc_add`. At most ten routed tools for a single
+  topic, twelve for "find PoCs at X" (people plus sheet, since the sheet group
+  gained `sheet_columns` and `sheet_query`; the web pair is on top), each with a one-sentence description, and the engine prompt's notes / mapping /
   channel sections ride only with their tools. Routing is by the question's
   own words — deterministic, no model call — and a follow-up inherits the
   group of the question before it.

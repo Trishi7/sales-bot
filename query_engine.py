@@ -59,6 +59,36 @@ MAX_TOOL_ITERATIONS = max(1, int(config.QUERY_ENGINE_MAX_TOOL_ITERATIONS))
 # answers short; this only stops a runaway.
 MAX_TOKENS = max(256, int(config.QUERY_ENGINE_MAX_TOKENS))
 
+# QUESTIONS ABOUT ROWS ON THE SHEET (NFT2-1095). Sent only with sheet_query:
+# a line telling the model to use a tool it was not given is a line it will
+# try to obey. On 15 Oct Saley answered "I can't filter by that" to a question
+# the sheet answered in 8 rows — this is the rule that stops it.
+SHEET_QUESTIONS_RULE = """
+=== QUESTIONS ABOUT ROWS ON THE SHEET (sheet_columns / sheet_query) ===
+- Any question about rows on a sheet tab ("which PoCs…", "list everyone
+  whose…", "how many rows have…"): call sheet_columns when you are not sure of
+  the column or the value, then sheet_query. Words in the question map to the
+  sheet's own headers and dropdown values: "Next Steps status 'research the
+  poc'" is column "Next Steps", value "Research the PoC". "Next Steps" is the
+  dropdown; "Notes/Remarks" is the free text. They are different columns.
+- "UK or USA", "in India" and the like: contains_any with the ways the sheet
+  writes it, e.g. [UK, United Kingdom, London, USA, United States, US].
+- NEVER ANSWER "I can't slice by that" or "which column holds that". If the
+  column does not exist, say so and name the columns that do (the tool lists
+  them). If two columns match, ask which one (the tool gives the question). If
+  a value matched nothing, ask the did_you_mean question.
+- A QUESTION ACROSS TWO TABS ("PoCs whose company is P1 on the pipeline"): one
+  call per tab, join them by company name yourself, and say the join in one
+  line ("matched on company name").
+- THE ANSWER: give the match count first, then one bullet per row in the shape
+  the person asked for ("Name / Company/Uni / Designation"), in the order the
+  tool returned them. Long lists are fine; the reply is split for Discord.
+  When truncated is true, say how many there are in all. When unreadable_dates
+  is above 0, say that many dates could not be read.
+- These tools only read. A change to the sheet goes through an approval
+  proposal, never through them.
+"""
+
 
 class QuestionLimits:
     """One question's two caps, and its ONE extension.
@@ -158,6 +188,7 @@ def _engine_text(*, requester_name: str, today: str, tool_names: list[str]) -> s
         hints += ("When somebody asks to find PoCs, people or contacts at a named "
                   "company (or one of its teams), use find_people and give its "
                   "text unchanged.\n")
+    sheet_rule = SHEET_QUESTIONS_RULE if "sheet_query" in have else ""
 
     text = f"""You are answering a question asked in one of
 the team's SALES channels. Today's date is {today} (IST). The person asking is
@@ -220,7 +251,7 @@ Your reach is limited in two ways, and you must be straight about both:
   limits, tools, indexes or today's date in a reply unless you were asked about
   them. Saying what you have NOT checked yet is not talking about how you
   looked — always say it, as "not checked yet", without naming a limit.
-
+{sheet_rule}
 === MEETING-NOTES QUESTIONS (when the notes tools are available) ===
 - RESOLVE THE DATE yourself from today's date above and pass it as
   date=YYYY-MM-DD: "today" → today; "yesterday" → today − 1; a weekday → the most

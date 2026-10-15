@@ -89,6 +89,15 @@ ONE_LINE = {
         "Filtered slices of the outreach tracker for questions about many rows "
         "(filter: all, open, no_response, responded, never_contacted, "
         "no_next_step, no_poc, meetings) — quote match_count and cite the tab."),
+    "sheet_columns": (
+        "A tab's headers in order with letter and role, and each dropdown's "
+        "values with counts — call it first when the column or value asked "
+        "about is not certain."),
+    "sheet_query": (
+        "Rows of any tab meeting every {column, op, value} condition (equals, "
+        "contains, contains_any, starts_with, empty, not_empty, in, before, "
+        "after, greater, less) — for ANY question about rows; quote "
+        "match_count."),
     "prospect_priority": (
         "The prospect-priority tab (P1/P2/P3 with a rationale), optionally "
         "cross-checked against who has been contacted — quote the rationale as "
@@ -197,9 +206,13 @@ GROUPS = {
     # to see whether they are already on Outreach PoCs, and the one tool that
     # can ASK whether to add them. Small on purpose.
     "profile": ("web_search", "fetch_page", "lookup_company", "propose_poc_add"),
-    "sheet": ("lookup_company", "query_tracker", "prospect_priority",
-              "positioning_matrix", "next_action", "sheet_status",
-              "who_to_pitch", "cross_check_outreach"),
+    # sheet_columns + sheet_query (NFT2-1095): the general way to read any
+    # tab. Without them a question the eight query_tracker filters did not
+    # foresee ("Next Steps is Research the PoC and Based in the UK") had no
+    # tool, and the answer was "I can't filter by that".
+    "sheet": ("lookup_company", "query_tracker", "sheet_columns", "sheet_query",
+              "prospect_priority", "positioning_matrix", "next_action",
+              "sheet_status", "who_to_pitch", "cross_check_outreach"),
     "mapping": ("who_to_pitch", "mapping_rules", "mapping_coverage",
                 "mapping_edges", "cross_check_outreach", "lookup_company"),
     # MEETING questions only. The to-do tools left this group on 7 Oct: with
@@ -433,7 +446,10 @@ def _self_test() -> int:
           (groups, "todays_news" in got), (["web"], False))
     got, groups = names("where are we with Acme?")
     check("a sheet question -> sheet", groups, ["sheet"])
-    check("...under ten routed tools", len(routed(got)) < 10, True)
+    # TEN SINCE NFT2-1095: the sheet group gained sheet_columns and sheet_query.
+    check("...at most ten routed tools", len(routed(got)) <= 10, True)
+    check("...with sheet_columns and sheet_query",
+          ("sheet_columns" in got, "sheet_query" in got), (True, True))
     check("...and it has web_search now", "web_search" in got, True)
     check("...with the mapping join", "cross_check_outreach" in got, True)
     got, groups = names("remind me tomorrow at 2pm about the deck")
@@ -513,8 +529,14 @@ def _self_test() -> int:
     sizes = [len(routed(names(a)[0])) for a in asks]
     # TEN, NOT NINE, since propose_poc_add joined the people group: "find PoCs
     # at X" routes to people AND sheet, whose union was nine and is now ten.
-    check("every single-topic question is at most ten routed tools",
-          all(s <= 10 for s in sizes), True)
+    # TWELVE SINCE NFT2-1095: the sheet group gained sheet_columns and
+    # sheet_query, and that union is the largest.
+    check("every single-topic question is at most twelve routed tools",
+          all(s <= 12 for s in sizes), True)
+    got, groups = names("share list of PoCs whose Next Steps status is 'research the poc', and "
+                        "are based out of UK or USA?")
+    check("the 15 Oct question gets sheet_columns and sheet_query",
+          ("sheet" in groups, "sheet_columns" in got, "sheet_query" in got), (True, True, True))
 
     print("\none sentence each")
     check("every grouped tool has a one-liner",
