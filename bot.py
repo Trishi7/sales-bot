@@ -102,6 +102,7 @@ import replies
 import replyguard
 import research
 import search_backend
+import sheetquery
 import sheetwrite
 import sources
 import state
@@ -4819,25 +4820,72 @@ class SalesBot(discord.Client):
             return tab, None
 
         def _row_out(row: dict, tab) -> dict:
-            """One row as the model should see it: the mapped roles that are
-            actually filled, the extras, and the sheet row number. Empty cells
-            are listed in `empty_fields` rather than omitted — the prompt
-            requires saying when a cell is blank, which it can only do if it
-            knows which ones are."""
-            filled, empty = {}, []
-            for role in tab.role_to_col:
-                value = (row.get(role) or "").strip()
-                if value:
-                    filled[role] = value
-                else:
-                    empty.append(role)
-            extras = {k: v for k, v in (row.get("_extra") or {}).items() if str(v).strip()}
-            return {
-                "sheet_row": row.get("_row"),
-                "fields": filled,
-                "empty_fields": empty,
-                "other_columns": extras,
-            }
+            """One row as the model should see it — ONE SHAPE FOR EVERY SHEET
+            TOOL (NFT2-1095, `sheetquery.row_out`): keyed by the sheet's own
+            header with the role in brackets ("Next Steps (outreach_step)",
+            "Notes/Remarks (next_steps)"), the blank cells listed under
+            `empty`. Until then rows were keyed by role alone, and nobody on
+            the team could know that `next_steps` is the Notes/Remarks column."""
+            return sheetquery.row_out(tab, row)
+
+        def _readable_tabs():
+            """(every parsed tab, the titles the sheet has but the bot does not
+            read, error dict). Read at call time, so a column the team moved
+            is found by its header today."""
+            try:
+                primary = gtm_sheet.SHEETS.read()
+            except gtm_sheet.SheetAccessError as e:
+                return [], [], {
+                    "available": False, "error": str(e), "fix": e.remedy,
+                    "note": ("I can't read the GTM Playbook right now, and I have no cached "
+                             "copy. Say this plainly — do NOT answer the question from memory "
+                             "or from another source as if it were the sheet."),
+                }
+            tabs = list(primary.values())
+            for kind in list(primary):
+                with contextlib.suppress(Exception):
+                    for t in gtm_sheet.SHEETS.tabs_of(kind):
+                        if all(t.title != have.title for have in tabs):
+                            tabs.append(t)
+            unreadable = []
+            with contextlib.suppress(Exception):
+                unreadable = [e["title"] for e in gtm_sheet.SHEETS.discovered_tabs()
+                              if not e.get("kind")]
+            return tabs, unreadable, None
+
+        async def _sheet_columns(inp: dict):
+            refused = sheetquery.refuse_write(inp)
+            if refused:
+                return refused
+            tabs, unreadable, err = await asyncio.to_thread(_readable_tabs)
+            if err:
+                return err
+            tab, err = sheetquery.pick_tab(tabs, inp.get("tab") or "Outreach PoCs",
+                                           unreadable=unreadable)
+            if err:
+                return err
+            out = sheetquery.columns(tab)
+            out["available"] = True
+            out["staleness"] = gtm_sheet.SHEETS.staleness_note(tab)
+            return out
+
+        async def _sheet_query(inp: dict):
+            refused = sheetquery.refuse_write(inp)
+            if refused:
+                return refused
+            tabs, unreadable, err = await asyncio.to_thread(_readable_tabs)
+            if err:
+                return err
+            tab, err = sheetquery.pick_tab(tabs, inp.get("tab") or "Outreach PoCs",
+                                           unreadable=unreadable)
+            if err:
+                return err
+            out = sheetquery.query(tab, where=inp.get("where"), columns=inp.get("columns"),
+                                   limit=inp.get("limit"), today=dl.today_ist())
+            if "error" not in out:
+                out["available"] = True
+                out["staleness"] = gtm_sheet.SHEETS.staleness_note(tab)
+            return out
 
         async def _lookup_company(inp: dict):
             name = str(inp.get("company") or "").strip()
@@ -4945,13 +4993,14 @@ class SalesBot(discord.Client):
             want = str(inp.get("priority") or "").strip()
             wanted_band = gtm_sheet.parse_priority(want) if want else None
 
-            rows = []
+            rows, companies = [], []
             for tab in tabs:
                 for r in tab.rows:
                     band = gtm_sheet.parse_priority(r.get("priority"))
                     if wanted_band is not None and band != wanted_band:
                         continue
                     rows.append({**_row_out(r, tab), "tab": tab.title, "priority_band": band})
+                    companies.append(str(r.get("company") or "").strip())
 
             out = {
                 "available": True,
@@ -4990,8 +5039,7 @@ class SalesBot(discord.Client):
                                 touched_keys.add(key)
 
                     never, contacted = [], []
-                    for r in rows:
-                        company = r["fields"].get("company", "")
+                    for company in companies:
                         if not company:
                             continue
                         key = self.db.company_key(company)
@@ -5981,9 +6029,11 @@ class SalesBot(discord.Client):
                         "Everything the GTM outreach tracker holds about ONE company, plus any "
                         "deadlines I'm holding for it. USE THIS FIRST for 'where are we with "
                         "X', 'what did we send X', 'who's the PoC at X', 'has X replied'. "
-                        "Returns {tab, match_count, rows:[{sheet_row, fields, empty_fields, "
-                        "other_columns}], deadlines, staleness}. CITE THE TAB AND THE COMPANY "
-                        "in your answer. 'empty_fields' lists cells that are BLANK — say so "
+                        "Returns {tab, match_count, rows, deadlines, staleness}; each row is "
+                        "keyed by the SHEET HEADER with the role in brackets ('Next Steps "
+                        "(outreach_step)': 'Send email 1', 'Notes/Remarks (next_steps)': '…') "
+                        "plus sheet_row and 'empty'. CITE THE TAB AND THE COMPANY "
+                        "in your answer. 'empty' lists cells that are BLANK — say so "
                         "when the answer depends on one ('no Meeting Date is recorded'); never "
                         "fill a blank in from elsewhere. If match_count is 0 there is no such "
                         "row: say that, don't invent one. If 'staleness' is non-empty, include "
@@ -6005,8 +6055,11 @@ class SalesBot(discord.Client):
                         "rows: 'who hasn't replied', 'which rows have no next step', 'who has "
                         "no PoC', 'what meetings are booked', 'who have we never contacted'. "
                         "'filter' is one of: all, open, no_response, responded, never_contacted, "
-                        "no_next_step, no_poc, meetings. Narrow further with 'industry' or "
-                        "'use_case'. Returns rows in the same shape as lookup_company plus "
+                        "no_next_step, no_poc, meetings. 'no_next_step' means the "
+                        "Notes/Remarks cell is blank, NOT the Next Steps dropdown. Narrow "
+                        "further with 'industry' or 'use_case'. For ANY other question about "
+                        "rows (a column value, Based, Next Steps, a date) use sheet_query. "
+                        "Returns rows in the same shape as lookup_company plus "
                         "match_count/truncated — quote match_count rather than implying you "
                         "listed everything, and cite the tab."
                     ),
@@ -6027,6 +6080,77 @@ class SalesBot(discord.Client):
                     },
                 },
                 "handler": _query_tracker,
+            },
+            # NFT2-1095: THE GENERAL WAY TO READ THE SHEET. Read-only; neither
+            # tool has a write path, and the role-based column locks are about
+            # writing, so they are untouched.
+            {
+                "schema": {
+                    "name": "sheet_columns",
+                    "description": (
+                        "The columns of one sheet tab as the sheet shows them, in order: "
+                        "letter, header, role, and for any column with 30 or fewer distinct "
+                        "values (a dropdown) the top 20 values with counts. Call it FIRST "
+                        "when a question names a column or a value you are not sure of — "
+                        "\"Next Steps status 'research the poc'\" is column 'Next Steps', "
+                        "value 'Research the PoC'. Read-only."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "tab": {"type": "string", "description": (
+                                "Tab title or kind: Outreach PoCs (default), Master Pipeline, "
+                                "Deliverables, AI Events, Sales Packages, or any readable tab.")},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _sheet_columns,
+            },
+            {
+                "schema": {
+                    "name": "sheet_query",
+                    "description": (
+                        "Rows of one sheet tab that meet EVERY condition in 'where' — for any "
+                        "question about rows on the sheet. A condition is {column, op, "
+                        "value}; column is the sheet header (or the role); ops: equals, "
+                        "contains, contains_any (value is a list), starts_with, empty, "
+                        "not_empty, in (value is a list), before / after (dates, day first), "
+                        "greater / less (numbers). Matching ignores case and punctuation. "
+                        "For 'UK or USA' pass contains_any [UK, United Kingdom, London, USA, "
+                        "United States, US]. Returns match_count, returned, truncated, "
+                        "unreadable_dates and rows keyed by header (role in brackets). A "
+                        "column that fits two headers comes back as a question; a value that "
+                        "matched nothing comes back with the closest values. Read-only."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "tab": {"type": "string", "description": "Tab title or kind (default Outreach PoCs)."},
+                            "where": {
+                                "type": "array",
+                                "description": "Conditions; all must hold.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "column": {"type": "string"},
+                                        "op": {"type": "string", "enum": list(sheetquery.OPS)},
+                                        "value": {"description": "A string, or a list for contains_any / in."},
+                                    },
+                                    "required": ["column", "op"],
+                                },
+                            },
+                            "columns": {
+                                "type": "array", "items": {"type": "string"},
+                                "description": ("Columns to return, by header. Default: Name, "
+                                                "Company/Uni, Designation on Outreach PoCs."),
+                            },
+                            "limit": {"type": "integer", "description": "Max rows (default 50, cap 200)."},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _sheet_query,
             },
             {
                 "schema": {

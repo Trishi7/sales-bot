@@ -995,8 +995,11 @@ class TestBaselineIsFrozen:
         # NFT2-1063 adds ONE tool (todays_objectives) that did not exist when these hashes were taken. The prompt TEXT
         # must still be byte-identical (the plan adds none), so the set of tool names is the pre-NFT2-1063 one: was
         # every name in GROUPS. Counting the new name would change the hash for a reason that is not a text edit.
-        every = sorted({n for names in toolsets.GROUPS.values() for n in names} - {"todays_objectives"})
-        assert "todays_objectives" in {n for names in toolsets.GROUPS.values() for n in names}
+        # NFT2-1095 adds two more the same way (sheet_columns, sheet_query), and SHEET_QUESTIONS_RULE rides only
+        # with sheet_query, so leaving them out keeps every pre-existing byte of the prompt pinned.
+        added = {"todays_objectives", "sheet_columns", "sheet_query"}
+        every = sorted({n for names in toolsets.GROUPS.values() for n in names} - added)
+        assert added <= {n for names in toolsets.GROUPS.values() for n in names}
         assert h(tb.cos_persona("Saley")) == want["persona"]
         assert h(tb.CITATION_RULE) == want["citation_rule"]
         assert h(tb._engine_text(requester_name="Kushal", today="2026-10-07", tool_names=[])) == want["engine_none"]
