@@ -2327,6 +2327,10 @@ NEWS_ASK_DEFAULT_HOURS = _int("NEWS_ASK_DEFAULT_HOURS", 24)
 # How long, in minutes, a "yes" / "next" / "show me the rest" under a news
 # answer still gives its next page. Later, the bot asks before it lists.
 NEWS_ASK_REST_MINUTES = _int("NEWS_ASK_REST_MINUTES", 30)
+# A NAMED DAY OR RANGE asked for its "most important" or "top" news
+# (NEWS-ANSWER-OCT16-B) takes only stories scored this or more; the tail of a
+# day or range counts what is left at this score.
+NEWS_ASK_IMPORTANT_MIN = _int("NEWS_ASK_IMPORTANT_MIN", 4)
 
 # RETIRED WITH NFT2-1087 — nothing reads these names any more, and a value
 # left in .env is ignored, never a crash: NEWS_FEED_POLL_MINUTES and

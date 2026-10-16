@@ -63,6 +63,34 @@ last page has no tail, and one more "yes" gets "That was all of it.". Later than
 30 minutes the bot asks "The rest of the last-24-hour news?" and a yes to that
 gives the page. The state is per channel, in memory (`_news_pages`).
 
+*A named day is that day only* (NEWS-ANSWER-OCT16-B). On 16 Oct "give me news
+from last wednesday" got today's heading and "460 more in the last 7 days":
+the day had been turned into a rolling window. `news.parse_window` now returns a
+CLOSED window in IST — kind `day` ("last wednesday", "wednesday", "yesterday",
+"today", "14th oct", "14/10", "2026-10-14", "last wednesday-14th oct"), `range`
+("from monday to wednesday", "12 to 14 oct", "last week" = the previous Monday
+to Sunday, "this week" = Monday to now) or `rolling` (an hours phrase, or no
+time words: 24 h). A weekday is the most recent one STRICTLY BEFORE today. A day
+that has not happened, a weekday and a date that disagree ("Wednesday was 14
+Oct. Did you mean 14 or 15 Oct?"), or a day that cannot be read is ASKED BACK
+and nothing else is done — never a guessed rolling window. A day or a range:
+
+- reads only the items of that span (a story about us first SEEN in it counts);
+- is named in the heading: "**AI News, Wed 14 Oct**", "**AI News, 12–14 Oct**";
+- with "most important" or "top", takes only stories at `NEWS_ASK_IMPORTANT_MIN`
+  (4) or more — and with none, says "Nothing scored 4 or 5 on Wed 14 Oct. The
+  top 3-scored stories were:" and lists those;
+- gives the top 5, then "There are 23 more with a score of 4 or 5 on Wed 14
+  Oct. Would you like to see them all?"; "yes" gives ALL of them, newest first,
+  in one answer split at 2,000 characters with "(continued)", and no tail;
+- says "I have nothing stored for Wed 14 Oct. What I have runs from … to …" for
+  an empty day, and "I keep 14 days of news. The oldest I have is from …" for
+  one older than the store.
+
+Copies of one story are ONE LINE in an answer (`news.collapse_copies`: same
+headline key, story key or `same_story`): the first-seen copy's link, with "+3
+outlets" after the outlet. The daily post and the breaking post never carry it.
+
 *A topic with nothing in the window* gets "Nothing on ElevenLabs in the last 24
 hours. The latest I have is from <date>:" and the newest matching story in the
 store, or "Nothing on ElevenLabs in the last 14 days."
@@ -81,7 +109,9 @@ A question that names something ("anything on ElevenLabs this week?") goes to
 the engine and the `todays_news` tool with the **same rendered list**: the tool
 put it in the reply and tells the model only that it is there (the
 `todays_objectives` pattern). The tool takes `hours` (the window the person
-named; it wins over the older `days`) and `count` (1-5, "top 3"). When `todays_news` is the only thing the model
+named; it wins over the older `days`), `count` (1-5, "top 3"), and `date` /
+`date_to` (YYYY-MM-DD) for a named day or range — a date wins over hours and
+days, is read by the same rules, and a future one is asked back. When `todays_news` is the only thing the model
 looked at, the list is the whole answer and the model's text beside it is not
 sent. `web_search` is the fallback: only when the store has nothing on a
 company or topic the asker named, or they ask for more or older news. It costs
@@ -6889,7 +6919,7 @@ python verify_s1.py                       # cap 5 + R8/R9, the order of the day 
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window
 python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (the top 5 of the window, repeats included, no schedule talk, no model call)
 python verify_news_patch.py               # NEWS-PATCH-OCT16 T1-T14: one story many outlets, flag discipline, batched scoring and the launch rule, the breaking budget, catch-up cycles, the health line
-python verify_news_window.py              # NEWS-ANSWER-OCT16 T1-T16: the window a question names, the top 5 with repeats, the tail and the next page
+python verify_news_window.py              # NEWS-ANSWER-OCT16 T1-T16 and -B B1-B20: the window a question names (a named day is that day only), the top 5 with repeats, copies as one line, the tail and the rest
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one identity-block write, R3 weekly + the reminder offer
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)

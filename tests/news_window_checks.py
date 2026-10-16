@@ -92,29 +92,29 @@ def pure(check) -> None:
     got = news.parse_window("top news in the last 24 hours", now=now)
     check("T1 parse_window('top news in the last 24 hours') -> 24, 'last 24 hours'",
           (got["hours"], got["label"]), (24, "last 24 hours"))
-    check("T2 parse_window('any AI news?') -> None (the caller uses 24)",
-          news.parse_window("any AI news?", now=now), None)
+    # NEWS-ANSWER-OCT16-B: no time words is the rolling 24 hours (it used to
+    # be None); a named day ("today", "yesterday", "this week") is a closed
+    # window now and is checked in tests/news_window_b_checks.py.
+    got = news.parse_window("any AI news?", now=now)
+    check("T2 parse_window('any AI news?') -> no window named: the rolling 24 hours",
+          (got["kind"], got["hours"], got["end"] - got["start"]),
+          ("rolling", 24, timedelta(hours=24)))
     want = {
-        "what's the news today": (16, "day so far", datetime(2026, 10, 15, 0, 0, tzinfo=IST)),
-        "any news since yesterday": (40, "period from yesterday",
-                                     datetime(2026, 10, 14, 0, 0, tzinfo=IST)),
-        "news from yesterday": (40, "period from yesterday",
-                                datetime(2026, 10, 14, 0, 0, tzinfo=IST)),
         "what happened this morning": (10, "morning so far",
                                        datetime(2026, 10, 15, 6, 0, tzinfo=IST)),
-        "AI news in the past 2 days": (48, "past 2 days", None),
-        "top stories this week": (168, "past week", None),
-        "news from the last month": (336, "last month", None),
+        "AI news in the past 2 days": (48, "past 2 days", now - timedelta(hours=48)),
+        "top stories of the past week": (168, "past week", now - timedelta(hours=168)),
+        "news from the last month": (336, "last month", now - timedelta(hours=336)),
     }
     got = {q: news.parse_window(q, now=now, keep_days=14) for q in want}
-    check("T3 parse_window for today / yesterday / this morning / past 2 days / this week "
-          "/ last month -> the right hours in IST; last month capped at 14 days",
-          {q: (g["hours"], g["label"], g["since"]) for q, g in got.items()}, want)
+    check("T3 parse_window for this morning / past 2 days / past week / last month -> the "
+          "right hours in IST; last month capped at 14 days",
+          {q: (g["hours"], g["label"], g["start"]) for q, g in got.items()}, want)
     check("T3 ...and 'last month' says it was capped",
-          (got["news from the last month"]["capped"], got["top stories this week"]["capped"]),
-          (True, False))
+          (got["news from the last month"]["capped"],
+           got["top stories of the past week"]["capped"]), (True, False))
     check("edge 7 'today' follows the clock it is handed (a test day's)",
-          news.parse_window("news today", now=datetime(2026, 10, 3, 9, 0, tzinfo=IST))["since"],
+          news.parse_window("news today", now=datetime(2026, 10, 3, 9, 0, tzinfo=IST))["start"],
           datetime(2026, 10, 3, 0, 0, tzinfo=IST))
 
     imps = [5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3]
@@ -268,10 +268,11 @@ async def through_the_bot(check) -> None:
         n = w.n_posted
         await w.say("top 3 news today", mention=True)
         body = w.replies_after(n)[0] if w.n_posted > n else ""
+        today = news.day_label(dl.today_ist())
         check("T11 'top 3 news today' -> cap 3, since 00:00 IST (yesterday's 5s are not in "
-              "it); the tail counts the rest",
+              "it); the tail counts the rest (a named day since NEWS-ANSWER-OCT16-B)",
               (len(lines(body)), "chip startup" in body, last_line(body)),
-              (3, False, news.answer_tail(2, "day so far", 3)))
+              (3, False, news.answer_tail(2, today, 3, kind="day")))
         n = w.n_posted
         await w.say("top 20 news", mention=True)
         body = w.replies_after(n)[0] if w.n_posted > n else ""

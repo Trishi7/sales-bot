@@ -1780,6 +1780,12 @@ class SalesBot(discord.Client):
             # day before"): the post's close offers one, so this books it.
             if await self._maybe_meeting_reminder(message, text, ctx):
                 return True
+            # "YES" UNDER A NEWS ANSWER THAT OFFERED THE REST, under ANY part of
+            # it (NEWS-ANSWER-OCT16-B). Before the acknowledgement, which would
+            # give it a thumbs-up and stop.
+            if await self._maybe_news_rest(message, text):
+                self._mark_route(message, "news")
+                return True
             if await self._maybe_acknowledge(message, text, ctx):
                 return True
             async with self._typing(message.channel):
@@ -2164,7 +2170,9 @@ class SalesBot(discord.Client):
     async def _news_answer(self, *, topic: str = "", days: int = 0, hours: int = 0,
                            cap: int = 0, offset: int = 0, label: str = "",
                            since: Optional[datetime] = None,
-                           until: Optional[datetime] = None) -> dict:
+                           until: Optional[datetime] = None,
+                           window: Optional[dict] = None, important: bool = False,
+                           every: bool = False, exclude=()) -> dict:
         """The news for somebody who ASKED: which stories, and the message.
 
         Returns {"block", "stories", "sent_before", "total", "remaining",
@@ -2184,6 +2192,17 @@ class SalesBot(discord.Client):
         ones the asker meant. When more are left, the template's tail offers
         them. `days` is the tool's older field; `hours` wins over it. A window
         longer than NEWS_FEED_KEEP_DAYS is cut to it, and the answer says so.
+
+        A NAMED DAY IS THAT DAY ONLY (NEWS-ANSWER-OCT16-B). `window` is
+        `news.parse_window`'s closed span: kind "day" ("Wed 14 Oct") or "range"
+        ("12–14 Oct") reads only the stored items of that span in IST (a story
+        about us FIRST SEEN in it counts too), names it in the heading, and —
+        with "most important" or "top" (`important`) — takes only stories at
+        NEWS_ASK_IMPORTANT_MIN or more. Its tail offers EVERYTHING left at that
+        score; `every` is the "yes" to it: all of them (less `exclude`, the
+        ones already shown), newest first, in one answer split at 2,000
+        characters. A rolling window pages by 5, as before. Copies of one story
+        are one line, with "+N outlets" (`news.collapse_copies`).
 
         A TOPIC WITH NOTHING IN THE WINDOW gets the newest matching story in
         the store, said as such ("Nothing on X in the last 24 hours. The latest
@@ -2218,17 +2237,43 @@ class SalesBot(discord.Client):
         today = dl.today_ist()
         now = dl.now_ist()
         real = dl.real_now_ist()
-        until = until or min(now, real)
-        if since is None:
-            if hours <= 0:
-                hours = max(1, int(config.NEWS_ASK_DEFAULT_HOURS))
-                label = label or (news.DEFAULT_WINDOW_LABEL if hours == 24
-                                  else f"last {hours} hours")
-            since = until - timedelta(hours=hours)
-        label = label or f"last {max(1, hours)} hours"
-        capped = since < until - timedelta(days=keep_days)
+        kind = str((window or {}).get("kind") or "rolling")
+        if window and kind in ("day", "range"):
+            since, until, label = window["start"], window["end"], window["label"]
+            until = min(until, real)
+        else:
+            if window:
+                since = since or window.get("start")
+                label = label or window.get("label") or ""
+            kind = "rolling"
+            until = until or min(now, real)
+            if since is None:
+                if hours <= 0:
+                    hours = max(1, int(config.NEWS_ASK_DEFAULT_HOURS))
+                    label = label or (news.DEFAULT_WINDOW_LABEL if hours == 24
+                                      else f"last {hours} hours")
+                since = until - timedelta(hours=hours)
+            label = label or f"last {max(1, hours)} hours"
+        floor_top = max(1, min(5, int(config.NEWS_ASK_IMPORTANT_MIN)))
+        floor = floor_top if (important and kind != "rolling") else 3
+        when = label if kind != "rolling" else ""
+        oldest_kept = real - timedelta(days=keep_days)
+        out = {"block": "", "stories": [], "sent_before": [], "total": 0, "remaining": 0,
+               "offset": offset, "cap": cap, "hours": hours, "label": label,
+               "since": since, "until": until, "kind": kind, "floor": floor,
+               "window": window if kind != "rolling" else None, "repeat": False,
+               "unsent": 0, "unscored": 0, "topic": topic, "nothing": False,
+               "day": dl.iso(today), "quiet": ""}
+        if kind != "rolling" and until < oldest_kept:
+            # OLDER THAN THE STORE KEEPS: say so, and how far back it goes.
+            oldest = await asyncio.to_thread(self._news_store_span)
+            out["block"] = wording.news_older_than_keep(
+                keep_days, dl.format_date(oldest[0]) if oldest else "")
+            out["nothing"] = True
+            return out
+        capped = since < oldest_kept
         if capped:
-            since = until - timedelta(days=keep_days)
+            since = oldest_kept
         since_utc, until_utc = feeds.utc_iso(since), feeds.utc_iso(until)
         cutoff = news.cutoff_iso(today)
 
@@ -2239,21 +2284,26 @@ class SalesBot(discord.Client):
             return rows, sent
 
         rows, sent_keys = await asyncio.to_thread(read)
+        if kind != "rolling" and not rows and not topic \
+                and not (kind == "day" and since.date() == today):
+            # A NAMED DAY WITH NOTHING STORED: say so, and what the store holds.
+            # (Today with nothing yet is a quiet day: it gets the quiet line.)
+            span = await asyncio.to_thread(self._news_store_span)
+            out["block"] = wording.news_nothing_stored(
+                label, *(dl.format_date(d) for d in span) if span else ())
+            out["nothing"] = True
+            return out
         by_key = {r.get("url_key"): r for r in rows}
         unrated = [r for r in rows if not int(r.get("importance") or 0)]
         unscored = 0
-        nothing = False
         pool = await self._score_feed(rows, today=today, mode="question", max_calls=1) \
-            if unrated else None
+            if unrated and not every else None
         if pool is None:
             # Nothing to rate, or the rating could not be done (budget, a failed
             # call): what was already rated is still there to give.
             pool = [news.story_from_feed(r) for r in rows
                     if int(r.get("importance") or 0) >= 3]
             unscored = len(unrated)
-        else:
-            # Re-read: a row the call could not reach is still unrated.
-            unscored = 0
 
         def about(story: dict) -> str:
             row = by_key.get(story.get("url_key")) or story
@@ -2264,34 +2314,92 @@ class SalesBot(discord.Client):
 
         if topic:
             pool = [x for x in pool if self._news_matches(topic, about(x))]
+        pool = news.collapse_copies(pool)
+        is_sent = lambda x: x.get("url_key") in sent_keys   # noqa: E731
 
-        picked = news.choose_answer(
-            pool, is_sent=lambda x: x.get("url_key") in sent_keys, cap=cap, offset=offset)
-        block = news.render(picked["stories"], mode=news.MODE_ANSWER, day=today,
-                            remaining=picked["remaining"], label=label, cap=cap)
-        shown = [x for x in picked["stories"] if x.get("url")] if block else []
-        if block and capped:
+        if every:
+            # "YES" TO A DAY OR A RANGE: everything left at the top floor,
+            # newest first, in one answer (split at 2,000 characters).
+            rest = [x for x in pool if int(x.get("importance") or 0) >= floor_top
+                    and x.get("url_key") not in set(exclude or ())]
+            rest.sort(key=lambda x: str(x.get("published_at") or ""), reverse=True)
+            block = news.render(rest, mode=news.MODE_ANSWER, day=today, when=when,
+                                every=True)
+            out.update(block=block, stories=rest if block else [],
+                       sent_before=[x.get("url_key") for x in rest if is_sent(x)],
+                       total=len(rest), unscored=unscored)
+            log.info("[news] question: the rest of %s — %d at %d or more", label,
+                     len(rest), floor_top)
+            return out
+
+        ranked = [x for x in pool if int(x.get("importance") or 0) >= floor]
+        lead = ""
+        if not ranked and pool and floor > 3:
+            # NOTHING AT THE TOP FLOOR: say so, then the best of the rest.
+            lead = wording.news_nothing_at(news.scores_phrase(floor), label,
+                                           kind=kind, best=max(
+                                               int(x.get("importance") or 0) for x in pool))
+            ranked = pool
+        picked = news.choose_answer(ranked, is_sent=is_sent, cap=cap, offset=offset)
+        page = picked["stories"]
+        if kind == "rolling":
+            remaining = picked["remaining"]
+        else:
+            shown_keys = {x.get("url_key") for x in page}
+            remaining = sum(1 for x in pool if int(x.get("importance") or 0) >= floor_top
+                            and x.get("url_key") not in shown_keys)
+            if lead:
+                remaining = 0
+        block = news.render(page, mode=news.MODE_ANSWER, day=today, remaining=remaining,
+                            label=label, cap=cap, kind=kind, floor=floor_top, when=when)
+        if block and lead:
+            block = lead + "\n" + "\n".join(block.split("\n")[1:])
+        shown = [x for x in page if x.get("url")] if block else []
+        if block and capped and kind == "rolling":
             block += "\n" + wording.news_keep_days(keep_days)
+        nothing = False
         if not block and topic and not offset:
+            phrase = (f"in the {label}" if kind == "rolling"
+                      else f"on {label}" if kind == "day" else f"from {label}")
             block = await asyncio.to_thread(
-                lambda: self._news_latest_on(topic, label=label, keep_days=keep_days,
+                lambda: self._news_latest_on(topic, phrase=phrase, keep_days=keep_days,
                                              about=about, today=today))
             nothing = True
-        log.info("[news] question%s: %s to %s IST (%s) — %d collected, %d worth 3+ "
+        log.info("[news] question%s: %s to %s IST (%s, %s) — %d collected, %d at %d+ "
                  "(%d posted before), %d unrated; giving %d from %d, %d left",
                  f" about {topic!r}" if topic else "",
                  since.strftime("%a %d %b %H:%M"), until.strftime("%a %d %b %H:%M"),
-                 label, len(rows), picked["total"], len(picked["sent_before"]),
-                 unscored, len(shown), offset, picked["remaining"])
-        return {"block": block, "stories": shown, "sent_before": picked["sent_before"],
-                "total": picked["total"], "remaining": picked["remaining"] if shown else 0,
-                "offset": offset, "cap": cap, "hours": hours, "label": label,
-                "since": since, "until": until, "repeat": False,
-                "unsent": picked["unsent"], "unscored": unscored, "topic": topic,
-                "nothing": nothing,
-                "day": dl.iso(today), "quiet": "" if block else news.quiet_line(today)}
+                 label, kind, len(rows), picked["total"], floor,
+                 len(picked["sent_before"]), unscored, len(shown), offset, remaining)
+        out.update(block=block, stories=shown, sent_before=picked["sent_before"],
+                   total=picked["total"], remaining=remaining if shown else 0,
+                   unsent=picked["unsent"], unscored=unscored, nothing=nothing,
+                   since=since, until=until,
+                   quiet="" if block else news.quiet_line(today))
+        return out
 
-    def _news_latest_on(self, topic: str, *, label: str, keep_days: int, about,
+    def _news_store_span(self) -> tuple:
+        """(oldest, newest) IST dates of what the feed store holds, or ()."""
+        try:
+            with self._ledger().conn() as c:
+                row = c.execute(
+                    "SELECT MIN(published_at) AS lo, MAX(published_at) AS hi "
+                    "FROM news_feed_items WHERE published_at <> ''").fetchone()
+        except Exception:
+            log.exception("[news] could not read the feed store's span")
+            return ()
+        out = []
+        for v in (row["lo"], row["hi"]) if row is not None else ():
+            try:
+                when = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            except ValueError:
+                return ()
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            out.append(when.astimezone(dl.IST).date())
+        return tuple(out) if len(out) == 2 else ()
+
+    def _news_latest_on(self, topic: str, *, phrase: str, keep_days: int, about,
                         today) -> str:
         """A topic with nothing in the window: the newest matching story the
         store has (NEWS_FEED_KEEP_DAYS), said as such — or that there is none."""
@@ -2302,9 +2410,9 @@ class SalesBot(discord.Client):
         stories = [x for x in stories if self._news_matches(topic, about(x))]
         stories.sort(key=lambda x: str(x.get("published_at") or ""), reverse=True)
         if not stories:
-            return wording.news_nothing_on(topic, f"last {keep_days} days")
+            return wording.news_nothing_on(topic, f"in the last {keep_days} days")
         when = dl.parse_date(str(stories[0].get("published_at") or "")[:10])
-        return (wording.news_nothing_on(topic, label, latest=dl.format_date(when)
+        return (wording.news_nothing_on(topic, phrase, latest=dl.format_date(when)
                                         if when else "")
                 + "\n" + news.story_line(stories[0]))
 
@@ -2350,9 +2458,14 @@ class SalesBot(discord.Client):
         if cid is None:
             return
         if int(got.get("remaining") or 0) > 0:
+            # THE STATE OF A "YES" (NEWS-ANSWER-OCT16-B): the window (start,
+            # end, kind, label), the importance floor and what was shown.
             self._news_pages[cid] = {
                 "topic": got.get("topic") or "", "label": got.get("label") or "",
                 "since": got.get("since"), "until": got.get("until"),
+                "kind": got.get("kind") or "rolling", "window": got.get("window"),
+                "floor": int(got.get("floor") or 3),
+                "shown": [x.get("url_key") for x in got.get("stories") or []],
                 "cap": int(got.get("cap") or self.NEWS_QUESTION_MAX_ITEMS),
                 "offset": int(got.get("offset") or 0), "done": False, "asked": False,
                 "message_id": getattr(sent, "id", None), "at": _monotonic(),
@@ -2393,7 +2506,8 @@ class SalesBot(discord.Client):
         ref = getattr(getattr(message, "reference", None), "message_id", None)
         author = getattr(getattr(message, "author", None), "id", None)
         if ref is not None:
-            if str(ref) != str(page.get("message_id")):
+            mine = {str(page.get("message_id"))} | {str(x) for x in page.get("part_ids") or ()}
+            if str(ref) not in mine:
                 return False
         elif author != page.get("asker"):
             return False
@@ -2406,13 +2520,32 @@ class SalesBot(discord.Client):
         late = _monotonic() - float(page.get("at") or 0) \
             > max(1, int(config.NEWS_ASK_REST_MINUTES)) * 60
         if late and not page.get("asked"):
-            sent = await self._reply(message, news.rest_again(page.get("label") or ""),
+            sent = await self._reply(message, news.rest_again(page.get("label") or "",
+                                                              page.get("kind") or "rolling"),
                                      reason="a late yes to the rest of a news answer")
             page.update(asked=True, at=_monotonic(),
                         message_id=getattr(sent, "id", page.get("message_id")))
             log.info("[news] msg=%s a yes to the rest of the news came late; asked back",
                      getattr(message, "id", "?"))
             return True
+        if page.get("kind") in ("day", "range") and page.get("window"):
+            # A DAY OR A RANGE: everything left at the floor, at once.
+            got = await self._news_answer(
+                topic=page.get("topic") or "", window=page["window"], every=True,
+                exclude=page.get("shown") or ())
+            if got["block"]:
+                sent = await self._reply_news(message, got["block"],
+                                              reason="the rest of a news answer's day")
+                await self._record_news_answer(got)
+                self._news_pages.pop(cid, None)
+                if sent is not None:
+                    self._news_pages[cid] = dict(
+                        page, done=True, at=_monotonic(),
+                        message_id=getattr(sent, "id", None),
+                        part_ids=list(getattr(self, "_news_part_ids", {}).get(cid) or []))
+                self._remember_said(sent, kind="answer", question=text)
+                self.memory.record(message.channel.id, text, got["block"])
+                return True
         got = await self._news_answer(
             topic=page.get("topic") or "", cap=page.get("cap") or 0,
             offset=int(page.get("offset") or 0) + int(page.get("cap") or 0),
@@ -2441,10 +2574,15 @@ class SalesBot(discord.Client):
         for a news list would leave a second message of bare bullets with no
         heading. This splits only past Discord's 2,000 characters, only
         between stories, and repeats the heading (`news.split_message`).
-        Returns the first message sent, or None.
+        Returns the first message sent, or None. The id of EVERY part is kept
+        per channel (`_news_part_ids`), so a "yes" under the last part of a
+        long answer is read as a reply to it (NEWS-ANSWER-OCT16-B).
         """
         parts = news.split_message(str(body or ""), limit=2000)
         first = None
+        ids: list = []
+        self._news_part_ids = getattr(self, "_news_part_ids", {})
+        self._news_part_ids[getattr(message.channel, "id", None)] = ids
         for i, part in enumerate(parts):
             sent = await guardrails.send(
                 message.channel, part, reason=reason, kind="reply",
@@ -2453,6 +2591,7 @@ class SalesBot(discord.Client):
             )
             if sent is None:
                 return first
+            ids.append(getattr(sent, "id", None))
             if i == 0:
                 first = sent
                 timing = self._qstate.get(getattr(message, "id", None))
@@ -2473,16 +2612,29 @@ class SalesBot(discord.Client):
 
         THE WINDOW AND THE COUNT ARE READ FROM THE WORDS (NEWS-ANSWER-OCT16):
         "top 3 news today" is the top 3 since 00:00 IST (`news.parse_window`,
-        `news.parse_count`); no window named is the last 24 hours.
+        `news.parse_count`); no window named is the last 24 hours. A named day
+        is that day only, and one that cannot be read is asked back
+        (NEWS-ANSWER-OCT16-B).
 
         A quiet day gets the quiet line. Returns True: the question is
         answered either way.
         """
-        window = news.parse_window(text) or {}
-        got = await self._news_answer(hours=window.get("hours") or 0,
-                                      since=window.get("since"),
-                                      label=window.get("label") or "",
-                                      cap=news.parse_count(text) or 0)
+        window = news.parse_window(text)
+        if window.get("kind") == "unclear":
+            # A DAY THAT CANNOT BE READ (or has not happened): ask, nothing else.
+            sent = await self._reply(message, window["ask"],
+                                     reason="a news question named a day that cannot be read")
+            self._remember_said(sent, kind="answer", question=text)
+            self.memory.record(message.channel.id, text, window["ask"])
+            return True
+        if window.get("kind") == "rolling":
+            got = await self._news_answer(hours=window.get("hours") or 0,
+                                          since=window.get("since"),
+                                          label=window.get("label") or "",
+                                          cap=news.parse_count(text) or 0)
+        else:
+            got = await self._news_answer(window=window, cap=news.parse_count(text) or 0,
+                                          important=news.wants_important(text))
         body = got["block"] or got["quiet"]
         sent = await self._reply_news(message, body,
                                       reason="the AI news, on demand")
@@ -2512,10 +2664,25 @@ class SalesBot(discord.Client):
 
         async def _todays_news(inp: dict) -> dict:
             inp = inp or {}
-            got = await self._news_answer(topic=str(inp.get("topic") or ""),
-                                          days=inp.get("days") or 0,
-                                          hours=inp.get("hours") or 0,
-                                          cap=inp.get("count") or 0)
+            if str(inp.get("date") or "").strip():
+                # A NAMED DAY (NEWS-ANSWER-OCT16-B): the date wins over hours and
+                # days, and is read by the same rules as a question.
+                if inp.get("hours") or inp.get("days"):
+                    log.info("[news] todays_news: date=%r given with hours=%r days=%r; "
+                             "the date wins", inp.get("date"), inp.get("hours"),
+                             inp.get("days"))
+                window = news.window_for_dates(str(inp.get("date") or ""),
+                                               str(inp.get("date_to") or ""))
+                if window.get("kind") == "unclear":
+                    return {"stories": 0, "ask": window["ask"],
+                            "note": "Ask the person exactly this, and nothing else."}
+                got = await self._news_answer(topic=str(inp.get("topic") or ""),
+                                              window=window, cap=inp.get("count") or 0)
+            else:
+                got = await self._news_answer(topic=str(inp.get("topic") or ""),
+                                              days=inp.get("days") or 0,
+                                              hours=inp.get("hours") or 0,
+                                              cap=inp.get("count") or 0)
             sink = _NEWS_SINK.get()
             if got.get("nothing"):
                 # NOTHING ON THE TOPIC IN THE WINDOW (NEWS-ANSWER-OCT16): the
@@ -2577,6 +2744,13 @@ class SalesBot(discord.Client):
                         "hours": {"type": "integer",
                                   "description": "The window the person named, in hours. "
                                                  "Leave empty for the default 24."},
+                        "date": {"type": "string",
+                                 "description": "When the person names a day or a "
+                                                "date, that day as YYYY-MM-DD (IST). Do "
+                                                "not convert it to hours."},
+                        "date_to": {"type": "string",
+                                    "description": "The last day of a range the person "
+                                                   "named, YYYY-MM-DD. Optional."},
                         "count": {"type": "integer", "minimum": 1, "maximum": 5,
                                   "description": "How many stories, when the person "
                                                  "says e.g. \"top 3\". Optional; 5 "

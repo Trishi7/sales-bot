@@ -1552,11 +1552,35 @@ def news_keep_days(days: int) -> str:
     return f"I keep {plural(days, 'day')} of news."
 
 
-def news_nothing_on(topic: str, label: str, latest: str = "") -> str:
-    """A topic question with nothing in the window (NEWS-ANSWER-OCT16). With
-    `latest` the newest matching story follows on the next line."""
-    head = f"Nothing on {topic} in the {label}."
+def news_nothing_on(topic: str, phrase: str, latest: str = "") -> str:
+    """A topic question with nothing in the window (NEWS-ANSWER-OCT16).
+    `phrase` is "in the last 24 hours" / "on Wed 14 Oct". With `latest` the
+    newest matching story follows on the next line."""
+    head = f"Nothing on {topic} {phrase}."
     return head + (f" The latest I have is from {latest}:" if latest else "")
+
+
+def news_nothing_stored(label: str, oldest: str = "", newest: str = "") -> str:
+    """A named day with nothing in the feed store (NEWS-ANSWER-OCT16-B), and
+    what the store does hold, so the person knows the range."""
+    head = f"I have nothing stored for {label}."
+    if oldest and newest:
+        head += f" What I have runs from {oldest} to {newest}."
+    return head
+
+
+def news_older_than_keep(days: int, oldest: str = "") -> str:
+    """A named day older than the store keeps (NEWS-ANSWER-OCT16-B)."""
+    head = f"I keep {plural(days, 'day')} of news."
+    return head + (f" The oldest I have is from {oldest}." if oldest else "")
+
+
+def news_nothing_at(scores: str, label: str, *, kind: str = "day", best: int = 3) -> str:
+    """"Most important" on a day with nothing at the top scores
+    (NEWS-ANSWER-OCT16-B): said, then the best of what there is."""
+    prep = "on" if kind == "day" else "from"
+    return (f"Nothing scored {scores} {prep} {label}. The top {best}-scored stories "
+            "were:")
 
 
 def all_lines() -> list:
@@ -1564,8 +1588,11 @@ def all_lines() -> list:
     register test reads. A new line that is not added here is not checked, so
     add it here."""
     return [
-        news_keep_days(14), news_nothing_on("ElevenLabs", "last 24 hours", "Tue 13 Oct 2026"),
-        news_nothing_on("ElevenLabs", "last 14 days"),
+        news_keep_days(14),
+        news_nothing_on("ElevenLabs", "in the last 24 hours", "Tue 13 Oct 2026"),
+        news_nothing_on("ElevenLabs", "in the last 14 days"),
+        news_nothing_stored("Wed 14 Oct", "Thu 2 Oct 2026", "Fri 16 Oct 2026"),
+        news_older_than_keep(14, "Thu 2 Oct 2026"), news_nothing_at("4 or 5", "Wed 14 Oct"),
         *news_health_lines({"day": "Thu 15 Oct", "planned": 10, "run": 9, "late": 1,
                             "skipped": 1, "partial": 0, "fetched": 900, "new": 300,
                             "merged": 1, "flagged": 40, "noisy": ["Acme"],

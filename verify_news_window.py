@@ -1,7 +1,10 @@
 """NEWS-ANSWER-OCT16 "A QUESTION GETS THE REAL TOP 5" — every test case, T1 to T16.
 
-    python verify_news_window.py            every check, then the T1-T16 table
-    python verify_news_window.py --table    the T1-T16 table only
+    python verify_news_window.py            every check, then the T1-T16 and B1-B20 tables
+    python verify_news_window.py --table    the tables only
+
+NEWS-ANSWER-OCT16-B ("a named day is that day only") is checked here too, as
+B1-B20 (the ticket's T1-T20), in tests/news_window_b_checks.py.
 
 What is checked (the ticket's test cases and its edge cases):
 
@@ -48,6 +51,7 @@ GUARD = offline_guard.install_script()      # a real Sheets/Drive call fails the
 
 import logging  # noqa: E402
 
+import news_window_b_checks  # noqa: E402
 import news_window_checks  # noqa: E402
 
 logging.getLogger().setLevel(logging.ERROR)
@@ -55,9 +59,11 @@ QUIET = "--table" in sys.argv
 CASES = range(1, 17)
 failures = 0
 passed = 0
+B_CASES = range(1, 21)
 results: dict = {n: [] for n in CASES}
+b_results: dict = {n: [] for n in B_CASES}
 
-_T_RE = re.compile(r"^((?:T\d+)(?:/T\d+)*)\b")
+_T_RE = re.compile(r"^((?:[TB]\d+)(?:/[TB]\d+)*)\b")
 
 
 def check(name, got, want=True):
@@ -67,21 +73,26 @@ def check(name, got, want=True):
     passed += 1 if ok else 0
     found = _T_RE.match(str(name))
     for t in (found.group(1).split("/") if found else []):
-        results.setdefault(int(t[1:]), []).append(ok)
+        (b_results if t[0] == "B" else results).setdefault(int(t[1:]), []).append(ok)
     if not QUIET or not ok:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}"
               + ("" if ok else f": got {got!r}, want {want!r}"))
 
 
-def table() -> int:
-    print("\nT1-T16")
+def table(title: str, prefix: str, cases, res: dict) -> int:
+    print(f"\n{title}")
     bad = 0
-    for n in CASES:
-        got = results.get(n) or []
+    for n in cases:
+        got = res.get(n) or []
         word = "PASS" if got and all(got) else ("FAIL" if got else "MISSING")
         bad += 0 if word == "PASS" else 1
-        print(f"  T{n:<2} {word:<7} ({sum(got)}/{len(got)} checks)")
+        print(f"  {prefix}{n:<2} {word:<7} ({sum(got)}/{len(got)} checks)")
     return bad
+
+
+async def both() -> None:
+    await news_window_checks.run(check)
+    await news_window_b_checks.run(check)
 
 
 if QUIET:
@@ -89,11 +100,13 @@ if QUIET:
     import io
 
     with contextlib.redirect_stdout(io.StringIO()):
-        asyncio.run(news_window_checks.run(check))
+        asyncio.run(both())
 else:
-    asyncio.run(news_window_checks.run(check))
-uncovered = sum(1 for n in CASES if not results.get(n))
-table()
+    asyncio.run(both())
+uncovered = (sum(1 for n in CASES if not results.get(n))
+             + sum(1 for n in B_CASES if not b_results.get(n)))
+table("NEWS-ANSWER-OCT16: T1-T16", "T", CASES, results)
+table("NEWS-ANSWER-OCT16-B (the ticket's T1-T20): B1-B20", "B", B_CASES, b_results)
 print(f"\n{passed} check(s) passed" + (f", {failures} failed" if failures else "")
       + (f", {uncovered} test case(s) not covered" if uncovered else ""))
 bad = failures + uncovered

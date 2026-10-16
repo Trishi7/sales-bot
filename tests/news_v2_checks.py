@@ -1448,9 +1448,12 @@ async def rendering(check) -> None:
           (f"- Tavus's Griffin convinced 48% in simulated interviews ([NewsBytes](<{u}>))",
            False, False, False))
 
+    # NEWS-ANSWER-OCT16: an answer is ranked by score, then newest. The two
+    # stories score the same here so the order is the tie rule's (the newer,
+    # Sarvam, first) — template G's order, which came from the old newest-first.
     with Bot(pretend=(TUE, 11, 22)) as b:
         b.seed([{"title": SARVAM, "when": utc(TUE, 10), "source": "Economic Times",
-                 "flag": 1, "names": "Sarvam AI", "imp": 3},
+                 "flag": 1, "names": "Sarvam AI", "imp": 4},
                 {"title": STATE_AGS, "when": utc(TUE, 9), "imp": 4}])
         await b.w.say("any AI news today?", mention=True)
         reply = b.new_posts(0)

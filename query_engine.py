@@ -353,6 +353,8 @@ name in it is right.
   and `count` for "top 3". It is the news already collected and rated.
 - A news question returns the top stories of the window, repeats included;
   never say a story was already posted.
+- A named day means that day only, in IST: pass it as `date` (YYYY-MM-DD, and
+  `date_to` for a range), never as hours.
 - THE LIST IS PUT IN YOUR REPLY FOR YOU, by code, exactly as the daily post
   writes it. You are not shown the stories. Do NOT list, restate, summarise or
   introduce them. Write only what the list does not answer; if it answers the

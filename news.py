@@ -62,7 +62,7 @@ network or an API key — see `_self_test`.
 """
 import logging
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -1226,6 +1226,17 @@ def story_line(story: dict) -> str:
     return f"- {clean_headline(story)} ([{outlet(story)}](<{url}>))"
 
 
+def answer_line(story: dict) -> str:
+    """`story_line` for an answer: "+N outlets" after the outlet when N more
+    outlets carried the story (NEWS-ANSWER-OCT16-B). The daily post and the
+    breaking post never use it."""
+    line = story_line(story)
+    extra = int((story or {}).get("extra_outlets") or 0)
+    if extra < 1:
+        return line
+    return line[:-1] + f" +{extra} outlet{'s' if extra > 1 else ''})"
+
+
 def unique(stories: list) -> list:
     """`stories` with every second copy of a story removed, order kept.
 
@@ -1287,7 +1298,9 @@ def _picked(stories: list, cap: int) -> list:
 
 
 def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
-           tags: str = "", remaining: int = 0, label: str = "", cap: int = 0) -> str:
+           tags: str = "", remaining: int = 0, label: str = "", cap: int = 0,
+           kind: str = "rolling", floor: int = 4, when: str = "",
+           every: bool = False) -> str:
     """One news message, in one of the team's templates (NFT2-1087, s.16).
     Never written by a model: the opener, the two labels and the closer are
     fixed text, and every story is `story_line`.
@@ -1310,20 +1323,29 @@ def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
     News, <day>**` and the stories: no tags, no opener, no closer, no labels —
     and, when `remaining` stories are left after the page, the fixed tail
     (`answer_tail`, NEWS-ANSWER-OCT16). The other modes never carry it.
+    NEWS-ANSWER-OCT16-B, in MODE_ANSWER only: `when` names the window in the
+    heading ("**AI News, Wed 14 Oct**", "**AI News, 12–14 Oct**"); a story
+    that more outlets carried says "+N outlets" after its outlet; `every`
+    lifts the five-story cap ("yes" to a day gives all of it, split by
+    `split_message`).
 
     AT MOST MAX_PER_MESSAGE STORIES, each once (`unique`), whatever was handed
     in; ours (`is_ours`) before the industry, the order inside each kept as
     given. No stories: "" — there is no quiet line; nothing to send is no post.
     """
-    picked = _picked(stories, MAX_PER_MESSAGE)
+    answer = mode == MODE_ANSWER
+    picked = _picked(stories, len(stories or []) if (answer and every) else MAX_PER_MESSAGE)
     if not picked:
         return ""
     if mode != MODE_MAIN:
         head = heading(mode, day or dl.today_ist(),
                        tags=tags if mode == MODE_BREAKING else "")
-        body = _join([head] + [story_line(s) for s in picked])
-        tail = answer_tail(remaining, label, cap or len(picked)) \
-            if mode == MODE_ANSWER else ""
+        if answer and when:
+            head = f"**{HEADING_LABELS[MODE_ANSWER]}, {when}**"
+        body = _join([head] + [answer_line(s) if answer else story_line(s)
+                               for s in picked])
+        tail = answer_tail(remaining, label, cap or len(picked), kind=kind, floor=floor) \
+            if answer else ""
         return body + ("\n" + tail if tail else "")
     ours = [s for s in picked if is_ours(s)]
     industry = [s for s in picked if not is_ours(s)]
@@ -1478,61 +1500,293 @@ def _label(word: str, n: int, unit: str) -> str:
     return f"{word} {unit}" if n == 1 else f"{word} {n} {unit}s"
 
 
-def parse_window(text: str, *, now: Optional[datetime] = None,
-                 keep_days: Optional[int] = None) -> Optional[dict]:
-    """The window a news question names, or None (the caller uses 24 hours).
-
-    {"hours", "label", "since", "capped"}: `hours` the span (whole hours,
-    rounded up), `label` the phrase the answer's tail uses ("There are 7 more
-    in the {label}"), `since` the IST start when the phrase is anchored to the
-    clock ("today", "yesterday", "this morning") and None otherwise, `capped`
-    True when the span was cut to NEWS_FEED_KEEP_DAYS — the store keeps no
-    more. Pure: `now` is the caller's IST time (the test clock when set).
-
-      "last 24 hours" -> 24        "past 2 days" -> 48       "this week" -> 168
-      "today" -> since 00:00        "yesterday", "since yesterday" -> since
-      "this morning" -> since 06:00 yesterday's 00:00
-      "last month" -> 720, capped at NEWS_FEED_KEEP_DAYS x 24
-    """
-    body = " ".join(str(text or "").split())
-    if not body:
-        return None
-    now = now or dl.now_ist()
-    keep = max(1, int(keep_days if keep_days is not None else config.NEWS_FEED_KEEP_DAYS))
-    low = body.lower().replace("'", "").replace("’", "")
-    since = None
-    span, one = _SPAN_RE.search(body), _ONE_RE.search(body)
+def _rolling(text: str, now: datetime, keep: int) -> Optional[dict]:
+    """The rolling phrases of NEWS-ANSWER-OCT16: "last 24 hours", "past 2
+    days", "past week", "this morning", "last month" — a span back from now.
+    None when the text names none of them."""
+    low = text.lower().replace("'", "").replace("’", "")
+    span, one = _SPAN_RE.search(text), _ONE_RE.search(text)
+    start = None
     if span:
         raw = span.group(2).lower().replace(" of", "")
         n = max(1, int(raw) if raw.isdigit() else _NUM_WORDS.get(raw, 1))
         unit = _unit(span.group(3))
         hours, label = n * _UNIT_HOURS[unit], _label(span.group(1), n, unit)
-    elif one:
+    elif one and one.group(2).lower() != "week":
         unit = _unit(one.group(2))
         hours, label = _UNIT_HOURS[unit], _label(one.group(1), 1, unit)
-    elif re.search(r"\b(this|the)\s+week\b", low):
+    elif re.search(r"\bpast\s+week\b", low):
         hours, label = 168, "past week"
     elif re.search(r"\bthis\s+month\b", low):
         hours, label = 720, "past month"
-    elif re.search(r"\byesterday\b", low):
-        since = datetime.combine(now.date() - timedelta(days=1), datetime.min.time(),
-                                 now.tzinfo)
-        hours, label = 0, "period from yesterday"
     elif re.search(r"\bthis\s+morning\b", low):
         day = now.date() if now.hour >= 6 else now.date() - timedelta(days=1)
-        since = datetime.combine(day, datetime.min.time(), now.tzinfo) + timedelta(hours=6)
+        start = datetime.combine(day, time(6, 0), now.tzinfo)
         hours, label = 0, "morning so far"
-    elif re.search(r"\b(today|todays)\b", low):
-        since = datetime.combine(now.date(), datetime.min.time(), now.tzinfo)
-        hours, label = 0, "day so far"
     else:
         return None
-    if since is not None:
-        hours = max(1, int(-(-(now - since).total_seconds() // 3600)))
+    if start is not None:
+        hours = max(1, int(-(-(now - start).total_seconds() // 3600)))
     capped = hours > keep * 24
     if capped:
-        hours, since = keep * 24, None
-    return {"hours": int(hours), "label": label, "since": since, "capped": capped}
+        hours, start = keep * 24, None
+    start = start or now - timedelta(hours=hours)
+    return {"kind": "rolling", "start": start, "end": now, "label": label,
+            "hours": int(hours), "since": start, "capped": capped}
+
+
+# THE NAMED DAYS (NEWS-ANSWER-OCT16-B). Full weekday names and the
+# unambiguous short ones; "sat" and "sun" are words too often to count.
+_WEEKDAY = {"monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2,
+            "wed": 2, "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4,
+            "fri": 4, "saturday": 5, "sunday": 6}
+_MONTH = {"jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+          "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+          "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+          "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12}
+_WD = r"(" + "|".join(sorted(_WEEKDAY, key=len, reverse=True)) + r")"
+_MO = r"(" + "|".join(sorted(_MONTH, key=len, reverse=True)) + r")"
+_ORD = r"(?:st|nd|rd|th)?"
+_DATE_RES = (
+    ("iso", re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")),
+    ("dmy", re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")),
+    ("dm", re.compile(r"\b(\d{1,2})" + _ORD + r"\s*(?:of\s+)?" + _MO + r"\b(?:,?\s+(\d{4}))?",
+                      re.I)),
+    ("md", re.compile(r"\b" + _MO + r"\.?\s+(\d{1,2})" + _ORD + r"\b(?:,?\s+(\d{4}))?", re.I)),
+)
+# "12 to 14 oct": the first day borrows the second's month.
+_DAY_SPAN_RE = re.compile(r"\b(\d{1,2})" + _ORD + r"\s*(?:to|until|till|through|-|–)\s*(\d{1,2})"
+                          + _ORD + r"\s*(?:of\s+)?" + _MO + r"\b(?:,?\s+(\d{4}))?", re.I)
+_WEEKDAY_RE = re.compile(r"\b" + _WD + r"\b", re.I)
+_RANGE_WORD_RE = re.compile(r"\b(to|until|till|through|and)\b|–|—", re.I)
+
+UNCLEAR_DAY = "Which day do you mean? For example 'last Wednesday' or '14 Oct'."
+
+
+def _day_window(day: date, now: datetime) -> tuple:
+    start = datetime.combine(day, time(0, 0), now.tzinfo)
+    end = now if day == now.date() else datetime.combine(day, time(23, 59, 59), now.tzinfo)
+    return start, end
+
+
+def _short(day: date) -> str:
+    return f"{day.day} {day.strftime('%b')}"
+
+
+def range_label(first: date, last: date) -> str:
+    """"12–14 Oct", or "28 Sep–2 Oct" across a month."""
+    if first.month == last.month and first.year == last.year:
+        return f"{first.day}–{last.day} {last.strftime('%b')}"
+    return f"{_short(first)}–{_short(last)}"
+
+
+def _unclear(ask: str = UNCLEAR_DAY) -> dict:
+    return {"kind": "unclear", "ask": ask}
+
+
+def _mentions(text: str, today: date) -> list:
+    """Every day the text names, in order: [(pos, end, kind, date or None,
+    weekday or None)] — kind "date" or "weekday"; a date that does not exist
+    is None."""
+    found: list = []
+    taken: list = []
+
+    def free(a, b) -> bool:
+        return all(b <= x or a >= y for x, y in taken)
+
+    def make(y, m, d):
+        try:
+            return date(int(y), int(m), int(d))
+        except (TypeError, ValueError):
+            return None
+
+    for m in _DAY_SPAN_RE.finditer(text):
+        month = _MONTH[m.group(3).lower()]
+        year = int(m.group(4)) if m.group(4) else today.year
+        found.append((m.start(1), m.end(1), "date", make(year, month, m.group(1)), None))
+        found.append((m.start(2), m.end(), "date", make(year, month, m.group(2)), None))
+        taken.append((m.start(), m.end()))
+    for kind, rx in _DATE_RES:
+        for m in rx.finditer(text):
+            if not free(m.start(), m.end()):
+                continue
+            g = m.groups()
+            if kind == "iso":
+                d = make(g[0], g[1], g[2])
+            elif kind == "dmy":
+                year = int(g[2]) if g[2] else today.year
+                year = year + 2000 if year < 100 else year
+                d = make(year, g[1], g[0])
+            elif kind == "dm":
+                d = make(int(g[2]) if g[2] else today.year, _MONTH[g[1].lower()], g[0])
+            else:
+                d = make(int(g[2]) if g[2] else today.year, _MONTH[g[0].lower()], g[1])
+            found.append((m.start(), m.end(), "date", d, None))
+            taken.append((m.start(), m.end()))
+    for m in _WEEKDAY_RE.finditer(text):
+        if not free(m.start(), m.end()):
+            continue
+        wd = _WEEKDAY[m.group(1).lower()]
+        back = (today.weekday() - wd) % 7 or 7        # strictly before today
+        found.append((m.start(), m.end(), "weekday", today - timedelta(days=back), wd))
+    for m in re.finditer(r"\b(yesterday|today|todays|tonight)\b", text, re.I):
+        word = m.group(1).lower()
+        d = today - timedelta(days=1) if word == "yesterday" else today
+        found.append((m.start(), m.end(), "relative", d, None))
+    return sorted(found, key=lambda f: f[0])
+
+
+def parse_window(text: str, *, now: Optional[datetime] = None,
+                 keep_days: Optional[int] = None) -> dict:
+    """THE WINDOW A NEWS QUESTION NAMES, AS A CLOSED SPAN (NEWS-ANSWER-OCT16-B):
+    {"kind", "start", "end", "label"} with IST datetimes, or {"kind":
+    "unclear", "ask"} — the bot asks that and does nothing else.
+
+      day      "last wednesday", "on wednesday", "wednesday" (the most recent
+               one STRICTLY BEFORE today), "yesterday", "today" (00:00 to now),
+               "14th oct", "14 oct", "oct 14", "14/10", "14-10-2026",
+               "2026-10-14" (this year unless one is given), "last wednesday-
+               14th oct" (both name the same day). Label "Wed 14 Oct".
+      range    "from monday to wednesday", "monday–wednesday", "12 to 14 oct",
+               "last week" (the previous Monday to Sunday), "this week" /
+               "this week so far" (Monday to now). Label "12–14 Oct".
+      rolling  "last 24 hours", "past 2 days", "past week", "this morning",
+               "last month" (capped at NEWS_FEED_KEEP_DAYS) — and NO TIME
+               WORDS AT ALL, which is the last NEWS_ASK_DEFAULT_HOURS (24).
+               Also carries "hours", "since" and "capped".
+      unclear  a future day ("20 Oct has not happened yet."), a weekday and a
+               date that disagree ("Wednesday was 14 Oct. Did you mean 14 or
+               15 Oct?"), or a weekday or a date that cannot be read.
+
+    WHY. On 16 Oct "give me news from last wednesday" got today's heading and
+    "460 more in the last 7 days": a named day was turned into a rolling
+    window. A named day is that day only, and when it cannot be read the bot
+    asks — it never guesses a rolling window instead. Pure: `now` is the
+    caller's IST time (the test clock when set).
+    """
+    body = " ".join(str(text or "").split())
+    now = now or dl.now_ist()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dl.IST)
+    keep = max(1, int(keep_days if keep_days is not None else config.NEWS_FEED_KEEP_DAYS))
+    today = now.date()
+    low = body.lower()
+
+    # ---- whole weeks ----------------------------------------------------------
+    monday = today - timedelta(days=today.weekday())
+    if re.search(r"\blast\s+week\b", low) and not _mentions(body, today):
+        first, last = monday - timedelta(days=7), monday - timedelta(days=1)
+        start, _e = _day_window(first, now)
+        _s, end = _day_window(last, now)
+        return {"kind": "range", "start": start, "end": end,
+                "label": range_label(first, last)}
+    if re.search(r"\b(this|the)\s+week\b", low) and not _mentions(body, today):
+        start, _e = _day_window(monday, now)
+        return {"kind": "range", "start": start, "end": now,
+                "label": range_label(monday, today)}
+
+    found = _mentions(body, today)
+    if not found:
+        rolling = _rolling(body, now, keep)
+        if rolling is not None:
+            return rolling
+        hours = max(1, int(getattr(config, "NEWS_ASK_DEFAULT_HOURS", 24)))
+        return {"kind": "rolling", "start": now - timedelta(hours=hours), "end": now,
+                "label": DEFAULT_WINDOW_LABEL if hours == 24 else f"last {hours} hours",
+                "hours": hours, "since": None, "capped": False, "default": True}
+    if any(f[3] is None for f in found):
+        return _unclear()
+    for f in found:
+        if f[3] > today:
+            return _unclear(f"{_short(f[3])} has not happened yet.")
+    days = sorted({f[3] for f in found})
+    weekdays = [f for f in found if f[2] == "weekday"]
+    dates = [f for f in found if f[2] != "weekday"]
+    if len(days) == 1:
+        start, end = _day_window(days[0], now)
+        return {"kind": "day", "start": start, "end": end, "label": day_label(days[0])}
+    if len(days) > 2 and len({f[3] for f in dates}) > 2:
+        return _unclear()
+    first, second = found[0], found[-1]
+    between = body[first[1]:second[0]]
+    ranged = bool(_RANGE_WORD_RE.search(between)) or (
+        first[2] == second[2] and re.search(r"-", between) is not None)
+    if weekdays and dates and not ranged:
+        # A weekday and a date that do not name the same day: ask, never guess.
+        wd, dt = weekdays[0], dates[0]
+        named = wd[3]
+        other = dt[3]
+        both = (f"{named.day} or {other.day} {other.strftime('%b')}"
+                if named.month == other.month else f"{_short(named)} or {_short(other)}")
+        return _unclear(f"{named.strftime('%A')} was {_short(named)}. Did you mean {both}?")
+    if not ranged:
+        return _unclear()
+    lo, hi = first[3], second[3]
+    if first[2] == "weekday" and second[2] == "weekday" and lo > hi:
+        lo -= timedelta(days=7)
+    lo, hi = min(lo, hi), max(lo, hi)
+    start, _e = _day_window(lo, now)
+    _s, end = _day_window(hi, now)
+    return {"kind": "range", "start": start, "end": end, "label": range_label(lo, hi)}
+
+
+def window_for_dates(date_from: str, date_to: str = "", *,
+                     now: Optional[datetime] = None) -> dict:
+    """The todays_news tool's `date` / `date_to` (YYYY-MM-DD) as a window, by
+    the same rules as `parse_window`: one date is a day, two a range, a future
+    one is asked back, one that is not a date is unclear."""
+    text = str(date_from or "").strip()
+    if str(date_to or "").strip():
+        text = f"from {text} to {str(date_to).strip()}"
+    if not re.fullmatch(r"(from )?\d{4}-\d{1,2}-\d{1,2}( to \d{4}-\d{1,2}-\d{1,2})?", text):
+        return _unclear()
+    return parse_window(text, now=now)
+
+
+_IMPORTANT_RE = re.compile(r"\b(most\s+important|top)\b", re.I)
+
+
+def wants_important(text: str) -> bool:
+    """"most important" or "top" in the question. With a named day or range
+    the answer then takes only stories at NEWS_ASK_IMPORTANT_MIN or more."""
+    return bool(_IMPORTANT_RE.search(str(text or "")))
+
+
+def collapse_copies(stories: list, *, entities_of=None) -> list:
+    """ONE LINE PER STORY in an answer (NEWS-ANSWER-OCT16-B): stories with the
+    same headline key, the same story key, or that `same_story` joins, become
+    one — the FIRST-SEEN copy, carrying the best importance of the group and
+    `extra_outlets`, how many more outlets carried it (the stored
+    `outlet_count` of every copy, less one). On 16 Oct "yes" gave the same
+    Universal Cart story four times, once per outlet. Order: first seen first."""
+    rows = sorted([x for x in (stories or []) if x.get("url")],
+                  key=lambda x: str(x.get("seen_at") or x.get("published_at") or ""))
+    groups: list = []
+    by_key: dict = {}
+    names = entities_of or model_entities
+    for x in rows:
+        title = str(x.get("headline") or x.get("title") or "")
+        keys = [k for k in (x.get("headline_key"), x.get("story_key") or story_key(title)) if k]
+        home = next((by_key[k] for k in keys if k in by_key), None)
+        if home is None and len(set(names(title))) >= 2:
+            for g in groups:
+                if same_story(g[0], x, entities_of=names):
+                    home = g
+                    break
+        if home is None:
+            home = [x]
+            groups.append(home)
+        else:
+            home.append(x)
+        for k in keys:
+            by_key.setdefault(k, home)
+    out: list = []
+    for g in groups:
+        first = dict(g[0])
+        first["importance"] = max(int(y.get("importance") or 0) for y in g)
+        first["extra_outlets"] = max(0, sum(outlets_of(y) for y in g) - 1)
+        out.append(first)
+    return out
 
 
 _COUNT_RE = re.compile(r"\btop\s+" + _N_RE + r"\b|\b" + _N_RE
@@ -1551,17 +1805,36 @@ def parse_count(text: str) -> Optional[int]:
     return n if n and n > 0 else None
 
 
-def answer_tail(remaining: int, label: str, cap: int) -> str:
-    """The tail of a news answer that has more to give; "" when it has not."""
+# THE TAIL OF A DAY OR A RANGE (NEWS-ANSWER-OCT16-B): "yes" gives ALL of them.
+ANSWER_TAIL_DAY = ("There are {remaining} more with a score of {scores} {prep} {label}. "
+                   "Would you like to see them all?")
+
+
+def scores_phrase(floor: int) -> str:
+    """"4 or 5" for the floor 4; "5" for 5; "3 to 5" for 3."""
+    floor = max(1, min(5, int(floor)))
+    return "5" if floor == 5 else ("4 or 5" if floor == 4 else f"{floor} to 5")
+
+
+def answer_tail(remaining: int, label: str, cap: int, *, kind: str = "rolling",
+                floor: int = 4) -> str:
+    """The tail of a news answer that has more to give; "" when it has not. A
+    rolling window offers the next page; a day or a range offers everything
+    left at `floor` or more."""
     if int(remaining or 0) <= 0:
         return ""
+    if kind in ("day", "range"):
+        return ANSWER_TAIL_DAY.format(remaining=int(remaining), scores=scores_phrase(floor),
+                                      prep="on" if kind == "day" else "from", label=label)
     return ANSWER_TAIL.format(remaining=int(remaining),
                               label=label or DEFAULT_WINDOW_LABEL, cap=int(cap))
 
 
-def rest_again(label: str) -> str:
+def rest_again(label: str, kind: str = "rolling") -> str:
     """What a late "yes" is asked back: "The rest of the last-24-hour news?"."""
     label = label or DEFAULT_WINDOW_LABEL
+    if kind in ("day", "range"):
+        return f"The rest of the news from {label}?"
     m = re.fullmatch(r"(last|past) (\d+) (hour|day|week|month)s", label)
     if m:
         return f"The rest of the {m.group(1)}-{m.group(2)}-{m.group(3)} news?"
@@ -1579,6 +1852,10 @@ recently right rn round roundup see send share show so some stories story tell
 than that the there these this three to today todays top two up update updates
 us was we what whats whatever with world would you your happening
 last past yesterday since week within previous far
+on from to between most important st nd rd th of
+monday tuesday wednesday thursday friday saturday sunday mon tue tues wed thu thur thurs fri
+jan january feb february mar march apr april may jun june jul july aug august sep sept
+september oct october nov november dec december
 """.split())
 _NEWS_ASK_RE = re.compile(
     r"\b(news|headlines?)\b|\bwhat(?:\s+is|'?s|s)\s+(?:new|happening)\b", re.IGNORECASE)
@@ -1601,7 +1878,8 @@ def plain_question(text: str) -> bool:
     words = _words(body.replace("'", "").replace("’", ""))
     if not words or len(words) > 14:
         return False
-    return all(w in _PLAIN_NEWS_WORDS or w.isdigit() for w in words)
+    return all(w in _PLAIN_NEWS_WORDS or re.fullmatch(r"\d+(st|nd|rd|th)?", w)
+               for w in words)
 
 
 # -- R1 from the feeds: choosing what the scorer sees, and reading its verdicts --

@@ -2029,3 +2029,27 @@ forgets it — a "yes" after a restart is read like any other reply).
 ```
 
 `python verify_news_window.py` checks all of it offline and prints the T1-T16 table.
+
+## Upgrading to NEWS-ANSWER-OCT16-B (a named day is that day only)
+
+A follow-up to NEWS-ANSWER-OCT16, same build. "news from last wednesday" is Wednesday 00:00-23:59:59 IST and nothing
+else, headed "AI News, Wed 14 Oct"; "from monday to wednesday" is "12–14 Oct"; a day that cannot be read, or has not
+happened, is asked back. "most important" / "top" with a named day keeps only stories scored 4 or 5. The first answer is
+the top 5, and "yes" gives every other 4-or-5 story of that day at once. Copies of one story are one line with "+N
+outlets". Only the answers change: the daily post and the breaking post are byte-identical.
+
+**Lines for `.env`: the laptop AND `/opt/sales-bot/.env`.** One new, optional variable:
+
+```
+# NEWS_ASK_IMPORTANT_MIN=4      # "most important" / "top" for a named day or range: this score or more
+```
+
+No database change. **What to look for in the log:**
+
+```
+[news] question: Wed 14 Oct 00:00 to Wed 14 Oct 23:59 IST (Wed 14 Oct, day) — N collected, N at 4+ ...
+[news] question: the rest of Wed 14 Oct — 23 at 4 or more
+[news] todays_news: date='2026-10-14' given with hours=48 days=None; the date wins
+```
+
+`python verify_news_window.py` checks it offline (B1-B20, beside NEWS-ANSWER-OCT16's T1-T16).
