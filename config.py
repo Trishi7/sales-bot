@@ -2088,7 +2088,8 @@ BOT_RULES_FILE = (os.getenv("BOT_RULES_FILE", "./bot_rules.yaml") or "").strip()
 # THE DAILY POST is R1's drip post, one a weekday, in R1's place in the day's
 # order (`daily_order` in bot_rules.yaml), at most NEWS_MAX_ITEMS stories. A
 # BREAKING POST goes straight to the sales channel — never through drip_sends,
-# never against DAILY_MESSAGE_CAP — any day, with no daily limit.
+# never against DAILY_MESSAGE_CAP — any day, within its own budget
+# (NEWS_BREAKING_MAX_PER_CYCLE a cycle, NEWS_BREAKING_MAX_PER_DAY a day).
 #
 # These settings take precedence over the R1 row on the Bot Rules tab.
 
@@ -2109,6 +2110,18 @@ NEWS_PULL_UNTIL = (os.getenv("NEWS_PULL_UNTIL", "23:00") or "").strip()
 # cycle that follows a missed or partial one reaches back to the last cycle
 # that completed instead — never less than this, never more than 24.
 NEWS_PULL_WINDOW_HOURS = _int("NEWS_PULL_WINDOW_HOURS", 2)
+# A MISSED HOUR RUNS LATE (NEWS-PATCH-OCT16): each tick runs the OLDEST
+# unclaimed cycle of today, not the latest. A cycle more than this many whole
+# hours late is claimed "skipped" and not run, so the bot does not replay a whole day
+# after an outage.
+NEWS_CYCLE_LATE_SKIP_HOURS = _int("NEWS_CYCLE_LATE_SKIP_HOURS", 3)
+# THE LONGEST A CYCLE'S PULL MAY RUN, in seconds. Past it the pull stops at the
+# next source boundary, the cycle is "partial", and the drip goes on; the next
+# cycle's window reaches back over it.
+NEWS_CYCLE_MAX_SECONDS = _int("NEWS_CYCLE_MAX_SECONDS", 600)
+# THE NEWS HEALTH LINE, HH:MM IST: one message a day to SALES_TEST_CHANNEL_ID
+# (never the sales channel) with what the cycles did. Outside the daily cap.
+NEWS_HEALTH_TIME = (os.getenv("NEWS_HEALTH_TIME", "23:45") or "").strip()
 
 # THE TOPIC LIST, seeded from the "Sample Keywords" column of the Bot Rules tab
 # minus the four words too broad to steer anything (AI, ML, models, research).
@@ -2155,6 +2168,15 @@ NEWS_NAME_BATCH_SIZE = _int("NEWS_NAME_BATCH_SIZE", 15)
 NEWS_GENERIC_NAMES = _str_list(
     "NEWS_GENERIC_NAMES",
     "Google,Meta,Microsoft,NVIDIA,Apple,OpenAI,Amazon,Arcade,Multiple,Cleo")
+
+# THE SHORTEST NAME THAT IS MATCHED, in characters (NEWS-PATCH-OCT16; it was
+# 3). A shorter name on a sheet is never matched, and is listed once in the log
+# as "too short to match".
+NEWS_NAME_MIN_CHARS = _int("NEWS_NAME_MIN_CHARS", 4)
+# THE FLOOD CAP: after this many items in one pull name one company or watch
+# name, that name counts in the TITLE only for the rest of the pull, and the
+# pull lists it under "noisy names" (the health line prints them).
+NEWS_NAME_FLOOD_MAX = _int("NEWS_NAME_FLOOD_MAX", 30)
 
 # NAMES WATCHED THAT ARE NOT ON A SHEET: the competitors. Flagged like our own
 # companies and breaking at NEWS_POC_BREAKING_MIN. A name that is also on a
@@ -2222,9 +2244,18 @@ NEWS_BREAKING_MIN_IMPORTANCE = _int("NEWS_BREAKING_MIN_IMPORTANCE", 5)
 NEWS_POC_BREAKING_MIN = _int("NEWS_POC_BREAKING_MIN", 4)
 # THE FLOOD GUARD. One cycle posts at most this many breaking stories, in ONE
 # message: the highest-scored, then the higher source, then the newest. The
-# rest are not recorded, so the next cycle can send them. There is no daily
-# limit (NEWS_BREAKING_MAX_PER_DAY is retired).
-NEWS_BREAKING_MAX_PER_CYCLE = _int("NEWS_BREAKING_MAX_PER_CYCLE", 3)
+# rest are not recorded, so the next cycle can send them. ONE since
+# NEWS-PATCH-OCT16 (it was 3: on 14 Oct three went out an hour).
+NEWS_BREAKING_MAX_PER_CYCLE = _int("NEWS_BREAKING_MAX_PER_CYCLE", 1)
+# THE DAY'S BREAKING BUDGET (NEWS-PATCH-OCT16; the name was retired with
+# NFT2-1087 and is read again). At most this many breaking stories a day,
+# counted from the breaking stories recorded today (IST), so it starts again at
+# midnight. A candidate past it is held for the daily post and not recorded.
+NEWS_BREAKING_MAX_PER_DAY = _int("NEWS_BREAKING_MAX_PER_DAY", 4)
+# AN INDUSTRY STORY BREAKS ONLY WHEN THIS MANY OUTLETS CARRY IT (a 5 from one
+# outlet waits for a second outlet, or the daily post) — unless the launch rule
+# scored it (`news.launch_rule`). Stories about us are not held to it.
+NEWS_BREAKING_MIN_OUTLETS = _int("NEWS_BREAKING_MIN_OUTLETS", 2)
 # BREAKING MEANS NEW. A story is sent as breaking only while it was FIRST SEEN
 # within this many hours; older than that it goes to the daily post. A story
 # that reaches a breaking score late is never sent as stale breaking news.
@@ -2259,6 +2290,10 @@ NEWS_FEED_TIMEOUT_SECONDS = _int("NEWS_FEED_TIMEOUT_SECONDS", 10)
 # The most feed items ONE scoring call is shown (titles + summaries only).
 # 40 items is about 3k tokens on the light model. Items about us go first.
 NEWS_SCORE_MAX_ITEMS = _int("NEWS_SCORE_MAX_ITEMS", 40)
+# HOW MANY SCORING CALLS ONE CYCLE MAY MAKE (NEWS-PATCH-OCT16), each of
+# NEWS_SCORE_MAX_ITEMS, down the pre-rank (`news.preselect`). What is still
+# unscored after the last one is "carried" and scored first by the next cycle.
+NEWS_SCORE_MAX_CALLS = _int("NEWS_SCORE_MAX_CALLS", 3)
 # How long a feed item is kept, in days, before a pull prunes it.
 NEWS_FEED_KEEP_DAYS = _int("NEWS_FEED_KEEP_DAYS", 14)
 
@@ -2285,11 +2320,18 @@ NEWS_HOLD_AFTER_TEST_SECONDS = _int("NEWS_HOLD_AFTER_TEST_SECONDS", 300)
 # or breaking. Matched on the normalised URL OR the headline key.
 NEWS_REPEAT_DAYS = _int("NEWS_REPEAT_DAYS", 30)
 
+# A NEWS QUESTION (NEWS-ANSWER-OCT16): the window, in hours, when the question
+# names none ("any AI news?"). The top stories of that window are given,
+# repeats included. A question that names a window ("since yesterday") uses it.
+NEWS_ASK_DEFAULT_HOURS = _int("NEWS_ASK_DEFAULT_HOURS", 24)
+# How long, in minutes, a "yes" / "next" / "show me the rest" under a news
+# answer still gives its next page. Later, the bot asks before it lists.
+NEWS_ASK_REST_MINUTES = _int("NEWS_ASK_REST_MINUTES", 30)
+
 # RETIRED WITH NFT2-1087 — nothing reads these names any more, and a value
 # left in .env is ignored, never a crash: NEWS_FEED_POLL_MINUTES and
 # NEWS_CHECK_TIMES (the hourly cycle replaced the 15-minute poll and the check
-# slots), NEWS_CHECK_MAX_USES, NEWS_BREAKING_MAX_PER_DAY (no daily limit; the
-# flood guard is per cycle), NEWS_POC_TARGETS_PER_DAY, NEWS_POC_SLOTS and
+# slots), NEWS_CHECK_MAX_USES, NEWS_POC_TARGETS_PER_DAY, NEWS_POC_SLOTS and
 # NEWS_POC_LOOKBACK_DAYS (every name is watched every hour, in batches),
 # NEWS_OVERFLOW_ENABLED, NEWS_OVERFLOW_MIN_IMPORTANCE and
 # NEWS_OVERFLOW_MAX_ITEMS ("More AI News" is removed).

@@ -62,7 +62,8 @@ def test_what_counts_as_a_plain_news_question():
         assert not news.plain_question(ask), ask
 
 
-def test_an_answer_picks_by_score_and_lists_by_time():
+def test_the_old_fresh_rule_picks_by_score_and_lists_by_time():
+    """The pre-NEWS-ANSWER-OCT16 rule, kept behind mode="fresh"."""
     def story(name, imp, hour):
         return {"headline": name, "url": f"https://a.example/{name}", "url_key": name,
                 "headline_key": name, "importance": imp, "kind": "industry",
@@ -71,16 +72,35 @@ def test_an_answer_picks_by_score_and_lists_by_time():
     pool = [story("old five", 5, 1), story("new three", 3, 9), story("mid four", 4, 5),
             story("new four", 4, 8), story("old three", 3, 2), story("mid five", 5, 6),
             story("old four", 4, 3)]
-    got = news.choose_answer(pool, is_sent=lambda s: False)
+    got = news.choose_answer(pool, is_sent=lambda s: False, mode="fresh")
     assert [s["headline"] for s in got["stories"]] == [
         "new four", "mid five", "mid four", "old four", "old five"]
     assert got["repeat"] is False and got["unsent"] == 7
     sent = {"old five", "mid five", "new four", "mid four", "old four"}
-    got = news.choose_answer(pool, is_sent=lambda s: s["headline"] in sent)
+    got = news.choose_answer(pool, is_sent=lambda s: s["headline"] in sent, mode="fresh")
     assert [s["headline"] for s in got["stories"]] == ["new three", "old three"]
-    got = news.choose_answer(pool, is_sent=lambda s: True)
+    got = news.choose_answer(pool, is_sent=lambda s: True, mode="fresh")
     assert got["repeat"] is True and len(got["stories"]) == 5
-    assert news.choose_answer(pool, is_sent=lambda s: False, cap=99)["stories"].__len__() == 5
+    assert news.choose_answer(pool, is_sent=lambda s: False, cap=99, mode="fresh")["stories"].__len__() == 5
+
+
+def test_an_answer_is_the_top_of_the_window_repeats_included():
+    """NEWS-ANSWER-OCT16: by score then newest, sent or not, a page at a time."""
+    def story(name, imp, hour):
+        return {"headline": name, "url": f"https://a.example/{name}", "url_key": name,
+                "headline_key": name, "importance": imp, "kind": "industry",
+                "published_at": f"2026-10-08T{hour:02d}:00:00Z"}
+
+    pool = [story("old five", 5, 1), story("new three", 3, 9), story("mid four", 4, 5),
+            story("new four", 4, 8), story("old three", 3, 2), story("mid five", 5, 6),
+            story("old four", 4, 3)]
+    got = news.choose_answer(pool, is_sent=lambda s: s["headline"] == "mid five")
+    assert [s["headline"] for s in got["stories"]] == [
+        "mid five", "old five", "new four", "mid four", "old four"]
+    assert (got["total"], got["remaining"], got["sent_before"]) == (7, 2, ["mid five"])
+    rest = news.choose_answer(pool, is_sent=lambda s: False, offset=5)
+    assert [s["headline"] for s in rest["stories"]] == ["new three", "old three"]
+    assert rest["remaining"] == 0
 
 
 def test_a_story_an_answer_gave_does_not_use_up_the_daily_posts_topic_allowance(tmp_path):

@@ -1522,11 +1522,56 @@ def deliverables_lines_for_check() -> list:
 # -- every line, rendered, for the register check ----------------------------
 
 
+def news_health_lines(st: dict) -> list:
+    """THE NEWS HEALTH LINE (NEWS-PATCH-OCT16): one message a day to the TEST
+    channel, one line per item, plain words, no emoji. An operator line, so it
+    may name settings. `st` carries the counts (bot._news_health_stats)."""
+    noisy = ", ".join(st.get("noisy") or ()) or "none"
+    breaking = (f"Breaking: {st.get('breaking', 0)} posted today of a budget of "
+                f"{st.get('budget', 0)}")
+    if st.get("spent_at"):
+        breaking += f", budget spent at {st['spent_at']}"
+    return [
+        f"News health, {st.get('day', '?')} (IST)",
+        f"Cycles: {st.get('planned', 0)} planned, {st.get('run', 0)} run, "
+        f"{st.get('late', 0)} late, {st.get('skipped', 0)} skipped, "
+        f"{st.get('partial', 0)} partial",
+        f"Items: {st.get('fetched', 0)} fetched, {st.get('new', 0)} new, "
+        f"{plural(st.get('merged', 0), 'copy', 'copies')} merged",
+        f"Flagged as ours: {st.get('flagged', 0)}",
+        f"Noisy names: {noisy}",
+        f"Scored: {st.get('scored_model', 0)} by the model, {st.get('scored_rule', 0)} "
+        f"by the launch rule, {st.get('carried', 0)} carried",
+        breaking,
+        f"Daily post: {plural(st.get('daily', 0), 'story', 'stories')}",
+    ]
+
+
+def news_keep_days(days: int) -> str:
+    """Under a news answer whose window was longer than the store keeps."""
+    return f"I keep {plural(days, 'day')} of news."
+
+
+def news_nothing_on(topic: str, label: str, latest: str = "") -> str:
+    """A topic question with nothing in the window (NEWS-ANSWER-OCT16). With
+    `latest` the newest matching story follows on the next line."""
+    head = f"Nothing on {topic} in the {label}."
+    return head + (f" The latest I have is from {latest}:" if latest else "")
+
+
 def all_lines() -> list:
     """Every line this module can produce, with stand-in values — what the
     register test reads. A new line that is not added here is not checked, so
     add it here."""
     return [
+        news_keep_days(14), news_nothing_on("ElevenLabs", "last 24 hours", "Tue 13 Oct 2026"),
+        news_nothing_on("ElevenLabs", "last 14 days"),
+        *news_health_lines({"day": "Thu 15 Oct", "planned": 10, "run": 9, "late": 1,
+                            "skipped": 1, "partial": 0, "fetched": 900, "new": 300,
+                            "merged": 1, "flagged": 40, "noisy": ["Acme"],
+                            "scored_model": 120, "scored_rule": 1, "carried": 0,
+                            "breaking": 4, "budget": 4, "spent_at": "16:00",
+                            "daily": 5}),
         *INTERIM_WEB, *INTERIM_ENGINE,
         model_failure("APIConnectionError"), BRIEF_FAILED, BRIEF_EMPTY,
         greeting("Hi Vaishnavi", "morning"), not_followed("Hi"), FOUND_NOTHING, TRUNCATED,

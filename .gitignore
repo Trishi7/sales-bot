@@ -35,6 +35,10 @@ state/*
 # change to the line above cannot start committing it.
 state/prompts/
 
+# Channel exports written by export_channel.py (--out, default ./exports). They hold
+# the team's messages, so they are never committed.
+exports/
+
 # Logs (PM2 writes here; see DEPLOY.md)
 logs/
 *.log

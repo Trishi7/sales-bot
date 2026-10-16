@@ -1353,6 +1353,27 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # anthropic), so "what did you cost" can price a request. '' on rows from
     # before this is read as anthropic, which is what they were.
     ("web_search_usage", "backend", "TEXT NOT NULL DEFAULT ''"),
+    # NEWS-PATCH-OCT16: ONE STORY, MANY OUTLETS. `story_key` is the headline's
+    # significant words SORTED (news.story_key), so two outlets' word orders
+    # are one key; `outlets` lists every copy merged into the row ("Outlet|url",
+    # comma-separated) and `outlet_count` how many distinct outlets carried it
+    # (the industry's two-outlet breaking rule); `best_url` is the link of a
+    # NEWS_PREFERRED_DOMAINS copy when one arrived. `scored_by` says who scored
+    # the row: "model", or "rule" for the launch rule ('' = not scored, or
+    # scored before the column existed).
+    ("news_feed_items", "story_key", "TEXT NOT NULL DEFAULT ''"),
+    ("news_feed_items", "outlets", "TEXT NOT NULL DEFAULT ''"),
+    ("news_feed_items", "outlet_count", "INTEGER NOT NULL DEFAULT 1"),
+    ("news_feed_items", "best_url", "TEXT NOT NULL DEFAULT ''"),
+    ("news_feed_items", "scored_by", "TEXT NOT NULL DEFAULT ''"),
+    # What each cycle did, for the health line (NEWS-PATCH-OCT16): copies
+    # merged, the names past the flood cap, the items scored by the model and
+    # by the launch rule, and the items left unscored ("carried").
+    ("news_cycles", "merged", "INTEGER NOT NULL DEFAULT 0"),
+    ("news_cycles", "noisy", "TEXT NOT NULL DEFAULT ''"),
+    ("news_cycles", "scored_model", "INTEGER NOT NULL DEFAULT 0"),
+    ("news_cycles", "scored_rule", "INTEGER NOT NULL DEFAULT 0"),
+    ("news_cycles", "carried", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Indexes on migrated columns. They cannot live in SCHEMA — on an existing DB
@@ -1361,7 +1382,12 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 _POST_MIGRATION_SQL: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_news_stories_headline "
     "ON news_stories(headline_key, posted_on)",
+    "CREATE INDEX IF NOT EXISTS ix_news_feed_story ON news_feed_items(story_key)",
 ]
+
+# The meta key that says the story keys of the feed store were back-filled.
+STORY_KEY_BACKFILL_META = "news_feed_story_key_backfill"
+STORY_KEY_BACKFILL_BATCH = 500
 
 
 class DB:
@@ -1370,6 +1396,11 @@ class DB:
         with self.conn() as c:
             c.executescript(SCHEMA)
             self._migrate(c)
+        try:
+            self.news_feed_backfill_story_keys()
+        except Exception:
+            log.exception("[db] the story keys could not be back-filled; the next "
+                          "start tries again")
         log.info("[db] ready at %s", path)
 
     @staticmethod
@@ -3681,27 +3712,122 @@ class DB:
 
     # -- R1: the feed store (feeds.py) --------------------------------------
 
-    def news_feed_add(self, items: list) -> int:
+    def news_feed_backfill_story_keys(self, *, batch: int = STORY_KEY_BACKFILL_BATCH) -> int:
+        """Fill `story_key` on the rows stored before the column existed —
+        ONCE, at startup, in batches of `batch` rows (NEWS-PATCH-OCT16). A meta
+        row marks it done, so a title with no significant word is not read
+        again at every start. Returns how many rows were filled."""
+        if self.get_meta(STORY_KEY_BACKFILL_META):
+            return 0
+        import news
+
+        done, last = 0, 0
+        while True:
+            with self.conn() as c:
+                rows = c.execute(
+                    "SELECT rowid AS rid, title FROM news_feed_items WHERE rowid > ? "
+                    "AND story_key = '' ORDER BY rowid LIMIT ?",
+                    (last, max(1, int(batch)))).fetchall()
+                if not rows:
+                    break
+                c.executemany("UPDATE news_feed_items SET story_key = ? WHERE rowid = ?",
+                              [(news.story_key(r["title"]), r["rid"]) for r in rows])
+            done += len(rows)
+            last = rows[-1]["rid"]
+        self.set_meta(STORY_KEY_BACKFILL_META, f"{done} row(s)")
+        if done:
+            log.info("[db] story keys back-filled on %d stored feed item(s), in batches "
+                     "of %d", done, max(1, int(batch)))
+        return done
+
+    @staticmethod
+    def _outlet_entries(raw: str) -> list:
+        """The `outlets` column as [(outlet, url)]."""
+        out: list = []
+        for part in str(raw or "").split(","):
+            name, _sep, url = part.partition("|")
+            if name.strip() or url.strip():
+                out.append((name.strip(), url.strip()))
+        return out
+
+    @staticmethod
+    def _outlet_entry(source: str, url: str) -> str:
+        name = " ".join(str(source or "").replace(",", " ").replace("|", " ").split())
+        return f"{name[:80]}|{str(url or '').replace(',', '%2C').strip()}"
+
+    def news_feed_add(self, items: list, *, entities_of=None,
+                      stats: Optional[dict] = None) -> int:
         """Store the feed items that are NEW. Returns how many were.
 
-        NEW MEANS NEITHER KEY IS KNOWN: the same link (url_key) or the same
-        headline from another outlet (headline_key) is the same story and is
-        not stored twice. THE FIRST COPY IS THE ONE KEPT — its link, its
-        outlet and its `source_rank` — and the sources are read in priority
-        order (Google News for our names first), so Google's copy wins.
+        NEW MEANS NO KEY IS KNOWN AND NO STORED ROW IS THE SAME STORY. The same
+        link (url_key), the same headline in the same order (headline_key),
+        the same words in ANY order (story_key, NEWS-PATCH-OCT16) — or, after
+        those, `news.same_story` against the rows first seen in the last 36
+        hours that share a name with it (`entities_of(title)`: the sheets'
+        names and the industry's; default the industry's only). On 14 Oct the
+        Gemini 4 launch was stored 29 times because only the first two were
+        checked.
+
+        THE FIRST COPY IS THE ONE KEPT — its link, its outlet and its
+        `source_rank` — and the sources are read in priority order (Google
+        News for our names first), so Google's copy wins. EXCEPT a copy from
+        NEWS_PREFERRED_DOMAINS when the stored link is not on one: then the
+        row takes that copy's link, outlet and source rank, and `best_url`
+        records it. The url_key stays: it is the row's identity.
+
+        EVERY LATER COPY IS COUNTED. A copy with a new link is added to the
+        row's `outlets` ("Outlet|url"), and a new OUTLET bumps `outlet_count`
+        — the industry's two-outlet breaking rule reads it. The same link
+        fetched again an hour later is not a copy. `stats["merged"]` is how
+        many copies were merged.
 
         A SECOND COPY THAT NAMES US MARKS THE STORED ROW (NFT2-1087). Two
         outlets carry one story and only one of them names the company: the
         row's `flag` is set if EITHER copy named us, and its `names` are the
         union of both. Its score is kept — it is the same story.
         """
-        added = 0
+        import news
+        from datetime import datetime as _dt, timezone as _tz
+
+        names_of = entities_of or news.model_entities
+        added = merged = 0
+        recent: Optional[list] = None          # rows first seen in the last 36 h
+
+        def load_recent(c) -> list:
+            stamps = [str(it.get("seen_at") or "") for it in items or []
+                      if str(it.get("seen_at") or "")]
+            try:
+                first = _dt.fromisoformat(min(stamps).replace("Z", "+00:00")) \
+                    if stamps else _dt.now(_tz.utc)
+            except ValueError:
+                first = _dt.now(_tz.utc)
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=_tz.utc)
+            since = (first - timedelta(hours=news.SAME_STORY_HOURS)).isoformat(
+                timespec="seconds")
+            rows = c.execute(
+                "SELECT url_key, title, story_key, seen_at FROM news_feed_items "
+                "WHERE seen_at >= ?", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+        def entities(row: dict) -> set:
+            if "_ents" not in row:
+                try:
+                    row["_ents"] = set(names_of(row.get("title") or ""))
+                except Exception:
+                    row["_ents"] = set()
+            return row["_ents"]
+
         with self.conn() as c:
             for it in items or []:
                 ukey = str(it.get("url_key") or "").strip()
                 hkey = str(it.get("headline_key") or "").strip()
                 if not ukey:
                     continue
+                title = str(it.get("title") or "")
+                skey = str(it.get("story_key") or "").strip() or news.story_key(title)
+                url = str(it.get("url") or "")
+                source = str(it.get("source") or "")[:120]
                 flag = 1 if int(it.get("flag") or 0) else 0
                 names = [n.strip() for n in str(it.get("names") or "").split(",")
                          if n.strip()]
@@ -3713,38 +3839,86 @@ class DB:
                     rank = int(it.get("source_rank") or 9)
                 except (TypeError, ValueError):
                     rank = 9
+                cols = ("url_key, kind, names, flag, sheet_ref, url, source, source_rank, "
+                        "outlets, outlet_count, best_url")
                 seen = c.execute(
-                    "SELECT url_key, kind, names, flag, sheet_ref FROM news_feed_items "
-                    "WHERE url_key = ? OR (? <> '' AND headline_key = ?) LIMIT 1",
-                    (ukey, hkey, hkey),
+                    f"SELECT {cols} FROM news_feed_items WHERE url_key = ? "
+                    "OR (? <> '' AND headline_key = ?) OR (? <> '' AND story_key = ?) "
+                    "ORDER BY (url_key = ?) DESC LIMIT 1",
+                    (ukey, hkey, hkey, skey, skey, ukey),
                 ).fetchone()
+                if seen is None:
+                    if recent is None:
+                        recent = load_recent(c)
+                    mine = {"title": title, "story_key": skey,
+                            "seen_at": str(it.get("seen_at") or "")}
+                    ents = entities(mine)
+                    if len(ents) >= 2:
+                        for r in recent:
+                            if len(entities(r) & ents) >= 2 and news.same_story(
+                                    mine, r, entities_of=lambda t: set(names_of(t))):
+                                seen = c.execute(
+                                    f"SELECT {cols} FROM news_feed_items WHERE url_key = ?",
+                                    (r["url_key"],)).fetchone()
+                                if seen is not None:
+                                    break
                 if seen is not None:
+                    sets: dict = {}
                     have = [n.strip() for n in str(seen["names"] or "").split(",")
                             if n.strip()]
                     low = {n.lower() for n in have}
-                    merged = have + [n for n in names if n.lower() not in low]
-                    if merged != have or (flag and not int(seen["flag"] or 0)):
+                    merged_names = have + [n for n in names if n.lower() not in low]
+                    if merged_names != have or (flag and not int(seen["flag"] or 0)):
                         was = str(seen["kind"] or "")
+                        sets.update(
+                            names=", ".join(merged_names)[:500],
+                            flag=1 if (flag or int(seen["flag"] or 0)) else 0,
+                            kind=kind if (flag and was in ("", "industry")) else was,
+                            sheet_ref=str(seen["sheet_ref"] or "") or ref)
+                    if seen["url_key"] != ukey:
+                        listed = self._outlet_entries(seen["outlets"]) or [
+                            (str(seen["source"] or ""), str(seen["url"] or ""))]
+                        known_urls = {news.url_key(u) for _n, u in listed if u}
+                        known_names = {n.lower() for n, _u in listed if n}
+                        if news.url_key(url) not in known_urls:
+                            merged += 1
+                            listed.append((source, url))
+                            sets["outlets"] = ",".join(
+                                self._outlet_entry(n, u) for n, u in listed)[:4000]
+                            if source.strip().lower() not in known_names:
+                                sets["outlet_count"] = max(
+                                    int(seen["outlet_count"] or 1), len(known_names)) + 1
+                            if news.preferred_domain(url) \
+                                    and not news.preferred_domain(seen["url"]):
+                                sets.update(url=url, source=source, source_rank=rank,
+                                            best_url=url)
+                    if sets:
                         c.execute(
-                            "UPDATE news_feed_items SET names = ?, flag = ?, kind = ?, "
-                            "sheet_ref = ? WHERE url_key = ?",
-                            (", ".join(merged)[:500],
-                             1 if (flag or int(seen["flag"] or 0)) else 0,
-                             kind if (flag and was in ("", "industry")) else was,
-                             str(seen["sheet_ref"] or "") or ref, seen["url_key"]))
+                            "UPDATE news_feed_items SET "
+                            + ", ".join(f"{k} = ?" for k in sets) + " WHERE url_key = ?",
+                            tuple(sets.values()) + (seen["url_key"],))
                     continue
                 c.execute(
                     "INSERT INTO news_feed_items (url_key, headline_key, url, title, "
                     "summary, source, published_at, topic_hint, seen_at, kind, "
-                    "sheet_ref, names, flag, source_rank) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (ukey, hkey, str(it.get("url") or ""), str(it.get("title") or "")[:300],
-                     str(it.get("summary") or "")[:300], str(it.get("source") or "")[:120],
+                    "sheet_ref, names, flag, source_rank, story_key, outlets, "
+                    "outlet_count, best_url) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (ukey, hkey, url, title[:300],
+                     str(it.get("summary") or "")[:300], source,
                      str(it.get("published_at") or ""), str(it.get("topic_hint") or ""),
                      str(it.get("seen_at") or ""), kind, ref,
-                     ", ".join(names)[:500], flag, rank),
+                     ", ".join(names)[:500], flag, rank, skey,
+                     self._outlet_entry(source, url), 1,
+                     url if news.preferred_domain(url) else ""),
                 )
                 added += 1
+                if recent is not None:
+                    recent.append({"url_key": ukey, "title": title, "story_key": skey,
+                                   "seen_at": str(it.get("seen_at") or "")})
+        if stats is not None:
+            stats["merged"] = merged
+            stats["added"] = added
         return added
 
     def news_feed_between(self, since_utc: str, until_utc: str) -> list[dict]:
@@ -3919,27 +4093,41 @@ class DB:
         return n
 
     def news_feed_set_scores(self, scored: list, *, scored_at: str,
-                             generic_flag_min: int = 4) -> int:
-        """Write the light model's verdicts back: [{url_key, importance, topic,
-        what}]. An item scored once is never paid for again."""
+                             generic_flag_min: int = 4, scored_by: str = "model") -> int:
+        """Write the verdicts back: [{url_key, importance, topic, what,
+        scored_by?}]. An item scored once is never paid for again. `scored_by`
+        is "model" (the light model) or "rule" (the launch rule,
+        NEWS-PATCH-OCT16); a verdict's own `scored_by` wins."""
         rows = [(max(1, min(5, int(s.get("importance") or 1))),
                  str(s.get("topic") or ""), str(s.get("what") or "")[:300],
-                 str(scored_at), str(s["url_key"]))
+                 str(scored_at), str(s.get("scored_by") or scored_by or ""),
+                 str(s["url_key"]))
                 for s in (scored or []) if str(s.get("url_key") or "").strip()]
         if not rows:
             return 0
         with self.conn() as c:
             c.executemany(
                 "UPDATE news_feed_items SET importance = ?, topic = ?, what = ?, "
-                "scored_at = ? WHERE url_key = ?", rows)
+                "scored_at = ?, scored_by = ? WHERE url_key = ?", rows)
             # A GENERIC NAME'S ITEM (NEWS_GENERIC_NAMES: named in the title, no
             # person of ours on it) carries the name but not the flag. The
             # score is what settles it: at 4 or more it is about us after all.
             c.executemany(
                 "UPDATE news_feed_items SET flag = 1, kind = 'poc' WHERE url_key = ? "
                 "AND flag = 0 AND names <> '' AND importance >= ?",
-                [(r[4], max(1, int(generic_flag_min))) for r in rows])
+                [(r[5], max(1, int(generic_flag_min))) for r in rows])
         return len(rows)
+
+    def news_feed_unscored(self, since_utc: str, until_utc: str) -> list[dict]:
+        """Every item FIRST SEEN in [since, until] that nobody has scored —
+        what an earlier cycle could not reach (NEWS-PATCH-OCT16: "carried"),
+        newest first."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM news_feed_items WHERE importance = 0 "
+                "AND seen_at >= ? AND seen_at <= ? ORDER BY seen_at DESC",
+                (str(since_utc), str(until_utc))).fetchall()
+        return [dict(r) for r in rows]
 
     def news_feed_prune(self, before_utc: str) -> int:
         with self.conn() as c:
@@ -4098,14 +4286,39 @@ class DB:
 
     def news_cycle_finish(self, on_date: str, hour: str, *, status: str,
                           finished_at: str, fetched: int = 0, new_items: int = 0,
-                          flagged: int = 0, posted: int = 0, note: str = "") -> None:
+                          flagged: int = 0, posted: int = 0, note: str = "",
+                          merged: int = 0, noisy=(), scored_model: int = 0,
+                          scored_rule: int = 0, carried: int = 0) -> None:
         with self.conn() as c:
             c.execute(
                 "UPDATE news_cycles SET status = ?, finished_at = ?, fetched = ?, "
-                "new_items = ?, flagged = ?, posted = ?, note = ? "
+                "new_items = ?, flagged = ?, posted = ?, note = ?, merged = ?, "
+                "noisy = ?, scored_model = ?, scored_rule = ?, carried = ? "
                 "WHERE on_date = ? AND hour = ?",
                 (str(status), str(finished_at), int(fetched), int(new_items),
-                 int(flagged), int(posted), str(note)[:300], str(on_date), str(hour)))
+                 int(flagged), int(posted), str(note)[:300], int(merged),
+                 ", ".join(str(n).replace(",", " ") for n in (noisy or ()))[:500],
+                 int(scored_model), int(scored_rule), int(carried),
+                 str(on_date), str(hour)))
+
+    def news_cycle_skip(self, on_date: str, hour: str, *, at: str, note: str) -> bool:
+        """Claim a cycle that is too late to run as "skipped" (NEWS-PATCH-OCT16),
+        so it is never run and never offered again. False when it was taken."""
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO news_cycles (on_date, hour, started_at, "
+                "finished_at, status, note) VALUES (?,?,?,?, 'skipped', ?)",
+                (str(on_date), str(hour), str(at), str(at), str(note)[:300]))
+            return cur.rowcount > 0
+
+    def news_cycle_hours(self, on_date: str) -> list:
+        """The LIVE hours claimed on a date, any status (a test day's "test
+        HH:MM" rows are not live). FAILS CLOSED: an unreadable table raises."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT hour FROM news_cycles WHERE on_date = ? "
+                "AND hour NOT LIKE 'test%'", (str(on_date),)).fetchall()
+        return [str(r["hour"]) for r in rows]
 
     def news_cycle_last_done(self) -> Optional[dict]:
         """The most recent LIVE cycle that completed, or None. A test day's
@@ -4692,6 +4905,32 @@ class DB:
                 rows,
             )
         return len(rows)
+
+    def news_breaking_count_on(self, on_date: str) -> int:
+        """How many breaking stories were posted on this (IST) date — the
+        day's budget (NEWS_BREAKING_MAX_PER_DAY) counts against it."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM news_stories WHERE kind = 'breaking' "
+                "AND posted_on = ?", (str(on_date),)).fetchone()
+        return int(row["n"] or 0)
+
+    def news_breaking_times_on(self, on_date: str) -> list:
+        """When each breaking story of this date was recorded, oldest first
+        (the rows' `created_at`, UTC as SQLite writes it)."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT created_at FROM news_stories WHERE kind = 'breaking' "
+                "AND posted_on = ? ORDER BY created_at, rowid", (str(on_date),)).fetchall()
+        return [str(r["created_at"] or "") for r in rows]
+
+    def news_stories_count_on(self, on_date: str, kind: str) -> int:
+        """How many stories of one post kind (main | breaking) went out on a date."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM news_stories WHERE kind = ? AND posted_on = ?",
+                (str(kind), str(on_date))).fetchone()
+        return int(row["n"] or 0)
 
     def news_stories_posted(self, *, since_iso: str) -> int:
         with self.conn() as c:

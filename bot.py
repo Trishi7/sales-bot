@@ -456,6 +456,13 @@ class SalesBot(discord.Client):
         self._voice_tried_at: float = 0.0
         # Said once: under SEARCH_BACKEND=anthropic there is no news cycle.
         self._server_cycle_logged: bool = False
+        # THE CYCLE LOCK (NEWS-PATCH-OCT16): True while a news cycle runs, so
+        # a tick that fires meanwhile returns at once and two never overlap.
+        self._news_cycle_busy: bool = False
+        # THE NEWS ANSWER'S PAGES (NEWS-ANSWER-OCT16), per channel: the window,
+        # topic, page size, offset and message of the last news answer that
+        # offered "the rest" — so a "yes" under it gives the next page.
+        self._news_pages: dict = {}
 
         self.memory = ConversationMemory(
             max_turns=config.QUERY_MEMORY_TURNS,
@@ -1909,6 +1916,12 @@ class SalesBot(discord.Client):
         # A PLAIN "ANY AI NEWS?" IS ANSWERED BY CODE, before the extractor and
         # the router: no company, person or subject is named, so there is
         # nothing to decide and no model is asked (`_answer_plain_news`).
+        # "YES" / "THE REST" UNDER A NEWS ANSWER THAT OFFERED MORE: the next
+        # page (NEWS-ANSWER-OCT16), before a "show me the rest of the news"
+        # can be read as a new question.
+        if await self._maybe_news_rest(message, text):
+            self._mark_route(message, "news")
+            return True
         if news.plain_question(text):
             log.info("[query] msg=%s → the news list (a plain news question, "
                      "answered without the model)", message.id)
@@ -2148,55 +2161,74 @@ class SalesBot(discord.Client):
                  for w in re.findall(r"[a-z0-9]+", str(needle or "").lower())]
         return bool(words) and all(w in hay for w in words)
 
-    async def _news_answer(self, *, topic: str = "", days: int = 0) -> dict:
+    async def _news_answer(self, *, topic: str = "", days: int = 0, hours: int = 0,
+                           cap: int = 0, offset: int = 0, label: str = "",
+                           since: Optional[datetime] = None,
+                           until: Optional[datetime] = None) -> dict:
         """The news for somebody who ASKED: which stories, and the message.
 
-        Returns {"block", "stories", "repeat", "quiet", "day", "topic",
-        "unsent", "unscored"}. `block` is the finished message (news.render,
-        MODE_ANSWER) or "" when there is nothing to give; `quiet` is then the
-        day's quiet line.
+        Returns {"block", "stories", "sent_before", "total", "remaining",
+        "offset", "cap", "hours", "label", "since", "until", "topic", "day",
+        "quiet", "unscored", "repeat"}. `block` is the finished message
+        (news.render, MODE_ANSWER) or "" when there is nothing to give; `quiet`
+        is then the day's quiet line.
 
-        WHAT IT CHOOSES (the team, 8 Oct): the 5 highest-scored stories NOT
-        sent in the channel before, listed newest first. Fewer than 5 unsent:
-        those, with no padding. A story already sent is given again only when
-        NOT ONE unsent story is left, and then the 5 highest-scored are given
-        (`news.choose_answer`).
+        THE TOP OF THE WINDOW, REPEATS INCLUDED (NEWS-ANSWER-OCT16). The window
+        is the one the person named (`hours`, or an anchored `since` from
+        `news.parse_window`), else NEWS_ASK_DEFAULT_HOURS (24) — the old "since
+        the previous daily post" is no longer used for answers. Every stored
+        item in it scored 3 or more is ranked by score and then newest, and
+        the page of `cap` (at most 5) from `offset` is given, whether or not
+        it was posted before (`news.choose_answer`): on 15 Oct the old "unsent
+        first" rule hid the stories posted the evening before, which were the
+        ones the asker meant. When more are left, the template's tail offers
+        them. `days` is the tool's older field; `hours` wins over it. A window
+        longer than NEWS_FEED_KEEP_DAYS is cut to it, and the answer says so.
 
-        WHERE THEY COME FROM: the feed store, everything collected since the
-        previous daily post or in the last 24 hours, whichever is longer,
-        scored 3 or more. "Sent before" is the news_stories table inside
-        NEWS_REPEAT_DAYS — the daily post, the follow-up, a breaking post and
-        every earlier answer (`_record_news_answer`).
+        A TOPIC WITH NOTHING IN THE WINDOW gets the newest matching story in
+        the store, said as such ("Nothing on X in the last 24 hours. The latest
+        I have is from <date>:"), or "Nothing on X in the last 14 days."
 
-        NOTHING HERE KNOWS OR SAYS WHEN ANYTHING IS POSTED. The old answer
-        sorted what had been posted first and handed the model a "since Wed
-        2 PM" window, and the reply opened "All of today's stories were
-        already posted at 2 PM. Here's what ran:". The window is now only a
-        way of finding rows; it is logged and never returned.
+        NOTHING HERE KNOWS OR SAYS WHEN ANYTHING IS POSTED. The answer never
+        says a story was already posted.
 
         READ-ONLY apart from the scores `_score_feed` writes, so an item rated
         for a question is not paid for again later. At most ONE MODEL_LIGHT
-        call, and only when something unsent in the window has never been
-        rated; with nothing unrated there is no model call at all. THE SAME
-        DAY THE REST OF THE BOT IS ON (`dl.today_ist()`), so a test day reads
-        that day's news and its heading names that day.
+        call, down the pre-rank, and only when something in the window has
+        never been rated. THE SAME CLOCK THE REST OF THE BOT IS ON
+        (`dl.now_ist()`, the test clock when set), never past the real now.
         """
         topic = " ".join(str(topic or "").split())
         keep_days = max(1, int(config.NEWS_FEED_KEEP_DAYS))
         try:
+            hours = int(hours or 0)
+        except (TypeError, ValueError):
+            hours = 0
+        try:
             days = int(days or 0)
         except (TypeError, ValueError):
             days = 0
-        days = min(days, keep_days) if days > 0 else 0
+        if hours > 0 and days > 0:
+            log.info("[news] question: both hours=%d and days=%d were given; hours wins",
+                     hours, days)
+        if hours <= 0 and days > 0:
+            hours, label = days * 24, label or (
+                "last day" if days == 1 else f"last {days} days")
+        cap = max(1, min(int(cap or self.NEWS_QUESTION_MAX_ITEMS), news.MAX_PER_MESSAGE))
         today = dl.today_ist()
-
-        since, until = self._main_window(today)
-        until = min(until, dl.real_now_ist())
-        # Since the previous daily post OR the last 24 hours, whichever is longer.
-        since = min(since, until - timedelta(hours=24))
-        if days:
-            since = until - timedelta(days=days)
-        since = max(since, until - timedelta(days=keep_days))
+        now = dl.now_ist()
+        real = dl.real_now_ist()
+        until = until or min(now, real)
+        if since is None:
+            if hours <= 0:
+                hours = max(1, int(config.NEWS_ASK_DEFAULT_HOURS))
+                label = label or (news.DEFAULT_WINDOW_LABEL if hours == 24
+                                  else f"last {hours} hours")
+            since = until - timedelta(hours=hours)
+        label = label or f"last {max(1, hours)} hours"
+        capped = since < until - timedelta(days=keep_days)
+        if capped:
+            since = until - timedelta(days=keep_days)
         since_utc, until_utc = feeds.utc_iso(since), feeds.utc_iso(until)
         cutoff = news.cutoff_iso(today)
 
@@ -2208,55 +2240,90 @@ class SalesBot(discord.Client):
 
         rows, sent_keys = await asyncio.to_thread(read)
         by_key = {r.get("url_key"): r for r in rows}
-        waiting = [r for r in rows if r.get("url_key") not in sent_keys]
-        unrated = [r for r in waiting if not int(r.get("importance") or 0)]
+        unrated = [r for r in rows if not int(r.get("importance") or 0)]
         unscored = 0
-        fresh = await self._score_feed(waiting, today=today, mode="question") \
+        nothing = False
+        pool = await self._score_feed(rows, today=today, mode="question", max_calls=1) \
             if unrated else None
-        if fresh is None:
+        if pool is None:
             # Nothing to rate, or the rating could not be done (budget, a failed
             # call): what was already rated is still there to give.
-            fresh = [news.story_from_feed(r) for r in waiting
-                     if int(r.get("importance") or 0) >= 3]
+            pool = [news.story_from_feed(r) for r in rows
+                    if int(r.get("importance") or 0) >= 3]
             unscored = len(unrated)
-        again = [news.story_from_feed(r) for r in rows
-                 if r.get("url_key") in sent_keys and int(r.get("importance") or 0) >= 3]
-        pool = fresh + again
-        if topic:
-            def about(story: dict) -> str:
-                row = by_key.get(story.get("url_key")) or {}
-                return " ".join(str(v) for v in (
-                    story.get("headline"), row.get("summary"), story.get("topic"),
-                    row.get("topic_hint"), story.get("what"), story.get("sheet_ref"),
-                    story.get("source")) if v)
+        else:
+            # Re-read: a row the call could not reach is still unrated.
+            unscored = 0
 
-            pool = [s for s in pool if self._news_matches(topic, about(s))]
+        def about(story: dict) -> str:
+            row = by_key.get(story.get("url_key")) or story
+            return " ".join(str(v) for v in (
+                story.get("headline") or row.get("title"), row.get("summary"),
+                story.get("topic"), row.get("topic_hint"), story.get("what"),
+                story.get("sheet_ref"), story.get("source")) if v)
+
+        if topic:
+            pool = [x for x in pool if self._news_matches(topic, about(x))]
 
         picked = news.choose_answer(
-            pool, is_sent=lambda s: s.get("url_key") in sent_keys,
-            cap=self.NEWS_QUESTION_MAX_ITEMS)
-        block = news.render(picked["stories"], mode=news.MODE_ANSWER, day=today)
-        shown = [s for s in picked["stories"] if s.get("url")] if block else []
-        log.info("[news] question%s: %s to %s IST — %d collected, %d worth 3+ and not "
-                 "sent, %d sent before, %d unrated; giving %d%s",
+            pool, is_sent=lambda x: x.get("url_key") in sent_keys, cap=cap, offset=offset)
+        block = news.render(picked["stories"], mode=news.MODE_ANSWER, day=today,
+                            remaining=picked["remaining"], label=label, cap=cap)
+        shown = [x for x in picked["stories"] if x.get("url")] if block else []
+        if block and capped:
+            block += "\n" + wording.news_keep_days(keep_days)
+        if not block and topic and not offset:
+            block = await asyncio.to_thread(
+                lambda: self._news_latest_on(topic, label=label, keep_days=keep_days,
+                                             about=about, today=today))
+            nothing = True
+        log.info("[news] question%s: %s to %s IST (%s) — %d collected, %d worth 3+ "
+                 "(%d posted before), %d unrated; giving %d from %d, %d left",
                  f" about {topic!r}" if topic else "",
                  since.strftime("%a %d %b %H:%M"), until.strftime("%a %d %b %H:%M"),
-                 len(rows), picked["unsent"], len(again), unscored, len(shown),
-                 " (nothing new is left, so these are repeats)" if picked["repeat"] else "")
-        return {"block": block, "stories": shown, "repeat": picked["repeat"],
+                 label, len(rows), picked["total"], len(picked["sent_before"]),
+                 unscored, len(shown), offset, picked["remaining"])
+        return {"block": block, "stories": shown, "sent_before": picked["sent_before"],
+                "total": picked["total"], "remaining": picked["remaining"] if shown else 0,
+                "offset": offset, "cap": cap, "hours": hours, "label": label,
+                "since": since, "until": until, "repeat": False,
                 "unsent": picked["unsent"], "unscored": unscored, "topic": topic,
+                "nothing": nothing,
                 "day": dl.iso(today), "quiet": "" if block else news.quiet_line(today)}
+
+    def _news_latest_on(self, topic: str, *, label: str, keep_days: int, about,
+                        today) -> str:
+        """A topic with nothing in the window: the newest matching story the
+        store has (NEWS_FEED_KEEP_DAYS), said as such — or that there is none."""
+        until = dl.real_now_ist()
+        rows = self._ledger().news_feed_between(
+            feeds.utc_iso(until - timedelta(days=keep_days)), feeds.utc_iso(until))
+        stories = [news.story_from_feed(r) for r in rows if r.get("url")]
+        stories = [x for x in stories if self._news_matches(topic, about(x))]
+        stories.sort(key=lambda x: str(x.get("published_at") or ""), reverse=True)
+        if not stories:
+            return wording.news_nothing_on(topic, f"last {keep_days} days")
+        when = dl.parse_date(str(stories[0].get("published_at") or "")[:10])
+        return (wording.news_nothing_on(topic, label, latest=dl.format_date(when)
+                                        if when else "")
+                + "\n" + news.story_line(stories[0]))
 
     async def _record_news_answer(self, got: dict) -> int:
         """Remember the stories an answer just gave, so the next answer and
         the next daily post leave them out. How many were recorded.
+
+        Only the stories NEW to this answer (NEWS-ANSWER-OCT16): an answer now
+        gives the window's best whether posted or not, and a story it repeats
+        (`sent_before`) is not recorded again.
 
         AFTER THE SEND, like every other news ledger here: a reply that was
         refused must not bury its stories. A REPEAT IS NOT RE-RECORDED — those
         rows already say when and how each story first went out, and the
         daily post's topic counts read them.
         """
-        stories = list((got or {}).get("stories") or [])
+        before = set((got or {}).get("sent_before") or [])
+        stories = [x for x in list((got or {}).get("stories") or [])
+                   if x.get("url_key") not in before]
         if not stories or (got or {}).get("repeat"):
             return 0
         try:
@@ -2272,6 +2339,100 @@ class SalesBot(discord.Client):
                     date=str(got.get("day") or ""), stories=len(stories),
                     topic=str(got.get("topic") or "") or None)
         return int(wrote or 0)
+
+    async def _after_news_answer(self, message, sent, got: dict) -> None:
+        """Once a news answer has gone: record its new stories, and remember
+        its page (`_news_pages`) when it offered the rest."""
+        if sent is None or not (got or {}).get("block"):
+            return
+        await self._record_news_answer(got)
+        cid = getattr(getattr(message, "channel", None), "id", None)
+        if cid is None:
+            return
+        if int(got.get("remaining") or 0) > 0:
+            self._news_pages[cid] = {
+                "topic": got.get("topic") or "", "label": got.get("label") or "",
+                "since": got.get("since"), "until": got.get("until"),
+                "cap": int(got.get("cap") or self.NEWS_QUESTION_MAX_ITEMS),
+                "offset": int(got.get("offset") or 0), "done": False, "asked": False,
+                "message_id": getattr(sent, "id", None), "at": _monotonic(),
+                "asker": getattr(getattr(message, "author", None), "id", None)}
+        elif int(got.get("offset") or 0) > 0 and cid in self._news_pages:
+            page = self._news_pages[cid]
+            page.update(done=True, message_id=getattr(sent, "id", None), at=_monotonic())
+        else:
+            self._news_pages.pop(cid, None)
+
+    _REST_RE = re.compile(
+        r"^\s*(?:(?:yes|yeah|yep|yup|sure|ok(?:ay)?|please|pls|go on|go ahead)[\s,.!]*)*"
+        r"(?:(?:show|give|send)\s+(?:me\s+)?)?(?:the\s+)?(?:rest|next|more)?"
+        r"(?:\s+(?:ones?|of them|of it|please|pls|stories|news))*[\s.!]*$", re.IGNORECASE)
+
+    async def _maybe_news_rest(self, message, text: str) -> bool:
+        """"Yes", "next", "show me the rest" under a news answer that offered
+        the rest: the NEXT PAGE, same window and topic (NEWS-ANSWER-OCT16).
+
+        WHICH MESSAGES: a reply to that answer, or a message in its channel
+        from the person who asked, that is nothing but a yes or a "rest". Per
+        channel, so two askers in two channels page on their own.
+
+          within NEWS_ASK_REST_MINUTES  the next `cap` stories; the last page
+                                        has no tail
+          later                         the question back ("The rest of the
+                                        last-24-hour news?"); a yes to THAT
+                                        gives the page
+          after the last page           "That was all of it."
+        """
+        cid = getattr(getattr(message, "channel", None), "id", None)
+        page = self._news_pages.get(cid)
+        body = str(text or "").strip()
+        if not page or not body or "?" in body or not self._REST_RE.match(body):
+            return False
+        if not re.search(r"[a-z]", body, re.IGNORECASE):
+            return False
+        ref = getattr(getattr(message, "reference", None), "message_id", None)
+        author = getattr(getattr(message, "author", None), "id", None)
+        if ref is not None:
+            if str(ref) != str(page.get("message_id")):
+                return False
+        elif author != page.get("asker"):
+            return False
+        if page.get("done"):
+            self._news_pages.pop(cid, None)
+            sent = await self._reply(message, news.ANSWER_ALL_SHOWN,
+                                     reason="the news answer had no more pages")
+            self._remember_said(sent, kind="answer", question=text)
+            return True
+        late = _monotonic() - float(page.get("at") or 0) \
+            > max(1, int(config.NEWS_ASK_REST_MINUTES)) * 60
+        if late and not page.get("asked"):
+            sent = await self._reply(message, news.rest_again(page.get("label") or ""),
+                                     reason="a late yes to the rest of a news answer")
+            page.update(asked=True, at=_monotonic(),
+                        message_id=getattr(sent, "id", page.get("message_id")))
+            log.info("[news] msg=%s a yes to the rest of the news came late; asked back",
+                     getattr(message, "id", "?"))
+            return True
+        got = await self._news_answer(
+            topic=page.get("topic") or "", cap=page.get("cap") or 0,
+            offset=int(page.get("offset") or 0) + int(page.get("cap") or 0),
+            label=page.get("label") or "", since=page.get("since"),
+            until=page.get("until"))
+        if not got["block"]:
+            self._news_pages.pop(cid, None)
+            sent = await self._reply(message, news.ANSWER_ALL_SHOWN,
+                                     reason="the news answer had no more pages")
+            return True
+        log.info("[news] msg=%s the rest of the news: stories %d-%d of %d",
+                 getattr(message, "id", "?"), got["offset"] + 1,
+                 got["offset"] + len(got["stories"]), got["total"])
+        sent = await self._reply_news(message, got["block"],
+                                      reason="the next page of a news answer")
+        page.update(asked=False)
+        await self._after_news_answer(message, sent, got)
+        self._remember_said(sent, kind="answer", question=text)
+        self.memory.record(message.channel.id, text, got["block"])
+        return True
 
     async def _reply_news(self, message, body: str, *, reason: str):
         """Send a news answer as a reply: ONE message whenever it fits.
@@ -2310,15 +2471,22 @@ class SalesBot(discord.Client):
         template. No router call, no engine call; the only model call
         possible is the light scorer rating items nobody has rated yet.
 
+        THE WINDOW AND THE COUNT ARE READ FROM THE WORDS (NEWS-ANSWER-OCT16):
+        "top 3 news today" is the top 3 since 00:00 IST (`news.parse_window`,
+        `news.parse_count`); no window named is the last 24 hours.
+
         A quiet day gets the quiet line. Returns True: the question is
         answered either way.
         """
-        got = await self._news_answer()
+        window = news.parse_window(text) or {}
+        got = await self._news_answer(hours=window.get("hours") or 0,
+                                      since=window.get("since"),
+                                      label=window.get("label") or "",
+                                      cap=news.parse_count(text) or 0)
         body = got["block"] or got["quiet"]
         sent = await self._reply_news(message, body,
                                       reason="the AI news, on demand")
-        if sent is not None and got["block"]:
-            await self._record_news_answer(got)
+        await self._after_news_answer(message, sent, got)
         self._remember_said(sent, kind="answer", question=text)
         self.memory.record(message.channel.id, text, body)
         return True
@@ -2345,8 +2513,26 @@ class SalesBot(discord.Client):
         async def _todays_news(inp: dict) -> dict:
             inp = inp or {}
             got = await self._news_answer(topic=str(inp.get("topic") or ""),
-                                          days=inp.get("days") or 0)
+                                          days=inp.get("days") or 0,
+                                          hours=inp.get("hours") or 0,
+                                          cap=inp.get("count") or 0)
             sink = _NEWS_SINK.get()
+            if got.get("nothing"):
+                # NOTHING ON THE TOPIC IN THE WINDOW (NEWS-ANSWER-OCT16): the
+                # line, and the newest matching story if there is one, are
+                # placed by code; the model may still look further.
+                if sink is not None:
+                    sink[:] = [got]
+                    return {"stories": 0, "topic": got["topic"], "added_to_reply": True,
+                            "note": ("A line saying nothing was collected on this in "
+                                     "the window is ALREADY IN YOUR REPLY, placed by "
+                                     "code; do not repeat it. You may use web_search "
+                                     "(news=true) for it; say plainly if that finds "
+                                     "nothing either.")}
+                return {"stories": 0, "topic": got["topic"], "list": got["block"],
+                        "note": ("Give this line exactly as it is. You may use "
+                                 "web_search (news=true) for it; say plainly if that "
+                                 "finds nothing either.")}
             if got["block"]:
                 if sink is not None:
                     sink[:] = [got]
@@ -2357,7 +2543,8 @@ class SalesBot(discord.Client):
                                  "placed by code. You are not shown them. Do not "
                                  "list, restate, summarise or introduce them, and "
                                  "say nothing about when or whether anything was "
-                                 "posted. Write only what the list does not answer."),
+                                 "posted. Write only what the list does not answer. "
+                                 "If it offers the rest, do not offer it again."),
                     }
                 return {"stories": len(got["stories"]), "list": got["block"],
                         "note": "Give this list exactly as it is, and nothing about "
@@ -2387,6 +2574,13 @@ class SalesBot(discord.Client):
                         "days": {"type": "integer",
                                  "description": f"The last N days (1-{keep_days}). "
                                                 "Optional."},
+                        "hours": {"type": "integer",
+                                  "description": "The window the person named, in hours. "
+                                                 "Leave empty for the default 24."},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 5,
+                                  "description": "How many stories, when the person "
+                                                 "says e.g. \"top 3\". Optional; 5 "
+                                                 "at most."},
                     },
                 }},
             "handler": _todays_news,
@@ -2887,8 +3081,7 @@ class SalesBot(discord.Client):
             # The list alone: nothing else was asked, or the model added nothing.
             sent = await self._reply_news(message, news_block,
                                           reason="the AI news, on demand")
-            if sent is not None:
-                await self._record_news_answer(news_got)
+            await self._after_news_answer(message, sent, news_got)
             self._remember_said(sent, kind="answer", question=q)
             self.memory.record(message.channel.id, text, news_block)
             return True
@@ -2965,8 +3158,7 @@ class SalesBot(discord.Client):
             # A NEWS ANSWER IS ONE MESSAGE and is split only between stories.
             sent = await self._reply_news(
                 message, reply, reason="answered a news question in the sales channel")
-            if sent is not None:
-                await self._record_news_answer(news_got)
+            await self._after_news_answer(message, sent, news_got)
             self._remember_said(sent, kind="answer", question=q)
         elif reply.strip():
             # RULE IDS NEVER REACH A PERSON — unless they asked for the preview,
@@ -2977,8 +3169,8 @@ class SalesBot(discord.Client):
                 keep_rule_ids="cadence_preview" in (outcome.get("tools_used") or []),
             )
             await self._map_prompt(sent, site="answer")
-            if sent is not None and news_block:
-                await self._record_news_answer(news_got)
+            if news_block:
+                await self._after_news_answer(message, sent, news_got)
             # WHAT THIS MESSAGE ANSWERED, so a reply to it is routed with it.
             self._remember_said(sent, kind="objectives" if objectives else "answer",
                                 question=q)
@@ -7533,8 +7725,10 @@ class SalesBot(discord.Client):
         THE ONE EXCEPTION is R1's hourly news cycle (`_news_cycle`): it runs
         on every tick, weekends included, reads the feeds once an hour from
         NEWS_PULL_FIRST, stays silent unless something is BREAKING, and posts
-        outside the drip and the cap. There is no daily limit on those posts;
-        the flood guard is per cycle (NEWS_BREAKING_MAX_PER_CYCLE).
+        outside the drip and the cap — at most NEWS_BREAKING_MAX_PER_CYCLE
+        stories a cycle and NEWS_BREAKING_MAX_PER_DAY a day. And at
+        NEWS_HEALTH_TIME the news health line goes to the TEST channel
+        (`_news_health`), outside the cap too.
 
         Guarded so a failing drip never stops the state summary being written.
         """
@@ -7546,6 +7740,10 @@ class SalesBot(discord.Client):
             await self._news_cycle()
         except Exception:
             log.exception("[news-cycle] tick raised; continuing")
+        try:
+            await self._news_health()
+        except Exception:
+            log.exception("[news-health] tick raised; continuing")
         try:
             await self._maybe_send_drip()
         except Exception:
@@ -8206,6 +8404,10 @@ class SalesBot(discord.Client):
           the message ended on an offer to LOOK SOMETHING UP → the engine
             runs it, with the bot's message as context.
         """
+        # THE REST OF A NEWS ANSWER (NEWS-ANSWER-OCT16) is an offer like the
+        # others, taken up here when the routing above did not reach it.
+        if await self._maybe_news_rest(message, text):
+            return True
         if not ctx["direct_is_bot"] or ctx["proposals"] or ctx["listed"]:
             return False
         if "?" in (text or ""):
@@ -13363,24 +13565,59 @@ class SalesBot(discord.Client):
 
         return await asyncio.to_thread(unposted)
 
-    async def _score_feed(self, rows: list, *, today, mode: str) -> Optional[list]:
-        """Have MODEL_LIGHT score the UNSCORED rows among `rows`, write the
-        verdicts back, and return every row in `rows` worth a 3 or more as
-        story dicts. None when there was something to score and it could not
-        be — the token budget is spent, or the call failed.
+    def _news_people(self) -> set:
+        """The lower-case names of the PEOPLE on the name list — the pre-rank's
+        first group (`news.preselect`). Empty when the list cannot be read."""
+        try:
+            return {str(e.get("name") or "").strip().lower()
+                    for e in self._ledger().news_names_all()
+                    if e.get("kind") in (feeds.NAME_PERSON, feeds.NAME_RESEARCHER)}
+        except Exception:
+            log.exception("[news] the name list could not be read for the pre-rank")
+            return set()
+
+    async def _score_feed(self, rows: list, *, today, mode: str,
+                          stats: Optional[dict] = None,
+                          carried_before: str = "",
+                          max_calls: int = 0) -> Optional[list]:
+        """Score the UNSCORED rows among `rows`, write the verdicts back, and
+        return every row in `rows` worth a 3 or more as story dicts. None when
+        there was something to score and none of it could be — the token
+        budget is spent, or the first call failed.
 
         NOTHING NEW, NO MODEL CALL. Rows already scored — by an earlier cycle,
-        or by the daily post — are read from the store; only the rest are shown
-        to the model, NEWS_SCORE_MAX_ITEMS at most, titles and summaries only,
-        ITEMS ABOUT US FIRST (`news.preselect`). A row the model was shown and
-        left out is recorded as filler (1), so it is never paid for twice — a
-        flagged one too: it stays a candidate for the daily post, because the
-        flag wins.
+        or by the daily post — are read from the store.
+
+        THE LAUNCH RULE GOES FIRST, IN CODE (NEWS-PATCH-OCT16). A title that
+        names a frontier model and says it launched (`news.launch_rule`) is
+        written as importance 5, topic "frontier model", scored_by "rule",
+        before any model call and whatever the budget — it costs nothing, and
+        on 14 Oct the Gemini 4 launch waited ten hours for a scorer that never
+        reached it. It is not shown to the model.
+
+        THEN THE MODEL, IN BATCHES. The rest are put in the pre-rank
+        (`news.preselect`: our people, our companies, stories two outlets
+        carry, topic queries, the rest — with what an earlier cycle could not
+        reach, `carried_before`, ahead of it all) and scored
+        NEWS_SCORE_MAX_ITEMS at a time, at most NEWS_SCORE_MAX_CALLS calls,
+        titles and summaries only. A row the model was shown and left out is
+        recorded as filler (1), so it is never paid for twice — a flagged one
+        too: it stays a candidate for the daily post, because the flag wins.
+        What is left after the last call is CARRIED: logged as "carried N",
+        and the next cycle scores it first. A call that fails stops the run:
+        the batches before it stand, the rest are carried, and
+        `stats["failed"]` is set (the cycle ends `unscored`).
+
+        `stats`, when given, is filled with {"model", "rule", "carried",
+        "calls", "failed"}. `max_calls` lowers NEWS_SCORE_MAX_CALLS for one
+        caller (a question: one call at most).
 
         THE MODEL NEVER SETS THE FLAG, with one exception written into the
         rule itself: a generic name's item (NEWS_GENERIC_NAMES) becomes ours
         when its score reaches NEWS_POC_BREAKING_MIN (`db.news_feed_set_scores`).
         """
+        st = stats if stats is not None else {}
+        st.update(model=0, rule=0, carried=0, calls=0, failed=False)
         fresh = [r for r in rows if not int(r.get("importance") or 0)]
         known = [r for r in rows if int(r.get("importance") or 0)]
         stories = [news.story_from_feed(r) for r in known
@@ -13390,47 +13627,92 @@ class SalesBot(discord.Client):
                      "scored) — no model call", mode, len(known))
             return stories
 
-        if await asyncio.to_thread(usage.over_budget):
-            log.info("[news] %s: %d item(s) unscored and the token budget is "
-                     "spent — not scoring", mode, len(fresh))
+        # ---- the launch rule: in code, before the model --------------------
+        ruled = [r for r in fresh if news.launch_rule(r)]
+        if ruled:
+            verdicts = [news.launch_verdict(r) for r in ruled]
+            await asyncio.to_thread(
+                lambda: self._ledger().news_feed_set_scores(
+                    verdicts, scored_at=feeds.utc_iso(dl.real_now_ist()),
+                    generic_flag_min=config.NEWS_POC_BREAKING_MIN,
+                    scored_by=news.SCORED_BY_RULE))
+            st["rule"] = len(ruled)
+            for r, v in zip(ruled, verdicts):
+                stories.append(news.story_from_feed(dict(
+                    r, importance=5, topic=v["topic"], what=v["what"],
+                    scored_by=news.SCORED_BY_RULE)))
+            log.info("[news] %s: %d frontier launch(es) scored 5 by rule, not sent to "
+                     "the model: %s", mode, len(ruled),
+                     "; ".join(repr(str(r.get("title") or "")[:80]) for r in ruled[:3]))
+            keys = {r["url_key"] for r in ruled}
+            fresh = [r for r in fresh if r["url_key"] not in keys]
+            if not fresh:
+                return stories
+
+        # ---- the model, in batches down the pre-rank -----------------------
+        people = await asyncio.to_thread(self._news_people)
+        order = news.preselect(fresh, cap=len(fresh), people=people,
+                               carried_before=carried_before)
+        placed = {r["url_key"] for r in order}
+        doubles = [r for r in fresh if r["url_key"] not in placed]
+        size = max(1, int(config.NEWS_SCORE_MAX_ITEMS))
+        calls = max(1, int(config.NEWS_SCORE_MAX_CALLS))
+        if max_calls:
+            calls = min(calls, max(1, int(max_calls)))
+        batches = [order[i:i + size] for i in range(0, len(order), size)]
+        scored_all: list = []
+        done = 0
+        for n, shown in enumerate(batches[:calls]):
+            if await asyncio.to_thread(usage.over_budget):
+                log.info("[news] %s: the token budget is spent — %d item(s) not "
+                         "scored", mode, len(order) - done)
+                st["failed"] = True
+                break
+            text = await self.llm.score_news(items=shown, topics=config.NEWS_TOPICS,
+                                             today=today, mode=mode)
+            if text is None:
+                log.warning("[news] %s: scoring call %d of %d failed; the batches "
+                            "before it stand", mode, n + 1, min(calls, len(batches)))
+                st["failed"] = True
+                break
+            st["calls"] += 1
+            scored = news.parse_scores(text, shown)
+            by_key = {x["url_key"]: x for x in scored}
+            # A SECOND OUTLET'S COPY OF A STORY THAT WAS SHOWN is settled with
+            # it: same key, so it is recorded as filler rather than left to be
+            # scored — and posted — as though it were another story.
+            ids = set()
+            for r in shown:
+                ids |= {k for k in (r.get("story_key"), r.get("headline_key")) if k}
+            twins = [r for r in doubles if {r.get("story_key"), r.get("headline_key")}
+                     & ids]
+            verdicts = [
+                {"url_key": r["url_key"],
+                 "importance": by_key[r["url_key"]]["importance"]
+                 if r["url_key"] in by_key else 1,
+                 "topic": by_key[r["url_key"]]["topic"] if r["url_key"] in by_key else "",
+                 "what": by_key[r["url_key"]]["what"] if r["url_key"] in by_key else ""}
+                for r in shown
+            ] + [{"url_key": r["url_key"], "importance": 1, "topic": "", "what": ""}
+                 for r in twins]
+            await asyncio.to_thread(
+                lambda v=verdicts: self._ledger().news_feed_set_scores(
+                    v, scored_at=feeds.utc_iso(dl.real_now_ist()),
+                    generic_flag_min=config.NEWS_POC_BREAKING_MIN,
+                    scored_by=news.SCORED_BY_MODEL))
+            st["model"] += len(verdicts)
+            done += len(shown)
+            scored_all += scored
+        st["carried"] = len(order) - done
+        if st["calls"] == 0 and not ruled:
             return None
-        # WHEN EVERYTHING FITS, EVERYTHING IS SHOWN. The per-topic limit only
-        # applies when there are more unscored items than one call may carry —
-        # otherwise an item held back by it would still be "new" at the next
-        # cycle, and a cycle with nothing new would not be free.
-        cap = max(1, int(config.NEWS_SCORE_MAX_ITEMS))
-        shown = news.preselect(fresh, cap=cap,
-                               per_hint=cap if len(fresh) <= cap else 3)
-        text = await self.llm.score_news(items=shown, topics=config.NEWS_TOPICS,
-                                         today=today, mode=mode)
-        if text is None:
-            return None
-        scored = news.parse_scores(text, shown)
-        by_key = {s["url_key"]: s for s in scored}
-        # A SECOND OUTLET'S COPY OF A STORY THAT WAS SHOWN is settled with it:
-        # same headline key, so it is recorded as filler rather than left to be
-        # scored — and posted — as though it were another story.
-        heads = {r.get("headline_key") for r in shown if r.get("headline_key")}
-        shown_keys = {r["url_key"] for r in shown}
-        twins = [r for r in fresh if r["url_key"] not in shown_keys
-                 and r.get("headline_key") in heads]
-        verdicts = [
-            {"url_key": r["url_key"],
-             "importance": by_key[r["url_key"]]["importance"] if r["url_key"] in by_key else 1,
-             "topic": by_key[r["url_key"]]["topic"] if r["url_key"] in by_key else "",
-             "what": by_key[r["url_key"]]["what"] if r["url_key"] in by_key else ""}
-            for r in shown
-        ] + [{"url_key": r["url_key"], "importance": 1, "topic": "", "what": ""}
-             for r in twins]
-        await asyncio.to_thread(
-            lambda: self._ledger().news_feed_set_scores(
-                verdicts, scored_at=feeds.utc_iso(dl.real_now_ist()),
-                generic_flag_min=config.NEWS_POC_BREAKING_MIN))
-        log.info("[news] %s: scored %d of %d unscored item(s) in one %s call (%d about "
-                 "us, shown first) — %d worth 3 or more", mode, len(shown), len(fresh),
-                 config.MODEL_LIGHT, sum(1 for r in shown if news.is_ours(r)),
-                 len(scored))
-        return stories + [s for s in scored if int(s.get("importance") or 0) >= 3]
+        log.info("[news] %s: scored %d of %d unscored item(s) in %d %s call(s) "
+                 "(pre-ranked, %d about us) — %d worth 3 or more%s", mode, done,
+                 len(order), st["calls"], config.MODEL_LIGHT,
+                 sum(1 for r in order[:done] if news.is_ours(r)), len(scored_all),
+                 f"; carried {st['carried']} to the next cycle "
+                 "(NEWS_SCORE_MAX_CALLS)" if st["carried"] else "")
+        return stories + [x for x in scored_all if int(x.get("importance") or 0) >= 3]
 
     async def _main_sweep(self, items: list, *, today, marker: str):
         """THE DAILY POST'S STORIES: everything since the previous daily post
@@ -13685,6 +13967,24 @@ class SalesBot(discord.Client):
     async def _news_cycle(self, *, force: bool = False, channel=None,
                           at: Optional[datetime] = None,
                           now: Optional[datetime] = None) -> Optional[dict]:
+        """ONE NEWS CYCLE, BEHIND A LOCK (NEWS-PATCH-OCT16): when a cycle is
+        already running — a long pull, a slow scoring call — the tick returns
+        None at once and claims nothing, so two cycles never run together.
+        The cycle itself is `_run_news_cycle`."""
+        if getattr(self, "_news_cycle_busy", False):
+            log.info("[news-cycle] a cycle is still running; this tick returns "
+                     "without claiming anything")
+            return None
+        self._news_cycle_busy = True
+        try:
+            return await self._run_news_cycle(force=force, channel=channel, at=at,
+                                              now=now)
+        finally:
+            self._news_cycle_busy = False
+
+    async def _run_news_cycle(self, *, force: bool = False, channel=None,
+                              at: Optional[datetime] = None,
+                              now: Optional[datetime] = None) -> Optional[dict]:
         """ONE NEWS CYCLE: read -> store -> flag -> score -> check (NFT2-1087).
 
         Called from `_sweep_once` on every tick, BEFORE the drip, weekdays AND
@@ -13693,11 +13993,18 @@ class SalesBot(discord.Client):
         read once an hour from NEWS_PULL_FIRST to NEWS_PULL_UNTIL, and a
         breaking story is posted in the same cycle that finds it.
 
-        WHICH CYCLE. The latest slot at or before the REAL now
-        (`news.cycle_slot`); before the first slot of the day, nothing. The
-        slot is CLAIMED in `news_cycles` before the pull, so an hour runs once
-        even across restarts. A CYCLE RUNS ON THE REAL CLOCK, whatever date a
-        tester is standing on: the feeds are the real world's.
+        WHICH CYCLE (NEWS-PATCH-OCT16). The OLDEST UNCLAIMED slot of today at
+        or before the REAL now (`news.due_slots`), one per tick — so a missed
+        hour runs late, its row saying "late by N min" — and before the first
+        slot of the day, nothing. A slot more than NEWS_CYCLE_LATE_SKIP_HOURS
+        whole hours late is claimed "skipped" and not run. The slot is CLAIMED
+        in `news_cycles` before the pull, so an hour runs once even across
+        restarts. A CYCLE RUNS ON THE REAL CLOCK, whatever date a tester is
+        standing on: the feeds are the real world's.
+
+        THE PULL HAS A TIME CAP (NEWS_CYCLE_MAX_SECONDS): past it the pull
+        stops at the next source boundary and the cycle ends `partial`, so the
+        drip behind it is not held up for long.
 
         THE BIG PULL is the first cycle of a day — decided by the table, not
         the time: no cycle has COMPLETED today. A bot started at 16:30
@@ -13714,22 +14021,27 @@ class SalesBot(discord.Client):
         THE FIVE STEPS:
           1-3  `feeds.pull` reads every source in priority order, flags what
                names us BY RULE, and stores what is new. Zero API calls.
-          4    ONE light-model call scores the items SEEN since the window
-               opened that nobody has scored (`_score_feed`) — seen, not
-               published: an outlet that publishes late is not missed. Nothing
-               new means no model call at all. Past the token budget, or when
-               the call fails, the items stay unscored, the breaking check is
-               skipped and the next cycle tries again.
+          4    THE SCORING (`_score_feed`) of the items SEEN since the window
+               opened that nobody has scored — seen, not published: an outlet
+               that publishes late is not missed — plus anything an earlier
+               cycle carried, first. The launch rule scores frontier launches
+               in code; the model takes the rest in up to
+               NEWS_SCORE_MAX_CALLS batches. Nothing new means no model call
+               at all. Past the token budget, or when the first call fails,
+               the items stay unscored, the breaking check is skipped and the
+               next cycle tries again.
           5    THE BREAKING CHECK (`news.choose_breaking`): about us at
-               NEWS_POC_BREAKING_MIN, industry at NEWS_BREAKING_MIN_IMPORTANCE,
+               NEWS_POC_BREAKING_MIN, industry at NEWS_BREAKING_MIN_IMPORTANCE
+               from NEWS_BREAKING_MIN_OUTLETS outlets (or by the launch rule),
                first seen within NEWS_BREAKING_MAX_AGE_HOURS, not already
-               posted; at most NEWS_BREAKING_MAX_PER_CYCLE, in ONE message.
+               posted; at most NEWS_BREAKING_MAX_PER_CYCLE, in ONE message, and
+               NEWS_BREAKING_MAX_PER_DAY a day.
 
         A BREAKING POST IS NOT A DRIP MESSAGE. It goes straight to the sales
         channel (the test channel under SALES_TEST_MODE) through
         `guardrails.send`, never through `drip_sends`, never against
         DAILY_MESSAGE_CAP, never inside the two-hour gap — any day of the
-        week, with NO daily limit. Its stories are recorded in `news_stories`
+        week, within its own daily budget. Its stories are recorded in `news_stories`
         AFTER the send, which is what keeps them out of the daily post; a
         story the flood guard held, a post that was refused and a cycle with
         no reachable channel record nothing, so the next cycle still has them.
@@ -13779,13 +14091,32 @@ class SalesBot(discord.Client):
                 return None
         else:
             today = real.date()
-            slot = news.cycle_slot(real)
+            try:
+                hours_claimed = await asyncio.to_thread(
+                    lambda: ledger.news_cycle_hours(dl.iso(today)))
+            except Exception:
+                log.exception("[news-cycle] could not read news_cycles; skipping the tick")
+                return None
+            due = news.due_slots(real, hours_claimed)
+            for old, late in due["skip"]:
+                note = (f"{news.late_note(late, grace=0)} — more than "
+                        f"{int(config.NEWS_CYCLE_LATE_SKIP_HOURS)} h late "
+                        "(NEWS_CYCLE_LATE_SKIP_HOURS), not run")
+                took = await asyncio.to_thread(
+                    lambda o=old, n=note: ledger.news_cycle_skip(
+                        dl.iso(today), o, at=feeds.utc_iso(real_utc), note=n))
+                if took:
+                    log.warning("[news-cycle] %s %s: skipped — %s", dl.iso(today), old,
+                                note)
+            slot = due["run"]
             if slot is None:
                 return None
-            if await asyncio.to_thread(
-                    lambda: ledger.news_cycle_claimed(dl.iso(today), slot)):
-                return None
+            late_text = news.late_note(
+                due["late"], grace=min(15, max(1, int(
+                    config.COS_FOLLOWUP_CHECK_INTERVAL_MINUTES))))
         marker = dl.iso(today)
+        if force:
+            late_text = ""
 
         def previous() -> tuple:
             return (ledger.news_cycle_last_done(),
@@ -13807,20 +14138,29 @@ class SalesBot(discord.Client):
                 window_hours=hours))
         if not claimed:
             return None
-        log.info("[news-cycle] %s %s: %s pull, the last %dh%s", marker, slot,
-                 "BIG" if big else "small", hours, " (forced by a test)" if force else "")
+        log.info("[news-cycle] %s %s: %s pull, the last %dh%s%s", marker, slot,
+                 "BIG" if big else "small", hours, " (forced by a test)" if force else "",
+                 f" — {late_text}" if late_text else "")
 
         outcome = {"slot": slot, "date": marker, "big": big, "hours": hours,
                    "pull": {}, "scored": False, "partial": False, "unscored": False,
-                   "silent": "",
+                   "silent": "", "late": late_text, "score": {},
                    "kept": [], "held": [], "skipped": [], "posted": 0, "body": "",
-                   "status": "partial"}
+                   "budget_spent": False, "status": "partial"}
 
         async def _finish(note: str = "") -> dict:
             pulled = outcome["pull"] or {}
+            score = outcome["score"] or {}
             status = ("partial" if outcome["partial"]
                       else "unscored" if outcome["unscored"] else "done")
             outcome["status"] = status
+            said = "; ".join(x for x in (
+                late_text,
+                f"stopped after {int(config.NEWS_CYCLE_MAX_SECONDS)}s"
+                if pulled.get("timed_out") else "",
+                f"carried {int(score.get('carried') or 0)}"
+                if int(score.get("carried") or 0) else "",
+                note) if x)
             await asyncio.to_thread(
                 lambda: ledger.news_cycle_finish(
                     marker, slot, status=status,
@@ -13828,7 +14168,12 @@ class SalesBot(discord.Client):
                     fetched=int(pulled.get("fetched") or 0),
                     new_items=int(pulled.get("new") or 0),
                     flagged=int(pulled.get("flagged") or 0),
-                    posted=int(outcome["posted"]), note=note))
+                    posted=int(outcome["posted"]), note=said,
+                    merged=int(pulled.get("merged") or 0),
+                    noisy=pulled.get("noisy_names") or (),
+                    scored_model=int(score.get("model") or 0),
+                    scored_rule=int(score.get("rule") or 0),
+                    carried=int(score.get("carried") or 0)))
             return outcome
 
         # ---- 1-3: read, flag, store ------------------------------------------
@@ -13836,7 +14181,8 @@ class SalesBot(discord.Client):
             await self._rebuild_news_names(today=real.date())
         try:
             pulled = await asyncio.to_thread(
-                lambda: feeds.pull(now=real_utc, big=big, hours=hours))
+                lambda: feeds.pull(now=real_utc, big=big, hours=hours,
+                                   max_seconds=max(1, int(config.NEWS_CYCLE_MAX_SECONDS))))
         except Exception:
             log.exception("[news-cycle] %s %s: the pull raised; the cycle is partial",
                           marker, slot)
@@ -13855,9 +14201,23 @@ class SalesBot(discord.Client):
             return [r for r in rows if not self.db.news_story_seen(
                 r.get("url_key") or "", r.get("headline_key") or "", since_iso=cutoff)]
 
-        seen = await asyncio.to_thread(
-            lambda: unposted(ledger.news_feed_seen_after(since_utc, until_utc)))
-        scored = await self._score_feed(seen, today=today, mode=news.MODE_CYCLE)
+        def window_rows() -> list:
+            # THE WINDOW, PLUS WHAT EARLIER CYCLES CARRIED (NEWS-PATCH-OCT16):
+            # anything first seen in the last day that is still unscored,
+            # whatever the window — the pre-rank puts it first.
+            rows = ledger.news_feed_seen_after(since_utc, until_utc)
+            have = {r["url_key"] for r in rows}
+            back = feeds.utc_iso(real_utc - timedelta(hours=news.MAX_WINDOW_HOURS))
+            rows += [r for r in ledger.news_feed_unscored(back, until_utc)
+                     if r["url_key"] not in have]
+            return unposted(rows)
+
+        seen = await asyncio.to_thread(window_rows)
+        score: dict = {}
+        outcome["score"] = score
+        scored = await self._score_feed(seen, today=today, mode=news.MODE_CYCLE,
+                                        stats=score,
+                                        carried_before=feeds.utc_iso(real_utc))
         if scored is None:
             # THE SCORER COULD NOT RUN (budget, a failed call). The items stay
             # unscored, this cycle's breaking check is skipped, and the cycle
@@ -13868,6 +14228,10 @@ class SalesBot(discord.Client):
                      "check this cycle — the next one scores them", marker, slot)
             return await _finish("the scoring could not run")
         outcome["scored"] = True
+        if score.get("failed"):
+            # A LATER BATCH FAILED: the batches before it stand and go to the
+            # breaking check; the rest are carried and the cycle is `unscored`.
+            outcome["unscored"] = True
 
         # ---- 5: the breaking check --------------------------------------------
         if not force:
@@ -13897,11 +14261,19 @@ class SalesBot(discord.Client):
                 stories, today=today, db=self.db, now=real_utc, max_age_hours=age,
                 ours_min=config.NEWS_POC_BREAKING_MIN,
                 industry_min=config.NEWS_BREAKING_MIN_IMPORTANCE,
-                cap=config.NEWS_BREAKING_MAX_PER_CYCLE)
+                cap=config.NEWS_BREAKING_MAX_PER_CYCLE,
+                max_per_day=config.NEWS_BREAKING_MAX_PER_DAY,
+                min_outlets=config.NEWS_BREAKING_MIN_OUTLETS)
 
         picked = await asyncio.to_thread(choose)
         keep = picked["keep"]
-        outcome.update(kept=keep, held=picked["held"], skipped=picked["skipped"])
+        outcome.update(kept=keep, held=picked["held"], skipped=picked["skipped"],
+                       budget_spent=bool(picked.get("budget_spent")))
+        if picked.get("budget_spent"):
+            log.info("[news-cycle] %s %s: the day's breaking budget is spent "
+                     "(NEWS_BREAKING_MAX_PER_DAY=%d) — %d candidate(s) held for the "
+                     "daily post", marker, slot, int(config.NEWS_BREAKING_MAX_PER_DAY),
+                     len(picked["held"]))
         for line in picked["skipped"]:
             log.info("[news-cycle] %s %s: %s", marker, slot, line)
         if not keep:
@@ -13956,6 +14328,128 @@ class SalesBot(discord.Client):
                  f"; {len(picked['held'])} more wait for the next cycle"
                  if picked["held"] else "")
         return await _finish()
+
+    # THE META KEY that says the day's news health line went out.
+    NEWS_HEALTH_META = "news_health_posted"
+
+    def _news_health_stats(self, on_date: str) -> dict:
+        """THE NUMBERS OF ONE DAY'S NEWS, from the store (NEWS-PATCH-OCT16):
+        the live cycles of `news_cycles` (a test day's "test HH:MM" rows are
+        not counted) — their pulls, merges, flags, noisy names and what they
+        scored, by the model and by the launch rule — the breaking stories
+        recorded that day against the budget, and the daily post's stories.
+        (A question or the daily post may score a few more items; those are
+        not the cycles' and are not counted here.)"""
+        ledger = self._ledger()
+        day = dl.parse_date(on_date)
+        cycles = [c for c in ledger.news_cycles_on(on_date)
+                  if not str(c.get("hour") or "").startswith("test")]
+        ran = [c for c in cycles if c.get("status") != "skipped"]
+        noisy: list = []
+        for c in cycles:
+            for n in str(c.get("noisy") or "").split(","):
+                if n.strip() and n.strip() not in noisy:
+                    noisy.append(n.strip())
+        finished = [c for c in ran if c.get("status") != "running"]
+        budget = max(0, int(config.NEWS_BREAKING_MAX_PER_DAY))
+        stamps = self.db.news_breaking_times_on(on_date)
+        spent_at = ""
+        if budget and len(stamps) >= budget:
+            # WHEN: the cycle whose post took the last of the budget (its slot,
+            # e.g. "16:00"); failing that, when the story was recorded.
+            total = 0
+            for c in sorted(ran, key=lambda c: str(c.get("started_at") or "")):
+                total += int(c.get("posted") or 0)
+                if total >= budget:
+                    spent_at = str(c.get("hour") or "")
+                    break
+            if not spent_at:
+                try:
+                    when = datetime.fromisoformat(stamps[budget - 1].replace(" ", "T"))
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    spent_at = when.astimezone(dl.IST).strftime("%H:%M")
+                except ValueError:
+                    spent_at = "?"
+        return {
+            "day": news.day_label(day), "date": on_date,
+            "planned": len(news.pull_slots()), "run": len(ran),
+            "late": sum(1 for c in ran if "late by" in str(c.get("note") or "")),
+            "skipped": sum(1 for c in cycles if c.get("status") == "skipped"),
+            "partial": sum(1 for c in cycles if c.get("status") == "partial"),
+            "fetched": sum(int(c.get("fetched") or 0) for c in cycles),
+            "new": sum(int(c.get("new_items") or 0) for c in cycles),
+            "merged": sum(int(c.get("merged") or 0) for c in cycles),
+            "flagged": sum(int(c.get("flagged") or 0) for c in cycles),
+            "noisy": noisy,
+            "scored_model": sum(int(c.get("scored_model") or 0) for c in cycles),
+            "scored_rule": sum(int(c.get("scored_rule") or 0) for c in cycles),
+            "carried": int((finished[-1] if finished else {}).get("carried") or 0),
+            "breaking": len(stamps), "budget": budget, "spent_at": spent_at,
+            "daily": self.db.news_stories_count_on(on_date, news.MODE_MAIN),
+        }
+
+    async def _news_health(self, *, now: Optional[datetime] = None, channel=None,
+                           force: bool = False) -> Optional[dict]:
+        """THE NEWS HEALTH LINE (NEWS-PATCH-OCT16): at NEWS_HEALTH_TIME IST,
+        once a day, ONE message to SALES_TEST_CHANNEL_ID — never the sales
+        channel — saying what the day's cycles did: cycles planned, run, late,
+        skipped and partial; items fetched, new and merged; flagged; noisy
+        names; scored by the model, by the launch rule, and carried; breaking
+        posted against the day's budget; the daily post's stories.
+
+        NOT A DRIP MESSAGE: no drip_sends row, never against
+        DAILY_MESSAGE_CAP. ON THE REAL CLOCK with the REAL date, whatever date
+        a tester is standing on. Posted once a day (a meta row); a post that
+        fails is tried again on the next tick. The kill switch silences it
+        like every other proactive post. With no test channel set it is
+        logged, and nothing is posted anywhere else.
+
+        `force` posts now whatever the time (a check); `now` is the real time
+        to stand at. Returns {"date", "stats", "body", "posted"} or None when
+        nothing was due.
+        """
+        real = now or dl.real_now_ist()
+        if real.tzinfo is None:
+            real = real.replace(tzinfo=dl.IST)
+        real = real.astimezone(dl.IST)
+        on_date = dl.iso(real.date())
+        if not force:
+            at = news._minutes(config.NEWS_HEALTH_TIME)
+            if at is None:
+                at = news._minutes("23:45")
+            if real.hour * 60 + real.minute < at:
+                return None
+            if await asyncio.to_thread(lambda: self.db.get_meta(self.NEWS_HEALTH_META)) \
+                    == on_date:
+                return None
+            if not config.digest_enabled():
+                return None
+        stats = await asyncio.to_thread(lambda: self._news_health_stats(on_date))
+        body = "\n".join(wording.news_health_lines(stats))
+        out = {"date": on_date, "stats": stats, "body": body, "posted": False}
+        if channel is None:
+            cid = config.test_channel_id()
+            channel = self.get_channel(cid) if cid else None
+            if channel is None:
+                log.warning("[news-health] SALES_TEST_CHANNEL_ID is not set or not "
+                            "reachable (%s); the health line is not posted (it never "
+                            "goes to the sales channel):\n%s", cid, body)
+                await asyncio.to_thread(
+                    lambda: self.db.set_meta(self.NEWS_HEALTH_META, on_date))
+                return out
+        sent = await guardrails.send(channel, self._tag_test(body),
+                                     reason=f"the news health line for {on_date}",
+                                     kind="news-health")
+        if sent is None:
+            log.warning("[news-health] %s: the post was refused or failed; the next "
+                        "tick tries again", on_date)
+            return out
+        await asyncio.to_thread(lambda: self.db.set_meta(self.NEWS_HEALTH_META, on_date))
+        out["posted"] = True
+        log.info("[news-health] %s: posted to the test channel (outside the daily cap)",
+                 on_date)
+        return out
 
     async def _search_available(self, *, feed_first: bool = False) -> tuple:
         """(ok, why). The reasons research cannot happen, said plainly: search

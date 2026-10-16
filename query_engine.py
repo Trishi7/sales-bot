@@ -349,7 +349,10 @@ name in it is right.
 === NEWS QUESTIONS (todays_news) ===
 - A question about news on a company, a person or a subject, or about the
   week's AI news: call todays_news FIRST — with `topic` when they name one,
-  with `days` for "this week" (7). It is the news already collected and rated.
+  with `hours` for the window they name ("last 24 hours" 24, "this week" 168)
+  and `count` for "top 3". It is the news already collected and rated.
+- A news question returns the top stories of the window, repeats included;
+  never say a story was already posted.
 - THE LIST IS PUT IN YOUR REPLY FOR YOU, by code, exactly as the daily post
   writes it. You are not shown the stories. Do NOT list, restate, summarise or
   introduce them. Write only what the list does not answer; if it answers the

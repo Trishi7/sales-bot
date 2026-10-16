@@ -80,6 +80,17 @@ PINS = {
     "NEWS_BLOCKED_DOMAINS": [], "NEWS_FEED_TIMEOUT_SECONDS": 10,
     "NEWS_HOLD_AFTER_TEST_SECONDS": 300,
     "SALES_ALWAYS_TAG_IDS": [rw.APPROVER, rw.APPROVER2],
+    # NEWS-PATCH-OCT16 CHANGED FOUR THINGS THESE CHECKS WERE WRITTEN AGAINST,
+    # so they run with the NFT2-1087 behaviour pinned and the patch's own
+    # behaviour is checked in tests/news_patch_checks.py (verify_news_patch.py):
+    #   - a tick runs the latest slot only (catch-up off: every older slot is
+    #     more than 0 hours late, so it is skipped, not run);
+    #   - no daily breaking budget, and one outlet is enough for an industry 5;
+    #   - the first copy of a story keeps its link (no preferred outlet takes
+    #     it over — the .env.example list names techcrunch.com, which the
+    #     fixtures use).
+    "NEWS_CYCLE_LATE_SKIP_HOURS": 0, "NEWS_BREAKING_MAX_PER_DAY": 99,
+    "NEWS_BREAKING_MIN_OUTLETS": 1, "NEWS_PREFERRED_DOMAINS": [],
 }
 
 # Every message any scenario here sent, for T82.
@@ -1625,8 +1636,9 @@ def settings(check) -> None:
            "NEWS_INSTITUTION_WORDS", "NEWS_REQUEST_GAP_SECONDS",
            "NEWS_BREAKING_MAX_PER_CYCLE", "NEWS_POC_BREAKING_MIN", "NEWS_CARRY_MAX_DAYS",
            "NEWS_BREAKING_MAX_AGE_HOURS", "ARXIV_ENABLED", "ARXIV_BATCH_SIZE"]
+    # NEWS_BREAKING_MAX_PER_DAY was the tenth; NEWS-PATCH-OCT16 reads it again.
     retired = ["NEWS_FEED_POLL_MINUTES", "NEWS_CHECK_TIMES", "NEWS_CHECK_MAX_USES",
-               "NEWS_BREAKING_MAX_PER_DAY", "NEWS_POC_TARGETS_PER_DAY", "NEWS_POC_SLOTS",
+               "NEWS_POC_TARGETS_PER_DAY", "NEWS_POC_SLOTS",
                "NEWS_POC_LOOKBACK_DAYS", "NEWS_OVERFLOW_ENABLED",
                "NEWS_OVERFLOW_MIN_IMPORTANCE", "NEWS_OVERFLOW_MAX_ITEMS"]
     live, dead = env.live_keys(), env.retired_keys()
@@ -1638,8 +1650,9 @@ def settings(check) -> None:
                       "NEWS_BREAKING_MAX_PER_CYCLE", "NEWS_POC_BREAKING_MIN",
                       "NEWS_CARRY_MAX_DAYS", "NEWS_BREAKING_MAX_AGE_HOURS", "ARXIV_ENABLED",
                       "ARXIV_BATCH_SIZE")]),
-          ([], ["14:00", "23:00", "2", "15", "1.5", "3", "4", "3", "3", "true", "20"]))
-    check("T71 ...and the ten retired ones are in the RETIRED block, not live",
+          # NEWS_BREAKING_MAX_PER_CYCLE: 3 -> 1 with NEWS-PATCH-OCT16.
+          ([], ["14:00", "23:00", "2", "15", "1.5", "1", "4", "3", "3", "true", "20"]))
+    check("T71 ...and the nine retired ones are in the RETIRED block, not live",
           ([v for v in retired if v not in dead], [v for v in retired if v in live]),
           ([], []))
     text = env._example_text()
@@ -1661,7 +1674,7 @@ def settings(check) -> None:
 
     env_vars = dict(os.environ, ANTHROPIC_API_KEY="x", PYTHONIOENCODING="utf-8",
                     NEWS_FEED_POLL_MINUTES="7", NEWS_CHECK_TIMES="banana,25:99",
-                    NEWS_CHECK_MAX_USES="x", NEWS_BREAKING_MAX_PER_DAY="lots",
+                    NEWS_CHECK_MAX_USES="x",
                     NEWS_POC_TARGETS_PER_DAY="-1", NEWS_POC_SLOTS="two",
                     NEWS_POC_LOOKBACK_DAYS="", NEWS_OVERFLOW_ENABLED="maybe",
                     NEWS_OVERFLOW_MIN_IMPORTANCE="9", NEWS_OVERFLOW_MAX_ITEMS="x")

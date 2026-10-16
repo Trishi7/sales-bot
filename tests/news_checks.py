@@ -23,7 +23,7 @@ import news_cases as nc
 LINE_RE = re.compile(r"^- [^*\n]+ \(\[[^\]\n]+\]\(<https?://[^>\s]+>\)\)$")
 
 
-def _shape(check, label: str, text: str, heading: str, n: int) -> None:
+def _shape(check, label: str, text: str, heading: str, n: int, tail: str = "") -> None:
     lines = text.split("\n")
     check(f"{label}: the bold heading, with the day", lines[0], heading)
     check(f"{label}: NO blank line under the heading",
@@ -33,7 +33,12 @@ def _shape(check, label: str, text: str, heading: str, n: int) -> None:
     check(f"{label}: a blank line between two stories, and only there",
           (text.count("\n\n"), text.count("\n\n- ")), (n - 1, n - 1))
     check(f"{label}: only the heading is bold", text.count("**"), 2)
-    check(f"{label}: nothing after the last story", lines[-1].startswith("- "), True)
+    if tail:
+        # NEWS-ANSWER-OCT16: an answer with more left ends on the fixed tail.
+        check(f"{label}: the tail, and nothing else, after the last story",
+              (lines[-1], lines[-2].startswith("- ")), (tail, True))
+    else:
+        check(f"{label}: nothing after the last story", lines[-1].startswith("- "), True)
 
 
 async def answers(check) -> None:
@@ -44,32 +49,30 @@ async def answers(check) -> None:
     check("each answer is ONE Discord message", [len(a) for a in live["answers"]], [1, 1, 1])
     print("   the first answer:")
     print("\n".join("   " + ln for ln in first[0].split("\n")))
-    _shape(check, "first answer", first[0], nc.HEADING, 5)
+    _shape(check, "first answer", first[0], nc.HEADING, 5,
+           tail=news.answer_tail(2, "last 24 hours", 5))
     check("every line is a headline and its outlet, no bold, nothing else",
           all(nc_line for nc_line in map(LINE_RE.match, nc.bullets(first[0]))), True)
     by_score = dict(nc.NINE)
     got = nc.headlines(first[0])
-    check("9 unsent: the 5 highest-scored (three 5s, and the two newest 4s)",
-          sorted(by_score[h] for h in got), [4, 4, 5, 5, 5])
-    check("...listed newest first",
-          got, ["Open weights model tops a coding benchmark",
-                "Search engine adds an agent mode",
+    # NEWS-ANSWER-OCT16: the top of the last 24 hours up to the bot's now —
+    # the test clock's 11:22 — so the 11:30 and 12:00 stories are not in it.
+    check("the 5 highest-scored of the window (the two 5s, the two 4s, the newest 3)",
+          sorted(by_score[h] for h in got), [3, 4, 4, 5, 5])
+    check("...ranked by score, then newest",
+          got, ["Cloud provider cuts inference prices",
+                "Frontier lab ships a reasoning model",
                 "Startup releases an open speech dataset",
-                "Cloud provider cuts inference prices",
-                "Frontier lab ships a reasoning model"])
+                "Chipmaker unveils an inference accelerator",
+                "Consortium drafts an agent safety standard"])
     check("the answer's stories are recorded as sent (kind=answer)",
           (len(live["records"][0]), set(live["records"][0].values())), (5, {"answer"}))
     got2 = nc.headlines(second[0])
-    check("asked again: none of the first answer's stories", sorted(set(got) & set(got2)), [])
-    check("...the 4 that were left, and only those (no padding)",
-          sorted(got2), sorted(h for h in by_score if h not in got))
-    check("...newest first", got2, ["Consortium drafts an agent safety standard",
-                                    "University publishes an RLHF study",
-                                    "Chipmaker unveils an inference accelerator",
-                                    "Regulator opens an inquiry into model evals"])
+    check("asked again: the same top five, repeats included (NEWS-ANSWER-OCT16)", got2, got)
     got3 = nc.headlines(third[0])
-    check("asked a third time, nothing new left: the 5 highest-scored again", got3, got)
-    check("...and a repeat is not recorded twice", len(live["records"][2]), 9)
+    check("asked a third time: the same again", got3, got)
+    check("...and a repeat is not recorded twice",
+          (len(live["records"][1]), len(live["records"][2])), (5, 5))
     for i, a in enumerate(live["answers"], start=1):
         check(f"answer {i} says nothing about 2 PM, a schedule, 'already', 'since' or 'ran'",
               nc.banned_in(a[0]), [])
@@ -167,10 +170,12 @@ async def daily(check) -> None:
     check("the industry stories are the highest-scored left, never a 4 while a 5 waits",
           all(h in nc.MAJOR for h in nc.headlines(post)[2:]), True)
     nxt = nc.headlines(live["next_answer"][0])
-    check("the next answer gives only what is still unsent: nothing the post or the first answer gave",
-          sorted(set(nxt) & (set(nc.headlines(post)) | set(nc.ASKED))), [])
-    check("...and what did not fit is simply there for it (industry news is not carried)",
-          all(h in nc.MAJOR for h in nxt), True)
+    check("the next answer is the top of the window again, repeats included "
+          "(NEWS-ANSWER-OCT16): the five newest 5s",
+          sorted(nxt), sorted(nc.ASKED))
+    check("...and what the daily post took is not hidden from it either: the post's "
+          "stories are ranked like any other",
+          all(h in nc.MAJOR + nc.ASKED for h in nxt), True)
     kinds = sorted(set(live["records"].values()))
     check("everything sent is recorded by how it went out - answer and main, no overflow",
           kinds, ["answer", "main"])
@@ -365,8 +370,8 @@ async def replay(check) -> None:
           [bool(LINE_RE.match(ln)) for ln in nc.bullets(reply)], [True] * 5)
     check("8 Oct: no 'already posted at 2 PM', no 'Here's what ran', no window",
           (nc.banned_in(reply), "Here's" in reply, "news.google.com\n" in reply), ([], False, False))
-    check("8 Oct: asked again, none of those five come back",
-          sorted(set(nc.headlines(reply)) & set(nc.headlines(live["answers"][1][0]))), [])
+    check("8 Oct: asked again, the same top five (repeats included since NEWS-ANSWER-OCT16)",
+          nc.headlines(live["answers"][1][0]), nc.headlines(reply))
     check("8 Oct: test mode == live — answers, records and calls",
           nc.same(live, test, ("answers", "records", "calls", "routes")), [])
 

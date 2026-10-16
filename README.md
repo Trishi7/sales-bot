@@ -31,40 +31,65 @@ triangulates across all of them — citing the tab and the company, and saying
 plainly when a cell is empty.
 
 **News questions are answered from the collected news, by code.** "Any AI
-news?", "what's in the news", "top 5 headlines" are plain news questions
-(`news.plain_question`): no company, person or subject is named, so there is
-nothing to decide and **no model is called** (`_answer_plain_news`). The answer
+news?", "what's in the news", "top 5 headlines", "top news in the last 24
+hours", "top 3 news today" are plain news questions (`news.plain_question`): no
+company, person or subject is named, so there is nothing to decide and **no
+model is called** (`_answer_plain_news`). The answer
 is the news list in the one template every news message uses (see
 [The news template](#the-news-template-one-shape-everywhere)), read from the
 same feed store the daily post is built from.
 
-*Which stories* (`_news_answer`, `news.choose_answer`): the 5 highest-scored
-stories **not sent in the channel before**, listed newest first. Fewer than 5
-unsent: those, with no padding. A story already sent is repeated only when not
-one unsent story is left, and then the 5 highest-scored are given again.
-Candidates are everything collected since the previous daily post or in the
-last 24 hours, whichever is longer, scored 3 or more; "sent before" is the
-`news_stories` table inside `NEWS_REPEAT_DAYS`. Every story an answer gives is
-recorded there with `kind=answer` once the reply has gone, so the next answer
-and the next daily post leave it out. (An answer's stories do not use up the
-daily post's per-topic allowance.)
+*Which stories* (`_news_answer`, `news.choose_answer`; NEWS-ANSWER-OCT16): **the
+top of the window, repeats included** — every story collected in the window and
+scored 3 or more, ranked by score and then newest, 5 at a time ("top 3" asks for
+3; 5 is the most). On 15 Oct somebody asked for the top AI news of the last 24
+hours and got weaker unposted stories, because the old rule gave unsent stories
+first and left out the ones posted the evening before — the ones she meant.
+
+*The window* is the one the question names (`news.parse_window`, IST, the test
+clock when it is set): "last 24 hours", "past 2 days", "today" (since 00:00),
+"yesterday" / "since yesterday" (since yesterday 00:00), "this morning" (since
+06:00), "this week" (168 h), "last month" (capped at `NEWS_FEED_KEEP_DAYS`, and
+the answer says "I keep 14 days of news."). No window named:
+`NEWS_ASK_DEFAULT_HOURS` (24). The old "since the previous daily post" window is
+not used for answers any more.
+
+*The rest.* When more stories are left, the list ends on a fixed line (never a
+model's): "There are 7 more in the last 24 hours. These are the top 5. Would you
+like to see the rest?". A "yes", "next" or "show me the rest" — as a reply to
+that answer, or from the asker in the same channel — within
+`NEWS_ASK_REST_MINUTES` (30) gives the next page, same window and topic; the
+last page has no tail, and one more "yes" gets "That was all of it.". Later than
+30 minutes the bot asks "The rest of the last-24-hour news?" and a yes to that
+gives the page. The state is per channel, in memory (`_news_pages`).
+
+*A topic with nothing in the window* gets "Nothing on ElevenLabs in the last 24
+hours. The latest I have is from <date>:" and the newest matching story in the
+store, or "Nothing on ElevenLabs in the last 14 days."
+
+*What is recorded:* the stories NEW to an answer, in `news_stories` with
+`kind=answer` once the reply has gone, so the next daily post leaves them out;
+a story the answer repeats is not recorded again. (An answer's stories do not
+use up the daily post's per-topic allowance.)
 
 *What it never says:* when anything is posted. No "2 PM", no "scheduled", no
-"already posted", no "since …". The old answer handed the model a window and a
+"already posted" — a repeated story is shown like any other. The old answer handed the model a window and a
 posted-first list and got back "All of today's stories were already posted at
 2 PM. Here's what ran:".
 
 A question that names something ("anything on ElevenLabs this week?") goes to
 the engine and the `todays_news` tool with the **same rendered list**: the tool
-puts it in the reply and tells the model only that it is there (the
-`todays_objectives` pattern). When `todays_news` is the only thing the model
+put it in the reply and tells the model only that it is there (the
+`todays_objectives` pattern). The tool takes `hours` (the window the person
+named; it wins over the older `days`) and `count` (1-5, "top 3"). When `todays_news` is the only thing the model
 looked at, the list is the whole answer and the model's text beside it is not
 sent. `web_search` is the fallback: only when the store has nothing on a
 company or topic the asker named, or they ask for more or older news. It costs
 a SQLite read plus at most one `MODEL_LIGHT` scoring call, and only when
-something unsent has never been rated — those scores are written back, so the
-daily sweep does not pay for them again. `python verify_news_question.py` and
-`python verify_news_format.py` check all of it offline.
+something in the window has never been rated — those scores are written back,
+so the daily sweep does not pay for them again. `python verify_news_question.py`,
+`python verify_news_format.py` and `python verify_news_window.py` (T1-T16) check
+all of it offline.
 
 **Reads one canonical tab: "Outreach PoCs".** Everything the bot says on its own
 initiative comes from that tab of the GTM Playbook, found **by name**
@@ -718,6 +743,33 @@ reply and hands the model only a pointer.
 isn't X due"; it is not offered for "what do we need to do today".
 
 ---
+
+## Export a channel
+
+A one-off tool, not a bot feature: `export_channel.py` reads one channel, and every
+thread under it, into CSV, JSONL and Markdown, then exits.
+
+```
+./venv/bin/python export_channel.py <channel_id> [--out DIR] [--since DD-MM-YYYY] [--until DD-MM-YYYY] [--no-threads] [--format csv|jsonl|md|all]
+```
+
+- It logs in with the bot's own `DISCORD_TOKEN` from `.env` (no new variable) as a
+  plain `discord.Client` with the bot's intents. The bot itself does not need to be
+  stopped. **Read-only:** it never sends, reacts, or touches the sheet or the
+  database, and the token is never printed.
+- Files go to `--out` (default `./exports`, gitignored), named
+  `<channel_name>_<channel_id>_<YYYYMMDD-HHMM>.csv|jsonl|md`. `--format` defaults to
+  `all`. Records are written as they arrive, so a long history does not fill memory.
+- `--since` / `--until` are day-first dates on the message time, in whole UTC days.
+- Threads: the active ones, the archived public ones, and the archived private ones
+  when the bot may list them. A forum channel is exported as its posts. A thread the
+  bot cannot read is skipped and counted in the summary.
+- **Permissions the bot needs on that channel:** View Channel and Read Message
+  History, plus Manage Threads to list archived private threads. Without the first
+  two, the script names the missing permission and exits with code 2. The bot's
+  application also needs the Message Content intent enabled in the developer portal
+  (it already does, for the bot to work), or `content` comes back empty.
+- Tests: `tests/test_export_channel.py` (a fake channel; no login).
 
 ## The two documents the bot thinks with
 
@@ -4611,18 +4663,42 @@ is recorded as 1.
 
 Posted in the cycle that finds the story, through `guardrails.send` (kind
 `news-breaking`): **never a drip message** — no `drip_sends` row, never against
-`DAILY_MESSAGE_CAP`, never inside the two-hour gap — seven days a week, with
-**no daily limit**.
+`DAILY_MESSAGE_CAP`, never inside the two-hour gap — seven days a week, within
+its own budget (since NEWS-PATCH-OCT16, below): `NEWS_BREAKING_MAX_PER_DAY` (4)
+a day, and an industry 5 needs `NEWS_BREAKING_MIN_OUTLETS` (2) outlets unless
+the launch rule scored it.
 
 - **New only**: sent only while the story was *first seen* within
   `NEWS_BREAKING_MAX_AGE_HOURS` (3). One that reaches a breaking score later
   goes to the daily post; a carried story is never breaking.
-- **The flood guard**: at most `NEWS_BREAKING_MAX_PER_CYCLE` (3) stories a
-  cycle, in one message. The rest are not recorded, so the next cycle can send
+- **The flood guard**: at most `NEWS_BREAKING_MAX_PER_CYCLE` (1 since
+  NEWS-PATCH-OCT16; it was 3) stories a cycle, in one message. The rest are not recorded, so the next cycle can send
   them.
 - Recorded in `news_stories` **after** the send. A refused post, or a cycle
   with no reachable sales channel, records nothing: the story is still unsent
   for the next cycle.
+
+#### The patch of 16 Oct: the Gemini 4 miss (NEWS-PATCH-OCT16)
+
+On 14 Oct the Gemini 4 "Aragon" launch came in 29 times from 14:01 and was never
+posted: every copy was stored as a new story (the headline key is word ORDER),
+each cycle flagged 564-603 items as ours and put them all ahead of the industry
+in a single 40-item scoring call, five of ten cycles never ran, and breaking had
+no daily cap. A bug-fix of the v1 flow, not the v2 rebuild:
+
+| | What changed | Settings |
+|---|---|---|
+| F1 one story | `news.story_key`: the headline's first 12 significant words, SORTED. A feed item is the same story by link, headline key, story key, or `news.same_story` (two shared names — the sheets' and Gemini, GPT, Claude, Llama, Grok, Mistral, DeepSeek, Qwen, OpenAI, DeepMind, Anthropic, Meta, Microsoft, NVIDIA, Google — AND 60% of the words over their union, within 36 h). Every copy is listed on the row (`outlets`, "Outlet\|url") and counted (`outlet_count`); a copy from a preferred domain takes over the link (`best_url`). Old rows get a story key once at startup, 500 at a time | `NEWS_PREFERRED_DOMAINS` |
+| F2 flags | A name under 4 characters never matches (logged once, "too short to match"). After 30 items in one pull name the same company, it counts in the title only for the rest of the pull and is a "noisy name" | `NEWS_NAME_MIN_CHARS`, `NEWS_NAME_FLOOD_MAX` |
+| F3 scoring | `news.preselect` is a RANK, not a cut: our people, our companies, stories two outlets carry, topic queries, the rest (newest first in each; what an earlier cycle could not reach first of all). Up to 3 calls of 40 a cycle; the rest is "carried" and scored first next cycle. A failed call keeps the batches before it and ends the cycle `unscored`. **The launch rule**: a title naming a frontier model (Gemini, GPT, Claude, Llama, Grok, Mistral, DeepSeek, Qwen, o-series like "o5") with a launch word is importance 5, topic "frontier model", `scored_by` "rule", in code, before the model | `NEWS_SCORE_MAX_ITEMS`, `NEWS_SCORE_MAX_CALLS` |
+| F4 breaking | 1 a cycle, 4 a day (counted from today's breaking rows, IST; past it a candidate is held for the daily post). An industry 5 needs two outlets, or the launch rule | `NEWS_BREAKING_MAX_PER_CYCLE`, `NEWS_BREAKING_MAX_PER_DAY`, `NEWS_BREAKING_MIN_OUTLETS` |
+| F5 every hour | A tick runs the OLDEST unclaimed slot of today (`news.due_slots`), one a tick, noted "late by N min"; more than 3 whole hours late is claimed `skipped`. A pull stops at a source boundary after 600 s (`partial`). A tick that fires during a cycle returns at once (the lock) | `NEWS_CYCLE_LATE_SKIP_HOURS`, `NEWS_CYCLE_MAX_SECONDS` |
+| F6 health | At 23:45 IST one message to the TEST channel (never the sales channel), outside the daily cap: cycles planned / run / late / skipped / partial; items fetched / new / copies merged; flagged; noisy names; scored by the model / by rule / carried; breaking posted against the budget, and when it was spent; the daily post's stories (`wording.news_health_lines`) | `NEWS_HEALTH_TIME` |
+
+Why five cycles were missed, and the `.env` lines, are in DEPLOY.md ("Upgrading
+to NEWS-PATCH-OCT16"): the laptop's `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES=150`
+reproduces the 14 Oct pattern exactly. Checked offline by
+`python verify_news_patch.py` (T1-T14).
 
 #### The daily post
 
@@ -6811,7 +6887,9 @@ python verify_poc_crosscheck.py           # R11: the Outreach PoCs cross-check (
 python verify_day_order.py                # NFT2-1069: every weekday's order and exact times, the 120-minute gap that never shrinks, nothing after 20:00, R7 minus rule 13's people, R11 on Wednesdays, R1's news window, the startup check; prints one planned day per weekday
 python verify_s1.py                       # cap 5 + R8/R9, the order of the day THREE WAYS (live sweep ticked every 15 min, test day, simulation), R1 every weekday, the Sunday post, one reminder lane, R9's ladder, free search
 python verify_s2.py                       # AI news: PoC slots, "More AI News", OTHER bypass, the since-last-post window
-python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (5 best unsent, newest first, no schedule talk, no model call)
+python verify_news_format.py              # the one news template in every mode, the 5-story cap, one message, and the news answer (the top 5 of the window, repeats included, no schedule talk, no model call)
+python verify_news_patch.py               # NEWS-PATCH-OCT16 T1-T14: one story many outlets, flag discipline, batched scoring and the launch rule, the breaking budget, catch-up cycles, the health line
+python verify_news_window.py              # NEWS-ANSWER-OCT16 T1-T16: the window a question names, the top 5 with repeats, the tail and the next page
 python verify_s3.py                       # R4 team/link, R7 contacts, R10 empty columns, R5's one-company post, R6's email + the one identity-block write, R3 weekly + the reminder offer
 python verify_prospects_priority.py       # R5: one company at a time, the six stacking rules, the same five, "yes" / "move on", the month-end lines (--show prints the messages)
 python verify_li_no_dm.py                 # R6: who is picked (the whole tab, the LI DM Sent cell), the four blocks, the two caps, the MX check, no address from the sheet printed, the add (--show prints the messages)

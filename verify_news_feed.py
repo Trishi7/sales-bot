@@ -91,6 +91,14 @@ config.NEWS_SCORE_MAX_ITEMS = 40
 config.NEWS_HOLD_AFTER_TEST_SECONDS = 0
 config.ARXIV_ENABLED = False
 config.TOKEN_DAILY_BUDGET = 0
+# NEWS-PATCH-OCT16 changed what this script was written against; it runs with
+# the NFT2-1087 behaviour pinned (the patch is checked by verify_news_patch.py):
+# a tick runs the latest slot only (catch-up off), no daily breaking budget,
+# one outlet enough for an industry 5, and no preferred outlet takes a link over.
+config.NEWS_CYCLE_LATE_SKIP_HOURS = 0
+config.NEWS_BREAKING_MAX_PER_DAY = 99
+config.NEWS_BREAKING_MIN_OUTLETS = 1
+config.NEWS_PREFERRED_DOMAINS = []
 
 import deadlines as dl  # noqa: E402
 import drip  # noqa: E402
@@ -458,8 +466,13 @@ async def main():
     check("the 19:00 window reaches back to the last COMPLETED cycle (16:00): 3 hours",
           (out["hours"], all("when:3h" in u for u in google_urls(mark))), (3, True))
     check("...and the cycle in the middle, which was partial, is not what it measures from",
-          [(c["hour"], c["status"]) for c in ledger.news_cycles_on("2026-09-29")][-3:],
+          [(c["hour"], c["status"]) for c in ledger.news_cycles_on("2026-09-29")
+           if c["status"] != "skipped"][-3:],
           [("16:00", "done"), ("17:00", "partial"), ("19:00", "done")])
+    check("...and the hour nobody ran (18:00) is claimed 'skipped', never run "
+          "(NEWS-PATCH-OCT16, catch-up pinned off here)",
+          [c["status"] for c in ledger.news_cycles_on("2026-09-29") if c["hour"] == "18:00"],
+          ["skipped"])
 
     # ------------------------------------------------------------------ (v)
     print("\n(v) THE KILL SWITCH - Tue 20:00 off, 21:00 on")
@@ -554,7 +567,8 @@ async def main():
     check("the first tick pulled; the second pulled nothing", (ran > 0, len(SERVED) - mark - ran),
           (True, 0))
     check("the cycle runs BEFORE the drip on every tick", ORDER, ["cycle", "drip", "cycle", "drip"])
-    hours = [c["hour"] for c in ledger.news_cycles_on("2026-09-29")]
+    hours = [c["hour"] for c in ledger.news_cycles_on("2026-09-29")
+             if c["status"] != "skipped"]
     check("each slot appears once", len(hours), len(set(hours)))
     check("the slots that ran today", hours, ["14:00", "15:00", "16:00", "17:00", "19:00",
                                               "20:00", "21:00", "22:00"])

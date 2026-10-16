@@ -1873,6 +1873,7 @@ NEWS_BREAKING_MIN_IMPORTANCE=5
 # ARXIV_BATCH_SIZE=20
 
 # DELETE these lines if present (retired, no longer read; leaving one in is harmless):
+#   (NEWS_BREAKING_MAX_PER_DAY is read again since NEWS-PATCH-OCT16 — see that section)
 #   NEWS_FEED_POLL_MINUTES  NEWS_CHECK_TIMES  NEWS_CHECK_MAX_USES  NEWS_BREAKING_MAX_PER_DAY
 #   NEWS_POC_TARGETS_PER_DAY  NEWS_POC_SLOTS  NEWS_POC_LOOKBACK_DAYS
 #   NEWS_OVERFLOW_ENABLED  NEWS_OVERFLOW_MIN_IMPORTANCE  NEWS_OVERFLOW_MAX_ITEMS
@@ -1907,3 +1908,124 @@ harmless (the next cycle reaches back over it); every hour, raise `NEWS_REQUEST_
 in the code reads it, but it should be brought in line with the README section above.
 
 `python verify_news_v2.py` checks all of it offline and prints the T1-T83 table.
+
+## Upgrading to NEWS-PATCH-OCT16 (the Gemini 4 miss)
+
+A bug-fix patch of the v1 news cycle (not the v2 rebuild). On 14 Oct the Gemini 4 "Aragon" launch came in 29 times
+and was never posted, each cycle flagged 564-603 items as ours, five of ten hourly cycles never ran, and up to three
+breaking posts went out a cycle with no daily cap. What changed: one story is one row however many outlets carry it
+(`outlet_count`); short and flooding names stop flagging everything; the scorer works down a ranked list in up to three
+calls a cycle and a frontier-model launch is scored 5 in code; breaking is one a cycle and four a day, and an industry
+story needs two outlets; a missed hour runs late instead of never; and a health line goes to the test channel at 23:45.
+
+**Why five cycles were missed on 14 Oct.** No `news_cycles` rows for 14-15 Oct were available: the two database
+copies in the repo (`sales_bot.db`, 7 Oct; `sales_bot_test.db`, 5 Oct) predate the table, and the server's
+`/opt/sales-bot` database is not visible from here. Reasoning from the code instead:
+
+- The news cycle runs only on a sweep tick (`_sweep_once`, before the drip). The loop sleeps
+  `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` AFTER each tick, so one tick follows the last by the interval plus the tick's
+  own run time.
+- The old `news.cycle_slot` ran only the LATEST slot at or before the tick, and nothing went back for an older one. Any
+  gap of more than an hour between two ticks therefore lost a slot for good.
+- With the shipped interval of 15 minutes a tick would have to run for over 45 minutes to lose an hour. A big pull is
+  about 90 Google requests 1.5 s apart, plus one scoring call. That is minutes, not three quarters of an hour.
+- **The laptop's `.env` has `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES=150`** (`.env.agent`), and config logs "is over an
+  hour" at boot for it. At 150 minutes the ticks fall at about 14:0x, 16:3x, 19:0x, 21:3x and then after midnight, so
+  the cycles that run are 14, 16, 19 and 21. A restart between 22:00 and 23:00 (which ticks at once) adds 22. The
+  missed slots are then exactly 15:00, 17:00, 18:00, 20:00 and 23:00, which is what happened. The server's value is
+  not visible here: check it with `grep COS_FOLLOWUP_CHECK_INTERVAL_MINUTES /opt/sales-bot/.env`, and look in the log
+  for `is over an hour` and for a restart near 22:00 on 14 Oct.
+
+The patch makes every tick run the OLDEST unclaimed slot of today (marked `late by N min`), and skips one that is more
+than 3 whole hours late. That is still ONE SLOT A TICK, so **with a 150-minute interval it still cannot keep up**: ten
+hourly slots need at least ten ticks between 14:00 and 23:59, and 150 minutes gives about four. Set the interval to 15
+(the default, and what Rule 13 and the posting window already expect).
+
+**Lines for `.env`: the laptop AND `/opt/sales-bot/.env`.**
+
+```
+# SET (or delete the line; 15 is the default). The cause of the missed cycles if the server has 150 like the laptop:
+COS_FOLLOWUP_CHECK_INTERVAL_MINUTES=15
+
+# CHANGE or DELETE: retired by NFT2-1087 and READ AGAIN now, as the day's breaking budget (new default 4).
+# The laptop has NEWS_BREAKING_MAX_PER_DAY=2, which would now cap breaking at two a day.
+NEWS_BREAKING_MAX_PER_DAY=4
+
+# CHANGE if present: the per-cycle default is now 1 (a line that is present overrides it).
+NEWS_BREAKING_MAX_PER_CYCLE=1
+
+# CHECK: the ticket's bar for INDUSTRY breaking news is 5. The laptop has 4, which with two outlets would break
+# on a 4 from two outlets.
+NEWS_BREAKING_MIN_IMPORTANCE=5
+
+# NEW, all optional: the defaults are the ticket's. Add a line only to change one.
+# NEWS_NAME_MIN_CHARS=4
+# NEWS_NAME_FLOOD_MAX=30
+# NEWS_SCORE_MAX_CALLS=3
+# NEWS_BREAKING_MIN_OUTLETS=2
+# NEWS_CYCLE_LATE_SKIP_HOURS=3
+# NEWS_CYCLE_MAX_SECONDS=600
+# NEWS_HEALTH_TIME=23:45
+```
+
+`NEWS_PREFERRED_DOMAINS` now matters for more than the old prompt line: a copy of a stored story from one of those
+domains takes over the row's link (`best_url`). The laptop's list is the `.env.example` one.
+
+The health line goes to `SALES_TEST_CHANNEL_ID`. With that unset it is only logged, never posted to the sales channel.
+
+**The database** upgrades itself at the first start: five columns on `news_feed_items` (`story_key`, `outlets`,
+`outlet_count`, `best_url`, `scored_by`), five on `news_cycles` (`merged`, `noisy`, `scored_model`, `scored_rule`,
+`carried`), an index on `story_key`, and a one-off backfill of `story_key` in batches of 500 rows. Look for, once:
+
+```
+[db] migrating: adding news_feed_items.story_key        (and the other nine)
+[db] story keys back-filled on N stored feed item(s), in batches of 500
+```
+
+**What to look for in the log after the next 14:00.**
+
+```
+[feeds] name list: 'Xyz' is too short to match (under 4 characters, NEWS_NAME_MIN_CHARS) — never matched   (once per name)
+[feeds] hourly pull (when:2h): ... N new, N copies merged[, noisy names: ...] — 0 API calls
+[news] cycle: N frontier launch(es) scored 5 by rule, not sent to the model: ...
+[news] cycle: scored N of N unscored item(s) in N <model> call(s) (pre-ranked, N about us) — ...[; carried N to the next cycle]
+[news-cycle] 2026-10-17 15:00: small pull, the last 2h — late by 40 min                   (a catch-up)
+[news-cycle] 2026-10-17 15:00: skipped — late by 4 h 10 min — more than 3 h late ...     (after an outage)
+[news-cycle] ...: the day's breaking budget is spent (NEWS_BREAKING_MAX_PER_DAY=4) — N candidate(s) held ...
+[news-health] 2026-10-17: posted to the test channel (outside the daily cap)
+```
+
+A `carried N` every hour means three calls of 40 are not enough for the day's volume: look at the health line's
+noisy names first, then raise `NEWS_SCORE_MAX_CALLS`. `the pull has run 600s` every hour means the pull is too slow
+for the cap: look at `NEWS_REQUEST_GAP_SECONDS` and the number of names.
+
+`python verify_news_patch.py` checks all of it offline and prints the T1-T14 table.
+
+## Upgrading to NEWS-ANSWER-OCT16 (a question gets the real top 5)
+
+Runs after NEWS-PATCH-OCT16, on the same build. A news question now gets the top stories of the window it names
+(default the last 24 hours), POSTED BEFORE OR NOT, ranked by score and then newest, five at a time; the list ends on
+"There are N more in the <window>. These are the top 5. Would you like to see the rest?" when more are left, and a
+"yes" / "next" / "show me the rest" within 30 minutes gives the next page. "top news in the last 24 hours", "since
+yesterday" and "this week" stay on the no-model path. Only the daily post and the breaking post are unchanged.
+
+**Lines for `.env`: the laptop AND `/opt/sales-bot/.env`.** Both are new and optional: the defaults are the ticket's.
+
+```
+# NEWS_ASK_DEFAULT_HOURS=24      # the window of a news question that names none
+# NEWS_ASK_REST_MINUTES=30       # how long a "yes" under an answer still gives the next page
+```
+
+Nothing else changes: no database change, no new table (the page state is in memory, per channel, and a restart
+forgets it — a "yes" after a restart is read like any other reply).
+
+**What to look for in the log** after somebody asks:
+
+```
+[news] question: Thu 15 Oct 16:10 to Fri 16 Oct 16:10 IST (last 24 hours) — N collected, N worth 3+ (N posted before), 0 unrated; giving 5 from 0, N left
+[news] msg=... the rest of the news: stories 6-10 of N
+[news] msg=... a yes to the rest of the news came late; asked back
+[news] question: both hours=48 and days=1 were given; hours wins
+```
+
+`python verify_news_window.py` checks all of it offline and prints the T1-T16 table.

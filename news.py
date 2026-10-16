@@ -11,11 +11,13 @@ outlets, then arXiv). Every stored story has TWO NUMBERS:
 
 The flag decides whether the team MUST see a story; the score decides WHEN:
 
-    BREAKING   about us at 4 or 5, industry at 5 — posted in the cycle that
-               finds it, any day, with no daily limit, straight to the
-               channel: never through drip_sends, never against the cap.
-               At most NEWS_BREAKING_MAX_PER_CYCLE stories a cycle, and only
-               while the story is new (NEWS_BREAKING_MAX_AGE_HOURS).
+    BREAKING   about us at 4 or 5, industry at 5 from two outlets (or a
+               frontier launch, by rule) — posted in the cycle that finds it,
+               any day, straight to the channel: never through drip_sends,
+               never against the cap. At most NEWS_BREAKING_MAX_PER_CYCLE
+               stories a cycle and NEWS_BREAKING_MAX_PER_DAY a day
+               (NEWS-PATCH-OCT16), and only while the story is new
+               (NEWS_BREAKING_MAX_AGE_HOURS).
 
     DAILY      every weekday, in R1's place in the day's order: at most
                NEWS_MAX_ITEMS stories, ours first, then the industry. A story
@@ -29,6 +31,14 @@ bold, no "— what" clause, no sheet tag. The messages are the team's templates
 
 THE TOPICS ARE SEEDS, NOT LIMITS (NEWS_TOPICS): important news off the list is
 welcome, tagged OTHER.
+
+ONE STORY IS STORED ONCE (NEWS-PATCH-OCT16). On 14 Oct the Gemini 4 launch
+came in 29 times and was 29 stories, none of them scored. A feed item is now
+the same story as a stored one by link, by headline key, by STORY KEY (the
+words sorted, so word order is gone — `story_key`), or by `same_story` (two
+shared names and most of the words, within 36 hours); every copy is counted on
+the row (`outlet_count`). A title that names a frontier model and says it
+launched is a 5 BY RULE, in code, before the model (`launch_rule`).
 
 ONE STORY IS POSTED ONCE. `news_stories` remembers every story that went out,
 daily or breaking, by normalised URL AND by headline key — four outlets give
@@ -138,6 +148,149 @@ def headline_key(headline: str) -> str:
         if len(tokens) >= HEADLINE_KEY_TOKENS:
             break
     return " ".join(tokens)
+
+
+# -- one story, many outlets (NEWS-PATCH-OCT16) -------------------------------
+#
+# ON 14 OCT THE GEMINI 4 LAUNCH WAS STORED 29 TIMES. `headline_key` is the
+# first eight words IN ORDER, and "Google launches Gemini 4 Aragon" and "Gemini
+# 4 Aragon: Google launches its new model" share the words, not the order. So
+# every copy was a new story, none of them was scored, and nothing was posted.
+
+# How many significant tokens make a story key (sorted, so order is gone).
+STORY_KEY_TOKENS = 12
+
+# How close in time two copies of one story are: first seen within this many
+# hours of each other.
+SAME_STORY_HOURS = 36
+
+# The share of significant tokens two headlines must have in common, on top of
+# two shared names, to be one story: the words they share over ALL the words
+# either uses. Over the union, so "Google launches Gemini 4 Aragon" and
+# "Google's Gemini 4 Aragon fails safety test" (3 shared of 7) stay apart.
+SAME_STORY_OVERLAP = 0.6
+
+# THE NAMES THE INDUSTRY IS ABOUT. Two headlines that share two of these (or two
+# names from the sheets, `feeds.NameIndex.entities`) and most of their words are
+# one story. One shared name is never enough: "Gemini 4 launched" and "Gemini 4
+# fails safety test" are two stories on the same day.
+MODEL_ENTITIES = ("Gemini", "GPT", "Claude", "Llama", "Grok", "Mistral", "DeepSeek",
+                  "Qwen", "OpenAI", "DeepMind", "Anthropic", "Meta", "Microsoft",
+                  "NVIDIA", "Google")
+_MODEL_ENTITY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(" + "|".join(re.escape(e) for e in MODEL_ENTITIES)
+    + r")(?![a-z])", re.IGNORECASE)
+
+
+def _significant(headline: str) -> list:
+    """The headline's significant tokens, in order: lower case, no punctuation,
+    no digits, no stopwords, a possessive "'s" dropped ("Google's" is Google)."""
+    out: list = []
+    for raw in re.findall(r"[A-Za-z0-9'’]+", str(headline or "").lower()):
+        raw = re.sub(r"['’]s$", "", raw)
+        tok = re.sub(r"[\d'’]", "", raw)
+        if len(tok) < 2 or tok in _STOPWORDS:
+            continue
+        out.append(tok)
+    return out
+
+
+def story_key(headline: str) -> str:
+    """WHO DID WHAT, WHATEVER THE ORDER: the first 12 significant tokens,
+    SORTED, joined with spaces. "Google launches Gemini 4 Aragon" and "Gemini 4
+    Aragon: Google launches" are one key. Digits go, as in `headline_key`."""
+    return " ".join(sorted(dict.fromkeys(_significant(headline)[:STORY_KEY_TOKENS])))
+
+
+def model_entities(text: str) -> set:
+    """The industry names (`MODEL_ENTITIES`) in a text, lower case."""
+    return {m.group(1).lower() for m in _MODEL_ENTITY_RE.finditer(str(text or ""))}
+
+
+def _when(value) -> Optional[datetime]:
+    try:
+        when = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def same_story(a: dict, b: dict, *, entities_of=None,
+               hours: int = SAME_STORY_HOURS) -> bool:
+    """Are two feed items ONE STORY? `a` and `b` carry `title` (or
+    `headline`) and `seen_at`. `entities_of(title)` gives the names in a title
+    (default: `model_entities` only; feeds.py adds the sheets' names).
+
+    TRUE WHEN the story keys match, OR the two share at least TWO names AND
+    `SAME_STORY_OVERLAP` of their significant tokens — and either way they were
+    first seen within `hours` of each other. A shared name alone is never a
+    match: that is what keeps "Gemini 4 launched" and "Gemini 4 fails safety
+    test" apart.
+    """
+    ta = str(a.get("title") or a.get("headline") or "")
+    tb = str(b.get("title") or b.get("headline") or "")
+    wa, wb = _when(a.get("seen_at")), _when(b.get("seen_at"))
+    if wa is not None and wb is not None and abs((wa - wb).total_seconds()) > hours * 3600:
+        return False
+    ka = a.get("story_key") or story_key(ta)
+    kb = b.get("story_key") or story_key(tb)
+    if ka and ka == kb:
+        return True
+    names = entities_of or model_entities
+    if len(set(names(ta)) & set(names(tb))) < 2:
+        return False
+    sa, sb = set(_significant(ta)), set(_significant(tb))
+    if not sa or not sb:
+        return False
+    return len(sa & sb) / len(sa | sb) >= SAME_STORY_OVERLAP
+
+
+def preferred_domain(url: str, domains: Optional[list] = None) -> bool:
+    """Is this link on one of NEWS_PREFERRED_DOMAINS (a subdomain counts)?"""
+    host = (urlsplit(str(url or "")).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for d in (domains if domains is not None else (config.NEWS_PREFERRED_DOMAINS or [])):
+        d = str(d or "").strip().lower().lstrip(".")
+        if d and (host == d or host.endswith("." + d)):
+            return True
+    return False
+
+
+# -- the launch rule (NEWS-PATCH-OCT16) ---------------------------------------
+#
+# A FRONTIER MODEL LAUNCH IS SCORED IN CODE, before the model is asked. On 14
+# Oct the Gemini 4 launch sat at 0 for ten hours because the scorer never
+# reached it; a title that names a frontier model and says it launched is a 5
+# whatever the scorer would say, and it costs nothing.
+
+LAUNCH_TOPIC = "frontier model"
+SCORED_BY_RULE = "rule"
+SCORED_BY_MODEL = "model"
+
+_FRONTIER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?i:gemini|gpt|claude|llama|grok|mistral|deepseek|qwen)"
+    r"(?![a-z])|o[1-9](?![0-9A-Za-z]))")
+_LAUNCH_RE = re.compile(
+    r"(?<![a-z])(?:launch|launches|launched|release|releases|released|unveil|unveils"
+    r"|unveiled|announce|announces|announced|introduces|introducing|new model)(?![a-z])",
+    re.IGNORECASE)
+
+
+def launch_rule(item: dict) -> bool:
+    """Does this item's TITLE name a frontier model (Gemini, GPT, Claude,
+    Llama, Grok, Mistral, DeepSeek, Qwen, or an o-series name like "o5") AND a
+    launch word? Then it is importance 5 by rule. The summary is not read: a
+    review that mentions the launch is not the launch."""
+    title = str((item or {}).get("title") or (item or {}).get("headline") or "")
+    return bool(_FRONTIER_RE.search(title)) and bool(_LAUNCH_RE.search(title))
+
+
+def launch_verdict(item: dict) -> dict:
+    """The score the launch rule writes: 5, "frontier model", the title."""
+    title = " ".join(str(item.get("title") or "").split())
+    return {"url_key": item.get("url_key"), "importance": 5, "topic": LAUNCH_TOPIC,
+            "what": title[:300], "scored_by": SCORED_BY_RULE}
 
 
 # -- building the search ------------------------------------------------------
@@ -775,13 +928,31 @@ def is_breaking(story: dict, *, ours_min: int, industry_min: int) -> bool:
     return imp >= (int(ours_min) if is_ours(story) else int(industry_min))
 
 
+def outlets_of(story: dict) -> int:
+    """How many outlets carried this story (`outlet_count`; 1 when unknown)."""
+    try:
+        return max(1, int((story or {}).get("outlet_count") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def by_rule(story: dict) -> bool:
+    """Was this story scored by the launch rule rather than the model?"""
+    return str((story or {}).get("scored_by") or "") == SCORED_BY_RULE
+
+
 def choose_breaking(stories: list, *, today: date, db, now: datetime,
                     max_age_hours: int, ours_min: int, industry_min: int,
-                    cap: int) -> dict:
-    """WHAT ONE CYCLE SENDS AS BREAKING NEWS. {"keep", "held", "skipped"}.
+                    cap: int, max_per_day: Optional[int] = None,
+                    min_outlets: int = 1) -> dict:
+    """WHAT ONE CYCLE SENDS AS BREAKING NEWS. {"keep", "held", "skipped",
+    "budget_spent"}.
 
     THE GATES, IN ORDER:
-      1. the score — about us 4 or 5, industry 5 (`is_breaking`);
+      1. the score — about us 4 or 5, industry 5 (`is_breaking`). AN
+         INDUSTRY STORY ALSO NEEDS `min_outlets` OUTLETS (NEWS-PATCH-OCT16:
+         NEWS_BREAKING_MIN_OUTLETS, 2) — one outlet's 5 waits for a second
+         outlet or the daily post — unless the launch rule scored it;
       2. NEW — first SEEN within `max_age_hours` of `now`. A story that only
          reaches a breaking score hours later is not sent as stale breaking
          news: it is in the next daily post instead. A CARRIED story is never
@@ -790,7 +961,13 @@ def choose_breaking(stories: list, *, today: date, db, now: datetime,
          of a story that already went out is the same story;
       4. THE FLOOD GUARD — the top `cap` in the one order (score, source rank,
          newest) go now, in ONE message. The rest are `held`: the caller does
-         not record them, so the next cycle can send them.
+         not record them, so the next cycle can send them;
+      5. THE DAY'S BUDGET (NEWS-PATCH-OCT16) — at most `max_per_day`
+         breaking stories a day, counted from `news_stories` rows of kind
+         "breaking" posted on `today` (`db.news_breaking_count_on`), so the
+         count starts again at IST midnight. When the budget is spent the
+         candidates are held for the daily post, not recorded, and
+         `budget_spent` is True. None = no daily budget.
     """
     skipped: list = []
 
@@ -805,6 +982,12 @@ def choose_breaking(stories: list, *, today: date, db, now: datetime,
     for s in stories or []:
         if not is_breaking(s, ours_min=ours_min, industry_min=industry_min):
             continue
+        if not is_ours(s) and not by_rule(s) and outlets_of(s) < int(min_outlets):
+            _why(s, f"industry news at {int(s.get('importance') or 0)} from "
+                    f"{outlets_of(s)} outlet(s) — breaking needs {int(min_outlets)} "
+                    "(NEWS_BREAKING_MIN_OUTLETS); held for a second outlet or the "
+                    "daily post")
+            continue
         if is_carried(s) or int(s.get("carry_count") or 0) < 0:
             _why(s, "carried from an earlier daily post; a carried story is never "
                     "breaking")
@@ -817,12 +1000,28 @@ def choose_breaking(stories: list, *, today: date, db, now: datetime,
         fresh.append(s)
     pool = _qualify(fresh, db=db, today=today, why=_why)
     room = max(0, min(int(cap), MAX_PER_MESSAGE))
-    keep, held = pool[:room], pool[room:]
-    for s in held:
-        _why(s, f"{room} breaking stories already go out this cycle "
-                "(NEWS_BREAKING_MAX_PER_CYCLE) — not recorded; the next cycle "
-                "can send it")
-    return {"keep": keep, "held": held, "skipped": skipped}
+    left = None
+    if max_per_day is not None:
+        try:
+            done = int(db.news_breaking_count_on(dl.iso(today)))
+        except Exception:
+            log.exception("[news] could not count today's breaking posts; treating "
+                          "the day's budget as spent")
+            done = int(max_per_day)
+        left = max(0, int(max_per_day) - done)
+    keep = pool[:min(room, left) if left is not None else room]
+    held = pool[len(keep):]
+    spent = left is not None and len(keep) < room and len(held) > 0
+    for i, s in enumerate(held):
+        if spent and (left == 0 or i < room - len(keep)):
+            _why(s, f"the day's breaking budget is spent ({int(max_per_day)}, "
+                    "NEWS_BREAKING_MAX_PER_DAY) — held for the daily post, not "
+                    "recorded")
+        else:
+            _why(s, f"{room} breaking stories already go out this cycle "
+                    "(NEWS_BREAKING_MAX_PER_CYCLE) — not recorded; the next cycle "
+                    "can send it")
+    return {"keep": keep, "held": held, "skipped": skipped, "budget_spent": spent}
 
 
 # -- what the message says ----------------------------------------------------
@@ -1088,7 +1287,7 @@ def _picked(stories: list, cap: int) -> list:
 
 
 def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
-           tags: str = "") -> str:
+           tags: str = "", remaining: int = 0, label: str = "", cap: int = 0) -> str:
     """One news message, in one of the team's templates (NFT2-1087, s.16).
     Never written by a model: the opener, the two labels and the closer are
     fixed text, and every story is `story_line`.
@@ -1108,7 +1307,9 @@ def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
 
     A BREAKING POST (MODE_BREAKING) — `**Breaking news** <tags>` and the
     stories: no date, no opener, no closer. AN ANSWER (MODE_ANSWER) — `**AI
-    News, <day>**` and the stories: no tags, no opener, no closer, no labels.
+    News, <day>**` and the stories: no tags, no opener, no closer, no labels —
+    and, when `remaining` stories are left after the page, the fixed tail
+    (`answer_tail`, NEWS-ANSWER-OCT16). The other modes never carry it.
 
     AT MOST MAX_PER_MESSAGE STORIES, each once (`unique`), whatever was handed
     in; ours (`is_ours`) before the industry, the order inside each kept as
@@ -1120,7 +1321,10 @@ def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
     if mode != MODE_MAIN:
         head = heading(mode, day or dl.today_ist(),
                        tags=tags if mode == MODE_BREAKING else "")
-        return _join([head] + [story_line(s) for s in picked])
+        body = _join([head] + [story_line(s) for s in picked])
+        tail = answer_tail(remaining, label, cap or len(picked)) \
+            if mode == MODE_ANSWER else ""
+        return body + ("\n" + tail if tail else "")
     ours = [s for s in picked if is_ours(s)]
     industry = [s for s in picked if not is_ours(s)]
     lines = [OPENER]
@@ -1199,17 +1403,26 @@ def split_message(text: str, *, limit: int = 2000) -> list:
     return parts
 
 
-def choose_answer(stories: list, *, is_sent, cap: int = MAX_PER_MESSAGE) -> dict:
+def choose_answer(stories: list, *, is_sent, cap: int = MAX_PER_MESSAGE,
+                  offset: int = 0, mode: str = "window") -> dict:
     """Which stories somebody who ASKED for the news is given.
 
-    Returns {"stories": [...], "repeat": bool, "unsent": int}.
+    THE TOP OF THE WINDOW, REPEATS INCLUDED (NEWS-ANSWER-OCT16). On 15 Oct
+    somebody asked for the top AI news of the last 24 hours and was given
+    weaker stories nobody had posted, because the old rule handed out unsent
+    stories first: the two or three posted the evening before — the ones she
+    meant — were left out. A question about a window gets that window's best.
 
-    1. The `cap` HIGHEST-SCORED stories that have NOT been sent in the channel
-       before (`is_sent(story)` is False) — a tie goes to the newer one.
-    2. Fewer than `cap` unsent: those, and no padding with old ones.
-    3. NOT ONE unsent story left — and only then — the `cap` highest-scored
-       are given again (`repeat` is True).
-    Whatever is chosen is LISTED NEWEST FIRST. One story once (`unique`).
+    Returns {"stories", "total", "remaining", "sent_before", "repeat",
+    "unsent"}: the page of at most `cap` stories starting at `offset`, ranked
+    by importance and then newest (a tie goes to the newer one), one story
+    once (`unique`); how many there are in all; how many come after this page;
+    and the url keys of the page's stories already sent (`is_sent`), which the
+    caller does not record again. Nothing in it says a story was posted.
+
+    `mode="fresh"` is the OLD RULE, kept only for the checks that still pin it:
+    the `cap` best unsent stories, the best sent ones only when no unsent one
+    is left (`repeat`), listed newest first.
 
     Pure: `is_sent` is the caller's (the news_stories table, inside
     NEWS_REPEAT_DAYS), so a test can say what was sent without a database.
@@ -1218,11 +1431,141 @@ def choose_answer(stories: list, *, is_sent, cap: int = MAX_PER_MESSAGE) -> dict
     newest = sorted([s for s in (stories or []) if s.get("url")],
                     key=lambda s: str(s.get("published_at") or ""), reverse=True)
     ranked = unique(sorted(newest, key=lambda s: -int(s.get("importance") or 3)))
-    unsent = [s for s in ranked if not is_sent(s)]
-    picked = unsent[:cap] if unsent else ranked[:cap]
-    picked = sorted(picked, key=lambda s: str(s.get("published_at") or ""), reverse=True)
-    return {"stories": picked, "repeat": bool(picked) and not unsent,
-            "unsent": len(unsent)}
+    if mode == "fresh":
+        unsent = [s for s in ranked if not is_sent(s)]
+        picked = unsent[:cap] if unsent else ranked[:cap]
+        picked = sorted(picked, key=lambda s: str(s.get("published_at") or ""),
+                        reverse=True)
+        return {"stories": picked, "repeat": bool(picked) and not unsent,
+                "unsent": len(unsent), "total": len(ranked),
+                "remaining": 0, "sent_before": []}
+    offset = max(0, int(offset or 0))
+    page = ranked[offset:offset + cap]
+    return {"stories": page, "total": len(ranked),
+            "remaining": max(0, len(ranked) - offset - len(page)),
+            "sent_before": [s.get("url_key") for s in page if is_sent(s)],
+            "repeat": False, "unsent": sum(1 for s in ranked if not is_sent(s))}
+
+
+# -- the window a question names (NEWS-ANSWER-OCT16) ----------------------------
+
+# THE ANSWER'S TAIL, after the list, in MODE_ANSWER only: fixed text, never a
+# model line. Only when more stories are left than the page shows.
+ANSWER_TAIL = ("There are {remaining} more in the {label}. These are the top {cap}. "
+               "Would you like to see the rest?")
+ANSWER_ALL_SHOWN = "That was all of it."
+DEFAULT_WINDOW_LABEL = "last 24 hours"
+
+_NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+              "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "twelve": 12,
+              "fifteen": 15, "twenty": 20, "thirty": 30, "few": 3, "couple": 2}
+_UNIT_HOURS = {"hour": 1, "day": 24, "week": 168, "month": 720}
+_N_RE = (r"(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|twelve|fifteen"
+         r"|twenty|thirty|few|couple(?: of)?)")
+_SPAN_RE = re.compile(r"\b(last|past|previous|within(?: the)?(?: last| past)?)\s+"
+                      + _N_RE + r"\s*(hours?|hrs?|h|days?|weeks?|months?)\b", re.I)
+_ONE_RE = re.compile(r"\b(last|past|previous)\s+(hour|day|week|month)\b", re.I)
+
+
+def _unit(word: str) -> str:
+    w = word.lower().rstrip("s")
+    return "hour" if w in ("hr", "h") else w
+
+
+def _label(word: str, n: int, unit: str) -> str:
+    word = word.lower().split()[0]
+    word = "last" if word in ("within", "previous") else word
+    return f"{word} {unit}" if n == 1 else f"{word} {n} {unit}s"
+
+
+def parse_window(text: str, *, now: Optional[datetime] = None,
+                 keep_days: Optional[int] = None) -> Optional[dict]:
+    """The window a news question names, or None (the caller uses 24 hours).
+
+    {"hours", "label", "since", "capped"}: `hours` the span (whole hours,
+    rounded up), `label` the phrase the answer's tail uses ("There are 7 more
+    in the {label}"), `since` the IST start when the phrase is anchored to the
+    clock ("today", "yesterday", "this morning") and None otherwise, `capped`
+    True when the span was cut to NEWS_FEED_KEEP_DAYS — the store keeps no
+    more. Pure: `now` is the caller's IST time (the test clock when set).
+
+      "last 24 hours" -> 24        "past 2 days" -> 48       "this week" -> 168
+      "today" -> since 00:00        "yesterday", "since yesterday" -> since
+      "this morning" -> since 06:00 yesterday's 00:00
+      "last month" -> 720, capped at NEWS_FEED_KEEP_DAYS x 24
+    """
+    body = " ".join(str(text or "").split())
+    if not body:
+        return None
+    now = now or dl.now_ist()
+    keep = max(1, int(keep_days if keep_days is not None else config.NEWS_FEED_KEEP_DAYS))
+    low = body.lower().replace("'", "").replace("’", "")
+    since = None
+    span, one = _SPAN_RE.search(body), _ONE_RE.search(body)
+    if span:
+        raw = span.group(2).lower().replace(" of", "")
+        n = max(1, int(raw) if raw.isdigit() else _NUM_WORDS.get(raw, 1))
+        unit = _unit(span.group(3))
+        hours, label = n * _UNIT_HOURS[unit], _label(span.group(1), n, unit)
+    elif one:
+        unit = _unit(one.group(2))
+        hours, label = _UNIT_HOURS[unit], _label(one.group(1), 1, unit)
+    elif re.search(r"\b(this|the)\s+week\b", low):
+        hours, label = 168, "past week"
+    elif re.search(r"\bthis\s+month\b", low):
+        hours, label = 720, "past month"
+    elif re.search(r"\byesterday\b", low):
+        since = datetime.combine(now.date() - timedelta(days=1), datetime.min.time(),
+                                 now.tzinfo)
+        hours, label = 0, "period from yesterday"
+    elif re.search(r"\bthis\s+morning\b", low):
+        day = now.date() if now.hour >= 6 else now.date() - timedelta(days=1)
+        since = datetime.combine(day, datetime.min.time(), now.tzinfo) + timedelta(hours=6)
+        hours, label = 0, "morning so far"
+    elif re.search(r"\b(today|todays)\b", low):
+        since = datetime.combine(now.date(), datetime.min.time(), now.tzinfo)
+        hours, label = 0, "day so far"
+    else:
+        return None
+    if since is not None:
+        hours = max(1, int(-(-(now - since).total_seconds() // 3600)))
+    capped = hours > keep * 24
+    if capped:
+        hours, since = keep * 24, None
+    return {"hours": int(hours), "label": label, "since": since, "capped": capped}
+
+
+_COUNT_RE = re.compile(r"\btop\s+" + _N_RE + r"\b|\b" + _N_RE
+                       + r"\s+(?:top\s+)?(?:ai\s+)?(?:news\s+)?(?:stories|headlines|items)\b",
+                       re.I)
+
+
+def parse_count(text: str) -> Optional[int]:
+    """"top 3" / "five headlines" -> how many the person asked for, or None.
+    Not capped here: the caller caps it at MAX_PER_MESSAGE (5)."""
+    m = _COUNT_RE.search(str(text or ""))
+    if not m:
+        return None
+    raw = (m.group(1) or m.group(2) or "").lower().replace(" of", "")
+    n = int(raw) if raw.isdigit() else _NUM_WORDS.get(raw)
+    return n if n and n > 0 else None
+
+
+def answer_tail(remaining: int, label: str, cap: int) -> str:
+    """The tail of a news answer that has more to give; "" when it has not."""
+    if int(remaining or 0) <= 0:
+        return ""
+    return ANSWER_TAIL.format(remaining=int(remaining),
+                              label=label or DEFAULT_WINDOW_LABEL, cap=int(cap))
+
+
+def rest_again(label: str) -> str:
+    """What a late "yes" is asked back: "The rest of the last-24-hour news?"."""
+    label = label or DEFAULT_WINDOW_LABEL
+    m = re.fullmatch(r"(last|past) (\d+) (hour|day|week|month)s", label)
+    if m:
+        return f"The rest of the {m.group(1)}-{m.group(2)}-{m.group(3)} news?"
+    return f"The rest of the news from the {label}?"
 
 
 # Words a question about "the news" is made of. A question built from these
@@ -1235,6 +1578,7 @@ list me might morning my new news newest now of on our out please quick recent
 recently right rn round roundup see send share show so some stories story tell
 than that the there these this three to today todays top two up update updates
 us was we what whats whatever with world would you your happening
+last past yesterday since week within previous far
 """.split())
 _NEWS_ASK_RE = re.compile(
     r"\b(news|headlines?)\b|\bwhat(?:\s+is|'?s|s)\s+(?:new|happening)\b", re.IGNORECASE)
@@ -1247,8 +1591,9 @@ def plain_question(text: str) -> bool:
     news for this hour?". Decided by the words alone, no model: it asks for
     news, and every other word is one of the few a news question is made of.
     "any news on ElevenLabs?" is NOT plain ("elevenlabs" is none of them) and
-    goes to the engine with the same rendered list. A week's worth ("this
-    week") is not plain either: that is a different window.
+    goes to the engine with the same rendered list. A window ("in the last
+    24 hours", "since yesterday", "this week") IS plain since NEWS-ANSWER-OCT16:
+    the caller reads it with `parse_window`, still with no model.
     """
     body = str(text or "")
     if not _NEWS_ASK_RE.search(body):
@@ -1277,56 +1622,67 @@ def future_note(day: date) -> str:
             "hasn't happened.")
 
 
-def preselect(items: list, *, cap: int, per_hint: int = 3) -> list:
-    """The feed items worth showing the scorer, at most `cap`, newest first.
+def preselect(items: list, *, cap: int, per_hint: int = 3,
+              people: Optional[set] = None, carried_before: str = "") -> list:
+    """THE PRE-RANK (NEWS-PATCH-OCT16): the feed items in the order the scorer
+    should see them, at most `cap`. A RANK, NOT A CUT — the caller scores in
+    batches of NEWS_SCORE_MAX_ITEMS down this list until nothing is left or
+    NEWS_SCORE_MAX_CALLS is reached.
 
-    ITEMS ABOUT US GO BEFORE ALL OF IT, EVERY ONE OF THEM (NFT2-1087). The
-    flag was set by rule when the item was stored, and a flagged story is one
-    the team must see; the score only decides when. There is no per-name
-    share any more: every name is read every hour in a batch, and the batch
-    returns what is new in the window, not a week of one company.
+    THE GROUPS, IN ORDER, each newest first:
+      1. flagged, naming one of our PEOPLE (`people`: lower-case names; a
+         researcher's item always counts);
+      2. flagged, naming a company (or a watch name);
+      3. from an outlet's own feed (no `topic_hint`) and carried by TWO OR MORE
+         outlets (`outlet_count`);
+      4. from a topic query (`topic_hint`);
+      5. the rest.
 
-    THEN THE OUTLETS' OWN FEEDS (no `topic_hint`): they are AI desks and
-    nearly everything on them is in scope — but they get at most 60% of what
-    is left, so a busy day on the desks cannot crowd out the topic queries,
-    which are where a story off those desks (a regulator, an Indian outlet)
-    arrives. The Google News queries fill the rest, at most `per_hint` per
-    topic; any room still left goes back to the outlets. Two rows with one
-    headline key count once.
+    ON 14 OCT the old order put every flagged item first, 564-603 of them an
+    hour, and industry stories never reached the scorer. The flood is now
+    capped in feeds.py (NEWS_NAME_FLOOD_MAX), and what is left of it no longer
+    hides everything else for good: the next batch reaches it.
+
+    CARRIED FIRST. With `carried_before` (an ISO time: the start of this
+    cycle) an item first seen before it — one an earlier cycle could not reach
+    — goes ahead of this cycle's, in the same five groups.
+
+    Two rows with one story key (or headline key, or link) count once.
+    `per_hint` is no longer read: a topic is not rationed in a rank.
     """
     cap = max(1, int(cap))
+    people = {str(p).strip().lower() for p in (people or ()) if str(p).strip()}
+
+    def group(row) -> int:
+        if is_ours(row):
+            names = {n.strip().lower() for n in str(row.get("names") or "").split(",")}
+            if str(row.get("kind") or "") == KIND_RESEARCHER or (names & people):
+                return 0
+            return 1
+        if not (row.get("topic_hint") or "").strip():
+            return 2 if outlets_of(row) >= 2 else 4
+        return 3
+
+    def carried(row) -> int:
+        seen = str(row.get("seen_at") or "")
+        return 0 if (carried_before and seen and seen < carried_before) else 1
+
     ordered = sorted(items or [], key=lambda r: str(r.get("published_at") or ""),
                      reverse=True)
+    ordered = sorted(ordered, key=lambda r: (carried(r), group(r)))
     out: list = []
-    heads: set = set()
-    per: dict = {}
-
-    def take(row, limit: int) -> bool:
-        hkey = row.get("headline_key") or row.get("url_key")
-        if hkey in heads or len(out) >= limit:
-            return False
-        heads.add(hkey)
-        out.append(row)
-        return True
-
+    keys: set = set()
     for row in ordered:
-        if is_ours(row):
-            take(row, cap)
-    ordered = [r for r in ordered if not is_ours(r)]
-    outlets = [r for r in ordered if not (r.get("topic_hint") or "").strip()]
-    queries = [r for r in ordered if (r.get("topic_hint") or "").strip()]
-    room = cap - len(out)
-    share = cap if not queries else len(out) + max(1, int(room * 0.6))
-    for row in outlets:
-        take(row, min(cap, share))
-    for row in queries:
-        hint = row["topic_hint"].strip()
-        if per.get(hint, 0) >= int(per_hint):
+        ids = {k for k in (row.get("story_key"), row.get("headline_key"),
+                           row.get("url_key")) if k}
+        if not ids:
+            ids = {story_key(row.get("title") or "")} - {""}
+        if ids & keys:
             continue
-        if take(row, cap):
-            per[hint] = per.get(hint, 0) + 1
-    for row in outlets:
-        take(row, cap)
+        keys |= ids
+        out.append(row)
+        if len(out) >= cap:
+            break
     return out
 
 
@@ -1472,6 +1828,12 @@ def story_from_feed(row: dict, *, topics: Optional[list] = None,
         "carry_count": int(row.get("carry_count") or 0),
         "published_at": str(row.get("published_at") or ""),
         "seen_at": str(row.get("seen_at") or ""),
+        # NEWS-PATCH-OCT16: how many outlets carried it (the industry's
+        # two-outlet breaking rule) and who scored it ("rule" = the launch
+        # rule, which needs no second outlet).
+        "story_key": str(row.get("story_key") or ""),
+        "outlet_count": outlets_of(row),
+        "scored_by": str(row.get("scored_by") or ""),
     }
 
 
@@ -1505,6 +1867,7 @@ def parse_scores(text: str, items: list, *, topics: Optional[list] = None) -> li
         row["importance"] = int(imp.group(1))
         row["what"] = _URL_RE.sub("", " ".join(parts[4:])).strip(" -–—") \
             if len(parts) > 4 else ""
+        row["scored_by"] = SCORED_BY_MODEL
         out.append(story_from_feed(row, topics=topics))
     return out
 
@@ -1585,6 +1948,52 @@ def cycle_slot(now: datetime) -> Optional[str]:
         if _minutes(s) <= at:
             best = s
     return best
+
+
+def due_slots(now: datetime, claimed, *, skip_hours: Optional[int] = None) -> dict:
+    """WHICH CYCLE A TICK RUNS (NEWS-PATCH-OCT16): the OLDEST UNCLAIMED slot of
+    today at or before `now` — not the latest. {"run", "late", "skip"}.
+
+    `claimed` is the hours already in `news_cycles` for today (any status).
+    `run` is the slot to run, or None; `late` its lateness in minutes (0 on
+    time); `skip` is [(slot, minutes late)] for every older unclaimed slot more
+    than `skip_hours` WHOLE hours late (NEWS_CYCLE_LATE_SKIP_HOURS, 3): the
+    caller claims those "skipped" and does not run them, so the bot does not
+    replay a whole day after an outage. A tick at 19:10 with 15:00-18:00
+    unclaimed skips 15:00 (four hours late) and runs 16:00 (three); the next
+    tick runs 17:00.
+
+    WHY. On 14 Oct five of ten cycles never ran: `cycle_slot` only ever
+    offered the latest slot, so a tick that came late, or a cycle that ran
+    long, stepped over an hour and nothing went back for it.
+    """
+    if skip_hours is None:
+        skip_hours = int(getattr(config, "NEWS_CYCLE_LATE_SKIP_HOURS", 3))
+    have = {str(h) for h in (claimed or ())}
+    at = now.hour * 60 + now.minute
+    skip: list = []
+    for s in pull_slots():
+        start = _minutes(s)
+        if start > at:
+            break
+        if s in have:
+            continue
+        late = at - start
+        if late // 60 > int(skip_hours):
+            skip.append((s, late))
+            continue
+        return {"run": s, "late": late, "skip": skip}
+    return {"run": None, "late": 0, "skip": skip}
+
+
+def late_note(minutes: int, *, grace: int = 15) -> str:
+    """"late by 40 min" — what a catch-up cycle's row says. '' on time: within
+    `grace` minutes of the slot is the first tick that could have run it (the
+    caller passes the sweep interval, at most 15)."""
+    m = int(minutes or 0)
+    if m <= max(0, int(grace)):
+        return ""
+    return f"late by {m} min" if m < 60 else f"late by {m // 60} h {m % 60} min"
 
 
 def window_hours(last_done: Optional[datetime], now: datetime) -> int:
@@ -2041,7 +2450,7 @@ def _self_test() -> int:
 
     nine = [A(f"story {i}", imp, f"2026-10-08T0{i}:00:00Z")
             for i, imp in enumerate([3, 5, 4, 3, 5, 4, 3, 4, 5], start=1)]
-    got = choose_answer(nine, is_sent=lambda s: False)
+    got = choose_answer(nine, is_sent=lambda s: False, mode="fresh")
     check("nine unsent: the five highest-scored",
           sorted(s["importance"] for s in got["stories"]), [4, 4, 5, 5, 5])
     check("...at a tie the newer one", "story 3" in [s["headline"] for s in got["stories"]],
@@ -2049,11 +2458,11 @@ def _self_test() -> int:
     check("...listed newest first", [s["headline"] for s in got["stories"]],
           ["story 9", "story 8", "story 6", "story 5", "story 2"])
     sent = {s["url_key"] for s in nine[:6]}
-    got = choose_answer(nine, is_sent=lambda s: s["url_key"] in sent)
+    got = choose_answer(nine, is_sent=lambda s: s["url_key"] in sent, mode="fresh")
     check("three unsent: those three, no padding", [s["headline"] for s in got["stories"]],
           ["story 9", "story 8", "story 7"])
     check("...and it is not a repeat", got["repeat"], False)
-    got = choose_answer(nine, is_sent=lambda s: True)
+    got = choose_answer(nine, is_sent=lambda s: True, mode="fresh")
     check("nothing unsent: the top five again, and it says so",
           (len(got["stories"]), got["repeat"]), (5, True))
     check("nothing at all: nothing", choose_answer([], is_sent=lambda s: False)["stories"], [])
@@ -2076,6 +2485,20 @@ def _self_test() -> int:
     check("the latest slot at or before now",
           cycle_slot(datetime(2026, 9, 29, 16, 30)), "16:00")
     check("nothing before the first", cycle_slot(datetime(2026, 9, 29, 13, 59)), None)
+    check("a missed hour runs late (NEWS-PATCH-OCT16)",
+          due_slots(datetime(2026, 9, 29, 15, 40), ["14:00"], skip_hours=3)["run"], "15:00")
+    check("...and one more than three whole hours late is skipped",
+          [s for s, _m in due_slots(datetime(2026, 9, 29, 19, 10), ["14:00"],
+                                    skip_hours=3)["skip"]], ["15:00"])
+    check("one story key whatever the word order",
+          story_key("Google launches Gemini 4 Aragon"),
+          story_key("Gemini 4 Aragon: Google launches"))
+    check("one shared name is not one story",
+          same_story({"title": "Gemini 4 launched"}, {"title": "Gemini 4 fails safety test"}),
+          False)
+    check("the launch rule reads the title",
+          (launch_rule({"title": "Google launches Gemini 4 Aragon"}),
+           launch_rule({"title": "Gemini 4 review: is it worth it?"})), (True, False))
     check("after the last slot it is still the last",
           cycle_slot(datetime(2026, 9, 29, 23, 40)), "23:00")
     at = datetime(2026, 9, 29, 12, 30, tzinfo=timezone.utc)
@@ -2151,9 +2574,13 @@ def _self_test() -> int:
         for i in range(1, 6)
     ]
     picked = preselect(feed, cap=40, per_hint=3)
-    check("the outlet's own feed leads", picked[0]["source"], "TechCrunch")
-    check("one busy topic is capped at three",
-          sum(1 for p in picked if p["topic_hint"] == "robot"), 3)
+    check("a topic query comes before a story only one outlet carries",
+          picked[0]["topic_hint"] != "", True)
+    picked = preselect([dict(feed[0], outlet_count=2)] + feed[1:], cap=40)
+    check("an outlet's story carried by two outlets leads the industry",
+          picked[0]["source"], "TechCrunch")
+    check("a busy topic is ranked, not cut (NEWS-PATCH-OCT16)",
+          sum(1 for p in picked if p["topic_hint"] == "robot"), 5)
     check("the same headline from a second outlet is not shown twice",
           sum(1 for p in picked if p["headline_key"] == feed[0]["headline_key"]), 1)
     check("the cap holds", len(preselect(feed, cap=2)), 2)

@@ -24,9 +24,9 @@ stubbed and a real Sheets or Drive call fails the run (tests/offline_guard.py).
   the cap        six stories give five; one story once (link, key, headline)
   one message    a full daily post is one message; past 2,000 characters the
                  split is between stories and the heading is repeated
-  answers        9 unsent give the 5 highest-scored, newest first; then the 4
-                 left; then, with nothing new, the top 5 again; recorded as
-                 sent; zero model calls; no "2 PM", "already", "scheduled",
+  answers        the top 5 of the window by score then newest, repeats included,
+                 with the tail when more are left (NEWS-ANSWER-OCT16); only new
+                 stories recorded as sent; zero model calls; no "2 PM", "already", "scheduled",
                  "since" or "ran"; a topic question goes to the engine with
                  the same list; a quiet ANSWER still gets the quiet line
   the daily post ONE message after an answer: ours first under "Our PoCs are

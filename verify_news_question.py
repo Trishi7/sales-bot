@@ -14,17 +14,18 @@ counts how often it was asked.
 
   (a) routing: a news question gets the "news" group, and select() hands the
       engine todays_news;
-  (b) the 5 highest-scored stories NOT sent before, listed newest first, in
-      the one template (NFT2-1087 template G: "**AI News, <day>**", no blank
-      line under it, "- Headline ([Outlet](<url>))" for EVERY story - a story
-      about us too, no bold, no sheet tag - and a blank line between two
-      stories); fewer than 5 unsent gives those; nothing unsent gives the top
-      5 again; an answer's stories are recorded as sent;
+  (b) the 5 highest-scored stories OF THE WINDOW, posted before or not
+      (NEWS-ANSWER-OCT16: on 15 Oct "unsent first" hid the stories the asker
+      meant), ranked by score then newest, in the one template (NFT2-1087
+      template G: "**AI News, <day>**", no blank line under it, "- Headline
+      ([Outlet](<url>))" for EVERY story - a story about us too, no bold, no
+      sheet tag - and a blank line between two stories), with the tail when
+      more are left; only the stories NEW to an answer are recorded as sent;
   (c) topic="ElevenLabs" gives only the stories that name it;
   (d) unrated rows cost exactly one scoring call, rated rows none, and past
       the token budget there is no call and nothing is guessed at;
-  (e) on a pretend past date the news it reads ends at that day's
-      NEWS_MAIN_TIME, and the answer never says so;
+  (e) on a pretend past date the news it reads is the 24 hours up to the
+      pretend now (NEWS-ANSWER-OCT16), and the answer never says so;
   (f) the web tail carries no counts, the engine prompt has the never-mention
       rule, and the news block rides only with todays_news.
 """
@@ -210,7 +211,7 @@ async def main():
           (groups, "todays_news" in [t["schema"]["name"] for t in full]), ([], True))
 
     # ------------------------------------------------------------------ (b)
-    say("(b) WHICH STORIES — the 5 highest-scored not sent before, newest first")
+    say("(b) WHICH STORIES — the 5 highest-scored of the window, posted or not")
     sent = [item("Posted story one", recent(300)), item("Posted story two", recent(290))]
     five = item("Frontier lab ships a new eval suite", recent(200))
     three = item("Startup publishes RLHF tooling notes", recent(30))
@@ -237,13 +238,12 @@ async def main():
     got = titles(result)
     check("exactly five", len(got), 5)
     check("the 5 is in", five["title"] in got, True)
-    check("what was already sent is NOT", [s["title"] in got for s in sent], [False, False])
     check("the two 5s, then the 4s — at a tie the newer ones",
           sorted(got), sorted([five["title"], poc["title"]] + [f["title"] for f in fours[:3]]))
     check("the 3s and the 2 are not there",
           (three["title"] in got, two["title"] in got), (False, False))
-    check("listed newest first",
-          got, [f["title"] for f in fours[:3]] + [poc["title"], five["title"]])
+    check("listed by score, then newest (the story about us first, as the template has it)",
+          got, [poc["title"], five["title"]] + [f["title"] for f in fours[:3]])
     lines = [ln for ln in result["block"].split("\n") if ln.startswith("- ")]
     check("the heading is bold, with the day", result["block"].split("\n")[0],
           news.heading(news.MODE_ANSWER, TODAY[0]))
@@ -252,9 +252,12 @@ async def main():
     check("a blank line between two stories, and only there",
           (result["block"].count("\n\n"), result["block"].count("\n\n- ")), (4, 4))
     check("an industry story is its headline and its outlet, no bold",
-          lines[0], f"- {fours[0]['title']} ([example.org](<{fours[0]['url']}>))")
+          lines[2], f"- {fours[0]['title']} ([example.org](<{fours[0]['url']}>))")
     check("a story about us is the SAME shape: no '- what' clause, no sheet tag",
-          lines[3], f"- {poc['title']} ([example.org](<{poc['url']}>))")
+          lines[0], f"- {poc['title']} ([example.org](<{poc['url']}>))")
+    check("the tail offers the rest of the window (17 worth 3 or more, 5 shown)",
+          (result["total"], result["remaining"], result["block"].split("\n")[-1]),
+          (17, 12, news.answer_tail(12, "last 24 hours", 5)))
     check("only the heading is bold; no tags, opener, closer or label in an answer",
           (result["block"].count("**"), any(x in result["block"] for x in (
               news.OPENER, news.CLOSER, news.LABEL_OURS, news.LABEL_INDUSTRY, "<@"))),
@@ -270,7 +273,7 @@ async def main():
     check("...and nothing called `window`, `items` or `posted`",
           [k for k in ("window", "items", "posted", "more") if k in handed], [])
 
-    say("(b2) FEWER THAN FIVE, AND NOTHING LEFT")
+    say("(b2) POSTED STORIES ARE IN THE TOP FIVE; ONLY THE NEW ONES ARE RECORDED")
     a, b, c = (item(f"{w} startup raises a seed round", recent(60 + n))
                for n, w in enumerate(("Xray", "Yankee", "Zulu")))
     old = [item(f"{w} model tops a benchmark", recent(120 + n))
@@ -283,30 +286,29 @@ async def main():
          for o, imp in zip(old, (5, 5, 4, 4, 3, 3))],
         on_date=dl.iso(TODAY[0]), rule_id="R1", kind=news.MODE_MAIN)
     result = await ask(bot)
-    check("three unsent: those three and no padding, newest first",
-          titles(result), [a["title"], b["title"], c["title"]])
+    top = [b["title"], old[0]["title"], old[1]["title"], c["title"], old[2]["title"]]
+    check("the five highest-scored of the window, posted before or not; a tie goes to "
+          "the newer", titles(result), top)
+    check("...three of them posted before; nothing says so",
+          (len(result["sent_before"]),
+           [w for w in BANNED if w.lower() in result["block"].lower()]), (3, []))
     wrote = await bot._record_news_answer(result)
-    check("an answer's stories are recorded as sent, kind=answer",
-          (wrote, bot.db.news_story_seen(a["url_key"], a["headline_key"],
+    check("only the answer's NEW stories are recorded as sent, kind=answer",
+          (wrote, bot.db.news_story_seen(b["url_key"], b["headline_key"],
                                          since_iso="2000-01-01")["kind"]),
-          (3, news.MODE_ANSWER))
+          (2, news.MODE_ANSWER))
     again = await ask(bot)
-    check("asked again with nothing unsent: the five highest-scored, again",
-          (again["repeat"], sorted(titles(again))),
-          (True, sorted([b["title"], c["title"], old[0]["title"], old[1]["title"],
-                         old[2]["title"]])))
-    check("...listed newest first",
-          titles(again), [b["title"], c["title"], old[0]["title"], old[1]["title"],
-                          old[2]["title"]])
-    check("a repeat is not recorded a second time",
+    check("asked again: the same five", titles(again), top)
+    check("...and nothing is recorded a second time",
           await bot._record_news_answer(again), 0)
     newcomer = item("Regulator opens an inquiry into model evals", recent(2))
     bot.db.news_feed_add([newcomer])
     bot.db.news_feed_set_scores([scored(newcomer, 3)],
                                 scored_at=feeds.utc_iso(dl.real_now_ist()))
     result = await ask(bot)
-    check("one new story arrives: it alone is given, however low it scored",
-          (titles(result), result["repeat"]), ([newcomer["title"]], False))
+    check("a new story at 3 ranks below the five; it is counted in the rest",
+          (newcomer["title"] in titles(result), result["total"], result["remaining"]),
+          (False, 10, 5))
     empty = await ask(new_bot([]))
     check("nothing collected at all: an ANSWER still gets the quiet line (only the daily "
           "post dropped it)",
@@ -322,8 +324,8 @@ async def main():
                   [scored(eleven, 4, "voice agent"), scored(by_summary, 3, "voice agent"),
                    scored(other, 4)])
     result = await ask(bot, topic="ElevenLabs")
-    check('topic="ElevenLabs" gives only the stories that name it, newest first',
-          titles(result), [by_summary["title"], eleven["title"]])
+    check('topic="ElevenLabs" gives only the stories that name it, by score',
+          titles(result), [eleven["title"], by_summary["title"]])
     result = await ask(bot, topic="voice agents")
     check('"voice agents" finds the "voice agent" stories', len(result["stories"]), 2)
     handed = await tool(bot, topic="Globex")
@@ -375,16 +377,19 @@ async def main():
     bot = new_bot([before, after, weekend],
                   [scored(before, 4), scored(after, 5), scored(weekend, 3)])
     TODAY[0] = past
+    # NEWS-ANSWER-OCT16: an answer reads the last 24 hours up to the bot's
+    # "now" — the pretend one when it is set — not the daily post's window.
+    real_now = dl.now_ist
+    dl.now_ist = lambda: at(18)
     try:
-        _since, until = bot._main_window(past)
         result = await ask(bot)
     finally:
         TODAY[0] = dl.real_today_ist()
+        dl.now_ist = real_now
     print("\n".join("   " + line for line in result["block"].splitlines()))
-    check("on a pretend past day the news it reads ends at R1's slot in that day's "
-          "order (Monday: third, 18:00)", until, at(18))
-    check("...so a story from after 18:00 that day is not there",
-          titles(result), [before["title"], weekend["title"]])
+    check("on a pretend past day the news it reads is the 24 hours up to the pretend now "
+          "(Monday 18:00): Saturday's story and the 19:00 one are not there",
+          titles(result), [before["title"]])
     check("...the heading names the pretend day",
           result["block"].split("\n")[0], news.heading(news.MODE_ANSWER, past))
     check("...and the answer still says nothing about a time or a window",

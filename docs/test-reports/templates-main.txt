@@ -1,13 +1,16 @@
 [ai_news]
-- Synthflow raises $20M Series A — what happened. (Synthflow AI — on Master Pipeline) [example.org](<https://example.org/synthflow-raises-20m-series-a>)
+Hey here's today's round-up:
+Our PoCs are in the news:
+- Synthflow raises $20M Series A ([example.org](<https://example.org/synthflow-raises-20m-series-a>))
 
-- **Papa raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/papa-raises-a-billion-dollar-round?oc=5>))
+- Dr. David Gamez on machine consciousness at the Royal Institution ([The Guardian](<https://news.google.com/rss/articles/dr-david-gamez-on-machine-consciousness-at-the-royal-institution?oc=5>))
+Elsewhere in AI
+- Papa raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/papa-raises-a-billion-dollar-round?oc=5>))
 
-- **Oscar raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
+- Oscar raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
 
-- **November raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
-
-- **Mike raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/mike-raises-a-billion-dollar-round?oc=5>))
+- November raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [closure_support]
 No closure support this week — Closure Prob% has empty values in the GTM sheet.
@@ -27,24 +30,16 @@ Can I help with any of these? I can pull together the PoC's background, a note o
 [closure_support]
 These deals are in the closure stage:
 1. Ada Lovelace (Acme AI) — 70% at Quote
-   In the news: [ACME-AI ships](<https://news.example/acme-ai-ships>), 13 Oct
+   In the news: [ACME-AI ships](<https://news.example/acme-ai-ships>), 15 Oct
 2. Bo Chen (Borealis) — 65% at Demo
-   In the news: [Borealis grows](<https://news.example/borealis-grows>), 13 Oct
+   In the news: [Borealis grows](<https://news.example/borealis-grows>), 15 Oct
 
 Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
 ==============================================================================
 [closure_support]
 These deals are in the closure stage:
 1. Ada Lovelace (Acme AI) — 70% at Quote
-   In the news: [Acme AI hires an evals lead](<https://news.example/acme-ai-hires-an-evals-lead>), 8 Oct
-2. Bo Chen (Borealis) — 65% at Demo
-
-Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
-==============================================================================
-[closure_support]
-These deals are in the closure stage:
-1. Ada Lovelace (Acme AI) — 70% at Quote
-   In the news: [Acme AI opens in Berlin](<https://news.example/acme-ai-opens-in-berlin>), 2 Oct
+   In the news: [Acme AI hires an evals lead](<https://news.example/acme-ai-hires-an-evals-lead>), 10 Oct
 2. Bo Chen (Borealis) — 65% at Demo
 
 Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
@@ -52,16 +47,24 @@ Can I help with any of these? I can pull together the PoC's background, a note o
 [closure_support]
 These deals are in the closure stage:
 1. Ada Lovelace (Acme AI) — 70% at Quote
-   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 12 Oct
+   In the news: [Acme AI opens in Berlin](<https://news.example/acme-ai-opens-in-berlin>), 4 Oct
+2. Bo Chen (Borealis) — 65% at Demo
+
+Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
+==============================================================================
+[closure_support]
+These deals are in the closure stage:
+1. Ada Lovelace (Acme AI) — 70% at Quote
+   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 14 Oct
 2. Alan Turing (Acme AI) — 60% at Demo
-   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 12 Oct
+   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 14 Oct
 
 Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
 ==============================================================================
 [closure_support]
 These deals are in the closure stage:
 1. Ada Lovelace (Acme AI) — 70% at Quote
-   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 12 Oct
+   In the news: [Acme AI raises $40M](<https://news.example/acme-ai-raises-40m>), 14 Oct
 2. Bo Chen (Borealis) — 65% at Demo
 
 Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
@@ -69,7 +72,7 @@ Can I help with any of these? I can pull together the PoC's background, a note o
 [closure_support]
 These deals are in the closure stage:
 1. Ada Lovelace (Acme AI) — 70% at Quote
-   In the news: [Acme AI raises forty million dollars…](<https://news.example/acme-ai-raises-forty-million-dollars-in-a-new-round>), 13 Oct
+   In the news: [Acme AI raises forty million dollars…](<https://news.example/acme-ai-raises-forty-million-dollars-in-a-new-round>), 15 Oct
 2. Bo Chen (Borealis) — 65% at Demo
 
 Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
@@ -92,7 +95,7 @@ Can I help with any of these? I can pull together the PoC's background, a note o
 These deals are in the closure stage:
 1. Ada Lovelace (Acme AI) — 70% at Quote
 2. Bo Chen (Borealis) — 65% at Demo
-   In the news: [Borealis signs a telco](<https://news.example/borealis-signs-a-telco>), 4 Oct
+   In the news: [Borealis signs a telco](<https://news.example/borealis-signs-a-telco>), 6 Oct
 
 Can I help with any of these? I can pull together the PoC's background, a note on the company, or a package summary
 ==============================================================================
@@ -129,7 +132,7 @@ Can I help with any of these? I can pull together the PoC's background, a note o
 [closure_support]
 These deals are in the closure stage:
 1. New Nia (Nimbus Labs) — 80% at Demo
-   In the news: [Nimbus Labs raises a seed round](<https://news.example/nimbus-labs-raises-a-seed-round>), 12 Oct
+   In the news: [Nimbus Labs raises a seed round](<https://news.example/nimbus-labs-raises-a-seed-round>), 14 Oct
 2. Ada Lovelace (Acme AI) — 70% at Quote
 3. Bo Chen (Borealis) — 65% at Demo
 
@@ -886,13 +889,13 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have a meeting in 3 days with:
-1. Ada Lovelace (Acme AI) — Sat 17 Oct
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
 
 Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
 ==============================================================================
 [meeting_prep]
 we have a meeting in 3 days with:
-1. Ada Lovelace (Acme AI) — Sat 17 Oct
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
    They've been in the news recently — worth a skim before the call:
    [Acme AI announces a very long and winding headline about its new platform announces a very long and…](<https://news.example/acme-ai-announces-a-very-long-and-winding-headline-about-its-new-platform-announces-a-very-long-and-winding-headline-about-its-new-platform-announces-a-very-long-and-winding-headline-about-its-new-platform>)
 
@@ -900,7 +903,7 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have a meeting in 3 days with:
-1. Ada Lovelace (Acme AI) — Sat 17 Oct
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
    They've been in the news recently — worth a skim before the call:
    [Acme AI is acquired](<https://news.example/acme-ai-is-acquired>)
 
@@ -908,7 +911,7 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have a meeting in 3 days with:
-1. Ada Lovelace (Acme AI) — Sat 17 Oct
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
    They've been in the news recently — worth a skim before the call:
    [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
 
@@ -916,12 +919,12 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have a meeting in 3 days with:
-1. Ada Lovelace (Acme AI) — Sat 17 Oct
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
    They've been in the news recently — worth a skim before the call:
    [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
 
 and a meeting in 5 days with:
-2. Sam Lee (Acme AI) — Mon 19 Oct
+2. Sam Lee (Acme AI) — Wed 21 Oct
 
 Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
 ==============================================================================
@@ -966,7 +969,7 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have a meeting in 3 days with:
-1. Nia Day (Nudge) — Sat 17 Oct
+1. Nia Day (Nudge) — Mon 19 Oct
 
 Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
 ==============================================================================
@@ -978,7 +981,7 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have a meeting in 5 days with:
-1. Ada Lovelace (Acme AI) — Mon 19 Oct
+1. Ada Lovelace (Acme AI) — Wed 21 Oct
    They've been in the news recently — worth a skim before the call:
    [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
 
@@ -1012,11 +1015,11 @@ Are we all set on the deck, the package and the demo? Let me know if you need an
 ==============================================================================
 [meeting_prep]
 we have three meetings in 3 days with:
-1. Ada Lovelace (Acme AI) — Sat 17 Oct
-2. Sam Lee (Acme AI) — Sat 17 Oct
+1. Ada Lovelace (Acme AI) — Mon 19 Oct
+2. Sam Lee (Acme AI) — Mon 19 Oct
    They've been in the news recently — worth a skim before the call:
    [Acme AI raises a seed round](<https://news.example/acme-ai-raises-a-seed-round>)
-3. Dr. David Gamez (Middlesex University London) — Sat 17 Oct
+3. Dr. David Gamez (Middlesex University London) — Mon 19 Oct
 
 Are we all set on the deck, the package and the demo? Let me know if you need anything from me, or if you'd like me to remind you again nearer the day.
 ==============================================================================
@@ -1130,223 +1133,224 @@ New companies in the Master Pipeline — since Wed 7 Oct
 Would you like me to look these up and suggest prospective PoCs we could contact?
 ==============================================================================
 [news.render]
-**AI News, Thu 8 Oct**
+**AI News, Fri 16 Oct**
+- Frontier lab ships a new eval suite ([example.org](<https://example.org/frontier-lab-ships-a-new-eval-suite>))
 
-- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+- Voice startup closes a Series A ([example.org](<https://example.org/voice-startup-closes-a-series-a>))
 
-- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+- Regulator publishes AI data rules ([example.org](<https://example.org/regulator-publishes-ai-data-rules>))
 
-- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+- Open model tops the speech benchmark ([example.org](<https://example.org/open-model-tops-the-speech-benchmark>))
 
-- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
-
-- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+- Chip maker unveils an inference part ([example.org](<https://example.org/chip-maker-unveils-an-inference-part>))
 ==============================================================================
 [news.render]
 **AI News, Thu 8 Oct**
+- ElevenLabs Doubles Its Valuation in Employee Tender ([streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>))
 
-- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
-
-- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
-
-- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
-
-- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
-
-- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
 ==============================================================================
 [news.render]
-**AI News, Wed 14 Oct**
+**AI News, Thu 8 Oct**
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
 
-- **Frontier lab ships a new eval suite** ([example.org](<https://example.org/frontier-lab-ships-a-new-eval-suite>))
-
-- **Voice startup closes a Series A** ([example.org](<https://example.org/voice-startup-closes-a-series-a>))
-
-- **Regulator publishes AI data rules** ([example.org](<https://example.org/regulator-publishes-ai-data-rules>))
-
-- **Open model tops the speech benchmark** ([example.org](<https://example.org/open-model-tops-the-speech-benchmark>))
-
-- **Chip maker unveils an inference part** ([example.org](<https://example.org/chip-maker-unveils-an-inference-part>))
+- TM Forum and Accenture launch AI trust framework for telecoms ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
 ==============================================================================
 [news.render]
-**AI News, Wed 7 Oct**
+**AI News, Thu 8 Oct**
+- The alpha lab ships a model ([Reuters](<https://news.google.com/rss/articles/six0>))
 
-- **Consortium drafts an agent safety standard** ([Reuters](<https://news.google.com/rss/articles/consortium-drafts-an-agent-safety-standard?oc=5>))
+- The bravo lab ships a model ([Reuters](<https://news.google.com/rss/articles/six1>))
 
-- **University publishes an RLHF study** ([Reuters](<https://news.google.com/rss/articles/university-publishes-an-rlhf-study?oc=5>))
+- The charlie lab ships a model ([Reuters](<https://news.google.com/rss/articles/six2>))
 
-- **Chipmaker unveils an inference accelerator** ([Reuters](<https://news.google.com/rss/articles/chipmaker-unveils-an-inference-accelerator?oc=5>))
+- The delta lab ships a model ([Reuters](<https://news.google.com/rss/articles/six3>))
 
-- **Regulator opens an inquiry into model evals** ([Reuters](<https://news.google.com/rss/articles/regulator-opens-an-inquiry-into-model-evals?oc=5>))
+- The echo lab ships a model ([Reuters](<https://news.google.com/rss/articles/six4>))
 ==============================================================================
 [news.render]
 **AI News, Wed 7 Oct**
+- Consortium drafts an agent safety standard ([Reuters](<https://news.google.com/rss/articles/consortium-drafts-an-agent-safety-standard?oc=5>))
 
-- **Echo lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/echo-lab-announces-a-frontier-model?oc=5>))
+- University publishes an RLHF study ([Reuters](<https://news.google.com/rss/articles/university-publishes-an-rlhf-study?oc=5>))
 
-- **Delta lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/delta-lab-announces-a-frontier-model?oc=5>))
+- Chipmaker unveils an inference accelerator ([Reuters](<https://news.google.com/rss/articles/chipmaker-unveils-an-inference-accelerator?oc=5>))
 
-- **Charlie lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/charlie-lab-announces-a-frontier-model?oc=5>))
-
-- **Bravo lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/bravo-lab-announces-a-frontier-model?oc=5>))
-
-- **Alpha lab announces a frontier model** ([Reuters](<https://news.google.com/rss/articles/alpha-lab-announces-a-frontier-model?oc=5>))
+- Regulator opens an inquiry into model evals ([Reuters](<https://news.google.com/rss/articles/regulator-opens-an-inquiry-into-model-evals?oc=5>))
 ==============================================================================
 [news.render]
 **AI News, Wed 7 Oct**
+- Echo lab announces a frontier model ([Reuters](<https://news.google.com/rss/articles/echo-lab-announces-a-frontier-model?oc=5>))
 
-- **ElevenLabs launches a Hindi voice agent** ([Reuters](<https://news.google.com/rss/articles/elevenlabs-launches-a-hindi-voice-agent?oc=5>))
+- Delta lab announces a frontier model ([Reuters](<https://news.google.com/rss/articles/delta-lab-announces-a-frontier-model?oc=5>))
+
+- Charlie lab announces a frontier model ([Reuters](<https://news.google.com/rss/articles/charlie-lab-announces-a-frontier-model?oc=5>))
+
+- Bravo lab announces a frontier model ([Reuters](<https://news.google.com/rss/articles/bravo-lab-announces-a-frontier-model?oc=5>))
+
+- Alpha lab announces a frontier model ([Reuters](<https://news.google.com/rss/articles/alpha-lab-announces-a-frontier-model?oc=5>))
 ==============================================================================
 [news.render]
 **AI News, Wed 7 Oct**
-
-- **ElevenLabs launches a Hindi voice agent** ([Reuters](<https://news.google.com/rss/articles/elevenlabs-launches-a-hindi-voice-agent?oc=5>))
-
-- **Voice startup closes a round** ([Reuters](<https://news.google.com/rss/articles/voice-startup-closes-a-round?oc=5>))
+- ElevenLabs launches a Hindi voice agent ([Reuters](<https://news.google.com/rss/articles/elevenlabs-launches-a-hindi-voice-agent?oc=5>))
 ==============================================================================
 [news.render]
 **AI News, Wed 7 Oct**
+- ElevenLabs launches a Hindi voice agent ([Reuters](<https://news.google.com/rss/articles/elevenlabs-launches-a-hindi-voice-agent?oc=5>))
 
-- **Open weights model tops a coding benchmark** ([Reuters](<https://news.google.com/rss/articles/open-weights-model-tops-a-coding-benchmark?oc=5>))
-
-- **Search engine adds an agent mode** ([Reuters](<https://news.google.com/rss/articles/search-engine-adds-an-agent-mode?oc=5>))
-
-- **Startup releases an open speech dataset** ([Reuters](<https://news.google.com/rss/articles/startup-releases-an-open-speech-dataset?oc=5>))
-
-- **Cloud provider cuts inference prices** ([Reuters](<https://news.google.com/rss/articles/cloud-provider-cuts-inference-prices?oc=5>))
-
-- **Frontier lab ships a reasoning model** ([Reuters](<https://news.google.com/rss/articles/frontier-lab-ships-a-reasoning-model?oc=5>))
+- Voice startup closes a round ([Reuters](<https://news.google.com/rss/articles/voice-startup-closes-a-round?oc=5>))
 ==============================================================================
 [news.render]
 **AI News, Wed 7 Oct**
+- Mike raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/mike-raises-a-billion-dollar-round?oc=5>))
 
-- **Romeo opens a regional office** ([Reuters](<https://news.google.com/rss/articles/romeo-opens-a-regional-office?oc=5>))
+- Lima raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/lima-raises-a-billion-dollar-round?oc=5>))
 
-- **Quebec publishes a tooling guide** ([Reuters](<https://news.google.com/rss/articles/quebec-publishes-a-tooling-guide?oc=5>))
+- Kilo raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/kilo-raises-a-billion-dollar-round?oc=5>))
 
-- **Golf raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/golf-raises-a-billion-dollar-round?oc=5>))
+- Juliet raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/juliet-raises-a-billion-dollar-round?oc=5>))
 
-- **Foxtrot raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/foxtrot-raises-a-billion-dollar-round?oc=5>))
+- India raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/india-raises-a-billion-dollar-round?oc=5>))
 ==============================================================================
 [news.render]
-**Breaking AI News, Thu 8 Oct**
+**AI News, Wed 7 Oct**
+- Open weights model tops a coding benchmark ([Reuters](<https://news.google.com/rss/articles/open-weights-model-tops-a-coding-benchmark?oc=5>))
 
-- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+- Search engine adds an agent mode ([Reuters](<https://news.google.com/rss/articles/search-engine-adds-an-agent-mode?oc=5>))
 
-- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+- Startup releases an open speech dataset ([Reuters](<https://news.google.com/rss/articles/startup-releases-an-open-speech-dataset?oc=5>))
 
-- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+- Cloud provider cuts inference prices ([Reuters](<https://news.google.com/rss/articles/cloud-provider-cuts-inference-prices?oc=5>))
 
-- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
-
-- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+- Frontier lab ships a reasoning model ([Reuters](<https://news.google.com/rss/articles/frontier-lab-ships-a-reasoning-model?oc=5>))
 ==============================================================================
 [news.render]
-**Breaking AI News, Thu 8 Oct**
-
-- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
-
-- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
-
-- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
-
-- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
-
-- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+**Breaking news**
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
 ==============================================================================
 [news.render]
-**More AI News, Thu 8 Oct**
+**Breaking news**
+- The alpha lab ships a model ([Reuters](<https://news.google.com/rss/articles/six0>))
 
-- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+- The bravo lab ships a model ([Reuters](<https://news.google.com/rss/articles/six1>))
 
-- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+- The charlie lab ships a model ([Reuters](<https://news.google.com/rss/articles/six2>))
 
-- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
+- The delta lab ships a model ([Reuters](<https://news.google.com/rss/articles/six3>))
 
-- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
-
-- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+- The echo lab ships a model ([Reuters](<https://news.google.com/rss/articles/six4>))
 ==============================================================================
 [news.render]
-**More AI News, Thu 8 Oct**
+**Breaking news**
+- The first story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy0>))
 
-- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
+- The second story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy1>))
 
-- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
+- The third story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy2>))
 
-- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
+- The fourth story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy3>))
 
-- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
-
-- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+- The fifth story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy4>))
 ==============================================================================
 [news.render]
-**More AI News, Wed 7 Oct**
-
-- **Lima raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/lima-raises-a-billion-dollar-round?oc=5>))
-
-- **Kilo raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/kilo-raises-a-billion-dollar-round?oc=5>))
-
-- **Juliet raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/juliet-raises-a-billion-dollar-round?oc=5>))
-
-- **India raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/india-raises-a-billion-dollar-round?oc=5>))
-
-- **Hotel raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/hotel-raises-a-billion-dollar-round?oc=5>))
+**Breaking news** <@111> <@222>
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
 ==============================================================================
 [news.render]
-- **Lab ships @​everyone a model** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+**Breaking news** <@111> <@222>
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- TM Forum and Accenture launch AI trust framework for telecoms ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- ElevenLabs Doubles Its Valuation in Employee Tender ([streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>))
 ==============================================================================
 [news.render]
-- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+Hey here's today's round-up:
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- TM Forum and Accenture launch AI trust framework for telecoms ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- As AI gains autonomy, enterprises must retain authority ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [news.render]
-- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+Hey here's today's round-up:
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
 
-- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+- TM Forum and Accenture launch AI trust framework for telecoms ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [news.render]
-- **State AGs launch investigations into OpenAI AI safety** ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
-
-- **TM Forum and Accenture launch AI trust framework for telecoms** ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
-
-- ElevenLabs Doubles Its Valuation in Employee Tender — ElevenLabs doubled its valuation in employee tender offer. (Elevenlabs — on Master Pipeline and Outreach PoCs) [streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>)
-
-- **As AI gains autonomy, enterprises must retain authority** ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
-
-- **GPT-5 - what we know so far** ([wired.com](<https://www.wired.com/story/gpt-5>))
+Hey here's today's round-up:
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [news.render]
-- **The alpha lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six0>))
-
-- **The bravo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six1>))
-
-- **The charlie lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six2>))
-
-- **The delta lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six3>))
-
-- **The echo lab ships a model** ([Reuters](<https://news.google.com/rss/articles/six4>))
+Hey here's today's round-up:
+- TM Forum and Accenture launch AI trust framework for telecoms ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [news.render]
-- **The first story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy0>))
+Hey here's today's round-up:
+- The alpha lab ships a model ([Reuters](<https://news.google.com/rss/articles/six0>))
 
-- **The second story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy1>))
+- The bravo lab ships a model ([Reuters](<https://news.google.com/rss/articles/six1>))
 
-- **The third story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy2>))
+- The charlie lab ships a model ([Reuters](<https://news.google.com/rss/articles/six2>))
 
-- **The fourth story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy3>))
+- The delta lab ships a model ([Reuters](<https://news.google.com/rss/articles/six3>))
 
-- **The fifth story with a long tracking link** ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy4>))
+- The echo lab ships a model ([Reuters](<https://news.google.com/rss/articles/six4>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [news.render]
-- Synthflow raises $20M Series A — what happened. (Synthflow AI — on Master Pipeline) [example.org](<https://example.org/synthflow-raises-20m-series-a>)
+Hey here's today's round-up:
+- The first story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy0>))
 
-- **Papa raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/papa-raises-a-billion-dollar-round?oc=5>))
+- The second story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy1>))
 
-- **Oscar raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
+- The third story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy2>))
 
-- **November raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
+- The fourth story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy3>))
 
-- **Mike raises a billion dollar round** ([Reuters](<https://news.google.com/rss/articles/mike-raises-a-billion-dollar-round?oc=5>))
+- The fifth story with a long tracking link ([Reuters](<https://news.google.com/rss/articles/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy4>))
+Let me know if you want me to dig into any of these
+==============================================================================
+[news.render]
+Hey here's today's round-up:
+Our PoCs are in the news:
+- ElevenLabs Doubles Its Valuation in Employee Tender ([streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>))
+
+- Eleven more news ([streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el2>))
+Let me know if you want me to dig into any of these
+==============================================================================
+[news.render]
+Hey here's today's round-up:
+Our PoCs are in the news:
+- ElevenLabs Doubles Its Valuation in Employee Tender ([streamlinefeed.co.ke](<https://streamlinefeed.co.ke/el>))
+Elsewhere in AI
+- State AGs launch investigations into OpenAI AI safety ([Reuters](<https://news.google.com/rss/articles/CBMi1?oc=5>))
+
+- TM Forum and Accenture launch AI trust framework for telecoms ([techcrunch.com](<https://www.techcrunch.com/2026/10/08/tm-forum>))
+
+- As AI gains autonomy, enterprises must retain authority ([Hindustan Times](<https://news.google.com/rss/articles/CBMi4?oc=5>))
+
+- GPT-5 - what we know so far ([wired.com](<https://www.wired.com/story/gpt-5>))
+Let me know if you want me to dig into any of these
+==============================================================================
+[news.render]
+Hey here's today's round-up:
+Our PoCs are in the news:
+- Synthflow raises $20M Series A ([example.org](<https://example.org/synthflow-raises-20m-series-a>))
+
+- Dr. David Gamez on machine consciousness at the Royal Institution ([The Guardian](<https://news.google.com/rss/articles/dr-david-gamez-on-machine-consciousness-at-the-royal-institution?oc=5>))
+Elsewhere in AI
+- Papa raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/papa-raises-a-billion-dollar-round?oc=5>))
+
+- Oscar raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
+
+- November raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
+Let me know if you want me to dig into any of these
 ==============================================================================
 [news_company_screen]
 Two companies in today's news aren't on the Master Pipeline yet:
@@ -1683,13 +1687,13 @@ Hey <@111>, <@222> — it's been a while since we last connected with this PoC, 
 1. **Person 01** (Co 01)
 ==============================================================================
 [reconnect]
-Hey Vaishnavi, Sid — it's been a while since we last connected with these PoCs, do get in touch when you can:
+Hey <@1480468450475380816> — it's been a while since we last connected with these PoCs, do get in touch when you can:
 
 1. **Ann** (Acme) (reconnect date unclear)
 2. **Bob** (Borealis) (reconnect date unclear)
 ==============================================================================
 [reconnect]
-Hey Vaishnavi, Sid — it's been a while since we last connected with this PoC, do get in touch when you can:
+Hey <@1480468450475380816> — it's been a while since we last connected with this PoC, do get in touch when you can:
 
 1. **Bob** (Borealis)
 ==============================================================================
