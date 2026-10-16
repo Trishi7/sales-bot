@@ -681,6 +681,102 @@ def render_news_posts() -> dict:
     return _RENDERED
 
 
+# =============================================================================
+# F7 — RESEARCH PUBLISHED (T15-T19)
+# =============================================================================
+
+
+def paper(title: str, *, url: str, seen: datetime, researcher: bool = False,
+          summary: str = "") -> dict:
+    """A stored paper: one of our researchers' (kind researcher, flagged, as the
+    arXiv author lane stores it) or one from a paper feed (industry)."""
+    it = feed_item(title, url=url, source="arXiv", seen=seen, flag=1 if researcher else 0,
+                   names="David Gamez" if researcher else "", rank=5 if researcher else 4)
+    it["summary"] = summary
+    if researcher:
+        it["kind"] = "researcher"
+    return it
+
+
+def _daily(b, day) -> dict:
+    """The daily post's choice over the store, as `_main_sweep` makes it."""
+    rows = b.rows()
+    stories = [news.story_from_feed(r) for r in rows if int(r.get("importance") or 0) > 0]
+    return news.choose_main(stories, today=day, db=b.db, cap=5, per_topic=2,
+                            topics_per_week=6, min_importance=5, offtopic_bypass=4)
+
+
+async def research(check) -> None:
+    print("\nF7 RESEARCH PUBLISHED (T15-T19)")
+    now = ist(TUE, 14, 0)
+    mine = paper("Student annotators and preference data for Hinglish speech",
+                 url="https://arxiv.org/abs/2610.00001", seen=now - timedelta(minutes=20),
+                 researcher=True)
+    keyword = paper("A new benchmark for multilingual reward models",
+                    url="https://arxiv.org/abs/2610.00002", seen=now - timedelta(minutes=30))
+    plain = paper("Graph theory results on planar colourings",
+                  url="https://arxiv.org/abs/2610.00003", seen=now - timedelta(minutes=40))
+    elsewhere = feed_item("Startup builds a benchmark for chatbots",
+                          url="https://example.org/benchmark-chatbots", source="Reuters",
+                          seen=now - timedelta(minutes=50))
+    with Bot() as b, v2.Net():
+        b.db.news_feed_add([mine, keyword, plain, elsewhere])
+        out = await b.cycle(now)
+        row = b.row(mine["title"])
+        check("T15 a researcher's paper -> 4 by rule, scored_by 'rule'",
+              (row.get("importance"), row.get("scored_by"), row.get("kind")),
+              (4, "rule", "researcher"))
+        check("T15 ...never breaking, though it is ours at 4: it waits for the daily post",
+              (mine["title"] in [s["headline"] for s in out["kept"]],
+               any("never breaking" in line for line in out["skipped"])), (False, True))
+        picked = _daily(b, TUE)
+        text = news.render(picked["keep"], mode=news.MODE_MAIN)
+        check("T15 ...in the research group of the daily post",
+              ([s["headline"] for s in picked["research"]][:1],
+               text.split("\n").index(news.LABEL_RESEARCH)
+               < text.split("\n").index(news.story_line(news.story_from_feed(row)))),
+              ([mine["title"]], True))
+        k = b.row(keyword["title"])
+        check("T16 a paper with a research keyword -> 4 by rule, in the group after ours",
+              (k.get("importance"), k.get("scored_by"),
+               [s["headline"] for s in picked["research"]]),
+              (4, "rule", [mine["title"], keyword["title"]]))
+        check("T16 ...a paper with no keyword, and a keyword story that is not a paper, "
+              "go to the model like any item",
+              (b.row(plain["title"]).get("scored_by"), b.row(elsewhere["title"]).get("scored_by"),
+               b.scorer.saw(plain["title"]), b.scorer.saw(elsewhere["title"])),
+              ("model", "model", True, True))
+        check("T16 ...the model was shown the research items for a topic and a clause only",
+              b.scorer.saw(keyword["title"]), True)
+
+    with Bot() as b, v2.Net():
+        three = [paper(f"{w} preference data for Indic speech evaluation",
+                       url=f"https://arxiv.org/abs/2610.0001{i}",
+                       seen=now - timedelta(minutes=10 + i), researcher=(i == 0))
+                 for i, w in enumerate(("Amber", "Basil", "Cedar"))]
+        three[1]["title"] = "Basil preference data, RLHF and DPO for Indic speech evaluation"
+        b.db.news_feed_add(three)
+        await b.cycle(now)
+        picked = _daily(b, TUE)
+        check("T17 three research items -> two shown (ours first, then most keywords), "
+              "the third carried",
+              ([s["headline"] for s in picked["research"]],
+               [s["headline"] for s in picked["carry"]]),
+              ([three[0]["title"], three[1]["title"]], [three[2]["title"]]))
+        check("T17 ...the research lines count inside the five", len(picked["keep"]) <= 5, True)
+
+    plain_post = news.render([news.story_from_feed(dict(elsewhere, importance=4))],
+                             mode=news.MODE_MAIN)
+    check("T18 no research -> no 'Research published:' heading",
+          news.LABEL_RESEARCH in plain_post, False)
+
+    got = render_news_posts()
+    gold = open(os.path.join(ROOT, "docs", "test-reports", "templates-main.txt"),
+                encoding="utf-8").read()
+    check("T19 templates-main.txt updated (it carries the research group) and matching",
+          (news.LABEL_RESEARCH in gold, got["returncode"], got["same"]), (True, 0, True))
+
+
 def templates(check) -> None:
     print("\nT14 THE TEMPLATES")
     got = render_news_posts()
@@ -690,7 +786,7 @@ def templates(check) -> None:
           (0, True, True, True))
 
 
-GROUPS = (story_keys, flags, scoring, budget, every_hour, health)
+GROUPS = (story_keys, flags, scoring, budget, every_hour, health, research)
 
 
 async def run(check) -> None:

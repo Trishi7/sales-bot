@@ -346,6 +346,16 @@ def _parse_daily_order(raw, rules: list) -> dict:
     for rule in rules:
         if rule.trigger in FIXED_TIME_TRIGGERS:
             continue
+        if not rule.enabled:
+            # A RULE THAT IS OFF HAS NO SLOT (RULES-OCT16: R7 is off and out of
+            # Monday's order). Its weekdays stay, so turning it back on is
+            # enabled: true and its id back in the order — this check then holds
+            # it to both again.
+            if any(rule.id in ids for ids in order.values()):
+                _fail(f"{rule.id} ({rule.name}) is switched off but daily_order still "
+                      "lists it",
+                      "Take it out of daily_order, or set enabled: true.")
+            continue
         runs = {d for d in rule.weekdays if d in ORDER_DAYS}
         listed = {d for d, ids in order.items() if rule.id in ids}
         if runs != listed:
@@ -837,12 +847,13 @@ def _self_test() -> int:
     check("R13 is outside the cap", by_id("R13").counts_toward_cap, False)
     check("R13 carries 5 per post", by_id("R13").max_items_per_post, 5)
     check("R13 needs no web", by_id("R13").needs_web, False)
-    # R7 CAME BACK ON MONDAYS (8 Oct). Who it lists is narrowed by Rule 13's own
-    # check, in nextaction; here it is only switched on, on its one day.
-    check("R7 is switched on", by_id("R7").enabled, True)
-    check("R7 runs Monday only",
+    # R7 IS OFF SINCE 16 OCT (RULES-OCT16): Rule 13 owns the chase. Its weekdays
+    # stay, so turning it back on is enabled: true and its place in the order.
+    check("R7 is switched off (RULES-OCT16)", by_id("R7").enabled, False)
+    check("R7 runs on no day while it is off",
           [by_id("R7").runs_on(d) for d in (mon, tue, wed, thu, fri)],
-          [True, False, False, False, False])
+          [False, False, False, False, False])
+    check("...and its weekdays still say Monday", sorted(by_id("R7").weekdays), [0])
 
     print("\ncaps and destinations")
     check("R4 carries the week's list, 20 per post", by_id("R4").max_items_per_post, 20)
@@ -862,8 +873,8 @@ def _self_test() -> int:
     check("R12 does not", by_id("R12").needs_web, False)
 
     print("\nfor_day")
-    check("Monday's rules", [r.id for r in for_day(mon)],
-          ["R1", "R4", "R13", "R7", "R8", "R9", "R10", "R14"])
+    check("Monday's rules (R7 is off)", [r.id for r in for_day(mon)],
+          ["R1", "R4", "R13", "R8", "R9", "R10", "R14"])
     check("Wednesday's rules", [r.id for r in for_day(wed)],
           ["R1", "R3", "R13", "R8", "R9", "R11", "R14"])
     check("Thursday's rules", [r.id for r in for_day(thu)],
@@ -878,7 +889,7 @@ def _self_test() -> int:
 
     print("\nthe order of the day's posts")
     check("the file has a daily_order", has_daily_order(), True)
-    check("Monday's order", order_for(mon), ["R4", "R7", "R1", "R10"])
+    check("Monday's order (R7 off: R1 moves up)", order_for(mon), ["R4", "R1", "R10"])
     check("Tuesday's order", order_for(tue), ["R5", "R6", "R2", "R1"])
     check("Wednesday's order", order_for(wed), ["R11", "R1", "R3"])
     check("Thursday's order", order_for(thu), ["R5", "R1", "R12"])
@@ -886,7 +897,7 @@ def _self_test() -> int:
     check("Saturday and Sunday have no order",
           (order_for(date(2026, 9, 26)), order_for(date(2026, 9, 27))), ([], []))
     check("R1's place, Monday to Friday",
-          [order_index("R1", d) for d in (mon, tue, wed, thu, fri)], [2, 3, 1, 1, 2])
+          [order_index("R1", d) for d in (mon, tue, wed, thu, fri)], [1, 3, 1, 1, 2])
     check("a fixed-time rule has no place in the order",
           [order_index(r, mon) for r in ("R8", "R9", "R13")], [None, None, None])
     check("R8, R9, R13 and R14 are the fixed-time rules",
@@ -925,9 +936,25 @@ def _self_test() -> int:
     check("R11 listed on Thursday too: refused, naming both lists",
           ("R11" in err, "weekdays say [wed]" in err,
            "daily_order lists it on [wed, thu]" in err), (True, True, True))
-    err = refused("  mon: [R4, R7, R1, R10]", "  mon: [R4, R7, R1, R10, R13]")
+    err = refused("  mon: [R4, R1, R10]", "  mon: [R4, R1, R10, R13]")
     check("a fixed-time rule in the order: refused",
           "R13" in err and "fixed time" in err, True)
+    err = refused("  mon: [R4, R1, R10]", "  mon: [R4, R7, R1, R10]")
+    check("a switched-off rule (R7) left in the order: refused",
+          "R7" in err and "switched off" in err, True)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bot_rules.yaml")
+        on = (shipped.replace("  mon: [R4, R1, R10]", "  mon: [R4, R7, R1, R10]")
+              .replace("    # off since 16 Oct by decision; R13 owns the chase\n"
+                       "    enabled: false", "    enabled: true"))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(on)
+        reload(path)
+        check("R7 turned back on (enabled: true and back in Monday's order): it loads "
+              "and runs Mondays, second, as before",
+              (by_id("R7").enabled, order_for(mon), by_id("R7").max_items_per_post),
+              (True, ["R4", "R7", "R1", "R10"], 3))
+    reload()
     err = refused("  fri: [R2, R6, R1]", "  fri: [R2, R6, R1, R6]")
     check("a rule listed twice in a day: refused", "R6 twice" in err, True)
     err = refused("  fri: [R2, R6, R1]", "  fri: [R2, R6, R1, R99]")
@@ -946,10 +973,10 @@ def _self_test() -> int:
                      + shipped.split("\nrules:", 1)[1])
         reload(path)
         check("no daily_order block: not an error", has_daily_order(), False)
-        check("no daily_order block: Monday goes in file order",
-              order_for(mon), ["R1", "R4", "R7", "R10"])
+        check("no daily_order block: Monday goes in file order (R7 is off)",
+              order_for(mon), ["R1", "R4", "R10"])
     reload()
-    check("the shipped file is back", order_for(mon), ["R4", "R7", "R1", "R10"])
+    check("the shipped file is back", order_for(mon), ["R4", "R1", "R10"])
 
     print(f"\n{'ALL PASSED' if not failures else str(failures) + ' FAILED'}")
     return 1 if failures else 0

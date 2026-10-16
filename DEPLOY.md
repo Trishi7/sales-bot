@@ -2001,6 +2001,27 @@ for the cap: look at `NEWS_REQUEST_GAP_SECONDS` and the number of names.
 
 `python verify_news_patch.py` checks all of it offline and prints the T1-T14 table.
 
+### NEWS-PATCH-OCT16, F7: "Research published:" in the daily post
+
+**The daily post gained one optional group on 16 Oct, by decision**: "Research published:", between "Our PoCs are in
+the news:" and "Elsewhere in AI". It is printed only when there is research, takes at most `NEWS_RESEARCH_MAX_PER_POST`
+(2) of the five lines, and is never breaking. A story by one of our researchers, or a paper (a link on arxiv.org or
+huggingface.co/papers) with one of `NEWS_RESEARCH_KEYWORDS` in its title or summary, is importance 4 by rule.
+`docs/test-reports/templates-main.txt` was updated for this one change only: three daily-post renders were added (ours,
+research and the industry; research alone; ours and the industry with no research). Nothing else in the file moved.
+
+Nothing reads an arXiv category feed or Hugging Face papers today: the arXiv lane looks up our researchers as authors.
+For the keyword lane, add the feed URLs you want to `NEWS_RSS_FEEDS` (on both machines). Both new variables are
+optional:
+
+```
+# NEWS_RESEARCH_MAX_PER_POST=2
+# NEWS_RESEARCH_KEYWORDS=evaluation,benchmark,preference,RLHF,DPO,human feedback,annotator,red team,red-teaming,speech,ASR,TTS,voice,Hindi,Hinglish,Indic,multilingual,low-resource,alignment,reward model
+```
+
+In the log: `[news] cycle: N research item(s) scored 4 by rule (F7)`, and in the daily post's skipped lines "research,
+and the post has room for N — carried to the next daily post".
+
 ## Upgrading to NEWS-ANSWER-OCT16 (a question gets the real top 5)
 
 Runs after NEWS-PATCH-OCT16, on the same build. A news question now gets the top stories of the window it names
@@ -2053,3 +2074,41 @@ No database change. **What to look for in the log:**
 ```
 
 `python verify_news_window.py` checks it offline (B1-B20, beside NEWS-ANSWER-OCT16's T1-T16).
+
+## Upgrading to RULES-OCT16 (R6 shows only the email work; R7 is off)
+
+**R6, "Email check: connected, no DM yet" (Tuesday and Friday).** The post is the email work only: "Found an email:",
+"Email on the sheet cannot receive mail:" (the address and the reason) and "Couldn't find an email:", five people at
+most, in turn (least recently named first). Somebody whose email on the sheet works is not named. A person with no LI
+Connected Date is not eligible. When nobody needs anything: "Everyone connected has a working email on file." A new
+table, `li_no_dm_mentions`, holds the rotation; it is created at the first start.
+
+**R7, "No meeting booked yet", is OFF** (`enabled: false`, out of Monday's order). Monday is R4 at 14:00, R1 at 16:00,
+R10 at 18:00: the AI news moves up one slot, and its window starts at Monday 16:00. To turn R7 back on: `enabled: true`
+on R7 AND R7 back in `daily_order` (`mon: [R4, R7, R1, R10]`), then restart. A switched-off rule left in the order is
+refused at startup.
+
+**Lines for `.env`: the laptop AND `/opt/sales-bot/.env`.**
+
+```
+# NEW, optional: the defaults are the ticket's.
+# LI_NO_DM_SHOW_WITH_EMAIL=false
+# LI_NO_DM_REQUIRE_DATE=true
+
+# RETIRED while R7 is off (harmless if left; they apply again if R7 is turned back on):
+#   DM_NO_MEETING_DAYS  DM_NO_MEETING_BOOKED_GAP_DAYS  DM_NO_MEETING_MAX_CONTACTS
+```
+
+**What to look for in the log** on the next Tuesday or Friday:
+
+```
+[rules] R6: N row(s) read (the whole tab); N qualify ...; N with no connected date; all N handed on in rotation order
+[rules] R6: <name> (<company>) has no LI Connected Date, so is not eligible (LI_NO_DM_REQUIRE_DATE)   (once each)
+[email] R6: N handed on -> N named (...; N with email work, cap 5: N found, N cannot receive mail, N not found); N verified and not named; ...
+[rules] R6: recorded N person(s) named on <date>
+```
+
+**The Bot Rules tab, by hand:** rule 6's and rule 7's "What the Bot Shares / Checks" wording should follow the yaml
+(`sheet_wording` on R6; rule 7 can say "Off since 16 Oct. Rule 13 reminds about calls after a DM.").
+
+`python verify_li_no_dm.py`, `python verify_dm_no_meeting.py` and `python verify_day_order.py` check it offline.

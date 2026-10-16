@@ -2151,6 +2151,14 @@ NEWS_TOPICS = (
 
 # The most stories the daily post carries: ours first, then the industry.
 NEWS_MAX_ITEMS = _int("NEWS_MAX_ITEMS", 5)
+# "RESEARCH PUBLISHED:" (NEWS-PATCH-OCT16, F7), a group of the daily post between
+# ours and the industry: at most this many lines, inside NEWS_MAX_ITEMS. The rest
+# is carried to the next daily post.
+NEWS_RESEARCH_MAX_PER_POST = _int("NEWS_RESEARCH_MAX_PER_POST", 2)
+# A paper from an arXiv or Hugging Face papers feed is research for the team when
+# its title or summary has one of these (whole words, any case). Our researchers'
+# papers and stories need none. Both are importance 4 by rule.
+NEWS_RESEARCH_KEYWORDS = _str_list("NEWS_RESEARCH_KEYWORDS", "evaluation,benchmark,preference,RLHF,DPO,human feedback,annotator,red team,red-teaming,speech,ASR,TTS,voice,Hindi,Hinglish,Indic,multilingual,low-resource,alignment,reward model")
 
 # THE NAME LIST (`news_names`, rebuilt at every big pull): every company on
 # Master Pipeline, every company AND every person on Outreach PoCs — active
@@ -2487,6 +2495,16 @@ LI_NO_DM_DM_REPLIED_MARKERS: list[str] = _str_list(
 # skips the "These domains can't receive mail" block entirely; it never
 # reports every domain as fine.
 LI_NO_DM_VERIFY_MX = _bool("LI_NO_DM_VERIFY_MX", default=True)
+
+# R6 (RULES-OCT16) — BLOCK 1, "Verified email on file, no DM yet": people whose
+# sheet email passes the checks. OFF: the post is the email work only, and a
+# person with a working email is not named at all. On, block 1 goes first with
+# up to R6's max_items_per_post (5) names, then the email work with up to
+# LI_NO_DM_EMAIL_NAMES_PER_POST (5).
+LI_NO_DM_SHOW_WITH_EMAIL = _bool("LI_NO_DM_SHOW_WITH_EMAIL", default=False)
+# R6 (RULES-OCT16) — a person with no LI Connected Date is NOT eligible (the
+# rule counts from that date). Off brings back "no date, in straight away".
+LI_NO_DM_REQUIRE_DATE = _bool("LI_NO_DM_REQUIRE_DATE", default=True)
 
 # -- R7 — NO MEETING BOOKED YET: THE ESCALATION BEHIND R13 (rebuilt 13 Oct 2026) --
 # R13 does the chasing: from NEXT_STEP_CALL_AFTER_DM_DAYS after the DM it says

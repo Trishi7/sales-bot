@@ -632,44 +632,49 @@ def next_step_lines_for_check() -> list:
 
 # -- connected, no DM yet (rule 6) --------------------------------------------
 #
-# ONE POST, FOUR BLOCKS, NUMBERED STRAIGHT THROUGH, each person once:
+# THE EMAIL CHECK (RULES-OCT16): the email work only, numbered straight through,
+# each person once, at most five:
 #
-#     **Connected, no DM yet**
+#     **Email check: connected, no DM yet**
 #     @Vaishnavi @Sid
 #
-#     1. Daisy Leigh (PolyAI)
-#     2. Ioana Mocanu (Agoda)
+#     Found an email:
+#     1. Joel Georgie J. (ARTPARK) — joel@artpark.in (people.example)
 #
-#     Found missing or alternate emails:
-#     3. Joel Georgie J. (ARTPARK) — joel@artpark.in
+#     Email on the sheet cannot receive mail:
+#     2. Angus Addlesee (PolyAI) — angus@addleseehq.co.uk (its domain can't receive mail)
 #
-#     These domains can't receive mail:
-#     4. Angus Addlesee (PolyAI) — addleseehq.co.uk
+#     Couldn't find an email:
+#     3. Ishan Mishra (AI Security Institute)
 #
-#     Couldn't find an email for:
-#     5. Ishan Mishra (AI Security Institute)
+#     Would you like me to add these emails to the sheet?
 #
-#     Would you like me to add these emails to the Outreach PoCs sheet?
+# THE STRINGS LIVE HERE AND NOWHERE ELSE. What is never in the message: a person
+# whose email works (unless LI_NO_DM_SHOW_WITH_EMAIL puts them in block 1, by
+# name only), a column name, a claim that an address exists, a line asking for
+# a DM.
 #
-# THE STRINGS LIVE HERE AND NOWHERE ELSE. What is never in the message: an
-# address that is already in the sheet, a column name, a claim that an address
-# does or does not exist, and anything about a person whose email is fine
-# beyond their name and company.
-LI_NO_DM_ALL_CLEAR = "All clear, nobody is waiting on a DM."
-LI_NO_DM_FOUND = "Found missing or alternate emails:"
-LI_NO_DM_DEAD = "These domains can't receive mail:"
-LI_NO_DM_NONE = "Couldn't find an email for:"
-LI_NO_DM_ADD_QUESTION = "Would you like me to add these emails to the Outreach PoCs sheet?"
+# RULES-OCT16 (Vaishnavi): THE POST IS THE EMAIL WORK. Block 1, "Verified email
+# on file, no DM yet:", is behind LI_NO_DM_SHOW_WITH_EMAIL (off); block 2 is the
+# three email lists below, with the address on the sheet SHOWN when it cannot
+# receive mail, and the reason in plain words. No line asks anyone to DM.
+LI_NO_DM_ALL_CLEAR = "Everyone connected has a working email on file."
+LI_NO_DM_PLAIN = "Verified email on file, no DM yet:"
+LI_NO_DM_FOUND = "Found an email:"
+LI_NO_DM_DEAD = "Email on the sheet cannot receive mail:"
+LI_NO_DM_NONE = "Couldn't find an email:"
+LI_NO_DM_ADD_QUESTION = "Would you like me to add these emails to the sheet?"
 LI_NO_DM_BLOCKS = ("plain", "found", "dead", "none")
+LI_NO_DM_REASON_SYNTAX = "not a valid email address"
+LI_NO_DM_REASON_MX = "its domain can't receive mail"
 
 
 def li_no_dm_post(people, *, ask: bool = True) -> list:
     """The lines of R6's post under its heading and tags.
 
     `people` are dicts with `who`, `block` (one of LI_NO_DM_BLOCKS) and, for
-    "found", `emails` (the addresses the bot FOUND), for "dead", `domains`
-    (the domains that cannot receive mail: the DOMAIN ONLY, never the
-    address). The blocks appear in the agreed order whatever order people
+    "found", `emails` (the addresses the bot FOUND) and `source` (where), for
+    "dead", `emails` (the addresses ON THE SHEET that fail) and `reason`. The blocks appear in the agreed order whatever order people
     arrive in; a block with nobody in it does not appear; the numbering runs
     straight through all of them. THE CLOSING QUESTION is there only when the
     "found" block has somebody in it, and `ask` is true (it is false when the
@@ -681,8 +686,8 @@ def li_no_dm_post(people, *, ask: bool = True) -> list:
         blocks.get(block, blocks["plain"]).append(person)
     lines: list = []
     n = 0
-    for name, heading in (("plain", ""), ("found", LI_NO_DM_FOUND), ("dead", LI_NO_DM_DEAD),
-                          ("none", LI_NO_DM_NONE)):
+    for name, heading in (("plain", LI_NO_DM_PLAIN), ("found", LI_NO_DM_FOUND),
+                          ("dead", LI_NO_DM_DEAD), ("none", LI_NO_DM_NONE)):
         if not blocks[name]:
             continue
         if lines:
@@ -692,11 +697,14 @@ def li_no_dm_post(people, *, ask: bool = True) -> list:
         for person in blocks[name]:
             n += 1
             line = f"{n}. {str(person.get('who') or '').strip() or '(unnamed row)'}"
-            extra = [str(x).strip() for x in (person.get("emails") if name == "found"
-                                              else person.get("domains") if name == "dead"
+            extra = [str(x).strip() for x in (person.get("emails") if name in ("found", "dead")
                                               else ()) or () if str(x).strip()]
             if extra:
                 line += " \u2014 " + ", ".join(extra)
+            tail = str((person.get("source") if name == "found"
+                        else person.get("reason") if name == "dead" else "") or "").strip()
+            if extra and tail:
+                line += f" ({tail})"
             lines.append(line)
     if blocks["found"] and ask and lines:
         lines += ["", LI_NO_DM_ADD_QUESTION]
@@ -705,8 +713,8 @@ def li_no_dm_post(people, *, ask: bool = True) -> list:
 
 def li_no_dm_lines_for_check() -> list:
     """Every fixed line R6's post can carry."""
-    return [LI_NO_DM_ALL_CLEAR, LI_NO_DM_FOUND, LI_NO_DM_DEAD, LI_NO_DM_NONE,
-            LI_NO_DM_ADD_QUESTION]
+    return [LI_NO_DM_ALL_CLEAR, LI_NO_DM_PLAIN, LI_NO_DM_FOUND, LI_NO_DM_DEAD, LI_NO_DM_NONE,
+            LI_NO_DM_ADD_QUESTION, LI_NO_DM_REASON_SYNTAX, LI_NO_DM_REASON_MX]
 
 
 # -- no meeting booked yet (rule 7) --------------------------------------------

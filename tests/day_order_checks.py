@@ -64,7 +64,8 @@ _ABSENT = object()
 
 # What the team asked for, with every rule due. (rule, time) in the order they post.
 SPACED = {
-    MON: [("R4", "14:00"), ("R7", "16:00"), ("R1", "18:00"), ("R10", "20:00")],
+    # R7 IS OFF SINCE 16 OCT (RULES-OCT16): Monday is R4, R1, R10.
+    MON: [("R4", "14:00"), ("R1", "16:00"), ("R10", "18:00")],
     TUE: [("R5", "14:00"), ("R6", "16:00"), ("R2", "18:00"), ("R1", "20:00")],
     WED: [("R11", "14:00"), ("R1", "16:00"), ("R3", "18:00")],
     THU: [("R5", "14:00"), ("R1", "16:00"), ("R12", "18:00")],
@@ -235,17 +236,14 @@ def every_weekday(check) -> None:
 def moving_up(check) -> None:
     """A rule with nothing to post takes no slot and the next one moves up."""
     with pinned():
-        check("Monday with no deliverables: R7 14:00, R1 16:00, R10 18:00",
+        check("Monday with no deliverables: R1 14:00, R10 16:00 (R7 is off)",
               posts(plan(MON, without=("R4",)), pinned_only=False),
-              [("R7", "14:00"), ("R1", "16:00"), ("R10", "18:00")])
-        check("Monday with nobody for R7: R4, R1, R10 at 14:00, 16:00, 18:00",
-              posts(plan(MON, without=("R7",)), pinned_only=False),
-              [("R4", "14:00"), ("R1", "16:00"), ("R10", "18:00")])
-        check("Monday with no deliverables and nobody for R7 either: R1 14:00, R10 16:00",
-              posts(plan(MON, without=("R4", "R7")), pinned_only=False),
               [("R1", "14:00"), ("R10", "16:00")])
+        check("T9 Monday with R7 off: R4, R1, R10 at 14:00, 16:00, 18:00, nothing for R7",
+              posts(plan(MON), pinned_only=False),
+              [("R4", "14:00"), ("R1", "16:00"), ("R10", "18:00")])
         check("Monday with only AI news due: it goes at 14:00",
-              posts(plan(MON, without=("R4", "R7", "R10")), pinned_only=False), [("R1", "14:00")])
+              posts(plan(MON, without=("R4", "R10")), pinned_only=False), [("R1", "14:00")])
         check("Tuesday with no prospects and no LinkedIn check: R2 14:00, R1 16:00",
               posts(plan(TUE, without=("R5", "R6")), pinned_only=False),
               [("R2", "14:00"), ("R1", "16:00")])
@@ -266,14 +264,14 @@ def moving_up(check) -> None:
         morning = plan(MON, without=("R4",))
         first = morning["messages"][[m["pinned"] for m in morning["messages"]].index(False)]
         sent = [sent_row(first, MON, "14:00")]
-        check("Monday planned with no deliverables: R7 went at 14:00",
-              (first["rule_id"], first["send_at_hhmm"]), ("R7", "14:00"))
+        check("Monday planned with no deliverables: R1 went at 14:00",
+              (first["rule_id"], first["send_at_hhmm"]), ("R1", "14:00"))
         later = plan(MON, already_sent=sent)
         check("...then a P1 deliverable appears: the checklist takes the next free slot, 16:00, "
               "and the rest follow two hours apart",
-              posts(later, pinned_only=False), [("R4", "16:00"), ("R1", "18:00"), ("R10", "20:00")])
+              posts(later, pinned_only=False), [("R4", "16:00"), ("R10", "18:00")])
         check("...and what has already gone is not sent twice",
-              [m["rule_id"] for m in later["messages"] if m["rule_id"] == "R7"], [])
+              [m["rule_id"] for m in later["messages"] if m["rule_id"] == "R1"], [])
 
 
 def the_gap(check) -> None:
@@ -285,21 +283,21 @@ def the_gap(check) -> None:
               [t.strftime("%H:%M") for t in drip.slot_times(MON, count=4)],
               ["14:00", "16:00", "18:00", "20:00"])
 
-        # SIX SPACED GROUPS ON A FOUR-SLOT DAY. Two more rules than Monday has, run by naming them.
+        # FIVE SPACED GROUPS ON A FOUR-SLOT DAY. Two more rules than Monday has (three since R7 is
+        # off, RULES-OCT16), run by naming them.
         extra = [r for r in rules_mod.safe_load() if r.id in ("R12", "R5")]
         items = nextaction.run(day_rules=rules_mod.for_day(MON) + extra, **world(MON))["actions"]
         crowded = drip.plan(items, day=MON)
-        check("six spaced groups on Monday: four go, at the same four times, gaps unchanged",
-              (posts(crowded, pinned_only=False), gaps(crowded)), (SPACED[MON], [120, 120, 120]))
-        check("...the other two are not sent today (they would land at 22:00 and 00:00)",
-              sorted((g["rule_id"], g["rolled_why"]) for g in crowded["rolled"]),
-              # CHANGED 13 Oct 2026: with the cap at 7 (it was 5) the sixth group is no longer over the cap;
-              # the four-slot window is what holds both of them.
-              [("R12", "window"), ("R5", "window")])
+        went = posts(crowded, pinned_only=False)
+        check("five spaced groups on Monday: four go, Monday's three first, at the four slot "
+              "times, gaps unchanged",
+              (went[:3], [t for _r, t in went], gaps(crowded)),
+              (SPACED[MON], ["14:00", "16:00", "18:00", "20:00"], [120, 120, 120]))
+        check("...the fifth is not sent today (it would land at 22:00)",
+              [g["rolled_why"] for g in crowded["rolled"]], ["window"])
         check("...and the plan says why in plain words",
               [g["why"] for g in crowded["rolled"] if g["rolled_why"] == "window"],
-              ["it would land at 22:00, after 20:00, so it waits for the next day its rule runs",
-               "it would land at 00:00, after 20:00, so it waits for the next day its rule runs"])
+              ["it would land at 22:00, after 20:00, so it waits for the next day its rule runs"])
 
         # A POST THAT LEFT ON A SWEEP TICK A FEW MINUTES AFTER ITS SLOT keeps the day on its slots.
         whole = plan(MON)
@@ -311,13 +309,13 @@ def the_gap(check) -> None:
         # A POST THAT WENT LATE (the bot was down): the next is a full gap after it, and never past 20:00.
         late = plan(MON, already_sent=[sent_row(spaced[0], MON, "17:20")])
         check("the first post left at 17:20: the next is at 19:20, a full 120 minutes later",
-              posts(late, pinned_only=False), [("R7", "19:20")])
-        check("...and the two that would land after 20:00 are not sent today",
+              posts(late, pinned_only=False), [("R1", "19:20")])
+        check("...and the one that would land after 20:00 is not sent today",
               sorted((g["rule_id"], g["rolled_why"]) for g in late["rolled"]),
-              [("R1", "window"), ("R10", "window")])
+              [("R10", "window")])
         very_late = plan(MON, already_sent=[sent_row(spaced[0], MON, "19:30")])
         check("the first post left at 19:30: nothing else spaced goes today",
-              (posts(very_late, pinned_only=False), len(very_late["rolled"])), ([], 3))
+              (posts(very_late, pinned_only=False), len(very_late["rolled"])), ([], 2))
 
         # A FIXED-TIME ROW IS NOT WHAT THE GAP IS MEASURED FROM.
         fixed = [m for m in whole["messages"] if m["pinned"]]
@@ -366,7 +364,17 @@ def the_gap(check) -> None:
 
 
 def rule_7(check) -> None:
-    """R7 on Mondays, the escalation behind Rule 13 (13 Oct 2026): a person Rule 13 names that day is skipped."""
+    """R7 on Mondays, the escalation behind Rule 13 (13 Oct 2026): a person Rule 13 names that day is skipped.
+
+    R7 IS OFF SINCE 16 OCT (RULES-OCT16). These checks run with it TURNED BACK ON — enabled: true and back
+    in Monday's order (`dm_no_meeting_checks.r7_back_on`) — to show it comes back exactly as it was."""
+    import dm_no_meeting_checks as dmc
+
+    with dmc.r7_back_on():
+        _rule_7(check)
+
+
+def _rule_7(check) -> None:
     with pinned():
         got = queue(MON)
         r7 = [a for a in got["by_rule"].get("R7", [])]
@@ -494,10 +502,10 @@ def news_window(check) -> None:
                 since, until = SalesBot._main_window(None, day)
                 return since.strftime("%a %H:%M"), until.strftime("%a %H:%M")
 
-            check("Tuesday's post (fourth, 20:00) covers from Monday's slot (third, 18:00)",
-                  window(TUE), ("Mon 18:00", "Tue 20:00"))
+            check("Tuesday's post (fourth, 20:00) covers from Monday's slot (second, 16:00: R7 is off)",
+                  window(TUE), ("Mon 16:00", "Tue 20:00"))
             check("Monday's post covers from Friday's slot (third, 18:00): the whole weekend",
-                  window(MON), ("Fri 18:00", "Mon 18:00"))
+                  window(MON), ("Fri 18:00", "Mon 16:00"))
             check("Wednesday's (second, 16:00) covers from Tuesday's 20:00",
                   window(WED), ("Tue 20:00", "Wed 16:00"))
             check("Thursday's (second, 16:00) covers from Wednesday's 16:00",
@@ -508,10 +516,10 @@ def news_window(check) -> None:
                   [window(d)[0] == window(p)[1] for p, d in zip(WEEK, WEEK[1:])], [True] * 4)
             check("R1's slot is read off the day's order",
                   [drip.order_slot("R1", d).strftime("%H:%M") for d in WEEK],
-                  ["18:00", "20:00", "16:00", "16:00", "18:00"])
+                  ["16:00", "20:00", "16:00", "16:00", "18:00"])
             since, until = SalesBot._main_window(None, fixed_now.date())
             check("on the real day the window ends now, and still starts at the previous R1 slot",
-                  (since.strftime("%a %d %H:%M"), until), ("Mon 19 18:00", fixed_now))
+                  (since.strftime("%a %d %H:%M"), until), ("Mon 19 16:00", fixed_now))
             check("the same answer with no bot at all: it reads the schedule, not what was sent",
                   SalesBot._main_window(object(), TUE) == SalesBot._main_window(None, TUE), True)
 
@@ -561,9 +569,9 @@ def startup(check) -> None:
                "its weekdays say [mon, tue, wed, thu, fri]" in err, "daily_order lists it on [wed]" in err),
               (True, True, True))
         check("...and says what to do", "Change one of them in bot_rules.yaml" in err, True)
-        err = refused("  mon: [R4, R7, R1, R10]", "  mon: [R4, R1, R10]")
-        check("R7 runs on Monday but is missing from Monday's order: refused, naming both",
-              ("R7 (" in err, "its weekdays say [mon]" in err, "daily_order lists it on [no day]" in err),
+        err = refused("  mon: [R4, R1, R10]", "  mon: [R4, R7, R1, R10]")
+        check("R7 is switched off but put back in Monday's order: refused, saying so (RULES-OCT16)",
+              ("R7 (" in err, "switched off" in err, "daily_order still lists it" in err),
               (True, True, True))
         err = refused("  tue: [R5, R6, R2, R1]", "  tue: [R5, R6, R2, R1, R12]")
         check("R12 listed on a Tuesday it does not run: refused, naming both",
@@ -588,13 +596,17 @@ def startup(check) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
     check("the shipped file loads, with the order the team gave",
           [rules_mod.order_for(d) for d in WEEK],
-          [["R4", "R7", "R1", "R10"], ["R5", "R6", "R2", "R1"], ["R11", "R1", "R3"],
+          [["R4", "R1", "R10"], ["R5", "R6", "R2", "R1"], ["R11", "R1", "R3"],
            ["R5", "R1", "R12"], ["R2", "R6", "R1"]])
     check("R8, R9 and R13 appear in no day's order",
           [r for d in WEEK for r in rules_mod.order_for(d) if r in ("R8", "R9", "R13")], [])
-    check("every rule's weekdays agree with its days in the order (the shipped file, checked directly)",
-          [r.id for r in rules_mod.safe_load() if not rules_mod.is_fixed_time(r)
+    check("every rule that is ON has weekdays that agree with its days in the order (the shipped file, "
+          "checked directly)",
+          [r.id for r in rules_mod.safe_load() if not rules_mod.is_fixed_time(r) and r.enabled
            and {d.weekday() for d in WEEK if r.id in rules_mod.order_for(d)} != set(r.weekdays)], [])
+    check("...and a rule that is OFF (R7 since 16 Oct) is in no day's order",
+          [r.id for r in rules_mod.safe_load() if not r.enabled
+           and any(r.id in rules_mod.order_for(d) for d in WEEK)], [])
 
 
 def weekend(check) -> None:
@@ -697,7 +709,7 @@ def wording(check) -> None:
     strategy = open(os.path.join(ROOT, "sales_strategy.md"), encoding="utf-8").read()
     check("sales_strategy.md: the weekly schedule is the team's order",
           all(p in strategy for p in (
-              "2 PM deliverables checklist · 4 PM no meeting booked yet · 6 PM AI news · 8 PM closure support",
+              "2 PM deliverables checklist · 4 PM AI news · 6 PM closure support",
               "2 PM new companies in the pipeline (asks first) · 4 PM AI news · 6 PM AI events")), True)
     check("...and nothing in it gives the news a fixed time or says R7 is replaced",
           [p for p in ("One post at 2:00 PM", "planned first", "Replaced by rule 13",
@@ -716,7 +728,7 @@ SECTIONS = (
     ("EVERY WEEKDAY, EVERY RULE DUE", every_weekday),
     ("A RULE WITH NOTHING TO POST TAKES NO SLOT", moving_up),
     ("THE GAP NEVER SHRINKS, AND NOTHING AFTER 20:00", the_gap),
-    ("RULE 7 IS BACK ON MONDAYS, MINUS RULE 13's PEOPLE", rule_7),
+    ("RULE 7, TURNED BACK ON (OFF SINCE 16 OCT), MINUS RULE 13's PEOPLE", rule_7),
     ("RULE 11 ON WEDNESDAYS ONLY", rule_11),
     ("AI NEWS: SINCE THE PREVIOUS POST'S SLOT", news_window),
     ("THE STARTUP CHECK: weekdays AND daily_order MUST AGREE", startup),

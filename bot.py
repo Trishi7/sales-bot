@@ -12421,51 +12421,51 @@ class SalesBot(discord.Client):
         )
 
     async def _li_no_dm_email_work(self, message: dict, *, today) -> None:
-        """R6: check or look for each person's email, and decide who the post
-        names and in which block. Sets `block` on the actions it names.
+        """R6: the EMAIL WORK, and who the post names (RULES-OCT16). Sets
+        `block` on the actions it names.
 
-        THE WALK. People are taken in the rule's order (a connected date
-        first, oldest first; then no date, in sheet order). Each lands in one
-        of two lists, and the walk stops when both are full:
+        THE WALK, in the rule's rotation order (least recently named first):
 
-          the PLAIN list, R6's `max_items_per_post` (5)
-              an address on file whose domain can receive mail, or nothing to
-              report. Nothing is said about them beyond the name.
-          the EMAIL blocks, LI_NO_DM_EMAIL_NAMES_PER_POST (5) between them
-              "found"  nothing usable on file, and the search found one
-              "dead"   an address on file whose domain cannot receive mail
-              "none"   nothing on file and the search found nothing
+          email on the sheet, every address passes the checks (an address, and
+          its domain can receive mail — a DNS MX lookup)
+              NOTHING TO DO: not named. With LI_NO_DM_SHOW_WITH_EMAIL on, block 1
+              "Verified email on file, no DM yet:", up to R6's
+              max_items_per_post (5).
+          the cell has an "@" but no valid address, or an address whose domain
+          cannot receive mail
+              "dead": "Email on the sheet cannot receive mail:", the address and
+              the reason in plain words
+          no address on the sheet (blank, or words like "not available")
+              ONE search (`_email_lookup`, cached, at most
+              EMAIL_LOOKUP_MAX_PER_POST a post). An address is kept only when a
+              snippet shows it word for word -> "found", with its source; else
+              "none"
 
-        Two caps, kept apart, so a quiet week cannot fill every place with
-        names that need nothing and push the email work off the post.
+        Block 2 ("found", "dead", "none") takes LI_NO_DM_EMAIL_NAMES_PER_POST (5)
+        between them. The walk stops when the blocks are full.
 
-        THE EMAIL CELL:
-          blank, or not an address ("not available", a phone number)
-              ONE search, through `_email_lookup` and its cache, at most
-              EMAIL_LOOKUP_MAX_PER_POST a post. An address is kept only when
-              it is in a snippet the search returned, character for character.
-          one or more addresses
-              each is checked (`email_checks`): the domain's MX record, and,
-              for the log only, whether the domain looks like the company's.
-              THERE IS NO SMTP PROBE. The post never claims an address exists.
-
-        WHAT MAY REACH THE POST: addresses the bot FOUND, and the DOMAIN of an
-        address that cannot receive mail. AN ADDRESS ALREADY ON THE SHEET IS
-        NEVER PRINTED BACK. A found address that is already in the cell is
-        dropped, and the person counts as having a working email.
+        A SHEET ADDRESS THAT FAILS IS NOT SEARCHED FOR AGAIN: a found address
+        could only be written into a BLANK Email cell (the hard rule), so the
+        offer would be one the bot cannot keep. It is shown with its reason.
 
         WHEN A CHECK CANNOT RUN, NOTHING IS CLAIMED: search off or its budget
         spent, dnspython missing, a DNS timeout, a date that has not happened.
-        The person goes in the plain list, and the log says why.
+        That person is not named this time, and the log says why.
+
+        NOBODY NAMED, AND EVERYBODY CHECKED FINE: the post is the all-clear line
+        ("Everyone connected has a working email on file."). Somebody could not
+        be checked: nothing is posted rather than claim it.
         """
         people = drip.li_no_dm_order(list(message.get("actions") or []))
         for a in people:
-            for field in ("block", "dead_domains"):
+            for field in ("block", "dead_addresses", "dead_reason", "email_source_label"):
                 a.pop(field, None)
             a["web_pending"] = False
         if not people:
             return
-        plain_cap = max(1, int(message.get("max_items_per_post") or 0) or 5)
+        show_plain = bool(config.LI_NO_DM_SHOW_WITH_EMAIL)
+        plain_cap = (max(1, int(message.get("max_items_per_post") or 0) or 5)
+                     if show_plain else 0)
         news_cap = max(0, int(config.LI_NO_DM_EMAIL_NAMES_PER_POST))
         lookups = max(0, int(config.EMAIL_LOOKUP_MAX_PER_POST))
         future = self._is_future(today)
@@ -12475,44 +12475,54 @@ class SalesBot(discord.Client):
                         "for this post. No domain is reported as unable to receive mail.")
             verify = False
         plain = news = searched = 0
-        told: dict = {"found": 0, "dead": 0, "none": 0, "unchecked": 0}
-
-        def to_plain(a) -> None:
-            nonlocal plain
-            if plain < plain_cap:
-                a["block"] = "plain"
-                plain += 1
+        told: dict = {"fine": 0, "found": 0, "dead": 0, "none": 0, "unchecked": 0}
 
         for a in people:
             if plain >= plain_cap and news >= news_cap:
                 break
             cell = str(a.get("email_on_file") or "")
             on_file = email_checks.addresses_in(cell)
+            if "@" in cell and not on_file:
+                if news < news_cap:
+                    a.update(block="dead", dead_addresses=[" ".join(cell.split())[:80]],
+                             dead_reason=wording.LI_NO_DM_REASON_SYNTAX)
+                    news += 1
+                    told["dead"] += 1
+                continue
             if on_file:
+                if not verify:
+                    told["unchecked"] += 1
+                    continue
                 dead: list = []
                 for address in on_file:
                     domain = email_checks.domain_of(address)
-                    fit = email_checks.company_check(address, str(a.get("company") or ""))
-                    status = email_checks.SKIPPED
-                    if verify:
-                        status = await asyncio.to_thread(email_checks.mx_status, domain)
-                    if status == email_checks.DEAD and domain not in dead:
-                        dead.append(domain)
-                    # THE LOG NAMES THE DOMAIN AND THE VERDICTS, never the address.
-                    log.info("[email] R6 %s (%s): an address at %s is on file; mail: %s; "
-                             "company: %s", a.get("poc"), a.get("company"), domain, status, fit)
-                if dead and news < news_cap:
-                    a["block"], a["dead_domains"] = "dead", dead
-                    news += 1
-                    told["dead"] += 1
-                elif not dead:
-                    to_plain(a)
+                    status = await asyncio.to_thread(email_checks.mx_status, domain)
+                    log.info("[email] R6 %s (%s): an address at %s is on file; mail: %s",
+                             a.get("poc"), a.get("company"), domain, status)
+                    if status == email_checks.DEAD:
+                        dead.append(address)
+                    elif status != email_checks.OK:
+                        dead = None
+                        break
+                if dead is None:
+                    told["unchecked"] += 1
+                    continue
+                if dead:
+                    if news < news_cap:
+                        a.update(block="dead", dead_addresses=dead,
+                                 dead_reason=wording.LI_NO_DM_REASON_MX)
+                        news += 1
+                        told["dead"] += 1
+                    continue
+                told["fine"] += 1
+                if plain < plain_cap:
+                    a["block"] = "plain"
+                    plain += 1
                 continue
             if news >= news_cap:
                 continue
             if future or searched >= lookups:
                 told["unchecked"] += 1
-                to_plain(a)
                 continue
             a["email_lookup"] = True
             a["web_pending"] = True
@@ -12520,32 +12530,45 @@ class SalesBot(discord.Client):
             await self._research_items([a], today=today)
             a["web_pending"] = False
             if not a.get("email_checked"):
-                log.info("[email] R6 %s (%s): the email search could not run (%s); nothing "
-                         "is said about their email", a.get("poc"), a.get("company"),
+                log.info("[email] R6 %s (%s): the email search could not run (%s); not named "
+                         "this time", a.get("poc"), a.get("company"),
                          a.get("research_note") or "no reason given")
                 told["unchecked"] += 1
-                to_plain(a)
                 continue
             found = [str(e) for e in (a.get("emails_found") or (
                 [a["email_found"]] if a.get("email_found") else [])) if str(e).strip()]
             fresh = [e for e in found if e.lower() not in cell.lower()][:2]
             if found and not fresh:
-                # ALREADY IN THE CELL: dropped, and they count as having an email.
-                to_plain(a)
+                # ALREADY IN THE CELL (written there in words the address check
+                # does not read): they have it on file; nothing to say.
+                told["fine"] += 1
                 continue
             a["emails_found"] = fresh
+            source = str(a.get("email_source") or "")
+            import links
+
+            a["email_source_label"] = links.site_name(source) if source else ""
             a["block"] = "found" if fresh else "none"
             news += 1
             told["found" if fresh else "none"] += 1
         for a in people:
-            # THE POST IS ITS FOUR BLOCKS AND NOTHING ELSE: no sentence from the
+            # THE POST IS ITS BLOCKS AND NOTHING ELSE: no sentence from the
             # lookup, no source link under it, no bracketed note.
             a["research"], a["sources"], a["research_note"] = "", [], ""
-        log.info("[email] R6: %d handed on -> %d in the plain list (cap %d), %d with email "
-                 "news (cap %d: %d found, %d dead domain(s), %d not found); %d search(es) "
-                 "asked for; %d could not be checked; MX check %s", len(people), plain,
-                 plain_cap, news, news_cap, told["found"], told["dead"], told["none"],
-                 searched, told["unchecked"], "on" if verify else "off")
+            # THE WORK HAS RUN: from here the post names only who was placed.
+            a["email_work_done"] = True
+        placed = plain + news
+        if not placed and not told["unchecked"]:
+            # EVERYBODY CHECKED, NOBODY NEEDS ANYTHING: the all-clear line.
+            people[0]["notice"] = wording.LI_NO_DM_ALL_CLEAR
+        log.info("[email] R6: %d handed on -> %d named (%d verified shown, cap %d; %d with "
+                 "email work, cap %d: %d found, %d cannot receive mail, %d not found); %d "
+                 "verified and not named; %d search(es); %d could not be checked; MX check %s%s",
+                 len(people), placed, plain, plain_cap, news, news_cap, told["found"],
+                 told["dead"], told["none"], told["fine"] - plain, searched, told["unchecked"],
+                 "on" if verify else "off",
+                 " — the all-clear line goes out" if not placed and not told["unchecked"]
+                 else "")
 
     async def _open_email_proposal(self, message: dict, *, sent, marker: str) -> None:
         """The post showed an email it found — record the offer to write it.
@@ -12854,6 +12877,8 @@ class SalesBot(discord.Client):
             await self._record_next_steps(message, sent=sent, marker=marker)
         elif kind == nextaction.R_DM_NO_MEETING:
             await self._record_dm_no_meeting(message, marker=marker)
+        elif kind == nextaction.R_LI_NO_DM:
+            await self._record_li_no_dm(message, marker=marker)
         elif kind == nextaction.R_MEETING_PREP:
             await self._record_meeting_touches(message, marker=marker)
         elif kind == nextaction.R_RECONNECT:
@@ -12947,6 +12972,29 @@ class SalesBot(discord.Client):
                  len(stories), since.strftime("%a %d %b %H:%M"), until.strftime("%a %d %b %H:%M"),
                  why, found, len(deals))
         return found
+
+    async def _record_li_no_dm(self, message: dict, *, marker: str) -> int:
+        """Record who an R6 post named (RULES-OCT16): the rotation, least recently
+        named first. Only after a real send, only the people the post SHOWED,
+        and by path exactly as R7 (`_record_dm_no_meeting`)."""
+        if (clock.pretending() and not simulation.in_simulation()
+                and not NEXT_STEP_TEST_DAY_RECORDS_ON_LIVE_DB
+                and not str(config.DB_PATH or "").endswith("_test.db")):
+            log.info("[rules] R6: test day on a live database; the rotation is not recorded")
+            return 0
+        people = []
+        for action in drip.shown_contacts(message):
+            key = str(action.get("row_key") or "").strip()
+            if not key or action.get("notice"):
+                continue
+            block = str(action.get("block") or "")
+            await asyncio.to_thread(
+                lambda k=key, b=block: self.db.record_li_no_dm_mention(
+                    k, on_date=marker, block=b))
+            people.append(key)
+        if people:
+            log.info("[rules] R6: recorded %d person(s) named on %s", len(people), marker)
+        return len(people)
 
     async def _record_dm_no_meeting(self, message: dict, *, marker: str) -> int:
         """Record who an R7 post named. How many people were recorded.
@@ -13464,6 +13512,12 @@ class SalesBot(discord.Client):
         except Exception:
             log.exception("[rules] R7's rotation state could not be read")
             dm_no_meeting_state = None
+        # R6's ROTATION (RULES-OCT16), the same rule.
+        try:
+            li_no_dm_state = await asyncio.to_thread(self.db.li_no_dm_state)
+        except Exception:
+            log.exception("[rules] R6's rotation state could not be read")
+            li_no_dm_state = None
 
         # R8's MEMORY: which touch has gone out for which meeting. Unreadable
         # is passed on as unreadable, and the evaluator then names nobody.
@@ -13495,6 +13549,7 @@ class SalesBot(discord.Client):
                 prospect_rows=list(tab.rows),
                 next_step_state=next_step_state,
                 dm_no_meeting_state=dm_no_meeting_state,
+                li_no_dm_state=li_no_dm_state,
                 # R11's CROSS-CHECK: a SUMMARY of every row on the tab (a count
                 # and the mandatory roles left blank, per company), built here
                 # so the engine is handed no row and stays pure.
@@ -13823,6 +13878,25 @@ class SalesBot(discord.Client):
             if not fresh:
                 return stories
 
+        # ---- research (F7): 4 by rule; the model gives only topic and clause --
+        papers = [r for r in fresh if news.is_research(r)]
+        paper_keys = {r["url_key"] for r in papers}
+        if papers:
+            await asyncio.to_thread(
+                lambda: self._ledger().news_feed_set_scores(
+                    [news.research_verdict(r) for r in papers],
+                    scored_at=feeds.utc_iso(dl.real_now_ist()),
+                    generic_flag_min=config.NEWS_POC_BREAKING_MIN,
+                    scored_by=news.SCORED_BY_RULE))
+            st["rule"] += len(papers)
+            for r in papers:
+                v = news.research_verdict(r)
+                stories.append(news.story_from_feed(dict(
+                    r, importance=4, topic=v["topic"], what=v["what"],
+                    scored_by=news.SCORED_BY_RULE)))
+            log.info("[news] %s: %d research item(s) scored 4 by rule (F7); the model "
+                     "gives them a topic and a clause only", mode, len(papers))
+
         # ---- the model, in batches down the pre-rank -----------------------
         people = await asyncio.to_thread(self._news_people)
         order = news.preselect(fresh, cap=len(fresh), people=people,
@@ -13869,6 +13943,15 @@ class SalesBot(discord.Client):
                 for r in shown
             ] + [{"url_key": r["url_key"], "importance": 1, "topic": "", "what": ""}
                  for r in twins]
+            for v in verdicts:
+                if v["url_key"] in paper_keys:
+                    # RESEARCH KEEPS ITS RULE SCORE; the model's topic and clause
+                    # are taken when it gave them.
+                    v.update(importance=4, scored_by=news.SCORED_BY_RULE,
+                             topic=v["topic"] or news.RESEARCH_TOPIC,
+                             what=v["what"] or news.research_verdict(
+                                 next(r for r in shown if r["url_key"] == v["url_key"])
+                             )["what"])
             await asyncio.to_thread(
                 lambda v=verdicts: self._ledger().news_feed_set_scores(
                     v, scored_at=feeds.utc_iso(dl.real_now_ist()),
@@ -13878,8 +13961,9 @@ class SalesBot(discord.Client):
             done += len(shown)
             scored_all += scored
         st["carried"] = len(order) - done
-        if st["calls"] == 0 and not ruled:
+        if st["calls"] == 0 and not ruled and not papers:
             return None
+        scored_all = [x for x in scored_all if x.get("url_key") not in paper_keys]
         log.info("[news] %s: scored %d of %d unscored item(s) in %d %s call(s) "
                  "(pre-ranked, %d about us) — %d worth 3 or more%s", mode, done,
                  len(order), st["calls"], config.MODEL_LIGHT,

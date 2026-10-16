@@ -70,6 +70,9 @@ def test_never_an_address_from_the_sheet_or_a_column_name():
     lnd.the_message(quiet)
     lnd.the_caps(quiet)
     lnd.gina_and_the_checks(quiet)
+    # RULES-OCT16: several of those cases now post nothing at all, so the posts of the rotation and the
+    # all-clear are swept too.
+    lnd.repeats_and_all_clear(quiet)
     _run(lnd.never_in_the_message)
 
 

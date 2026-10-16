@@ -189,9 +189,41 @@ async def daily(check) -> None:
     check("in live mode it carries none", live["raw"][0].startswith(nc.HEADING), True)
 
 
+def research_group(check) -> None:
+    """NEWS-PATCH-OCT16 F7: "Research published:" between ours and the industry,
+    only when there is research. Rendered here so tools/render_templates.py
+    (and so docs/test-reports/templates-main.txt) carries the new group."""
+    print("\nTHE DAILY POST - the 'Research published:' group (NEWS-PATCH-OCT16, F7)")
+    ours = {"headline": "Sarvam AI raises $90M to scale Indic language models",
+            "source": "Economic Times", "url": "https://example.org/sarvam", "url_key": "r1",
+            "headline_key": "sarvam raises", "importance": 4, "flag": 1, "kind": "poc",
+            "names": "Sarvam AI", "published_at": "2026-10-08T05:00:00Z"}
+    paper = {"headline": "Preference data from student annotators for Hinglish speech",
+             "source": "arXiv", "url": "https://arxiv.org/abs/2610.01234", "url_key": "r2",
+             "headline_key": "preference data student", "importance": 4, "flag": 1,
+             "kind": "researcher", "names": "David Gamez",
+             "published_at": "2026-10-08T04:00:00Z"}
+    industry = {"headline": "State AGs launch investigations into OpenAI AI safety practices",
+                "source": "Reuters", "url": "https://example.org/state-ags", "url_key": "r3",
+                "headline_key": "state ags launch", "importance": 4, "flag": 0,
+                "kind": "industry", "published_at": "2026-10-08T03:00:00Z"}
+    full = news.render([ours, paper, industry], mode=news.MODE_MAIN)
+    check("research sits between ours and the industry, under its own label",
+          full.split("\n"), [news.OPENER, news.LABEL_OURS, news.story_line(ours),
+                             news.LABEL_RESEARCH, news.story_line(paper),
+                             news.LABEL_INDUSTRY, news.story_line(industry), news.CLOSER])
+    only = news.render([paper], mode=news.MODE_MAIN)
+    check("only research: its group, and no 'Elsewhere in AI'",
+          only.split("\n"), [news.OPENER, news.LABEL_RESEARCH, news.story_line(paper),
+                             news.CLOSER])
+    check("no research: no research label",
+          news.LABEL_RESEARCH in news.render([ours, industry], mode=news.MODE_MAIN), False)
+
+
 def pure(check) -> None:
     import drip
 
+    research_group(check)
     print("\nTHE TEMPLATE - news.render in every mode, exact text (NFT2-1087 section 16)")
     day = date(2026, 10, 8)
     G = "https://news.google.com/rss/articles/"

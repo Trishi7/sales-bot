@@ -143,33 +143,34 @@ def example_values(day=TUE) -> list:
     ]
 
 
-EXPECTED = """**Connected, no DM yet**
-1. Daisy Leigh (PolyAI)
-2. Ioana Mocanu (Agoda)
+# RULES-OCT16: the post is the email work only. Daisy and Ioana's emails work, so they are not named.
+HEADING = "**Email check: connected, no DM yet**"
+EXPECTED = HEADING + """
+Found an email:
+1. Joel Georgie J. (ARTPARK) — joel@artpark.in (people.example)
+2. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai (people.example)
 
-Found missing or alternate emails:
-3. Joel Georgie J. (ARTPARK) — joel@artpark.in
-4. Mouparna Sen (Gnani.ai) — mouparna.sen@gnani.ai
+Email on the sheet cannot receive mail:
+3. Angus Addlesee (PolyAI) — angus@addleseehq.co.uk (its domain can't receive mail)
 
-These domains can't receive mail:
-5. Angus Addlesee (PolyAI) — addleseehq.co.uk
+Couldn't find an email:
+4. Ishan Mishra (AI Security Institute)
 
-Couldn't find an email for:
-6. Ishan Mishra (AI Security Institute)
-
-Would you like me to add these emails to the Outreach PoCs sheet?"""
+Would you like me to add these emails to the sheet?"""
+ALL_CLEAR = HEADING + "\nEveryone connected has a working email on file."
 
 
 def rows_of(values) -> list:
     return list(fx.parse(values).rows)
 
 
-def engine(values, day=TUE, *, active=None, rule_ids=("R6",)):
+def engine(values, day=TUE, *, active=None, rule_ids=("R6",), state="not supplied"):
     """The rule alone. `active` is what the activation gate let through (default: nothing, to show the rule
-    reads the whole tab)."""
+    reads the whole tab). `state` is R6's rotation state (RULES-OCT16)."""
     rows = rows_of(values)
     return nextaction.run(today=day, rows=list(active if active is not None else []), prospect_rows=rows,
-                          day_rules=[rules_mod.by_id(r) for r in rule_ids], next_step_state={})
+                          day_rules=[rules_mod.by_id(r) for r in rule_ids], next_step_state={},
+                          li_no_dm_state=state)
 
 
 def picked(result) -> list:
@@ -293,11 +294,29 @@ def one_post(values, **kw) -> dict:
 # -- the checks -----------------------------------------------------------------------------------------------------------
 
 def who_is_picked(check):
-    print("\nWHO IS PICKED — LI DM Sent blank, three days connected or no date at all; the whole tab")
+    print("\nWHO IS PICKED — LI DM Sent blank, three days connected (a date is needed); the whole tab")
     base = lambda **c: [poc(1, "Pat Person", "Co", **c)]  # noqa: E731
     check("LI DM Sent blank, connected 3 days ago: in", picked(engine(base(days=3))), ["Pat Person"])
     check("connected 2 days ago: not yet", picked(engine(base(days=2))), [])
-    check("no LI Connected Date at all: in straight away", picked(engine(base())), ["Pat Person"])
+    res = engine(base())
+    check("T6 no LI Connected Date: not eligible (LI_NO_DM_REQUIRE_DATE), counted in the report",
+          (picked(res), res["reports"]["R6"]["no_date"]), ([], 1))
+    with config_pins(LI_NO_DM_REQUIRE_DATE=False):
+        check("T6 ...LI_NO_DM_REQUIRE_DATE=false brings back 'no date, in straight away'",
+              picked(engine(base())), ["Pat Person"])
+    tap = LogTap()
+    logging.getLogger().addHandler(tap)
+    was = logging.getLogger().level
+    logging.getLogger().setLevel(logging.INFO)
+    try:
+        nextaction._R6_UNDATED_LOGGED.clear()
+        for _ in range(3):
+            engine([poc(1, "Logged Once", "Co")])
+    finally:
+        logging.getLogger().removeHandler(tap)
+        logging.getLogger().setLevel(was)
+    check("T6 ...and it is logged once, not every tick",
+          sum(1 for _l, m in tap.lines if "Logged Once" in m and "no LI Connected Date" in m), 1)
     check("LI DM Sent says sent, Sent, replied, Replied or Received: out",
           [picked(engine(base(days=30, dm_sent=v))) for v in ("sent", "Sent", "replied", "Replied", "Received")],
           [[]] * 5)
@@ -315,21 +334,28 @@ def who_is_picked(check):
     dated = [poc(10 + i, f"Dated {i}", "Dated Co", days=10 + i) for i in range(4)]
     res = engine(undated + dated, active=[])
     report = res["reports"]["R6"]
-    check("the rule reads the WHOLE TAB: with the activation gate letting no row through, all 64 qualify",
-          (report["rows"], report["qualify"], report["dated"], report["undated"]), (64, 64, 4, 60))
-    check("...and a row with no activating date at all is picked",
-          "Undated 000" in picked(res), True)
-    check("the order: a connected date first, OLDEST first; then no date, in sheet order",
-          picked(res)[:6], ["Dated 3", "Dated 2", "Dated 1", "Dated 0", "Undated 000", "Undated 001"])
-    check("...and only the first of them are handed on, not all 64",
-          (len(picked(res)), report["handed_on"]), (nextaction.LI_NO_DM_SCAN, nextaction.LI_NO_DM_SCAN))
-    check("no rotation: the same people, in the same order, on a second run with the sheet unchanged",
-          picked(engine(undated + dated, active=[])), picked(res))
+    check("the rule reads the WHOLE TAB: with the activation gate letting no row through, the 4 dated "
+          "qualify and the 60 with no connected date do not",
+          (report["rows"], report["qualify"], report["dated"], report["no_date"]), (64, 4, 4, 60))
+    check("...and a row the activation gate did not let through is picked", "Dated 0" in picked(res), True)
+    check("the order with nobody named yet: the OLDEST connection first",
+          picked(res), ["Dated 3", "Dated 2", "Dated 1", "Dated 0"])
+    check("...and EVERYBODY who qualifies is handed on (the walk stops when the blocks are full)",
+          report["handed_on"], 4)
+    yesterday = dl.iso(TUE - timedelta(days=1))
+    key = {a["poc"]: a["contact_key"] for a in res["actions"] if a.get("rule_id") == "R6"}
+    turned = engine(undated + dated, active=[], state={key["Dated 3"]: {"last_date": yesterday},
+                                                       key["Dated 2"]: {"last_date": yesterday}})
+    check("T5 the ROTATION: the two named yesterday go to the back; least recently named first",
+          picked(turned), ["Dated 1", "Dated 0", "Dated 3", "Dated 2"])
+    check("...the rotation state unreadable (None): nobody is named, rather than start again from the top",
+          picked(engine(undated + dated, active=[], state=None)), [])
     src = open(os.path.join(ROOT, "nextaction.py"), encoding="utf-8").read().split("def _r_li_no_dm(")[1].split(
         "\ndef ")[0]
-    check("the rule keeps no state: no drop clock, no mention counter, no 'first named' date",
-          [w for w in ("next_step_state", "first_named", "mentions", "sid_li_added", "marked_connected")
-           if w in src.split('"""')[2]], [])
+    check("the rule only READS its rotation (the sender writes it after a real send) and never reads "
+          "'Sid - LI Addition'",
+          ("li_no_dm_state" in src, [w for w in ("record_li_no_dm", "sid_li_added", "marked_connected")
+                                     if w in src.split('"""')[2]]), (True, []))
     with_r13 = [fx.person(1, name="Shared Sam", company="Co", li_date=TUE - timedelta(days=30),
                           step="Send email 1"),
                 poc(2, "Only Six", "Co", days=20)]
@@ -356,18 +382,21 @@ def who_is_picked(check):
 
 
 def the_message(check):
-    print("\nTHE MESSAGE — four blocks, numbered straight through, only addresses the bot found")
+    print("\nTHE MESSAGE — the email work only: found, cannot receive mail, not found")
     with pinned():
         got = one_post(example_values())
         test = one_post(example_values(), test_mode=True)
     text = got["text"]
     check("the ticket's example, character for character (the tags line goes under the heading at send)",
           text, EXPECTED)
-    check("the four blocks in order", [ln for ln in text.split("\n") if ln.endswith(":")],
-          [wording.LI_NO_DM_FOUND, wording.LI_NO_DM_DEAD, wording.LI_NO_DM_NONE])
+    check("T1 a verified email, no DM: not in the post (Daisy and Ioana are not named anywhere)",
+          [n for n in ("Daisy Leigh", "Ioana Mocanu") if n in text], [])
+    check("the blocks in order, under the new heading",
+          (text.split("\n")[0], [ln for ln in text.split("\n") if ln.endswith(":")]),
+          (HEADING, [wording.LI_NO_DM_FOUND, wording.LI_NO_DM_DEAD, wording.LI_NO_DM_NONE]))
     check("the numbering runs straight through, and each person appears once",
           (numbers_in(text), sorted(names_in(text)) == sorted(set(names_in(text))), len(names_in(text))),
-          ([1, 2, 3, 4, 5, 6], True, 6))
+          ([1, 2, 3, 4], True, 4))
     check("one search each for the three with no usable address, in the rule's order; none for the others",
           got["searches"], ["Joel Georgie J.", "Mouparna Sen", "Ishan Mishra"])
     check('"not available" in the Email cell is treated as blank: one search', "Joel Georgie J." in got["searches"],
@@ -376,85 +405,101 @@ def the_message(check):
           sorted(set(got["mx"])), ["addleseehq.co.uk", "agoda.com", "poly.ai"])
     check("an address plus a phone number: the address is used, the rest ignored",
           email_checks.addresses_in(EXISTING["Ioana Mocanu"]), ["ioana.m@agoda.com"])
-    check("the dead-domain block names the DOMAIN only, never the address",
-          [ln for ln in text.split("\n") if "Angus" in ln], ["5. Angus Addlesee (PolyAI) — addleseehq.co.uk"])
-    check("the closing question is there because an address was found, and it is the last line",
-          text.split("\n")[-1], wording.LI_NO_DM_ADD_QUESTION)
+    check("T2 a bad-domain email: block 2b, the address and the reason in plain words",
+          [ln for ln in text.split("\n") if "Angus" in ln],
+          ["3. Angus Addlesee (PolyAI) — angus@addleseehq.co.uk (its domain can't receive mail)"])
+    check("T3 a found email: block 2a with its source, and the add question is the last line",
+          ([ln for ln in text.split("\n") if "Joel" in ln], text.split("\n")[-1]),
+          (["1. Joel Georgie J. (ARTPARK) — joel@artpark.in (people.example)"], wording.LI_NO_DM_ADD_QUESTION))
+    check("T4 not found: block 2c, name and company", [ln for ln in text.split("\n") if "Ishan" in ln],
+          ["4. Ishan Mishra (AI Security Institute)"])
+    check("no line asks anybody to send a DM",
+          [w for w in ("send a DM", "send the DM", "DM them", "message them") if w in text.lower()], [])
     check("test mode: the same message, tagged", (test["text"], test["tagged"], got["tagged"]),
           (text, True, False))
 
     plain = one_post([poc(1, "Daisy Leigh", "PolyAI", days=34, email=EXISTING["Daisy Leigh"]),
                       poc(2, "Ioana Mocanu", "Agoda", days=10, email=EXISTING["Ioana Mocanu"])])
-    check("everybody's email is fine: a plain numbered list, no block heading and NO closing question",
-          plain["text"], "**Connected, no DM yet**\n1. Daisy Leigh (PolyAI)\n2. Ioana Mocanu (Agoda)")
+    check("T7 everybody's email works: the all-clear line, exact text, and nobody named",
+          plain["text"], ALL_CLEAR)
     check("...and no proposal is opened", plain["proposals"], {})
     only_dead = one_post([poc(1, "Angus Addlesee", "PolyAI", days=35, email=EXISTING["Angus Addlesee"])])
-    check("only a dead domain: that block alone, numbered from 1, and no question",
-          only_dead["text"], "**Connected, no DM yet**\nThese domains can't receive mail:\n"
-                             "1. Angus Addlesee (PolyAI) — addleseehq.co.uk")
+    check("only a bad domain: that block alone, numbered from 1, and no question",
+          only_dead["text"], HEADING + "\nEmail on the sheet cannot receive mail:\n"
+                             "1. Angus Addlesee (PolyAI) — angus@addleseehq.co.uk (its domain can't receive mail)")
+    syntax = one_post([poc(1, "Sy Ntax", "Typo Co", days=9, email="sy@typo")])
+    check("T2 ...an address that is not an address: the same block, 'not a valid email address'",
+          syntax["text"], HEADING + "\nEmail on the sheet cannot receive mail:\n"
+                          "1. Sy Ntax (Typo Co) — sy@typo (not a valid email address)")
     only_none = one_post([poc(1, "Ishan Mishra", "AI Security Institute", days=6)], found={})
     check("only nothing-found: that block alone, and no question (there is nothing to add)",
-          only_none["text"], "**Connected, no DM yet**\nCouldn't find an email for:\n"
+          only_none["text"], HEADING + "\nCouldn't find an email:\n"
                              "1. Ishan Mishra (AI Security Institute)")
 
     two = one_post([poc(1, "Tara Two", "Twin Labs", days=9)],
                    found={"Tara Two": ["tara@twinlabs.ai", "tara.two@gmail.com"]})
     check("two addresses found for one person: both on their one line, comma separated",
-          two["text"].split("\n")[2], "1. Tara Two (Twin Labs) — tara@twinlabs.ai, tara.two@gmail.com")
+          two["text"].split("\n")[2],
+          "1. Tara Two (Twin Labs) — tara@twinlabs.ai, tara.two@gmail.com (people.example)")
 
-    same = one_post([poc(1, "Sam Same", "Same Co", days=9, email="reach sam at sam [at] same.co"),
-                     poc(2, "Nina None", "None Co", days=8)],
-                    found={"Sam Same": ["sam@same.co"]})
     dup = one_post([poc(1, "Dee Dupe", "Dupe Co", days=9, email="Dee Dupe <DEE@dupe.co>; +1 555 0100 x")],
                    found={"Dee Dupe": ["dee@dupe.co"]})
-    check("an address on file is checked, not searched for, and never suggested back",
-          (dup["searches"], dup["text"]), ([], "**Connected, no DM yet**\n1. Dee Dupe (Dupe Co)"))
+    check("an address on file that works is checked, not searched for, and the person is not named",
+          (dup["searches"], dup["text"]), ([], ALL_CLEAR))
+
     async def already():
-        """A found address that is ALREADY in the cell (the cell is prose the syntax check reads no address in)."""
-        with Stage([poc(1, "Ollie Old", "Old Co", days=9, email="write to ollie@old .co or OLLIE@OLD.CO.")],
-                   found={"Ollie Old": ["ollie@old.co"]}) as s:
+        """A found address that is ALREADY in the cell, written in words the address check reads no address in."""
+        with Stage([poc(1, "Ollie Old", "Old Co", days=9, email="ollie@old.co (no, it bounces: write ollie at old)")],
+                   found={"Ollie Old": ["ollie@old.co"]}, dead={"old.co"}) as s:
             text, _p, msg = await s.post()
             return keep(text), s.searches, dict(s.w.proposals())
     with pinned():
         a_text, a_searches, a_props = asyncio.run(already())
-    check("a found address that is already in the cell produces NO line anywhere: the person is in the plain "
-          "list, with no address shown and no proposal",
-          (a_text, a_props), ("**Connected, no DM yet**\n1. Ollie Old (Old Co)", {}))
-    del same
+    check("a sheet address that cannot receive mail is not searched for again (a found one could only go in a "
+          "blank cell): it is shown with its reason, and no proposal",
+          (a_searches, a_props, "its domain can't receive mail" in a_text), ([], {}, True))
 
 
 def the_caps(check):
-    print("\nTHE TWO CAPS — five in the plain list, five with email news, counted separately")
+    print("\nTHE CAPS — five with email work; with block 1 on, five verified first (ten in all)")
     fine = [poc(i, f"Fine {i:02d}", "Fine Co", days=60 - i, email=f"fine{i}@fine.co") for i in range(1, 9)]
     news = [poc(20 + i, f"News {i:02d}", "News Co", days=30 - i) for i in range(1, 9)]
+    found = {f"News {i:02d}": [f"news{i}@news.co"] for i in (1, 2, 3)}
     with pinned():
-        got = one_post(fine + news, found={f"News {i:02d}": [f"news{i}@news.co"] for i in (1, 2, 3)})
+        got = one_post(fine + news, found=found)
     text = got["text"]
-    check("at most ten people: five in the plain list and five with email news",
+    check("block 1 off (the default): five with email work and nobody whose email works",
           (len(names_in(text)), [n for n in names_in(text) if n.startswith("Fine")],
            [n for n in names_in(text) if n.startswith("News")]),
-          (10, [f"Fine {i:02d}" for i in range(1, 6)], [f"News {i:02d}" for i in range(1, 6)]))
-    check("the three email blocks share ONE allowance of five (three found, two not found)",
+          (5, [], [f"News {i:02d}" for i in range(1, 6)]))
+    check("the three email lists share ONE allowance of five (three found, two not found)",
           (text.count("@news.co"), len(text.split(wording.LI_NO_DM_NONE)[1].strip().split("\n")[:2])), (3, 2))
     check("...so five searches, not eight: EMAIL_LOOKUP_MAX_PER_POST matches the allowance",
           got["searches"], [f"News {i:02d}" for i in range(1, 6)])
-    check("a quiet week cannot push the email work off the post: eight fine people still leave room for five "
-          "with email news", "Found missing or alternate emails:" in text, True)
+    with pinned():
+        both = one_post(fine + news, found=found, extra_pins={"LI_NO_DM_SHOW_WITH_EMAIL": True})
+    btext = both["text"]
+    check("T8 LI_NO_DM_SHOW_WITH_EMAIL=true: two blocks, five verified FIRST then five with email work; ten",
+          (btext.split("\n")[1], [n for n in names_in(btext) if n.startswith("Fine")],
+           [n for n in names_in(btext) if n.startswith("News")], numbers_in(btext)),
+          (wording.LI_NO_DM_PLAIN, [f"Fine {i:02d}" for i in range(1, 6)],
+           [f"News {i:02d}" for i in range(1, 6)], list(range(1, 11))))
+    check("...block 1 names the person only, never their address",
+          [n for n in ("fine1@fine.co", "fine2@fine.co") if n in btext], [])
     with pinned():
         small = one_post(fine + news, found={}, extra_pins={"LI_NO_DM_EMAIL_NAMES_PER_POST": 2})
-    check("LI_NO_DM_EMAIL_NAMES_PER_POST=2: two with email news, five plain",
-          (len([n for n in names_in(small["text"]) if n.startswith("News")]),
-           len([n for n in names_in(small["text"]) if n.startswith("Fine")]), small["searches"]),
-          (2, 5, ["News 01", "News 02"]))
+    check("LI_NO_DM_EMAIL_NAMES_PER_POST=2: two with email work",
+          (len([n for n in names_in(small["text"]) if n.startswith("News")]), small["searches"]),
+          (2, ["News 01", "News 02"]))
 
 
 def gina_and_the_checks(check):
     print("\nTHE THREE CHEAP CHECKS — and the cases where one cannot run")
-    gina = [poc(608, "Gina Neff", "Multiple", email=EXISTING["Gina Neff"])]
+    gina = [poc(608, "Gina Neff", "Multiple", days=9, email=EXISTING["Gina Neff"])]
     with pinned():
         got = one_post(gina)
-    check('Gina Neff, company "Multiple", two academic addresses: block 1, and nothing is said about her',
-          got["text"], "**Connected, no DM yet**\n1. Gina Neff (Multiple)")
+    check('Gina Neff, company "Multiple", two academic addresses that work: not named (the all-clear)',
+          got["text"], ALL_CLEAR)
     check("...both of her addresses had their domain checked", sorted(got["mx"]), ["cam.ac.uk", "qmul.ac.uk"])
     check('"Multiple" is not a company: the domain comparison is SKIPPED, not failed',
           [email_checks.company_check(a, "Multiple") for a in email_checks.addresses_in(EXISTING["Gina Neff"])],
@@ -466,20 +511,20 @@ def gina_and_the_checks(check):
     with pinned():
         personal = one_post([poc(1, "Percy Personal", "PolyAI", days=9, email="percy.p@gmail.com")])
         mismatch = one_post([poc(1, "Mina Mismatch", "Acme Robotics", days=9, email="mina@globex.com")])
-    check("an address on a personal domain: nothing said. A personal address is not an error",
-          personal["text"], "**Connected, no DM yet**\n1. Percy Personal (PolyAI)")
-    check("an address at another company's domain: nothing said either. Only a dead domain is ever reported",
-          mismatch["text"], "**Connected, no DM yet**\n1. Mina Mismatch (Acme Robotics)")
+    check("an address on a personal domain that works: not named. A personal address is not an error",
+          personal["text"], ALL_CLEAR)
+    check("an address at another company's domain that works: not named either. Only a failing address "
+          "is ever reported", mismatch["text"], ALL_CLEAR)
 
     angus = [poc(1, "Angus Addlesee", "PolyAI", days=35, email=EXISTING["Angus Addlesee"])]
     with pinned():
         no_dns = one_post(angus, dns=False)
         off = one_post(angus, extra_pins={"LI_NO_DM_VERIFY_MX": False})
-    check("dnspython absent: the MX check is skipped, nothing is reported dead, and it is logged",
-          (no_dns["text"], no_dns["mx"], len(no_dns["skipped_log"]) >= 1),
-          ("**Connected, no DM yet**\n1. Angus Addlesee (PolyAI)", [], True))
-    check("LI_NO_DM_VERIFY_MX=false: no lookup and no dead-domain block (never 'every domain is fine')",
-          (off["text"], off["mx"]), ("**Connected, no DM yet**\n1. Angus Addlesee (PolyAI)", []))
+    check("dnspython absent: the MX check is skipped, nothing is reported, NO post (never 'everyone has a "
+          "working email'), and it is logged",
+          (no_dns["text"], no_dns["mx"], len(no_dns["skipped_log"]) >= 1), ("", [], True))
+    check("LI_NO_DM_VERIFY_MX=false: no lookup, nothing reported, no post",
+          (off["text"], off["mx"]), ("", []))
     saved = email_checks.have_dns
     real_import = __import__
 
@@ -505,12 +550,12 @@ def gina_and_the_checks(check):
           bool(re.search(r"^dnspython", open(os.path.join(ROOT, "requirements.txt")).read(), re.MULTILINE)), True)
     with pinned():
         cannot = one_post([poc(1, "Una Unknown", "Co", days=9)], search_ok=False)
-    check("the search cannot run (switched off, or its budget spent): nothing is claimed about their email",
-          cannot["text"], "**Connected, no DM yet**\n1. Una Unknown (Co)")
+    check("the search cannot run (switched off, or its budget spent): nothing is claimed and nothing posted "
+          "(never a composed line, never a nudge to DM)", cannot["text"], "")
 
 
 def repeats_and_all_clear(check):
-    print("\nNO DROP, NO ROTATION — and the all-clear")
+    print("\nTHE ROTATION, NO DROP — and the all-clear")
 
     async def scenario():
         out = {}
@@ -523,15 +568,24 @@ def repeats_and_all_clear(check):
             second, _p, _m = await s.post(TUE)
             out["same"] = (keep(first), keep(second))
             out["searched_again"] = len(s.searches) - searches
-            # THE SHEET MOVES: the DM to Daisy is logged.
+            # THE SHEET MOVES: the DM to Joel is logged.
             moved = example_values(FRI)
-            moved[4][fx.HEADERS_7OCT.index("LI DM Sent")] = "Sent"
+            moved[2][fx.HEADERS_7OCT.index("LI DM Sent")] = "Sent"
             w.sheet.set(pocs=moved)
             third, _p, _m = await s.post(FRI)
             out["third"] = keep(third)
             with w.bot.db.conn() as c:
                 out["tables"] = [r[0] for r in c.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%li_no_dm%'").fetchall()]
+                out["named"] = c.execute("SELECT COUNT(*) FROM li_no_dm_mentions").fetchone()[0]
+        six = [poc(i, f"Six {i}", f"Co {i}", days=20 - i) for i in range(1, 7)]
+        with Stage(six, found={}) as s:
+            w = s.w
+            w.sheet.set(pocs=[poc(i, f"Six {i}", f"Co {i}", days=20 - i, day=PREV_FRI) for i in range(1, 7)])
+            a, _p, _m = await s.post(PREV_FRI)
+            w.sheet.set(pocs=six)
+            b, _p, _m = await s.post(TUE)
+            out["six"] = (names_in(keep(a)), names_in(keep(b)))
         with Stage([poc(1, "Sent Sue", "Co", days=30, dm_sent="Sent"),
                     poc(2, "Recent Rae", "Co", days=1)]) as s:
             text, post, msg = await s.post(TUE)
@@ -544,15 +598,20 @@ def repeats_and_all_clear(check):
 
     with pinned():
         got = asyncio.run(scenario())
-    check("named once already, still no DM: named again on the next post, the same message",
+    check("four people with email work and room for five: the same four on the next post, the same message",
           got["same"][1], got["same"][0])
     check("...and nobody was searched for a second time (the answers are cached)", got["searched_again"], 0)
     check("the list moves when the sheet moves: a logged DM takes that person out and the numbering closes up",
-          ("Daisy Leigh" in got["third"], got["third"].split("\n")[1], numbers_in(got["third"])),
-          (False, "1. Ioana Mocanu (Agoda)", [1, 2, 3, 4, 5]))
-    check("R6 keeps no state of its own: no table for it", got["tables"], [])
-    check("nobody qualifies: a post still goes out, one line under the heading",
-          got["clear"], "**Connected, no DM yet**\nAll clear, nobody is waiting on a DM.")
+          ("Joel Georgie J." in got["third"], numbers_in(got["third"])), (False, [1, 2, 3]))
+    check("R6 keeps its rotation in li_no_dm_mentions, written after a real send",
+          (got["tables"], got["named"] >= 4), (["li_no_dm_mentions"], True))
+    first, second = got["six"]
+    check("T5 six people: five shown, oldest connection first",
+          first, [f"Six {i}" for i in range(1, 6)])
+    check("T5 ...and the rotation moves: the sixth leads the next post, then the least recently named",
+          (second[0], len(second), sorted(second[1:]) <= sorted(first)), ("Six 6", 5, True))
+    check("T7 nobody qualifies: a post still goes out, the all-clear line, exact text",
+          got["clear"], ALL_CLEAR)
     check("...in R6's own slot, counted like the post it replaces",
           [(r[0], r[2]) for r in got["clear_rows"]], [(dl.iso(TUE), nextaction.R_LI_NO_DM)])
     check("the tab comes back empty: NO post, and it is logged at ERROR, never a silent skip",
@@ -587,7 +646,8 @@ def the_add(check):
     with pinned():
         got = asyncio.run(scenario(True))
         off = asyncio.run(scenario(False))
-    check("ONE proposal, kind email_write, carrying every address the post showed and no other",
+    check("T3 a found email: ONE proposal, kind email_write, carrying every address the post showed and "
+          "no other (EMAIL_WRITE_ALLOWED=true)",
           [k for k, _t in got["proposals"]], ["email_write"])
     text = got["proposals"][0][1] if got["proposals"] else ""
     check("the proposal text names both of Tara's addresses and says they go in one cell, one a line",
@@ -598,7 +658,7 @@ def the_add(check):
           [a for cell in EXISTING.values() for a in email_checks.addresses_in(cell)
            if a in text or a in got["payload"]], [])
     check("a yes from somebody who is not an approver writes nothing", got["after_member"], [])
-    check("an approver's yes writes each found address into that person's Email cell, two as two lines",
+    check("T3 ...an approver's yes writes each found address into that person's Email cell, two as two lines",
           got["writes"], [(4, "joel@artpark.in"), (3, "mouparna.sen@gnani.ai"),
                           (8, "tara@twinlabs.ai\ntara.two@gmail.com")][::1] and sorted(
               [(4, "joel@artpark.in"), (3, "mouparna.sen@gnani.ai"), (8, "tara@twinlabs.ai\ntara.two@gmail.com")]))
@@ -615,21 +675,24 @@ def the_add(check):
 def never_in_the_message(check):
     print("\nNEVER IN THE MESSAGE — an address from the sheet, a column name, a DM nudge")
     check("something was rendered to look at", len(RENDERED) > 15, True)
-    existing = sorted({a for cell in EXISTING.values() for a in email_checks.addresses_in(cell)} | {
-        "fine1@fine.co", "percy.p@gmail.com", "mina@globex.com", "dee@dupe.co", "ollie@old.co"})
-    check("no rendered message contains any address that was already in the sheet",
-          [(a, t[:40]) for t in RENDERED for a in existing if a.lower() in t.lower()], [])
+    # RULES-OCT16: an address on the sheet IS shown when it cannot receive mail (Angus's, Sy's, Ollie's);
+    # an address that WORKS never is.
+    working = sorted({a for name, cell in EXISTING.items() if name != "Angus Addlesee"
+                      for a in email_checks.addresses_in(cell)} | {
+        "fine1@fine.co", "percy.p@gmail.com", "mina@globex.com", "dee@dupe.co"})
+    check("no rendered message contains an address on the sheet that works",
+          [(a, t[:40]) for t in RENDERED for a in working if a.lower() in t.lower()], [])
     for name in COLUMN_NAMES:
         check(f'"{name}" appears in no rendered message and no fixed line',
               [t[:40] for t in RENDERED + wording.li_no_dm_lines_for_check() if name in t], [])
     check("no claim that an address exists or does not, and none of the old DM openers",
-          [w for t in RENDERED for w in ("doesn't exist", "does not exist", "is valid", "verified", "this week",
-                                          "still remember the name", "un-messaged", "Email on file")
+          [w for t in RENDERED for w in ("doesn't exist", "does not exist", "is valid", "this week",
+                                          "still remember the name", "un-messaged")
            if w in t], [])
     check("the old composed templates for R6 are gone and its post is rendered in code",
           (nextaction.R_LI_NO_DM in drip._ASK, nextaction.R_LI_NO_DM in drip.VERBATIM_TYPES,
            drip.HEADINGS["R6"], nextaction.TYPE_LABELS[nextaction.R_LI_NO_DM]),
-          (False, True, "Connected, no DM yet", "Connected, no DM yet"))
+          (False, True, "Email check: connected, no DM yet", "Email check: connected, no DM yet"))
 
 
 def settings(check):
@@ -644,6 +707,12 @@ def settings(check):
            _example("LI_NO_DM_DM_REPLIED_MARKERS"),
            bool(re.search(r'_bool\("LI_NO_DM_VERIFY_MX", default=True\)', src)), _example("LI_NO_DM_VERIFY_MX")),
           (True, "5", True, "sent", True, "replied,received", True, "true"))
+    check("RULES-OCT16: LI_NO_DM_SHOW_WITH_EMAIL false and LI_NO_DM_REQUIRE_DATE true, in the code and in "
+          ".env.example",
+          (bool(re.search(r'_bool\("LI_NO_DM_SHOW_WITH_EMAIL", default=False\)', src)),
+           _example("LI_NO_DM_SHOW_WITH_EMAIL"),
+           bool(re.search(r'_bool\("LI_NO_DM_REQUIRE_DATE", default=True\)', src)),
+           _example("LI_NO_DM_REQUIRE_DATE")), (True, "false", True, "true"))
     check("EMAIL_WRITE_ALLOWED is still false in the code and in .env.example",
           (bool(re.search(r'_bool\("EMAIL_WRITE_ALLOWED", default=False\)', src)), _example("EMAIL_WRITE_ALLOWED")),
           (True, "false"))
@@ -673,12 +742,12 @@ def settings(check):
           [("sent=sent" in m, "replied=replied,received" in m, "share 5 name(s)" in m, "MX check=True" in m)
            for m in line], [(True, True, True, True)])
     rule = rules_mod.by_id("R6")
-    check("R6: Tuesday and Friday, five in the plain list, counted toward the cap",
+    check("R6: Tuesday and Friday, five in block 1 when it is on, counted toward the cap",
           (rule.weekdays, rule.max_items_per_post, rule.counts_toward_cap), ((1, 4), 5, True))
     wordy = str(getattr(rule, "sheet_wording", "") or "")
     check("the Bot Rules wording says what the rule now does",
-          [w for w in ("Tuesday and Friday", "3 days", "5 names", "only adds", "until the DM is logged")
-           if w not in wordy], [])
+          [w for w in ("Email check", "Tuesday and Friday", "3 days", "5 names", "only adds",
+                       "Everyone connected has a working email on file") if w not in wordy], [])
 
 
 def run(check):

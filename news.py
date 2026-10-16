@@ -286,6 +286,67 @@ def launch_rule(item: dict) -> bool:
     return bool(_FRONTIER_RE.search(title)) and bool(_LAUNCH_RE.search(title))
 
 
+# -- research published (NEWS-PATCH-OCT16, F7) -------------------------------
+#
+# A THIRD GROUP IN THE DAILY POST, "Research published:", between ours and the
+# industry: a paper or a story by one of OUR RESEARCHERS (kind researcher —
+# the arXiv author lane and the researcher name batches), or a paper from an
+# arXiv or Hugging Face papers feed that is about what the team sells
+# (NEWS_RESEARCH_KEYWORDS). Both are importance 4 BY RULE; the model gives them
+# a topic and a clause, never the score. Research is never breaking news.
+
+LABEL_RESEARCH = "Research published:"
+RESEARCH_TOPIC = "research"
+_RESEARCH_HOSTS = ("arxiv.org", "huggingface.co")
+
+
+def research_source(url: str) -> bool:
+    """Is this link a paper — on arxiv.org, or huggingface.co/papers?"""
+    parts = urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if host == "arxiv.org" or host.endswith(".arxiv.org"):
+        return True
+    return (host == "huggingface.co" or host.endswith(".huggingface.co")) \
+        and parts.path.startswith("/papers")
+
+
+def research_keywords(item: dict, keywords: Optional[list] = None) -> list:
+    """The NEWS_RESEARCH_KEYWORDS in an item's title or summary (whole words,
+    any case), each once."""
+    words = keywords if keywords is not None else (config.NEWS_RESEARCH_KEYWORDS or [])
+    text = " ".join(str((item or {}).get(k) or "") for k in
+                    ("title", "headline", "summary", "what"))
+    return [w for w in dict.fromkeys(str(x).strip() for x in words if str(x).strip())
+            if re.search(r"(?<![A-Za-z0-9])" + re.escape(w) + r"(?![A-Za-z0-9])", text, re.I)]
+
+
+def is_research(item: dict, keywords: Optional[list] = None) -> bool:
+    """A story for "Research published:": one of our researchers', or a paper
+    (`research_source`) about what the team sells (`research_keywords`)."""
+    if str((item or {}).get("kind") or "") == KIND_RESEARCHER:
+        return True
+    return research_source((item or {}).get("url") or "") \
+        and bool(research_keywords(item, keywords))
+
+
+def research_order(stories: list) -> list:
+    """Inside the group: our researchers first, then the most keywords, then
+    the newest."""
+    newest = sorted(stories or [], key=lambda x: str(x.get("published_at") or ""),
+                    reverse=True)
+    return sorted(newest, key=lambda x: (
+        0 if str(x.get("kind") or "") == KIND_RESEARCHER else 1,
+        -len(research_keywords(x))))
+
+
+def research_verdict(item: dict) -> dict:
+    """The score the research rule writes: 4, "research", the title — the
+    model may fill the topic and the clause later, never the score."""
+    title = " ".join(str(item.get("title") or "").split())
+    return {"url_key": item.get("url_key"), "importance": 4, "topic": RESEARCH_TOPIC,
+            "what": title[:300], "scored_by": SCORED_BY_RULE}
+
+
 def launch_verdict(item: dict) -> dict:
     """The score the launch rule writes: 5, "frontier model", the title."""
     title = " ".join(str(item.get("title") or "").split())
@@ -821,7 +882,7 @@ def _qualify(stories: list, *, db, today: date, why) -> list:
 
 def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
                 topics_per_week: int, min_importance: int,
-                offtopic_bypass: int) -> dict:
+                offtopic_bypass: int, research_max: Optional[int] = None) -> dict:
     """THE DAILY POST: at most `cap` stories, OURS FIRST, then the industry.
 
     Returns {"keep", "ours", "industry", "carry", "dropped", "skipped"}.
@@ -849,6 +910,11 @@ def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
 
     THERE IS NO SECOND MESSAGE. "More AI News" is gone: what does not fit is
     carried if it is about us and dropped if it is not.
+
+    RESEARCH (NEWS-PATCH-OCT16, F7) goes between the two: after ours, at most
+    `research_max` (NEWS_RESEARCH_MAX_PER_POST, 2) of what is left of `cap`,
+    our researchers first (`research_order`); the rest is CARRIED like ours.
+    Returned as `research` too.
     """
     marker = dl.iso(today)
     bar = int(min_importance)
@@ -861,11 +927,22 @@ def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
     pool = _qualify(stories, db=db, today=today, why=_why)
 
     # ---- 1. ours first ------------------------------------------------------
-    mine = [s for s in pool if is_ours(s)]
+    mine = [s for s in pool if is_ours(s) and not is_research(s)]
     ours, carry = mine[:cap], mine[cap:]
     for s in carry:
         _why(s, f"about us, and the post is full (cap {cap}) — carried to the "
                 "next daily post")
+
+    # ---- 1b. research published (F7) ------------------------------------------
+    rmax = int(research_max if research_max is not None
+               else getattr(config, "NEWS_RESEARCH_MAX_PER_POST", 2))
+    papers = research_order([s for s in pool if is_research(s)])
+    room = max(0, min(rmax, cap - len(ours)))
+    research, later = papers[:room], papers[room:]
+    for s in later:
+        _why(s, f"research, and the post has room for {room} "
+                f"(NEWS_RESEARCH_MAX_PER_POST={rmax}) — carried to the next daily post")
+    carry = carry + later
 
     # ---- 2. the industry, in what is left -----------------------------------
     try:
@@ -887,7 +964,7 @@ def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
     industry: list = []
     dropped: list = []
     for s in pool:
-        if is_ours(s):
+        if is_ours(s) or is_research(s):
             continue
         imp = int(s.get("importance") or 3)
         topic = s.get("topic") or TOPIC_OTHER
@@ -895,7 +972,7 @@ def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
             _why(s, f"industry news at importance {imp}: below the {INDUSTRY_MIN_IMPORTANCE} "
                     "a story needs to be posted")
             continue
-        if len(ours) + len(industry) >= cap:
+        if len(ours) + len(research) + len(industry) >= cap:
             dropped.append(s)
             _why(s, f"the post is full (cap {cap}) — industry news is not carried")
             continue
@@ -917,8 +994,9 @@ def choose_main(stories: list, *, today: date, db, cap: int, per_topic: int,
         topic_counts[topic] = _count(topic) + 1
         if week_topics is not None:
             week_topics.add(topic)
-    return {"keep": ours + industry, "ours": ours, "industry": industry,
-            "carry": carry, "dropped": dropped, "skipped": skipped}
+    return {"keep": ours + research + industry, "ours": ours, "research": research,
+            "industry": industry, "carry": carry, "dropped": dropped,
+            "skipped": skipped}
 
 
 def is_breaking(story: dict, *, ours_min: int, industry_min: int) -> bool:
@@ -981,6 +1059,9 @@ def choose_breaking(stories: list, *, today: date, db, now: datetime,
     fresh: list = []
     for s in stories or []:
         if not is_breaking(s, ours_min=ours_min, industry_min=industry_min):
+            continue
+        if is_research(s):
+            _why(s, "research is never breaking — it waits for the daily post")
             continue
         if not is_ours(s) and not by_rule(s) and outlets_of(s) < int(min_outlets):
             _why(s, f"industry news at {int(s.get('importance') or 0)} from "
@@ -1347,14 +1428,19 @@ def render(stories: list, *, mode: str = MODE_MAIN, day: Optional[date] = None,
         tail = answer_tail(remaining, label, cap or len(picked), kind=kind, floor=floor) \
             if answer else ""
         return body + ("\n" + tail if tail else "")
-    ours = [s for s in picked if is_ours(s)]
-    industry = [s for s in picked if not is_ours(s)]
+    research = [s for s in picked if is_research(s)]
+    ours = [s for s in picked if is_ours(s) and not is_research(s)]
+    industry = [s for s in picked if not is_ours(s) and not is_research(s)]
     lines = [OPENER]
     if ours:
         lines.append(LABEL_OURS)
         lines += [story_line(s) for s in ours]
-        if industry:
-            lines.append(LABEL_INDUSTRY)
+    if research:
+        # NEWS-PATCH-OCT16 (F7): the research group, only when there is research.
+        lines.append(LABEL_RESEARCH)
+        lines += [story_line(s) for s in research]
+    if industry and (ours or research):
+        lines.append(LABEL_INDUSTRY)
     lines += [story_line(s) for s in industry]
     lines.append(CLOSER)
     return _join(lines)
@@ -2081,7 +2167,7 @@ def story_from_feed(row: dict, *, topics: Optional[list] = None,
     """
     flag = 1 if is_ours(row) else 0
     kind = str(row.get("kind") or "")
-    if not flag:
+    if not flag and kind != KIND_RESEARCHER:
         kind = KIND_INDUSTRY
     elif kind in ("", KIND_INDUSTRY):
         kind = KIND_POC
@@ -2110,6 +2196,7 @@ def story_from_feed(row: dict, *, topics: Optional[list] = None,
         # two-outlet breaking rule) and who scored it ("rule" = the launch
         # rule, which needs no second outlet).
         "story_key": str(row.get("story_key") or ""),
+        "summary": str(row.get("summary") or ""),
         "outlet_count": outlets_of(row),
         "scored_by": str(row.get("scored_by") or ""),
     }

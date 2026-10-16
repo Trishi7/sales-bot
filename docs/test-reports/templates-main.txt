@@ -1341,6 +1341,24 @@ Let me know if you want me to dig into any of these
 [news.render]
 Hey here's today's round-up:
 Our PoCs are in the news:
+- Sarvam AI raises $90M to scale Indic language models ([example.org](<https://example.org/sarvam>))
+Elsewhere in AI
+- State AGs launch investigations into OpenAI AI safety practices ([example.org](<https://example.org/state-ags>))
+Let me know if you want me to dig into any of these
+==============================================================================
+[news.render]
+Hey here's today's round-up:
+Our PoCs are in the news:
+- Sarvam AI raises $90M to scale Indic language models ([example.org](<https://example.org/sarvam>))
+Research published:
+- Preference data from student annotators for Hinglish speech ([arxiv.org](<https://arxiv.org/abs/2610.01234>))
+Elsewhere in AI
+- State AGs launch investigations into OpenAI AI safety practices ([example.org](<https://example.org/state-ags>))
+Let me know if you want me to dig into any of these
+==============================================================================
+[news.render]
+Hey here's today's round-up:
+Our PoCs are in the news:
 - Synthflow raises $20M Series A ([example.org](<https://example.org/synthflow-raises-20m-series-a>))
 
 - Dr. David Gamez on machine consciousness at the Royal Institution ([The Guardian](<https://news.google.com/rss/articles/dr-david-gamez-on-machine-consciousness-at-the-royal-institution?oc=5>))
@@ -1350,6 +1368,12 @@ Elsewhere in AI
 - Oscar raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/oscar-raises-a-billion-dollar-round?oc=5>))
 
 - November raises a billion dollar round ([Reuters](<https://news.google.com/rss/articles/november-raises-a-billion-dollar-round?oc=5>))
+Let me know if you want me to dig into any of these
+==============================================================================
+[news.render]
+Hey here's today's round-up:
+Research published:
+- Preference data from student annotators for Hinglish speech ([arxiv.org](<https://arxiv.org/abs/2610.01234>))
 Let me know if you want me to dig into any of these
 ==============================================================================
 [news_company_screen]

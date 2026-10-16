@@ -260,8 +260,10 @@ async def through_the_bot(check) -> None:
         now = dl.real_now_ist()
         midnight = datetime.combine(now.date(), time(0, 0), IST)
         span = max(60, int((now - midnight).total_seconds()) - 60)
+        # Yesterday's two, a minute or two before midnight: outside "today", inside "the last 24
+        # hours" at any hour this runs (it was 22:00, which left the last 24 hours after 22:00).
         rows = [(title(i, "chip startup ships a sensor"), 5,
-                 midnight - timedelta(hours=2, minutes=i), "evals") for i in range(2)]
+                 midnight - timedelta(minutes=1 + i), "evals") for i in range(2)]
         rows += [(title(i), 4, now - timedelta(seconds=span * (i + 1) // 7), "evals")
                  for i in range(2, 7)]
         seed(w, rows)

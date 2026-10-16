@@ -819,6 +819,19 @@ CREATE TABLE IF NOT EXISTS dm_no_meeting_mentions (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- R6: WHO WAS LAST NAMED UNDER "Email check: connected, no DM yet", and when
+-- (RULES-OCT16). The same rotation as R7's: least recently named first, so the
+-- five names change from post to post. Written only by the sender, after a
+-- real send. A person leaves the rule when the sheet moves (a working email,
+-- or LI DM Sent filled in); nothing here ends anybody.
+CREATE TABLE IF NOT EXISTS li_no_dm_mentions (
+    row_key    TEXT PRIMARY KEY,
+    last_date  TEXT NOT NULL DEFAULT '',
+    mentions   INTEGER NOT NULL DEFAULT 0,
+    last_block TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- R13: WHAT EACH POST SAID, by Discord message id.
 --
 -- RETIRED 12 Oct 2026. It existed so a reply to the post ("done") could be
@@ -3081,6 +3094,37 @@ class DB:
                 "last_block = excluded.last_block, updated_at = CURRENT_TIMESTAMP",
                 (key, str(on_date or ""), str(block or "")),
             )
+
+    def li_no_dm_state(self) -> Optional[dict]:
+        """{row_key: {last_date, mentions, last_block}} for R6's rotation, or
+        None when it cannot be read (the rule then names nobody, as R7 does:
+        an empty dict would start the rotation again from the top)."""
+        try:
+            with self.conn() as c:
+                rows = c.execute("SELECT row_key, last_date, mentions, last_block "
+                                 "FROM li_no_dm_mentions").fetchall()
+            return {r["row_key"]: {"last_date": str(r["last_date"] or ""),
+                                   "mentions": int(r["mentions"] or 0),
+                                   "last_block": str(r["last_block"] or "")} for r in rows}
+        except Exception:
+            log.exception("[db] R6's rotation state could not be read. R6 names nobody "
+                          "until it can.")
+            return None
+
+    def record_li_no_dm_mention(self, row_key: str, *, on_date: str,
+                                block: str = "") -> None:
+        """R6 named this contact in a post that really went out. Called by the
+        sender, never by the engine."""
+        key = str(row_key or "").strip()
+        if not key:
+            return
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO li_no_dm_mentions (row_key, last_date, mentions, last_block) "
+                "VALUES (?, ?, 1, ?) ON CONFLICT(row_key) DO UPDATE SET "
+                "last_date = excluded.last_date, mentions = mentions + 1, "
+                "last_block = excluded.last_block, updated_at = CURRENT_TIMESTAMP",
+                (key, str(on_date or ""), str(block or "")))
 
     def open_proposal(self, *, proposal_key: str, kind: str, tab: str,
                       sheet_row, row_key: str, company: str, poc: str,

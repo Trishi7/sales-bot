@@ -48,10 +48,44 @@ _ABSENT = object()
 
 
 def _example(name: str) -> str:
+    """A default from .env.example: its live line, or — for R7's three timing
+    settings, retired while R7 is off (RULES-OCT16) — its line in the RETIRED
+    block ("# NAME=value  -> ...")."""
+    retired = None
     for line in open(os.path.join(ROOT, ".env.example"), encoding="utf-8"):
         if line.startswith(name + "="):
             return line.split("=", 1)[1].strip()
+        m = re.match(r"^#\s*" + re.escape(name) + r"=(\S*)", line)
+        if m and retired is None:
+            retired = m.group(1)
+    if retired is not None:
+        return retired
     raise AssertionError(f"{name} is not in .env.example")
+
+
+@contextlib.contextmanager
+def r7_back_on():
+    """R7 IS OFF SINCE 16 OCT (RULES-OCT16). These are R7's own checks, so they
+    run with R7 TURNED BACK ON exactly as the yaml note says — enabled: true and
+    back in Monday's order — which is the ticket's T10: it runs as before."""
+    path = (config.BOT_RULES_FILE or "").strip()
+    shipped = open(path, encoding="utf-8").read()
+    on = (shipped.replace("  mon: [R4, R1, R10]", "  mon: [R4, R7, R1, R10]")
+          .replace("    # off since 16 Oct by decision; R13 owns the chase\n"
+                   "    enabled: false", "    enabled: true"))
+    assert on != shipped, "R7's off switch is not where the checks expect it"
+    tmp = tempfile.mkdtemp(prefix="saley-r7-on-")
+    here = os.path.join(tmp, "bot_rules.yaml")
+    open(here, "w", encoding="utf-8").write(on)
+    before = config.BOT_RULES_FILE
+    config.BOT_RULES_FILE = here
+    rules_mod.reload(here)
+    try:
+        yield
+    finally:
+        config.BOT_RULES_FILE = before
+        rules_mod.reload()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _list(name: str) -> list:
@@ -561,7 +595,8 @@ def settings(check):
     check("DM_NO_MEETING_DM_SENT_MARKERS empty: the boot check warns that nobody would ever qualify",
           [("nobody would ever qualify" in m) for m in boot(DM_NO_MEETING_DM_SENT_MARKERS=[])[1]], [True])
     rule = rules_mod.by_id("R7")
-    check("R7: Mondays, three a post, counted toward the cap, second in Monday's order",
+    check("T10 R7 turned back on: Mondays, three a post, counted toward the cap, second in "
+          "Monday's order",
           (rule.weekdays, rule.max_items_per_post, rule.counts_toward_cap, rule.enabled,
            [r for r in rules_mod.daily_order().get(0, [])][:2] if hasattr(rules_mod, "daily_order") else ["R4", "R7"]),
           ((0,), 3, True, True, ["R4", "R7"]))
@@ -573,14 +608,36 @@ def settings(check):
     check("...and nothing about days since the DM or the last note", [w for w in ("last note", "7 days") if w in wordy], [])
 
 
+def switched_off(check):
+    """RULES-OCT16: R7 is off in the shipped file and out of Monday's order."""
+    print("\nR7 IS OFF (RULES-OCT16) — the shipped file")
+    rule = rules_mod.by_id("R7")
+    order = rules_mod.order_for(MON) if hasattr(rules_mod, "order_for") else []
+    check("T9 R7 disabled: enabled false, not in Monday's order (R4, R1, R10)",
+          (rule.enabled, order), (False, ["R4", "R1", "R10"]))
+    monday = [r.id for r in rules_mod.for_day(MON)]
+    with pinned():
+        got = engine(seven(), rule_ids=tuple(monday))
+    check("T9 ...and with R7 off, Monday's rules leave it out and nothing is posted for it",
+          ("R7" in monday, [a["poc"] for a in got["actions"] if a.get("rule_id") == "R7"]),
+          (False, []))
+    text = open(os.path.join(ROOT, ".env.example"), encoding="utf-8").read()
+    names = ("DM_NO_MEETING_DAYS", "DM_NO_MEETING_BOOKED_GAP_DAYS", "DM_NO_MEETING_MAX_CONTACTS")
+    check("T11 .env.example: the three R7 timing settings are in the RETIRED block, commented, and not live",
+          ([n for n in names if re.search(rf"^# ?{n}=", text, re.M) is None],
+           [n for n in names if re.search(rf"^{n}=", text, re.M)]), ([], []))
+
+
 def run(check):
-    with pinned():
-        who_is_picked(check)
-        on_hold_and_stops(check)
-        the_rotation(check)
-        behind_rule_13(check)
-        the_message(check)
-    the_bot(check)
-    with pinned():
-        never_in_the_message(check)
-    settings(check)
+    switched_off(check)
+    with r7_back_on():
+        with pinned():
+            who_is_picked(check)
+            on_hold_and_stops(check)
+            the_rotation(check)
+            behind_rule_13(check)
+            the_message(check)
+        the_bot(check)
+        with pinned():
+            never_in_the_message(check)
+        settings(check)

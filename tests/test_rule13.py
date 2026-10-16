@@ -760,9 +760,9 @@ class TestShippedRules:
         assert r.plain and r.sheet_wording
 
     def test_O1_the_days(self):
-        # SINCE NFT2-1069 (8 Oct): R7 is back on Mondays and R11 runs on Wednesdays only.
+        # SINCE NFT2-1069 (8 Oct) R11 runs on Wednesdays only. R7 IS OFF SINCE 16 OCT (RULES-OCT16).
         # R14 is anchored (no weekdays), like R8 and R9, so it gets to look every day.
-        assert ids(MONDAY) == ["R1", "R4", "R13", "R7", "R8", "R9", "R10", "R14"]
+        assert ids(MONDAY) == ["R1", "R4", "R13", "R8", "R9", "R10", "R14"]
         assert ids(THURSDAY) == ["R1", "R13", "R5", "R8", "R9", "R12", "R14"]
         assert ids(date(2026, 10, 14)) == ["R1", "R3", "R13", "R8", "R9", "R11", "R14"]
         assert ids(SATURDAY) == ["R8", "R9", "R14"]
@@ -773,13 +773,19 @@ class TestShippedRules:
     def test_O1_R7_is_back_on_mondays_and_produces_nothing_for_a_person_rule_13_covers(self):
         """7 Oct: "rule 13 supercedes this", and R7 was switched off. 8 Oct (NFT2-1069): R7 is back on Mondays, but
         never for a person Rule 13 covers. The same person as before — Connected, with an LI Connected Date, DM'd
-        20 days ago, no meeting — still gets nothing from R7, and is Rule 13's."""
-        assert rules_mod.by_id("R7").enabled is True
-        assert "R7" in ids(MONDAY) and "R7" not in ids(TUESDAY)
-        tab = fx.parse([fx.person(1, name="Priya Rao", li_date=date(2026, 8, 1), dm_sent="Sent",
-                                  dm_date=MONDAY - D(days=20), step="Call the PoC")])
-        res = nextaction.run(today=MONDAY, rows=list(tab.rows), day_rules=rules_mod.for_day(MONDAY),
-                             next_step_state={}, dm_no_meeting_state={})
+        20 days ago, no meeting — still gets nothing from R7, and is Rule 13's.
+
+        16 Oct (RULES-OCT16): R7 is off; this runs with it TURNED BACK ON, to show it comes back as it was."""
+        import dm_no_meeting_checks as dmc
+
+        assert rules_mod.by_id("R7").enabled is False and "R7" not in ids(MONDAY)
+        with dmc.r7_back_on():
+            assert rules_mod.by_id("R7").enabled is True
+            assert "R7" in ids(MONDAY) and "R7" not in ids(TUESDAY)
+            tab = fx.parse([fx.person(1, name="Priya Rao", li_date=date(2026, 8, 1), dm_sent="Sent",
+                                      dm_date=MONDAY - D(days=20), step="Call the PoC")])
+            res = nextaction.run(today=MONDAY, rows=list(tab.rows), day_rules=rules_mod.for_day(MONDAY),
+                                 next_step_state={}, dm_no_meeting_state={})
         # CHANGED 13 Oct 2026: R7 is the escalation behind R13 and no longer reads `covered_by_next_steps`. It
         # produces nothing here because R13, listed first, names the person today and R7 skips them.
         assert not [a for a in res["actions"] if a["rule_id"] == "R7"]
@@ -798,8 +804,11 @@ class TestShippedRules:
                                   dm_date=MONDAY - D(days=21), step="Call the PoC")])
         row = dict(tab.rows[0], sid_li_added="")
         assert nextaction.covered_by_next_steps(row) is False
-        res = nextaction.run(today=MONDAY, rows=[row], day_rules=rules_mod.for_day(MONDAY), next_step_state={},
-                             dm_no_meeting_state={})
+        import dm_no_meeting_checks as dmc
+
+        with dmc.r7_back_on():                  # R7 is off since 16 Oct (RULES-OCT16)
+            res = nextaction.run(today=MONDAY, rows=[row], day_rules=rules_mod.for_day(MONDAY),
+                                 next_step_state={}, dm_no_meeting_state={})
         assert [a["poc"] for a in res["by_rule"].get("R7") or []] == ["Priya Rao"]
         assert not res["by_rule"].get("R13")
 

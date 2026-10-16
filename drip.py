@@ -1263,7 +1263,7 @@ HEADINGS = {
     # ("**PoCs to contact — Wisprlow.ai**") and a blank line under it, so it is
     # part of the rendered block (`prospects.post_parts`), like R11's opener.
     "R5": "",
-    "R6": "Connected, no DM yet",
+    "R6": "Email check: connected, no DM yet",          # RULES-OCT16
     "R7": "No meeting booked yet",
     # R8 IS TWO POSTS (12 Oct 2026), each about every meeting it lists, so
     # neither names a company: today's meetings, and the 3-day and 5-day ones.
@@ -2044,6 +2044,8 @@ def li_no_dm_shown(actions: list, *, plain_cap: int = 5) -> list:
     """
     rows = li_no_dm_order(actions)
     placed = [a for a in rows if a.get("block") in LI_NO_DM_BLOCK_ORDER]
+    if not placed and any(a.get("email_work_done") for a in actions or ()):
+        return []                     # the work ran and placed nobody (RULES-OCT16)
     if not placed:
         return rows[:max(1, int(plain_cap or 5))]
     return sorted(placed, key=lambda a: LI_NO_DM_BLOCK_ORDER[a["block"]])
@@ -2081,6 +2083,13 @@ def nothing_to_say(message: dict) -> bool:
         # Cannot happen (nobody due means no item, so no group); if it ever
         # did, an opener with nobody under it must not be posted.
         return not shown_contacts(message)
+    if message.get("type") == nextaction.R_LI_NO_DM:
+        # R6 (RULES-OCT16): THE EMAIL WORK RAN AND NAMED NOBODY, and the
+        # all-clear could not honestly be said (somebody could not be
+        # checked). Nothing is posted: never a composed line, never a nudge
+        # to DM.
+        return not notice_of(message) and not shown_contacts(message) and any(
+            a.get("email_work_done") for a in message.get("actions") or ())
     if message.get("type") == nextaction.R_NEWS_SCREEN:
         # R2: NOTHING SURVIVED THE SCREEN, OR THE SCREEN WAS CANCELLED (the
         # sheets could not be read). Every company in the news already being
@@ -2346,8 +2355,11 @@ def points_of(message: dict) -> Optional[dict]:
         # address was found AND the bot may write one.
         lines = wording.li_no_dm_post([
             {"who": a.get("who") or wording.next_step_who(a.get("poc"), a.get("company")),
-             "block": a.get("block") or "plain", "emails": a.get("emails_found") or [],
-             "domains": a.get("dead_domains") or []} for a in people], ask=False)
+             "block": a.get("block") or "plain",
+             "emails": (a.get("dead_addresses") if a.get("block") == "dead"
+                        else a.get("emails_found")) or [],
+             "source": a.get("email_source_label") or "",
+             "reason": a.get("dead_reason") or ""} for a in people], ask=False)
         offer = wording.LI_NO_DM_ADD_QUESTION if (
             config.EMAIL_WRITE_ALLOWED and any(a.get("block") == "found" for a in people)) else ""
         return {"header": "", "lines": lines + ([""] if offer else []), "extra": [],

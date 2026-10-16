@@ -29,12 +29,25 @@ def _run(fn, *, pin=True) -> None:
         if got != want:
             failed.append(f"{name}: got {got!r}, want {want!r}")
 
-    if pin:
-        with dnm.pinned():
+    # R7 IS OFF SINCE 16 OCT (RULES-OCT16): its own checks run with it turned back on.
+    with dnm.r7_back_on():
+        if pin:
+            with dnm.pinned():
+                fn(check)
+        else:
             fn(check)
-    else:
-        fn(check)
     assert seen, "the group made no checks at all"
+    assert not failed, "\n".join(failed)
+
+
+def test_r7_is_off_in_the_shipped_file_t9_t11():
+    failed = []
+
+    def check(name, got, want=True):
+        if got != want:
+            failed.append(f"{name}: got {got!r}, want {want!r}")
+
+    dnm.switched_off(check)
     assert not failed, "\n".join(failed)
 
 

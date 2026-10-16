@@ -1,4 +1,10 @@
-"""R6 "CONNECTED, NO DM YET" (rebuilt 12 Oct 2026). OFFLINE.
+"""R6 "EMAIL CHECK: CONNECTED, NO DM YET" (rebuilt 12 Oct 2026; RULES-OCT16 on 16 Oct). OFFLINE.
+
+RULES-OCT16 (T1-T8 in the check names): the post is the email work only. A person whose sheet email passes
+the checks is not named (block 1 is behind LI_NO_DM_SHOW_WITH_EMAIL, off); no LI Connected Date is not
+eligible; the order is a rotation, least recently named first; the all-clear is "Everyone connected has a
+working email on file."; an address on the sheet that cannot receive mail is shown with the reason. Some of
+the paragraphs below describe the 12 Oct shape and are kept for the checks that still hold.
 
     python verify_li_no_dm.py            # every check
     python verify_li_no_dm.py --show     # also print the rendered messages

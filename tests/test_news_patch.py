@@ -59,3 +59,6 @@ def test_every_hour_t11_t12():
 def test_health_line_t13():
     _run(patch.health)
 
+
+def test_research_published_t15_to_t18():
+    _run(patch.research)

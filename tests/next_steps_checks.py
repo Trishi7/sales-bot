@@ -47,9 +47,17 @@ _ABSENT = object()
 
 
 def _example(name: str) -> str:
+    """A default from .env.example: its live line, or its line in the RETIRED block (R7's three timing
+    settings, retired while R7 is off since 16 Oct — RULES-OCT16)."""
+    retired = None
     for line in open(os.path.join(ROOT, ".env.example"), encoding="utf-8"):
         if line.startswith(name + "="):
             return line.split("=", 1)[1].strip()
+        m = re.match(r"^#\s*" + re.escape(name) + r"=(\S*)", line)
+        if m and retired is None:
+            retired = m.group(1)
+    if retired is not None:
+        return retired
     raise AssertionError(f"{name} is not in .env.example")
 
 

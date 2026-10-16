@@ -3123,6 +3123,17 @@ typed to mean "not assessed yet" stops that contact for every rule.
 
 ### Rule 7: no meeting booked yet, the escalation behind rule 13
 
+**OFF SINCE 16 OCT 2026, by decision (RULES-OCT16): Rule 13 owns the chase.**
+`enabled: false` on R7 in `bot_rules.yaml`, and R7 is out of Monday's order
+(Monday is R4, R1, R10). The code, this section and `verify_dm_no_meeting.py`
+stay: the checks run with R7 turned back on. To turn it back on, set
+`enabled: true` AND put R7 back in `daily_order` (mon: [R4, R7, R1, R10]); a
+switched-off rule left in the order, or a switched-on one left out, is refused
+at startup. Its three timing settings (`DM_NO_MEETING_DAYS`,
+`DM_NO_MEETING_BOOKED_GAP_DAYS`, `DM_NO_MEETING_MAX_CONTACTS`) are in the
+RETIRED block of `.env.example`; the code still reads them, so it comes back
+with those values.
+
 **Rebuilt 13 Oct 2026.** Rule 13 does the chasing: from a week after the DM
 its call line says "We need to call these PoCs" every weekday. Rule 7 says, on
 Mondays, that the chasing is not working. `python verify_dm_no_meeting.py
@@ -3221,6 +3232,34 @@ named. A preview writes nothing; a test day on a database that is not a
 `*_test.db` writes nothing; a simulation writes to its sandbox copy.
 
 ### Rule 6: connected, no DM yet, and the email check
+
+**RULES-OCT16 (16 Oct, Vaishnavi): the post is the email work only**, under
+"Email check: connected, no DM yet":
+
+- **A person whose email is on the sheet and passes the checks** (an address,
+  and its domain can receive mail) **is not named.** They need no email work.
+  Block 1, "Verified email on file, no DM yet:", is behind
+  `LI_NO_DM_SHOW_WITH_EMAIL` (false); turned on, it goes first with up to 5
+  names, then the email work; ten at most.
+- **Block 2, at most `LI_NO_DM_EMAIL_NAMES_PER_POST` (5) people:** "Found an
+  email:" (no usable address on the sheet, and one search found one word for
+  word in a snippet: name, company, the address, where it was found; then
+  "Would you like me to add these emails to the sheet?", the email_write
+  proposal behind `EMAIL_WRITE_ALLOWED`), "Email on the sheet cannot receive
+  mail:" (the address on the sheet and the reason: "not a valid email address"
+  or "its domain can't receive mail") and "Couldn't find an email:".
+- **No LI Connected Date: not eligible** (`LI_NO_DM_REQUIRE_DATE`, logged once).
+- **A rotation**, least recently named first (`li_no_dm_mentions`, written by
+  the sender after a real send); everybody who qualifies is handed on, and the
+  walk stops when the blocks are full. A person leaves when their sheet email
+  passes the checks or LI DM Sent is filled in.
+- **Nobody needs anything:** "Everyone connected has a working email on file."
+  When somebody could not be checked (search off or out of budget, no DNS),
+  nothing is posted rather than claim it. No line asks anybody to send a DM.
+- A sheet address that cannot receive mail is not searched for again: a found
+  address could only be written into a BLANK Email cell (the hard rule).
+
+The rest of this section describes the 12 Oct shape where it still holds.
 
 **Two things in one post (rebuilt 12 Oct 2026):** a reminder that these people
 are connected and have had no DM, and a check on whether we hold a working
@@ -3854,7 +3893,7 @@ python -m reconnect      # R14's dates, rules and yes-reading
 python verify_reconnect.py   # R14 end to end, 35 numbered cases
 ```
 
-`rules.py` asserts that fourteen rules load (R13 listed before R5, R14 last), that R7 is on and Mondays only,
+`rules.py` asserts that fourteen rules load (R13 listed before R5, R14 last), that R7 is off (since 16 Oct) and in no day's order,
 that R11 is Wednesdays only, that each weekday's order is the one in `daily_order`, that a file whose
 `weekdays` and `daily_order` disagree is refused, that every trigger
 they name is implemented, that each runs on the right weekdays and no others,
@@ -4187,14 +4226,14 @@ answerable — *"yes, done"* means something. A document is not.
 
 | Day | 14:00 | 16:00 | 18:00 | 20:00 |
 |---|---|---|---|---|
-| Monday | R4 Deliverables | R7 No meeting booked yet | R1 AI news | R10 Closure support |
+| Monday | R4 Deliverables | R1 AI news | R10 Closure support | |
 | Tuesday | R5 Prospects | R6 LinkedIn connected, no DM | R2 News screen | R1 AI news |
 | Wednesday | R11 New company PoCs | R1 AI news | R3 AI events | |
 | Thursday | R5 Prospects | R1 AI news | R12 Sales packages | |
 | Friday | R2 News screen | R6 LinkedIn connected, no DM | R1 AI news | |
 
 - **A rule with nothing to post takes no slot and the next one moves up.** A
-  Monday with no P1 deliverable due is R7 14:00, R1 16:00, R10 18:00. A slot is
+  Monday with no P1 deliverable due is R1 14:00, R10 16:00 (R7 is off since 16 Oct). A slot is
   "how many spaced posts have gone today", not a time a rule owns.
 - **Something that appears after the day was planned takes the next free
   slot.** The plan is recomputed on every tick; what has been sent keeps its
@@ -4723,6 +4762,7 @@ no daily cap. A bug-fix of the v1 flow, not the v2 rebuild:
 | F3 scoring | `news.preselect` is a RANK, not a cut: our people, our companies, stories two outlets carry, topic queries, the rest (newest first in each; what an earlier cycle could not reach first of all). Up to 3 calls of 40 a cycle; the rest is "carried" and scored first next cycle. A failed call keeps the batches before it and ends the cycle `unscored`. **The launch rule**: a title naming a frontier model (Gemini, GPT, Claude, Llama, Grok, Mistral, DeepSeek, Qwen, o-series like "o5") with a launch word is importance 5, topic "frontier model", `scored_by` "rule", in code, before the model | `NEWS_SCORE_MAX_ITEMS`, `NEWS_SCORE_MAX_CALLS` |
 | F4 breaking | 1 a cycle, 4 a day (counted from today's breaking rows, IST; past it a candidate is held for the daily post). An industry 5 needs two outlets, or the launch rule | `NEWS_BREAKING_MAX_PER_CYCLE`, `NEWS_BREAKING_MAX_PER_DAY`, `NEWS_BREAKING_MIN_OUTLETS` |
 | F5 every hour | A tick runs the OLDEST unclaimed slot of today (`news.due_slots`), one a tick, noted "late by N min"; more than 3 whole hours late is claimed `skipped`. A pull stops at a source boundary after 600 s (`partial`). A tick that fires during a cycle returns at once (the lock) | `NEWS_CYCLE_LATE_SKIP_HOURS`, `NEWS_CYCLE_MAX_SECONDS` |
+| F7 research | A third group in the daily post, "Research published:", between "Our PoCs are in the news:" and "Elsewhere in AI": a story by one of OUR researchers (kind `researcher`: the arXiv author lane and the researcher name batches), or a paper — a link on arxiv.org or huggingface.co/papers — whose title or summary has a research keyword. Both are importance 4 BY RULE (`scored_by` "rule"); the model gives them a topic and a clause, never the score. At most 2 a post, inside the five; our researchers first, then the most keywords, then newest; the rest is carried. Never breaking. No research, no heading; research alone, no "Elsewhere in AI". No arXiv category or Hugging Face papers feed is configured by default: add one to `NEWS_RSS_FEEDS` to use the keyword lane | `NEWS_RESEARCH_MAX_PER_POST`, `NEWS_RESEARCH_KEYWORDS` |
 | F6 health | At 23:45 IST one message to the TEST channel (never the sales channel), outside the daily cap: cycles planned / run / late / skipped / partial; items fetched / new / copies merged; flagged; noisy names; scored by the model / by rule / carried; breaking posted against the budget, and when it was spent; the daily post's stories (`wording.news_health_lines`) | `NEWS_HEALTH_TIME` |
 
 Why five cycles were missed, and the `.env` lines, are in DEPLOY.md ("Upgrading
@@ -4733,7 +4773,9 @@ reproduces the 14 Oct pattern exactly. Checked offline by
 #### The daily post
 
 One message a weekday, at most `NEWS_MAX_ITEMS` (5) stories: **ours first, then
-the industry** (`news.choose_main`). "More AI News" is gone. **Nothing to send
+research, then the industry** (`news.choose_main`; the "Research published:"
+group, at most `NEWS_RESEARCH_MAX_PER_POST`, is printed only when there is
+research — F7 above). "More AI News" is gone. **Nothing to send
 is no post at all** — the quiet line is retired for R1 (somebody who *asks* for
 the news on a quiet day is still told so). The spread limits
 (`NEWS_PER_TOPIC_PER_DAY`, `NEWS_TOPICS_PER_WEEK`) apply to the industry part

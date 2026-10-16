@@ -1,7 +1,7 @@
-"""NEWS-PATCH-OCT16 "THE GEMINI 4 MISS" — every test case of the ticket, T1 to T14.
+"""NEWS-PATCH-OCT16 "THE GEMINI 4 MISS" — every test case of the ticket, T1 to T19.
 
-    python verify_news_patch.py            every check, then the T1-T14 table
-    python verify_news_patch.py --table    the T1-T14 table only
+    python verify_news_patch.py            every check, then the T1-T19 table
+    python verify_news_patch.py --table    the T1-T19 table only
 
 What is checked (the ticket's test cases and its edge cases):
 
@@ -18,6 +18,9 @@ What is checked (the ticket's test cases and its edge cases):
                   the cycle lock; the time cap
   F6 health       the 23:45 line's numbers against the temp DB; the test
                   channel only; the daily cap untouched
+  F7 research     "Research published:": our researchers' papers and keyword
+                  papers 4 by rule, never breaking, at most 2 a post, the rest
+                  carried; no research, no heading
   T14 templates   tools/render_templates.py re-run and compared byte for byte
                   with docs/test-reports/templates-main.txt (a few minutes)
 
@@ -53,7 +56,7 @@ import news_patch_checks  # noqa: E402
 
 logging.getLogger().setLevel(logging.ERROR)
 QUIET = "--table" in sys.argv
-CASES = range(1, 15)
+CASES = range(1, 20)
 failures = 0
 passed = 0
 results: dict = {n: [] for n in CASES}
@@ -75,7 +78,7 @@ def check(name, got, want=True):
 
 
 def table() -> int:
-    print("\nT1-T14")
+    print("\nT1-T19")
     bad = 0
     for n in CASES:
         got = results.get(n) or []

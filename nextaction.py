@@ -131,7 +131,7 @@ TYPE_LABELS = {
     R_EVENTS: "AI events & summits",
     R_DELIVERABLES: "Deliverables due",
     R_PROSPECTS: "Prospects to contact",
-    R_LI_NO_DM: "Connected, no DM yet",
+    R_LI_NO_DM: "Email check: connected, no DM yet",
     R_DM_NO_MEETING: "No meeting booked yet",
     R_MEETING_PREP: "Meeting prep",
     R_MEETING_FOLLOWUP: "Meeting done, no next steps",
@@ -1105,11 +1105,14 @@ def _r_prospects(rule, ctx) -> list:
     return out
 
 
-# How many people R6 hands on, in order, for the sender to check emails for
-# and choose its two lists from. More than the ten a post can name, because
-# some will be kept by an earlier rule for the day and the email blocks may
-# need to look past the first ten to find anybody with email news.
-LI_NO_DM_SCAN = 30
+# R6 HANDS ON EVERYBODY WHO QUALIFIES, in rotation order (RULES-OCT16). It
+# used to hand on the first 30; with the rotation, people whose email is fine
+# are never named, so they stay "least recently named" for ever and would fill
+# every scan. The sender's walk stops as soon as the post's blocks are full.
+LI_NO_DM_SCAN = None
+
+# Each person with no LI Connected Date is logged once a process, not every tick.
+_R6_UNDATED_LOGGED: set = set()
 
 
 def li_dm_state(row: dict) -> str:
@@ -1137,18 +1140,30 @@ def li_dm_state(row: dict) -> str:
 
 
 def li_no_dm_order(person: dict) -> tuple:
-    """R6's ORDER, in one place: people WITH an LI Connected Date first,
-    oldest connection first; then people with none, in sheet order. NOTHING
-    ELSE REORDERS THEM: no rotation, no "whose turn is it"."""
+    """R6's ORDER, in one place (RULES-OCT16): the people named TODAY first (a
+    post already gone keeps its people for the rest of the day), then the
+    ROTATION — least recently named first, never named ahead of everybody —
+    then the oldest connection, then sheet order."""
     connected = person.get("connected")
     row_no = int(person.get("sheet_row") or 0)
+    last = str(person.get("last_date") or "")
+    today = 0 if person.get("named_today") else 1
     if connected is None:
-        return (1, "", row_no)
-    return (0, dl.iso(connected), row_no)
+        return (today, last, 1, "", row_no)
+    return (today, last, 0, dl.iso(connected), row_no)
 
 
 def _r_li_no_dm(rule, ctx) -> list:
-    """R6 — connected on LinkedIn, no DM yet; and do we hold a working email.
+    """R6 — connected on LinkedIn, no DM yet: THE EMAIL WORK (RULES-OCT16).
+
+    WHAT CHANGED ON 16 OCT (Vaishnavi): the post is the email work. A person
+    whose email is on the sheet and passes the checks needs nothing and is not
+    named (block 1, "Verified email on file", is behind LI_NO_DM_SHOW_WITH_EMAIL,
+    off). A person with NO LI Connected Date is not eligible
+    (LI_NO_DM_REQUIRE_DATE). The order is a ROTATION, least recently named
+    first (`ctx["li_no_dm_state"]`, written by the sender after a real send;
+    None means unreadable and names nobody). Everybody who qualifies is handed
+    on; the sender's walk stops when the blocks are full.
 
     THREE COLUMNS AND NOTHING ELSE: LI Connected Date, LI DM Sent, Email id.
     It does not read "Sid - LI Addition".
@@ -1188,12 +1203,19 @@ def _r_li_no_dm(rule, ctx) -> list:
     source = ctx.get("prospect_rows")
     rows = list((source if source is not None else ctx.get("rows")) or ())
     report = {"rows": len(rows), "qualify": 0, "dated": 0, "undated": 0, "sent": 0,
-              "replied": 0, "other": 0, "not_yet": 0, "handed_on": 0}
+              "replied": 0, "other": 0, "not_yet": 0, "handed_on": 0, "no_date": 0}
     ctx.setdefault("reports", {})[rule_id] = report
     if not rows:
         log.error("[rules] %s: the Outreach PoCs tab came back with NO ROWS, so nothing is "
                   "posted. An empty tab is not the same as nobody waiting on a DM.", rule_id)
         return []
+    state = ctx.get("li_no_dm_state", {})
+    if state is None:
+        log.error("[rules] %s: the rotation state could not be read, so nobody is named. "
+                  "Guessing would start the rotation from the top.", rule_id)
+        return []
+    need_date = bool(getattr(config, "LI_NO_DM_REQUIRE_DATE", True))
+    today_iso = dl.iso(today)
 
     people = []
     for row in rows:
@@ -1207,21 +1229,33 @@ def _r_li_no_dm(rule, ctx) -> list:
             report[said] += 1
             continue
         connected = _date(row, "li_connected_date")
+        if connected is None and need_date:
+            report["no_date"] += 1
+            key = _contact_key(row)
+            if key not in _R6_UNDATED_LOGGED:
+                _R6_UNDATED_LOGGED.add(key)
+                log.info("[rules] %s: %s (%s) has no LI Connected Date, so is not eligible "
+                         "(LI_NO_DM_REQUIRE_DATE)", rule_id, _text(row, "name"),
+                         _text(row, "company"))
+            continue
         if connected is not None and _due(connected, days) > today:
             report["not_yet"] += 1
             continue
         report["dated" if connected is not None else "undated"] += 1
+        last = str((state.get(_contact_key(row)) or {}).get("last_date") or "")
         people.append({"row": row, "connected": connected, "sheet_row": row.get("_row"),
-                       "until": until})
+                       "until": until, "last_date": last,
+                       "named_today": last == today_iso})
     report["qualify"] = len(people)
     people.sort(key=li_no_dm_order)
-    handed = people[:max(1, int(LI_NO_DM_SCAN))]
+    handed = people if LI_NO_DM_SCAN is None else people[:max(1, int(LI_NO_DM_SCAN))]
     report["handed_on"] = len(handed)
     log.info("[rules] %s: %d row(s) read (the whole tab); %d qualify (%d with a connected date "
              "%d+ days old, %d with no connected date); out: %d DM sent, %d replied, %d other "
-             "value, %d connected too recently; the first %d in order are handed on",
-             rule_id, len(rows), len(people), report["dated"], days, report["undated"],
-             report["sent"], report["replied"], report["other"], report["not_yet"], len(handed))
+             "value, %d connected too recently, %d with no connected date; all %d handed on "
+             "in rotation order", rule_id, len(rows), len(people), report["dated"], days,
+             report["undated"], report["sent"], report["replied"], report["other"],
+             report["not_yet"], report["no_date"], len(handed))
     if not people:
         return [_item(
             rule=rule, trigger=R_LI_NO_DM, today=today, due=today,
@@ -1242,6 +1276,8 @@ def _r_li_no_dm(rule, ctx) -> list:
                  + (f"connected {dl.format_date(connected)}, {elapsed}d ago, "
                     f"LI_NO_DM_DAYS is {days}" if connected is not None
                     else "no LI Connected Date, so in straight away")
+                 + (f"; last named {person['last_date']}" if person.get("last_date")
+                    else "; never named")
                  + f"; {order + 1} of {len(handed)} handed on, {len(people)} qualify"),
             text=f"{who}: connected, no DM yet",
             company=_text(row, "company"), poc=_text(row, "name"),
@@ -2871,6 +2907,7 @@ def run(
     next_step_state: Optional[dict] = None,
     poc_company_index: Optional[dict] = None,
     dm_no_meeting_state: Optional[dict] = None,
+    li_no_dm_state="not supplied",
     meeting_rows: Optional[list] = None,
     meeting_state: Optional[dict] = None,
     reconnect_rows: Optional[list] = None,
@@ -2939,6 +2976,10 @@ def run(
         # R7's ROTATION STATE. None (unreadable) is kept as None, like R13's.
         "dm_no_meeting_state": (dict(dm_no_meeting_state)
                                 if dm_no_meeting_state is not None else None),
+        # R6's ROTATION STATE (RULES-OCT16). None (unreadable) names nobody;
+        # not supplied at all (a check, a preview) is an empty history.
+        "li_no_dm_state": ({} if li_no_dm_state == "not supplied" else
+                           dict(li_no_dm_state) if li_no_dm_state is not None else None),
         # R8 READS EVERY ROW THAT HAS A MEETING DATE (None = use `rows`), and
         # its memory of which touches have gone out.
         "meeting_rows": list(meeting_rows) if meeting_rows is not None else None,

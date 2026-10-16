@@ -66,6 +66,12 @@ ANTHROPIC_BACKEND_ONLY = {
     "WEB_SEARCH_BLOCKED_DOMAINS", "WEB_SEARCH_CITY", "WEB_SEARCH_REGION",
     "WEB_SEARCH_COUNTRY", "WEB_SEARCH_TIMEZONE",
 }
+# R7 IS OFF (RULES-OCT16, 16 Oct 2026), and these three timing settings sit in
+# the RETIRED block: setting them does nothing while R7 is off. The code still
+# reads them so R7 comes back exactly as it was if it is turned back on — the
+# second, and only other, exception to "a retired name is read nowhere".
+R7_OFF = {"DM_NO_MEETING_DAYS", "DM_NO_MEETING_BOOKED_GAP_DAYS", "DM_NO_MEETING_MAX_CONTACTS"}
+READ_WHILE_RETIRED = ANTHROPIC_BACKEND_ONLY | R7_OFF
 # NEWS_CHECK_MAX_USES was the tenth until NFT2-1087: the hourly check it capped
 # is gone under every backend, nothing reads it, and it is plainly retired.
 
@@ -181,7 +187,7 @@ class TestEveryVariableIsListed:
         """
         dead = [v for v in variables_read_by_the_code()
                 if v not in live_keys() and v in commented_keys()
-                and v not in ANTHROPIC_BACKEND_ONLY]
+                and v not in READ_WHILE_RETIRED]
         assert not dead, (
             "commented out in .env.example but still read by the code: "
             + ", ".join(dead)
@@ -202,7 +208,7 @@ class TestRetiredVariablesStayRetired:
 
     def test_a_retired_variable_is_not_read_anywhere(self):
         live = set(variables_read_by_the_code())
-        zombies = sorted((retired_keys() & live) - ANTHROPIC_BACKEND_ONLY)
+        zombies = sorted((retired_keys() & live) - READ_WHILE_RETIRED)
         assert not zombies, (
             "listed as RETIRED but still read by the code: "
             + ", ".join(zombies)
@@ -227,6 +233,21 @@ class TestRetiredVariablesStayRetired:
         assert not unread, (
             "listed as read under SEARCH_BACKEND=anthropic but no longer read "
             "at all — drop it from ANTHROPIC_BACKEND_ONLY: " + ", ".join(unread))
+
+    def test_r7s_three_settings_are_retired_while_r7_is_off(self):
+        """RULES-OCT16: R7 is off; its three timing settings are commented in the
+        RETIRED block, never live, the block says R7 is off, and the code still
+        reads every one of them (so turning R7 back on needs no code change)."""
+        retired = retired_keys()
+        assert not sorted(R7_OFF - retired), "not in RETIRED: " + ", ".join(
+            sorted(R7_OFF - retired))
+        assert not sorted(R7_OFF & live_keys()), "still live: " + ", ".join(
+            sorted(R7_OFF & live_keys()))
+        text = _example_text()
+        block = text[list(_BANNER_RE.finditer(text))[-1].start():]
+        assert "R7" in block and "OFF" in block, "the RETIRED block must say R7 is off"
+        unread = sorted(R7_OFF - set(variables_read_by_the_code()))
+        assert not unread, "no longer read at all — drop from R7_OFF: " + ", ".join(unread)
 
     def test_the_retired_block_exists(self):
         assert "RETIRED" in _example_text(), (
